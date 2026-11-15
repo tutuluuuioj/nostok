@@ -19,12 +19,20 @@ contract EligibilityGate is IEligibilityGate, Ownable {
     bool public permissionlessMode;
 
     mapping(address => bool) public allowlist;
+    mapping(address => bool) public isOperator;
 
     error ZeroAddress();
+    error Unauthorized();
     error InvalidSignature();
 
     event AttestationSignerUpdated(address indexed newSigner);
     event PermissionlessModeUpdated(bool enabled);
+    event OperatorUpdated(address indexed operator, bool isAllowed);
+
+    modifier onlyAdminOrOperator() {
+        if (msg.sender != owner() && !isOperator[msg.sender]) revert Unauthorized();
+        _;
+    }
 
     constructor(
         address initialOwner,
@@ -34,6 +42,13 @@ contract EligibilityGate is IEligibilityGate, Ownable {
         if (initialOwner == address(0)) revert ZeroAddress();
         attestationSigner = initialSigner;
         permissionlessMode = initialPermissionless;
+        isOperator[initialOwner] = true;
+    }
+
+    function setOperator(address operator, bool isAllowed) external onlyOwner {
+        if (operator == address(0)) revert ZeroAddress();
+        isOperator[operator] = isAllowed;
+        emit OperatorUpdated(operator, isAllowed);
     }
 
     function setAttestationSigner(address newSigner) external onlyOwner {
@@ -46,10 +61,20 @@ contract EligibilityGate is IEligibilityGate, Ownable {
         emit PermissionlessModeUpdated(enabled);
     }
 
-    function setAllowlist(address account, bool isAllowed) external onlyOwner {
+    function setAllowlist(address account, bool isAllowed) external onlyAdminOrOperator {
         if (account == address(0)) revert ZeroAddress();
         allowlist[account] = isAllowed;
         emit AccountEligibilityUpdated(account, isAllowed);
+    }
+
+    function setAllowlistBatch(address[] calldata accounts, bool isAllowed) external onlyAdminOrOperator {
+        for (uint256 i = 0; i < accounts.length; i++) {
+            address acc = accounts[i];
+            if (acc != address(0)) {
+                allowlist[acc] = isAllowed;
+                emit AccountEligibilityUpdated(acc, isAllowed);
+            }
+        }
     }
 
     function isEligible(

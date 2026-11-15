@@ -36,7 +36,7 @@ contract LoanCore is
     uint64 public constant GRACE_PERIOD_SECONDS = 24 hours;
 
     bytes32 public constant EXTEND_ORDER_TYPEHASH = keccak256(
-        "ExtendOrder(uint256 loanId,uint64 newMaturity,uint32 newRateBps,uint256 nonce)"
+        "ExtendOrder(uint256 loanId,uint64 newMaturity,uint32 newRateBps,uint256 nonce,uint64 deadline)"
     );
 
     address public escrow;
@@ -58,6 +58,7 @@ contract LoanCore is
     mapping(address => uint128) public assetOutstandingPrincipal;
     mapping(address => uint128) public claimable;
     mapping(uint256 => uint256) public loanExtensionNonce;
+    mapping(uint256 => uint256) public loanActiveAuction;
 
     error UnauthorizedCaller();
     error ZeroAddress();
@@ -73,6 +74,7 @@ contract LoanCore is
     error LoanNotInGrace();
     error LoanNotLiquidatable();
     error InsufficientPayment();
+    error OrderExpired();
     error InvalidSignature();
 
     event ProtocolPausedStateChanged(bool isPaused);
@@ -326,7 +328,14 @@ contract LoanCore is
     function repay(uint256 loanId) external override nonReentrant returns (uint128 totalPaid) {
         syncStatus(loanId);
         Loan storage l = loans[loanId];
-        if (l.status != uint8(LoanStatus.Active) && l.status != uint8(LoanStatus.Grace)) {
+        if (l.status == uint8(LoanStatus.Auction)) {
+            uint256 activeAuctionId = loanActiveAuction[loanId];
+            if (activeAuctionId != 0) {
+                ILiquidationAuction(liquidationAuction).cancelAuction(activeAuctionId);
+                loanActiveAuction[loanId] = 0;
+            }
+            IPositionNFT(positionNft).setAuctionLock(loanId, false);
+        } else if (l.status != uint8(LoanStatus.Active) && l.status != uint8(LoanStatus.Grace)) {
             revert LoanNotActive();
         }
 
@@ -440,8 +449,10 @@ contract LoanCore is
         uint256 loanId,
         uint64 newMaturity,
         uint32 newRateBps,
+        uint64 deadline,
         bytes calldata counterpartySig
     ) external override nonReentrant {
+        if (block.timestamp > deadline) revert OrderExpired();
         syncStatus(loanId);
         Loan storage l = loans[loanId];
         if (l.status != uint8(LoanStatus.Active)) revert LoanNotActive();
@@ -460,7 +471,7 @@ contract LoanCore is
         uint256 nonce = loanExtensionNonce[loanId]++;
 
         bytes32 digest = _hashTypedDataV4(
-            keccak256(abi.encode(EXTEND_ORDER_TYPEHASH, loanId, newMaturity, newRateBps, nonce))
+            keccak256(abi.encode(EXTEND_ORDER_TYPEHASH, loanId, newMaturity, newRateBps, nonce, deadline))
         );
         address signer = ECDSA.recover(digest, counterpartySig);
 
@@ -518,6 +529,7 @@ contract LoanCore is
             msg.sender,
             false // Not a default auction
         );
+        loanActiveAuction[loanId] = auctionId;
     }
 
     /**
@@ -554,18 +566,19 @@ contract LoanCore is
             msg.sender,
             true // Is default auction
         );
+        loanActiveAuction[loanId] = auctionId;
     }
 
     /**
      * @notice Settlement callback from LiquidationAuction.
-     * Updates remaining debt accurately per buy, and burns NFT only when auction settles.
+     * Accurately distinguishes partial liquidation from full liquidation and bad debt.
      */
     function onAuctionSettlement(
         uint256 loanId,
         uint128 principalPaid,
         uint128 interestPaid,
         uint128 collateralSold,
-        bool isSettled,
+        bool isAuctionCollateralDepleted,
         bool isDefault
     ) external override onlyAuction {
         Loan storage l = loans[loanId];
@@ -592,17 +605,50 @@ contract LoanCore is
         totalOutstandingPrincipal -= principalPaid;
         assetOutstandingPrincipal[l.collateralToken] -= principalPaid;
 
-        if (isSettled) {
-            if (isDefault) {
-                l.status = uint8(LoanStatus.SettledDefault);
-            } else {
-                l.status = uint8(LoanStatus.SettledLiquidated);
+        bool debtFullyRepaid = (l.principalRepaid >= l.principal);
+        bool collateralDepleted = (l.collateralRaw == 0);
+
+        if (debtFullyRepaid) {
+            // Debt 100% satisfied
+            loanActiveAuction[loanId] = 0;
+            if (l.collateralRaw > 0) {
+                uint128 leftover = l.collateralRaw;
+                l.collateralRaw = 0;
+                ICollateralEscrow(escrow).releaseCollateral(l.collateralToken, l.borrower, leftover);
             }
             IPositionNFT(positionNft).burn(loanId);
+            l.status = isDefault ? uint8(LoanStatus.SettledDefault) : uint8(LoanStatus.SettledLiquidated);
+        } else if (collateralDepleted) {
+            // All loan collateral sold, shortfall remains -> BAD DEBT
+            loanActiveAuction[loanId] = 0;
+            uint128 shortfall = l.principal - l.principalRepaid;
+            totalOutstandingPrincipal -= shortfall;
+            assetOutstandingPrincipal[l.collateralToken] -= shortfall;
+            emit BadDebtRecorded(loanId, shortfall);
+
+            IPositionNFT(positionNft).burn(loanId);
+            l.status = isDefault ? uint8(LoanStatus.SettledDefault) : uint8(LoanStatus.SettledLiquidated);
         } else {
-            // Partial buy: auction is still in progress
-            l.status = uint8(LoanStatus.Auction);
+            // Debt remains and collateral remains
+            if (isAuctionCollateralDepleted) {
+                // Partial liquidation auction completed; return loan to Active/Grace
+                loanActiveAuction[loanId] = 0;
+                IPositionNFT(positionNft).setAuctionLock(loanId, false);
+                l.status = block.timestamp > l.maturity ? uint8(LoanStatus.Grace) : uint8(LoanStatus.Active);
+                emit StatusSynced(loanId, LoanStatus(l.status));
+            } else {
+                // Multi-buy in active auction
+                l.status = uint8(LoanStatus.Auction);
+            }
         }
+    }
+
+    function onAuctionCancelled(uint256 loanId) external override onlyAuction {
+        Loan storage l = loans[loanId];
+        loanActiveAuction[loanId] = 0;
+        IPositionNFT(positionNft).setAuctionLock(loanId, false);
+        l.status = block.timestamp > l.maturity ? uint8(LoanStatus.Grace) : uint8(LoanStatus.Active);
+        emit StatusSynced(loanId, LoanStatus(l.status));
     }
 
     /**

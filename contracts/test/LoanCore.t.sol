@@ -11,6 +11,7 @@ import {OracleRouter} from "../src/OracleRouter.sol";
 import {FeeCollector} from "../src/FeeCollector.sol";
 import {EligibilityGate} from "../src/EligibilityGate.sol";
 import {LiquidationAuction} from "../src/LiquidationAuction.sol";
+import {ILiquidationAuction} from "../src/interfaces/ILiquidationAuction.sol";
 import {ILoanCore} from "../src/interfaces/ILoanCore.sol";
 import {IAssetRegistry} from "../src/interfaces/IAssetRegistry.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -44,7 +45,7 @@ contract LoanCoreTest is Test {
     address public lender;
 
     bytes32 public constant EXTEND_ORDER_TYPEHASH = keccak256(
-        "ExtendOrder(uint256 loanId,uint64 newMaturity,uint32 newRateBps,uint256 nonce)"
+        "ExtendOrder(uint256 loanId,uint64 newMaturity,uint32 newRateBps,uint256 nonce,uint64 deadline)"
     );
 
     function _hashTypedData(bytes32 structHash) internal view returns (bytes32) {
@@ -290,26 +291,27 @@ contract LoanCoreTest is Test {
 
         uint64 newMaturity = l.maturity + 15 days;
         uint32 newRateBps = 1200; // 12%
+        uint64 deadline = uint64(block.timestamp + 1 days);
 
         // 1. Reverts if rate exceeds 40% cap (4000 bps)
         vm.prank(borrower);
         vm.expectRevert(LoanCore.InvalidLoanTerms.selector);
-        core.extend(1, newMaturity, 4500, "");
+        core.extend(1, newMaturity, 4500, deadline, "");
 
         // 2. Reverts if extension term > 90 days from now
         vm.prank(borrower);
         vm.expectRevert(LoanCore.InvalidLoanTerms.selector);
-        core.extend(1, uint64(block.timestamp + 95 days), newRateBps, "");
+        core.extend(1, uint64(block.timestamp + 95 days), newRateBps, deadline, "");
 
         // 3. Reverts if unauthorized third party calls
         address attacker = address(0x9999);
         vm.prank(attacker);
         vm.expectRevert(LoanCore.UnauthorizedCaller.selector);
-        core.extend(1, newMaturity, newRateBps, "");
+        core.extend(1, newMaturity, newRateBps, deadline, "");
 
         // 4. Lender signs EIP-712 approval for extension
         bytes32 structHash = keccak256(
-            abi.encode(EXTEND_ORDER_TYPEHASH, 1, newMaturity, newRateBps, 0)
+            abi.encode(EXTEND_ORDER_TYPEHASH, 1, newMaturity, newRateBps, 0, deadline)
         );
         bytes32 digest = _hashTypedData(structHash);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(lenderPrivateKey, digest);
@@ -320,15 +322,72 @@ contract LoanCoreTest is Test {
         bytes memory badSig = abi.encodePacked(badR, badS, badV);
         vm.prank(borrower);
         vm.expectRevert(LoanCore.InvalidSignature.selector);
-        core.extend(1, newMaturity, newRateBps, badSig);
+        core.extend(1, newMaturity, newRateBps, deadline, badSig);
 
         // 6. Borrower submits with valid lender signature -> extends successfully!
         vm.prank(borrower);
-        core.extend(1, newMaturity, newRateBps, lenderSig);
+        core.extend(1, newMaturity, newRateBps, deadline, lenderSig);
 
         ILoanCore.Loan memory updatedLoan = core.getLoan(1);
         assertEq(updatedLoan.maturity, newMaturity);
         assertEq(updatedLoan.rateBps, newRateBps);
+    }
+
+    function test_Extend_ExpiredSignature_Reverts() public {
+        test_OpenLoan_Success();
+        ILoanCore.Loan memory l = core.getLoan(1);
+
+        uint64 newMaturity = l.maturity + 15 days;
+        uint32 newRateBps = 1200;
+        uint64 deadline = uint64(block.timestamp + 1 hours);
+
+        bytes32 structHash = keccak256(
+            abi.encode(EXTEND_ORDER_TYPEHASH, 1, newMaturity, newRateBps, 0, deadline)
+        );
+        bytes32 digest = _hashTypedData(structHash);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(lenderPrivateKey, digest);
+        bytes memory lenderSig = abi.encodePacked(r, s, v);
+
+        // Warp past deadline
+        vm.warp(block.timestamp + 2 hours);
+
+        vm.prank(borrower);
+        vm.expectRevert(LoanCore.OrderExpired.selector);
+        core.extend(1, newMaturity, newRateBps, deadline, lenderSig);
+    }
+
+    function test_RepayDuringAuction_CancelsAuctionAndSavesCollateral() public {
+        test_OpenLoan_Success();
+
+        // Trigger liquidation auction (50 shares * $125 = $6,250; debt $5,000 = 80% LTV > 78% threshold)
+        feed.setPrice(125e8);
+        address keeper = address(0xDDDD);
+        vm.prank(keeper);
+        uint256 auctionId = core.startLiquidation(1);
+        assertEq(auctionId, 1);
+        assertTrue(nft.isAuctionLocked(1));
+
+        // Borrower repays full debt during the active auction
+        usdc.mint(borrower, 6000e6);
+        vm.prank(borrower);
+        usdc.approve(address(core), type(uint256).max);
+
+        vm.prank(borrower);
+        core.repay(1);
+
+        // Auction was cancelled!
+        ILiquidationAuction.Auction memory a = auction.getAuction(auctionId);
+        assertEq(uint8(a.status), uint8(ILiquidationAuction.AuctionStatus.Cancelled));
+
+        // Borrower received 100% of their collateral back!
+        assertEq(stockToken.balanceOf(borrower), 100e6);
+        assertEq(escrow.getBalance(address(stockToken)), 0);
+
+        // Loan status is Repaid, NFT burned
+        ILoanCore.Loan memory l = core.getLoan(1);
+        assertEq(uint8(l.status), uint8(ILoanCore.LoanStatus.Repaid));
+        vm.expectRevert();
+        nft.ownerOf(1);
     }
 
     function test_PartialRepay_AccruesAndChargesInterest() public {

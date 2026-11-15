@@ -252,21 +252,117 @@ contract LiquidationAuctionTest is Test {
         assertEq(a1.collateralRemaining, 10e6); // 25e6 (50% partial auction) - 15e6 = 10e6
         assertEq(uint8(a1.status), uint8(ILiquidationAuction.AuctionStatus.Active));
 
-        // Second buy: liquidator buys remaining 10 shares
+        // Second buy: liquidator buys remaining 10 shares of the partial auction
         uint128 remainingCollateral = a1.collateralRemaining;
         vm.prank(liquidator);
         uint128 paid2 = auction.buy(auctionId, remainingCollateral, 30_000e6);
         assertGt(paid2, 0);
 
-        // Now loan IS settled: status is SettledLiquidated, NFT is burned, auction inactive
-        ILoanCore.Loan memory l2 = core.getLoan(loanId);
-        assertEq(uint8(l2.status), uint8(ILoanCore.LoanStatus.SettledLiquidated));
+        // Auction itself is settled, but LOAN is NOT settled!
+        // The remaining 25 shares are NOT stuck, and the remaining debt (~$2,250) is still owed!
         ILiquidationAuction.Auction memory a2 = auction.getAuction(auctionId);
         assertEq(uint8(a2.status), uint8(ILiquidationAuction.AuctionStatus.Settled));
 
-        // Position NFT burned (attempt to query owner of loanId reverts)
+        ILoanCore.Loan memory l2 = core.getLoan(loanId);
+        assertEq(uint8(l2.status), uint8(ILoanCore.LoanStatus.Active));
+        assertEq(l2.collateralRaw, 25e6); // Other half of stock is still in the loan!
+        assertGt(l2.principal - l2.principalRepaid, 2000e6); // ~$2,250 debt remains
+        assertEq(nft.ownerOf(loanId), lender); // Position NFT is NOT burned!
+        assertFalse(nft.isAuctionLocked(loanId)); // Auction lock removed!
+
+        // Borrower can now repay the remaining debt to reclaim their remaining 25 shares
+        usdc.mint(borrower, 3000e6);
+        vm.prank(borrower);
+        usdc.approve(address(core), type(uint256).max);
+
+        vm.prank(borrower);
+        core.repay(loanId);
+
+        // All collateral released cleanly, escrow empty, loan repaid, NFT burned!
+        assertEq(stockToken.balanceOf(borrower), 75e6);
+        assertEq(escrow.getBalance(address(stockToken)), 0);
+        ILoanCore.Loan memory lFinal = core.getLoan(loanId);
+        assertEq(uint8(lFinal.status), uint8(ILoanCore.LoanStatus.Repaid));
         vm.expectRevert();
         nft.ownerOf(loanId);
+    }
+
+    function test_BadDebt_ShortfallClearedFromCaps() public {
+        vm.prank(mockOrderSettlement);
+        uint256 loanId = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            50e6,
+            5800e6,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        // Severe crash into bad debt (> 90% LTV threshold): price drops to $60
+        // Collateral value = 50 * $60 = $3,000. Debt = $5,800.
+        feed.setPrice(60e8);
+
+        // Triggers 100% full liquidation auction
+        vm.prank(keeper);
+        uint256 auctionId = core.startLiquidation(loanId);
+        ILiquidationAuction.Auction memory a = auction.getAuction(auctionId);
+        assertEq(a.collateralTotal, 50e6); // 100% of collateral auctioned!
+
+        // Liquidator buys all 50 shares
+        vm.prank(liquidator);
+        auction.buy(auctionId, 50e6, 50_000e6);
+
+        // Loan settles with bad debt
+        ILoanCore.Loan memory l = core.getLoan(loanId);
+        assertEq(uint8(l.status), uint8(ILoanCore.LoanStatus.SettledLiquidated));
+        assertEq(l.collateralRaw, 0);
+        assertGt(l.principal - l.principalRepaid, 0); // Shortfall exists
+
+        // Crucial fix: Shortfall is cleared from totalOutstandingPrincipal and asset cap!
+        assertEq(core.totalOutstandingPrincipal(), 0);
+        assertEq(core.assetOutstandingPrincipal(address(stockToken)), 0);
+    }
+
+    function test_Auction_RestartOrCancel_PriceRecovered() public {
+        vm.prank(mockOrderSettlement);
+        uint256 loanId = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            50e6,
+            5800e6,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        feed.setPrice(145e8);
+        vm.prank(keeper);
+        uint256 auctionId = core.startLiquidation(loanId);
+
+        // 30-minute auction expires with nobody buying
+        vm.warp(block.timestamp + 1801);
+
+        // Price recovers back to $200!
+        feed.setPrice(200e8);
+        feed.setUpdatedAt(block.timestamp);
+
+        // Anyone calls restartOrCancelAuction -> detects price recovered and cancels!
+        auction.restartOrCancelAuction(auctionId);
+
+        ILiquidationAuction.Auction memory a = auction.getAuction(auctionId);
+        assertEq(uint8(a.status), uint8(ILiquidationAuction.AuctionStatus.Cancelled));
+
+        // Loan returns to Active status and NFT is unlocked!
+        ILoanCore.Loan memory l = core.getLoan(loanId);
+        assertEq(uint8(l.status), uint8(ILoanCore.LoanStatus.Active));
+        assertFalse(nft.isAuctionLocked(loanId));
     }
 
     function test_Auction_DefaultSettlesWithSettledDefault() public {

@@ -56,6 +56,9 @@ interface ILiquidationAuction {
         uint128 surplusToBorrower
     );
 
+    event AuctionCancelled(uint256 indexed auctionId, uint256 indexed loanId);
+    event AuctionRestarted(uint256 indexed auctionId, uint256 newStartPrice, uint256 newFloorPrice);
+
     function startAuction(
         uint256 loanId,
         address borrower,
@@ -74,6 +77,9 @@ interface ILiquidationAuction {
         uint128 collateralAmount,
         uint128 maxUsdcPayment
     ) external returns (uint128 usdcPaid);
+
+    function cancelAuction(uint256 auctionId) external;
+    function restartOrCancelAuction(uint256 auctionId) external;
 
     function getCurrentPrice(uint256 auctionId) external view returns (uint256 price);
     function getAuction(uint256 auctionId) external view returns (Auction memory);

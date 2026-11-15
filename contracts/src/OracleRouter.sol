@@ -66,9 +66,40 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
         assetRegistry = initialRegistry;
         sequencerUptimeFeed = initialSequencerFeed;
         sequencerGracePeriod = 3600; // 1 hour grace period
-        maxStaleClosedSecs = 345600; // 4 days (covers holiday weekends)
+        maxStaleClosedSecs = 86400; // 24 hours (1 day max stale tolerance when market is closed)
         isMarketOpenManual = true;
         useManualMarketSession = false;
+
+        _loadDefaultHolidays();
+    }
+
+    function _loadDefaultHolidays() internal {
+        // Pre-load NYSE holidays & half-days for 2024, 2025, 2026
+        // 2024: New Year's Day, MLK, Washington's Bday, Good Friday, Memorial Day, Juneteenth, July 4th, Labor Day, Thanksgiving, Christmas
+        uint256[30] memory holidays = [
+            // 2024
+            uint256(19723), 19737, 19772, 19811, 19870, 19893, 19908, 19968, 20055, 20082,
+            // 2025
+            uint256(20089), 20108, 20136, 20196, 20234, 20258, 20273, 20332, 20419, 20447,
+            // 2026
+            uint256(20454), 20472, 20500, 20546, 20598, 20623, 20637, 20703, 20783, 20812
+        ];
+        for (uint256 i = 0; i < 30; i++) {
+            isHoliday[holidays[i]] = true;
+        }
+
+        // Half-days (close 13:00 ET / 17:00 UTC EDT / 18:00 UTC EST)
+        // 2024: July 3, Black Friday (Nov 29), Christmas Eve (Dec 24)
+        // 2025: July 3, Black Friday (Nov 28), Christmas Eve (Dec 24)
+        // 2026: Black Friday (Nov 27), Christmas Eve (Dec 24)
+        uint256[8] memory halfDays = [
+            uint256(19907), 20056, 20081,
+            uint256(20272), 20420, 20446,
+            uint256(20784), 20811
+        ];
+        for (uint256 j = 0; j < 8; j++) {
+            isHalfDay[halfDays[j]] = true;
+        }
     }
 
     function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
@@ -226,16 +257,24 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
             return (0, decimals, OracleState.FROZEN_CORPORATE_ACTION);
         }
 
-        // Check 2: B20 Multiplier corporate action check
+        // Check 2: B20 Multiplier corporate action check & split scaling
+        uint256 mult = 1e18;
         (bool success, bytes memory ret) = token.staticcall(
             abi.encodeWithSelector(IB20Token.uiMultiplier.selector)
         );
         if (success && ret.length == 32) {
             uint256 currentMult = abi.decode(ret, (uint256));
-            uint256 recMult = recordedMultiplier[token];
-            if (recMult != 0 && currentMult != recMult) {
-                // Multiplier change detected without governance sync! Auto-freeze!
-                return (0, decimals, OracleState.FROZEN_CORPORATE_ACTION);
+            if (currentMult > 0) {
+                uint256 recMult = recordedMultiplier[token];
+                // Default baseline is 1e18 (1:1 ratio) if not yet explicitly set
+                if (recMult == 0) {
+                    recMult = 1e18;
+                }
+                if (currentMult != recMult) {
+                    // Multiplier change detected without governance sync! Auto-freeze!
+                    return (0, decimals, OracleState.FROZEN_CORPORATE_ACTION);
+                }
+                mult = currentMult;
             }
         }
 
@@ -257,7 +296,8 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
             return (0, decimals, OracleState.STALE_FEED);
         }
 
-        price = uint256(rawPrice);
+        // Price scaled by B20 corporate action / split multiplier
+        price = (uint256(rawPrice) * mult) / 1e18;
         bool marketOpen = isMarketOpen();
 
         if (marketOpen) {

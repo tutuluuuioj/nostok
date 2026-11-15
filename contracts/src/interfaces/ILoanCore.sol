@@ -75,6 +75,7 @@ interface ILoanCore {
         uint256 loanId,
         uint64 newMaturity,
         uint32 newRateBps,
+        uint64 deadline,
         bytes calldata counterpartySig
     ) external;
     function startLiquidation(uint256 loanId) external returns (uint256 auctionId);
@@ -84,13 +85,16 @@ interface ILoanCore {
         uint128 principalPaid,
         uint128 interestPaid,
         uint128 collateralSold,
-        bool isSettled,
+        bool isAuctionCollateralDepleted,
         bool isDefault
     ) external;
+    function onAuctionCancelled(uint256 loanId) external;
     function claim(address to) external returns (uint128 claimedAmount);
     function syncStatus(uint256 loanId) external returns (LoanStatus);
 
     function getLoan(uint256 loanId) external view returns (Loan memory);
     function getDueInterest(uint256 loanId) external view returns (uint128 interestOwed);
     function getClaimable(address account) external view returns (uint128 amount);
+    function oracleRouter() external view returns (address);
+    function assetRegistry() external view returns (address);
 }

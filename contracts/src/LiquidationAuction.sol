@@ -12,6 +12,8 @@ import {ILiquidationAuction} from "./interfaces/ILiquidationAuction.sol";
 import {ICollateralEscrow} from "./interfaces/ICollateralEscrow.sol";
 import {ILoanCore} from "./interfaces/ILoanCore.sol";
 import {IFeeCollector} from "./interfaces/IFeeCollector.sol";
+import {IOracleRouter} from "./interfaces/IOracleRouter.sol";
+import {IAssetRegistry} from "./interfaces/IAssetRegistry.sol";
 
 /**
  * @title LiquidationAuction
@@ -230,12 +232,13 @@ contract LiquidationAuction is
         uint128 surplus = principalAvailable - principalPayment;
         uint128 totalDebtPaid = interestPayment + principalPayment;
 
-        // Settle condition: auction finishes when all debt is paid OR collateral is depleted
-        bool isSettled = (a.debtPrincipalRemaining == 0 && a.debtInterestRemaining == 0) ||
-            a.collateralRemaining == 0;
+        // Auction completes when its collateral is depleted OR all debt is paid
+        bool isAuctionCollateralDepleted = (a.collateralRemaining == 0);
+        bool debtZero = (a.debtPrincipalRemaining == 0 && a.debtInterestRemaining == 0);
+        bool isAuctionSettled = isAuctionCollateralDepleted || debtZero;
 
         // If debt is fully paid and collateral remains, refund remaining collateral to borrower
-        if (a.debtPrincipalRemaining == 0 && a.debtInterestRemaining == 0 && a.collateralRemaining > 0) {
+        if (debtZero && a.collateralRemaining > 0) {
             uint128 leftoverCollateral = a.collateralRemaining;
             a.collateralRemaining = 0;
             ICollateralEscrow(escrow).releaseCollateral(a.collateralToken, a.borrower, leftoverCollateral);
@@ -256,15 +259,56 @@ contract LiquidationAuction is
             principalPayment,
             interestPayment,
             collateralAmount,
-            isSettled,
+            isAuctionCollateralDepleted,
             a.isDefaultAuction
         );
 
         emit AuctionBought(auctionId, msg.sender, collateralAmount, usdcPaid, currentPrice);
 
-        if (isSettled) {
+        if (isAuctionSettled) {
             a.status = AuctionStatus.Settled;
             emit AuctionSettled(auctionId, usdcPaid, totalDebtPaid, totalFee, surplus);
+        }
+    }
+
+    function cancelAuction(uint256 auctionId) external override onlyLoanCore {
+        Auction storage a = auctions[auctionId];
+        if (a.status != AuctionStatus.Active) revert AuctionNotActive();
+        a.status = AuctionStatus.Cancelled;
+        emit AuctionCancelled(auctionId, a.loanId);
+    }
+
+    function restartOrCancelAuction(uint256 auctionId) external override nonReentrant {
+        Auction storage a = auctions[auctionId];
+        if (a.status != AuctionStatus.Active) revert AuctionNotActive();
+        if (block.timestamp < a.startTime + a.duration) revert AuctionNotActive();
+        if (a.collateralRemaining == 0) revert InvalidAuctionAmount();
+
+        address router = ILoanCore(loanCore).oracleRouter();
+        (uint256 currentPrice, , IOracleRouter.OracleState oState) = IOracleRouter(router).getPrice(a.collateralToken);
+        if (oState != IOracleRouter.OracleState.VALID_OPEN) {
+            return; // Maintain status if oracle is closed or invalid
+        }
+
+        ILoanCore.Loan memory l = ILoanCore(loanCore).getLoan(a.loanId);
+        (uint256 grossVal, , ) = IOracleRouter(router).getValue(a.collateralToken, l.collateralRaw);
+        uint128 debtPrincipal = l.principal - l.principalRepaid;
+        uint128 debtInterest = ILoanCore(loanCore).getDueInterest(a.loanId);
+        uint256 totalDebt = debtPrincipal + debtInterest;
+        uint256 currentLtvBps = grossVal > 0 ? (totalDebt * 10000) / grossVal : 10000;
+
+        if (currentLtvBps < l.liqLtvBps && !a.isDefaultAuction) {
+            // Stock price recovered! Position is healthy. Cancel auction!
+            a.status = AuctionStatus.Cancelled;
+            ILoanCore(loanCore).onAuctionCancelled(a.loanId);
+            emit AuctionCancelled(auctionId, a.loanId);
+        } else {
+            // Still liquidatable; restart auction at fresh oracle price
+            IAssetRegistry.AssetConfig memory cfg = IAssetRegistry(ILoanCore(loanCore).assetRegistry()).getAssetConfig(a.collateralToken);
+            a.startPrice = (currentPrice * 99) / 100;
+            a.floorPrice = (currentPrice * (10000 - cfg.maxDiscountBps)) / 10000;
+            a.startTime = uint64(block.timestamp);
+            emit AuctionRestarted(auctionId, a.startPrice, a.floorPrice);
         }
     }
 

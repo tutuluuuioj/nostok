@@ -214,30 +214,29 @@ contract OracleRouterTest is Test {
         vm.warp(block.timestamp + 7200);
         feed.setUpdatedAt(block.timestamp);
 
-        // Initial multiplier = 1e18
+        // Even with NO manual setup (recordedMultiplier == 0), default baseline is 1e18
+        assertEq(router.recordedMultiplier(address(stockToken)), 0);
+
+        // Standard token with default 1e18 (or 0) multiplier functions normally
         stockToken.setUiMultiplier(1e18);
+        (uint256 baseP, , IOracleRouter.OracleState state0) = router.getPrice(address(stockToken));
+        assertEq(uint8(state0), uint8(IOracleRouter.OracleState.VALID_OPEN));
+        assertEq(baseP, 180e8);
 
-        // Governance records initial multiplier
-        vm.prank(owner);
-        router.syncMultiplier(address(stockToken));
-        assertEq(router.recordedMultiplier(address(stockToken)), 1e18);
-
-        // Normal query succeeds
-        (, , IOracleRouter.OracleState state) = router.getPrice(address(stockToken));
-        assertEq(uint8(state), uint8(IOracleRouter.OracleState.VALID_OPEN));
-
-        // Token splits / corporate action changes multiplier to 2e18 without governance sync
+        // Token splits 2-for-1 -> new multiplier 2e18 without governance sync
         stockToken.setUiMultiplier(2e18);
 
         // OracleRouter detects split mismatch and automatically freezes!
         (, , IOracleRouter.OracleState frozenState) = router.getPrice(address(stockToken));
         assertEq(uint8(frozenState), uint8(IOracleRouter.OracleState.FROZEN_CORPORATE_ACTION));
 
-        // When governance reviews and syncs the new multiplier, it unfreezes
+        // When governance reviews and syncs the new multiplier, it unfreezes AND scales price!
         vm.prank(owner);
         router.syncMultiplier(address(stockToken));
-        (, , IOracleRouter.OracleState recoveredState) = router.getPrice(address(stockToken));
+        (uint256 scaledP, , IOracleRouter.OracleState recoveredState) = router.getPrice(address(stockToken));
         assertEq(uint8(recoveredState), uint8(IOracleRouter.OracleState.VALID_OPEN));
+        // Price per token scaled 2x: $180 * 2 = $360.00
+        assertEq(scaledP, 360e8);
     }
 
     function test_StaleFeed_DuringClosedHours() public {
@@ -247,14 +246,29 @@ contract OracleRouterTest is Test {
         vm.prank(owner);
         router.setMarketSession(false, true);
 
-        // Feed updated 2 days ago (172800s <= 345600s maxStaleClosedSecs)
-        feed.setUpdatedAt(block.timestamp - 172800);
+        // Feed updated 12 hours ago (43200s <= 86400s maxStaleClosedSecs)
+        feed.setUpdatedAt(block.timestamp - 43200);
         (, , IOracleRouter.OracleState state1) = router.getPrice(address(stockToken));
         assertEq(uint8(state1), uint8(IOracleRouter.OracleState.VALID_CLOSED));
 
-        // Feed updated 5 days ago (432000s > 345600s maxStaleClosedSecs)
-        feed.setUpdatedAt(block.timestamp - 432000);
+        // Feed updated 25 hours ago (90000s > 86400s maxStaleClosedSecs)
+        feed.setUpdatedAt(block.timestamp - 90000);
         (, , IOracleRouter.OracleState state2) = router.getPrice(address(stockToken));
         assertEq(uint8(state2), uint8(IOracleRouter.OracleState.STALE_FEED));
+    }
+
+    function test_Thanksgiving_IsLoadedByDefault() public {
+        // Disable manual session override
+        vm.prank(owner);
+        router.setMarketSession(false, false);
+
+        // Thanksgiving 2024: Nov 28, 2024 15:00:00 UTC (normally trading hours on Thursday)
+        uint256 thanksgiving2024 = 1732806000;
+        vm.warp(thanksgiving2024);
+
+        // Verified preloaded holiday: market is CLOSED!
+        uint256 epochDay = thanksgiving2024 / 86400;
+        assertTrue(router.isHoliday(epochDay));
+        assertFalse(router.isMarketOpen());
     }
 }

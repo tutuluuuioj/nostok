@@ -58,8 +58,9 @@ contract DeployNostok is Script {
         console.log("Deployer:", deployer);
         console.log("Target Multisig Owner:", multisigOwner);
 
-        // 1. EligibilityGate (starts in permissioned mode: permissionless = false)
-        EligibilityGate gate = new EligibilityGate(deployer, address(0), false);
+        // 1. EligibilityGate (starts in permissioned mode with deployer operator and multisig ownership)
+        address attestationSigner = vm.envOr("ATTESTATION_SIGNER", address(0));
+        EligibilityGate gate = new EligibilityGate(deployer, attestationSigner, false);
         console.log("EligibilityGate deployed at:", address(gate));
 
         // 2. CollateralEscrow (IMMUTABLE) - deployer temporary owner for initial authorization wiring
@@ -151,7 +152,7 @@ contract DeployNostok is Script {
         NostokTimelock timelock = new NostokTimelock(proposers, executors, multisigOwner);
         console.log("NostokTimelock deployed at:", address(timelock));
 
-        // Transfer ownership of contracts to TimelockController
+        // Transfer ownership of core contracts and escrow to 48-hour TimelockController
         escrow.transferOwnership(address(timelock));
         nft.transferOwnership(address(timelock));
         registry.transferOwnership(address(timelock));
@@ -160,9 +161,12 @@ contract DeployNostok is Script {
         core.transferOwnership(address(timelock));
         auction.transferOwnership(address(timelock));
         settlement.transferOwnership(address(timelock));
-        gate.transferOwnership(address(timelock));
+
+        // EligibilityGate is owned directly by Multisig to allow immediate KYC / allowlisting without 48h timelock
+        gate.transferOwnership(multisigOwner);
 
         console.log("Contract ownership successfully transferred to TimelockController:", address(timelock));
+        console.log("EligibilityGate ownership transferred directly to Multisig:", multisigOwner);
         console.log("--- NOSTOK Protocol Deployment Complete ---");
 
         vm.stopBroadcast();
