@@ -12,6 +12,7 @@ import {FeeCollector} from "../src/FeeCollector.sol";
 import {EligibilityGate} from "../src/EligibilityGate.sol";
 import {LiquidationAuction} from "../src/LiquidationAuction.sol";
 import {ILiquidationAuction} from "../src/interfaces/ILiquidationAuction.sol";
+import {ILoanCore} from "../src/interfaces/ILoanCore.sol";
 import {IAssetRegistry} from "../src/interfaces/IAssetRegistry.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockAggregator} from "./mocks/MockAggregator.sol";
@@ -187,5 +188,120 @@ contract LiquidationAuctionTest is Test {
 
         // Keeper received reward
         assertGt(usdc.balanceOf(keeper), 0);
+    }
+
+    function test_Auction_DustBuyRejected() public {
+        vm.prank(mockOrderSettlement);
+        uint256 loanId = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            50e6,
+            5800e6,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        feed.setPrice(145e8);
+        vm.prank(keeper);
+        uint256 auctionId = core.startLiquidation(loanId);
+
+        // Attempt to buy 1 raw unit of collateral (< 10 USDC)
+        vm.prank(liquidator);
+        vm.expectRevert(LiquidationAuction.BuyAmountTooSmall.selector);
+        auction.buy(auctionId, 1, 100e6);
+    }
+
+    function test_Auction_MultiBuyAndDebtReduction() public {
+        // Open loan: 50 NVDAc, borrow $5,800
+        vm.prank(mockOrderSettlement);
+        uint256 loanId = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            50e6,
+            5800e6,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        feed.setPrice(145e8);
+        vm.prank(keeper);
+        uint256 auctionId = core.startLiquidation(loanId);
+
+        // First buy: liquidator buys 15 shares (partial buy)
+        uint128 firstBuyCollateral = 15e6;
+        vm.prank(liquidator);
+        uint128 paid1 = auction.buy(auctionId, firstBuyCollateral, 20_000e6);
+        assertGt(paid1, 10e6); // Well above $10 min buy size
+
+        // Verify partial buy state: loan is NOT settled yet, still in Auction
+        ILoanCore.Loan memory l1 = core.getLoan(loanId);
+        assertEq(uint8(l1.status), uint8(ILoanCore.LoanStatus.Auction));
+        assertTrue(nft.isAuctionLocked(loanId));
+        assertGt(l1.principalRepaid, 0);
+        assertLt(l1.principalRepaid, l1.principal);
+
+        ILiquidationAuction.Auction memory a1 = auction.getAuction(auctionId);
+        assertEq(a1.collateralRemaining, 10e6); // 25e6 (50% partial auction) - 15e6 = 10e6
+        assertEq(uint8(a1.status), uint8(ILiquidationAuction.AuctionStatus.Active));
+
+        // Second buy: liquidator buys remaining 10 shares
+        uint128 remainingCollateral = a1.collateralRemaining;
+        vm.prank(liquidator);
+        uint128 paid2 = auction.buy(auctionId, remainingCollateral, 30_000e6);
+        assertGt(paid2, 0);
+
+        // Now loan IS settled: status is SettledLiquidated, NFT is burned, auction inactive
+        ILoanCore.Loan memory l2 = core.getLoan(loanId);
+        assertEq(uint8(l2.status), uint8(ILoanCore.LoanStatus.SettledLiquidated));
+        ILiquidationAuction.Auction memory a2 = auction.getAuction(auctionId);
+        assertEq(uint8(a2.status), uint8(ILiquidationAuction.AuctionStatus.Settled));
+
+        // Position NFT burned (attempt to query owner of loanId reverts)
+        vm.expectRevert();
+        nft.ownerOf(loanId);
+    }
+
+    function test_Auction_DefaultSettlesWithSettledDefault() public {
+        vm.prank(mockOrderSettlement);
+        uint256 loanId = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            50e6,
+            4000e6,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        // Warp past maturity (30 days) + grace period (24 hours) + 1 second
+        vm.warp(block.timestamp + 31 days + 1);
+        feed.setUpdatedAt(block.timestamp);
+
+        // Default auction triggered
+        vm.prank(keeper);
+        uint256 auctionId = core.startDefaultAuction(loanId);
+        assertEq(auctionId, 1);
+
+        ILiquidationAuction.Auction memory a = auction.getAuction(auctionId);
+        assertTrue(a.isDefaultAuction);
+
+        // Liquidator buys all collateral
+        vm.prank(liquidator);
+        auction.buy(auctionId, a.collateralRemaining, 50_000e6);
+
+        // Status is SettledDefault!
+        ILoanCore.Loan memory l = core.getLoan(loanId);
+        assertEq(uint8(l.status), uint8(ILoanCore.LoanStatus.SettledDefault));
     }
 }

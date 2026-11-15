@@ -233,9 +233,15 @@ contract OrderSettlementTest is Test {
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(borrowerPrivateKey, digest);
         bytes memory sig = abi.encodePacked(r, s, v);
 
-        // Borrower cancels the order
+        // Third party attempt to cancel reverts
+        address attacker = address(0x9999);
+        vm.prank(attacker);
+        vm.expectRevert(OrderSettlement.Unauthorized.selector);
+        settlement.cancelBorrowOrder(order);
+
+        // Borrower cancels their order
         vm.prank(borrower);
-        settlement.cancelOrder(digest);
+        settlement.cancelBorrowOrder(order);
         assertTrue(settlement.isOrderCancelled(digest));
 
         // Fill attempt reverts

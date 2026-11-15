@@ -60,7 +60,8 @@ interface IOrderSettlement {
         uint128 fillUsdc
     ) external returns (uint256 loanId);
 
-    function cancelOrder(bytes32 orderHash) external;
+    function cancelBorrowOrder(BorrowOrder calldata order) external;
+    function cancelLendOffer(LendOffer calldata offer) external;
     function bumpNonce() external returns (uint256 newNonce);
 
     function hashBorrowOrder(BorrowOrder calldata order) external view returns (bytes32);

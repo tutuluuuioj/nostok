@@ -3,10 +3,12 @@ pragma solidity ^0.8.28;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {EIP712Upgradeable} from "@openzeppelin/contracts-upgradeable/utils/cryptography/EIP712Upgradeable.sol";
 import {ILoanCore} from "./interfaces/ILoanCore.sol";
 import {ICollateralEscrow} from "./interfaces/ICollateralEscrow.sol";
 import {IPositionNFT} from "./interfaces/IPositionNFT.sol";
@@ -17,13 +19,14 @@ import {ILiquidationAuction} from "./interfaces/ILiquidationAuction.sol";
 
 /**
  * @title LoanCore
- * @notice Central loan state machine, bullet interest math, top-ups, and settlement.
+ * @notice Central loan state machine, bullet interest math, top-ups, extensions, and settlement.
  */
 contract LoanCore is
     Initializable,
     UUPSUpgradeable,
     OwnableUpgradeable,
     ReentrancyGuardUpgradeable,
+    EIP712Upgradeable,
     ILoanCore
 {
     using SafeERC20 for IERC20;
@@ -31,6 +34,10 @@ contract LoanCore is
     uint8 public constant CORE_VERSION = 1;
     uint256 public constant SECONDS_PER_YEAR = 365 days;
     uint64 public constant GRACE_PERIOD_SECONDS = 24 hours;
+
+    bytes32 public constant EXTEND_ORDER_TYPEHASH = keccak256(
+        "ExtendOrder(uint256 loanId,uint64 newMaturity,uint32 newRateBps,uint256 nonce)"
+    );
 
     address public escrow;
     address public positionNft;
@@ -42,14 +49,15 @@ contract LoanCore is
     address public usdc;
     address public guardian;
 
-    bool public paused; // Pause new loan fills only; repay/topup/claim CANNOT be paused
-    uint128 public globalUsdcCap; // Guarded launch TVL cap
+    bool public paused;
+    uint128 public globalUsdcCap;
     uint128 public totalOutstandingPrincipal;
 
     uint256 public nextLoanId;
     mapping(uint256 => Loan) public loans;
     mapping(address => uint128) public assetOutstandingPrincipal;
     mapping(address => uint128) public claimable;
+    mapping(uint256 => uint256) public loanExtensionNonce;
 
     error UnauthorizedCaller();
     error ZeroAddress();
@@ -65,6 +73,7 @@ contract LoanCore is
     error LoanNotInGrace();
     error LoanNotLiquidatable();
     error InsufficientPayment();
+    error InvalidSignature();
 
     event ProtocolPausedStateChanged(bool isPaused);
     event GlobalCapUpdated(uint128 newCap);
@@ -108,7 +117,6 @@ contract LoanCore is
             initialAssetRegistry == address(0) ||
             initialOracleRouter == address(0) ||
             initialFeeCollector == address(0) ||
-            initialAuction == address(0) ||
             initialUsdc == address(0)
         ) {
             revert ZeroAddress();
@@ -116,6 +124,7 @@ contract LoanCore is
         __Ownable_init(initialOwner);
         __UUPSUpgradeable_init();
         __ReentrancyGuard_init();
+        __EIP712_init("NOSTOK Loan Core", "1");
 
         guardian = initialGuardian;
         escrow = initialEscrow;
@@ -127,10 +136,15 @@ contract LoanCore is
         usdc = initialUsdc;
 
         nextLoanId = 1;
-        globalUsdcCap = 250_000 * 1e6; // $250k initial guarded cap
+        globalUsdcCap = 250_000 * 1e6;
     }
 
     function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
+
+    function setLiquidationAuction(address newAuction) external onlyOwner {
+        if (newAuction == address(0)) revert ZeroAddress();
+        liquidationAuction = newAuction;
+    }
 
     function setOrderSettlement(address newSettlement) external onlyOwner {
         if (newSettlement == address(0)) revert ZeroAddress();
@@ -147,13 +161,25 @@ contract LoanCore is
         emit GlobalCapUpdated(newCap);
     }
 
-    /**
-     * @notice Guardian or Owner can pause new originations.
-     * Repayments, top-ups, claims, and liquidations remain permanently functional.
-     */
     function setPaused(bool isPaused) external onlyGuardianOrOwner {
         paused = isPaused;
         emit ProtocolPausedStateChanged(isPaused);
+    }
+
+    /**
+     * @notice Updates loan status from Active to Grace if maturity has passed.
+     */
+    function syncStatus(uint256 loanId) public override returns (LoanStatus) {
+        Loan storage l = loans[loanId];
+        if (l.status == uint8(LoanStatus.Active)) {
+            if (block.timestamp > l.maturity) {
+                if (block.timestamp <= l.maturity + GRACE_PERIOD_SECONDS) {
+                    l.status = uint8(LoanStatus.Grace);
+                    emit StatusSynced(loanId, LoanStatus.Grace);
+                }
+            }
+        }
+        return LoanStatus(l.status);
     }
 
     /**
@@ -178,8 +204,11 @@ contract LoanCore is
         if (principal < 500 * 1e6 || termDays < 7 || termDays > 90 || rateBps > 4000) {
             revert InvalidLoanTerms();
         }
+        // Enforce minInterestDays range between 1 and 30 days
+        if (minInterestDays < 1 || minInterestDays > 30) {
+            revert InvalidLoanTerms();
+        }
 
-        // Check Caps
         if (totalOutstandingPrincipal + principal > globalUsdcCap) revert GlobalCapExceeded();
 
         IAssetRegistry.AssetConfig memory cfg = IAssetRegistry(assetRegistry).getAssetConfig(collateralToken);
@@ -189,7 +218,6 @@ contract LoanCore is
             revert AssetCapExceeded();
         }
 
-        // Valuation and LTV Check
         (, uint256 effectiveVal, IOracleRouter.OracleState oState) = IOracleRouter(oracleRouter).getValue(
             collateralToken,
             collateralAmount
@@ -219,7 +247,7 @@ contract LoanCore is
             initLtvBps: allowedLtv,
             marginCallLtvBps: cfg.marginCallLtvBps,
             liqLtvBps: cfg.liqLtvBps,
-            minInterestDays: minInterestDays > 0 ? minInterestDays : 3,
+            minInterestDays: minInterestDays,
             status: uint8(LoanStatus.Active),
             yieldMode: yieldMode,
             coreVersion: CORE_VERSION,
@@ -230,14 +258,11 @@ contract LoanCore is
         totalOutstandingPrincipal += principal;
         assetOutstandingPrincipal[collateralToken] += principal;
 
-        // Pull collateral into immutable escrow
         ICollateralEscrow(escrow).depositCollateral(collateralToken, borrower, collateralAmount);
 
-        // Deduct origination fee (0.10%)
         uint128 fee = IFeeCollector(feeCollector).calculateOriginationFee(principal);
         uint128 proceeds = principal - fee;
 
-        // Pull USDC from lender and distribute
         IERC20(usdc).safeTransferFrom(lender, borrower, proceeds);
         if (fee > 0) {
             IERC20(usdc).safeTransferFrom(lender, address(this), fee);
@@ -245,7 +270,6 @@ contract LoanCore is
             IFeeCollector(feeCollector).distributeFees(usdc, fee);
         }
 
-        // Mint Position NFT to lender (tokenId == loanId)
         IPositionNFT(positionNft).mint(lender, loanId);
 
         emit LoanOpened(
@@ -277,7 +301,6 @@ contract LoanCore is
             (10000 * SECONDS_PER_YEAR);
 
         if (block.timestamp <= l.maturity) {
-            // Early or on-time repayment
             uint256 elapsed = block.timestamp - l.startTime;
             uint256 minSecs = uint256(l.minInterestDays) * 1 days;
             uint256 interestElapsed = elapsed < minSecs ? minSecs : elapsed;
@@ -287,7 +310,6 @@ contract LoanCore is
 
             return uint128(calculated > maxFullInterest ? maxFullInterest : calculated);
         } else {
-            // Grace period: full term interest + penalty interest
             uint256 graceElapsed = block.timestamp - l.maturity;
             uint256 penaltyRate = l.rateBps + l.penaltySpreadBps;
 
@@ -302,6 +324,7 @@ contract LoanCore is
      * @notice Repays a loan in full, releasing collateral to borrower and crediting NFT holder.
      */
     function repay(uint256 loanId) external override nonReentrant returns (uint128 totalPaid) {
+        syncStatus(loanId);
         Loan storage l = loans[loanId];
         if (l.status != uint8(LoanStatus.Active) && l.status != uint8(LoanStatus.Grace)) {
             revert LoanNotActive();
@@ -311,10 +334,8 @@ contract LoanCore is
         uint128 interestDue = getDueInterest(loanId);
         totalPaid = remainingPrincipal + interestDue;
 
-        // Pull payment from payer
         IERC20(usdc).safeTransferFrom(msg.sender, address(this), totalPaid);
 
-        // Deduct protocol interest cut (10%)
         uint128 interestCut = IFeeCollector(feeCollector).calculateInterestCut(interestDue);
         uint128 netInterest = interestDue - interestCut;
 
@@ -323,11 +344,9 @@ contract LoanCore is
             IFeeCollector(feeCollector).distributeFees(usdc, interestCut);
         }
 
-        // Credit NFT holder (claimant) with principal + netInterest
         address holder = IPositionNFT(positionNft).ownerOf(loanId);
         claimable[holder] += (remainingPrincipal + netInterest);
 
-        // Update state
         l.principalRepaid = l.principal;
         l.interestPaid += interestDue;
         l.status = uint8(LoanStatus.Repaid);
@@ -335,22 +354,20 @@ contract LoanCore is
         totalOutstandingPrincipal -= remainingPrincipal;
         assetOutstandingPrincipal[l.collateralToken] -= remainingPrincipal;
 
-        // Release entire collateral back to borrower
         ICollateralEscrow(escrow).releaseCollateral(l.collateralToken, l.borrower, l.collateralRaw);
-
-        // Burn NFT claim
         IPositionNFT(positionNft).burn(loanId);
 
         emit Repaid(loanId, msg.sender, remainingPrincipal, interestDue);
     }
 
     /**
-     * @notice Repays a portion of the principal and releases proportional collateral.
+     * @notice Repays a portion of principal, accrues interest on the repaid part, and releases collateral pro rata.
      */
     function partialRepay(
         uint256 loanId,
         uint128 principalRepayAmount
     ) external override nonReentrant returns (uint128 totalPaid) {
+        syncStatus(loanId);
         Loan storage l = loans[loanId];
         if (l.status != uint8(LoanStatus.Active)) revert LoanNotActive();
 
@@ -359,18 +376,35 @@ contract LoanCore is
             revert InvalidLoanTerms();
         }
 
-        // Proportionate collateral release
+        // Accrue and charge interest on the portion of principal being repaid
+        uint256 elapsed = block.timestamp - l.startTime;
+        uint256 minSecs = uint256(l.minInterestDays) * 1 days;
+        uint256 interestElapsed = elapsed < minSecs ? minSecs : elapsed;
+        uint128 interestOnRepaid = uint128(
+            (uint256(principalRepayAmount) * l.rateBps * interestElapsed + (10000 * SECONDS_PER_YEAR - 1)) /
+                (10000 * SECONDS_PER_YEAR)
+        );
+
+        uint128 interestCut = IFeeCollector(feeCollector).calculateInterestCut(interestOnRepaid);
+        uint128 netInterest = interestOnRepaid - interestCut;
+
+        totalPaid = principalRepayAmount + interestOnRepaid;
+        IERC20(usdc).safeTransferFrom(msg.sender, address(this), totalPaid);
+
+        if (interestCut > 0) {
+            IERC20(usdc).forceApprove(feeCollector, interestCut);
+            IFeeCollector(feeCollector).distributeFees(usdc, interestCut);
+        }
+
+        address holder = IPositionNFT(positionNft).ownerOf(loanId);
+        claimable[holder] += (principalRepayAmount + netInterest);
+
         uint128 collateralToRelease = uint128(
             (uint256(l.collateralRaw) * principalRepayAmount) / remainingPrincipal
         );
 
-        totalPaid = principalRepayAmount;
-        IERC20(usdc).safeTransferFrom(msg.sender, address(this), totalPaid);
-
-        address holder = IPositionNFT(positionNft).ownerOf(loanId);
-        claimable[holder] += principalRepayAmount;
-
         l.principalRepaid += principalRepayAmount;
+        l.interestPaid += interestOnRepaid;
         l.collateralRaw -= collateralToRelease;
 
         totalOutstandingPrincipal -= principalRepayAmount;
@@ -378,13 +412,14 @@ contract LoanCore is
 
         ICollateralEscrow(escrow).releaseCollateral(l.collateralToken, l.borrower, collateralToRelease);
 
-        emit PartialRepaid(loanId, msg.sender, principalRepayAmount, 0, collateralToRelease);
+        emit PartialRepaid(loanId, msg.sender, principalRepayAmount, interestOnRepaid, collateralToRelease);
     }
 
     /**
      * @notice Tops up collateral to reduce position risk. Allowed in all states.
      */
     function topUp(uint256 loanId, uint128 additionalCollateral) external override nonReentrant {
+        syncStatus(loanId);
         Loan storage l = loans[loanId];
         if (l.status != uint8(LoanStatus.Active) && l.status != uint8(LoanStatus.Grace)) {
             revert LoanNotActive();
@@ -398,20 +433,44 @@ contract LoanCore is
     }
 
     /**
-     * @notice Extends a loan term agreed upon by the current NFT claim holder.
+     * @notice Extends a loan term. Requires signed consent from counterparty via EIP-712.
+     * Enforces a 40% rate cap and 90-day max term.
      */
     function extend(
         uint256 loanId,
         uint64 newMaturity,
         uint32 newRateBps,
-        bytes calldata /* lenderSig */
+        bytes calldata counterpartySig
     ) external override nonReentrant {
+        syncStatus(loanId);
         Loan storage l = loans[loanId];
         if (l.status != uint8(LoanStatus.Active)) revert LoanNotActive();
-        if (newMaturity <= l.maturity) revert InvalidLoanTerms();
+
+        // Enforce rate cap (max 40% APR) and term boundaries
+        if (newRateBps > 4000) revert InvalidLoanTerms();
+        if (newMaturity <= l.maturity || newMaturity > block.timestamp + 90 days) {
+            revert InvalidLoanTerms();
+        }
 
         address holder = IPositionNFT(positionNft).ownerOf(loanId);
-        if (msg.sender != holder && msg.sender != l.borrower) revert UnauthorizedCaller();
+        if (msg.sender != l.borrower && msg.sender != holder) {
+            revert UnauthorizedCaller();
+        }
+
+        uint256 nonce = loanExtensionNonce[loanId]++;
+
+        bytes32 digest = _hashTypedDataV4(
+            keccak256(abi.encode(EXTEND_ORDER_TYPEHASH, loanId, newMaturity, newRateBps, nonce))
+        );
+        address signer = ECDSA.recover(digest, counterpartySig);
+
+        if (msg.sender == l.borrower) {
+            // Borrower calling -> counterparty must be current NFT holder
+            if (signer != holder) revert InvalidSignature();
+        } else {
+            // Holder calling -> counterparty must be borrower
+            if (signer != l.borrower) revert InvalidSignature();
+        }
 
         l.maturity = newMaturity;
         l.rateBps = newRateBps;
@@ -423,6 +482,7 @@ contract LoanCore is
      * @notice Starts Dutch liquidation auction if position has breached liquidation LTV during VALID_OPEN.
      */
     function startLiquidation(uint256 loanId) external override nonReentrant returns (uint256 auctionId) {
+        syncStatus(loanId);
         Loan storage l = loans[loanId];
         if (l.status != uint8(LoanStatus.Active) && l.status != uint8(LoanStatus.Grace)) {
             revert LoanNotActive();
@@ -436,7 +496,6 @@ contract LoanCore is
         uint128 debtInterest = getDueInterest(loanId);
         uint256 currentDebt = debtPrincipal + debtInterest;
 
-        // Current LTV in BPS
         uint256 currentLtvBps = (currentDebt * 10000) / grossVal;
         if (currentLtvBps < l.liqLtvBps) revert LoanNotLiquidatable();
 
@@ -445,8 +504,6 @@ contract LoanCore is
 
         IAssetRegistry.AssetConfig memory cfg = IAssetRegistry(assetRegistry).getAssetConfig(l.collateralToken);
         bool isFull = currentLtvBps >= cfg.badDebtLtvBps;
-
-        // Partial liquidation sells up to 50% of collateral; full liquidation sells 100%
         uint128 collateralToAuction = isFull ? l.collateralRaw : (l.collateralRaw / 2);
 
         auctionId = ILiquidationAuction(liquidationAuction).startAuction(
@@ -458,8 +515,8 @@ contract LoanCore is
             debtInterest,
             price,
             cfg.maxDiscountBps,
-            msg.sender, // Keeper address
-            isFull
+            msg.sender,
+            false // Not a default auction
         );
     }
 
@@ -467,6 +524,7 @@ contract LoanCore is
      * @notice Starts default auction if loan passed 24h grace period without repayment.
      */
     function startDefaultAuction(uint256 loanId) external override nonReentrant returns (uint256 auctionId) {
+        syncStatus(loanId);
         Loan storage l = loans[loanId];
         if (block.timestamp <= l.maturity + GRACE_PERIOD_SECONDS) revert LoanNotInGrace();
         if (l.status != uint8(LoanStatus.Active) && l.status != uint8(LoanStatus.Grace)) {
@@ -494,37 +552,56 @@ contract LoanCore is
             price,
             cfg.maxDiscountBps,
             msg.sender,
-            true // Default is always full liquidation
+            true // Is default auction
         );
     }
 
     /**
      * @notice Settlement callback from LiquidationAuction.
+     * Updates remaining debt accurately per buy, and burns NFT only when auction settles.
      */
     function onAuctionSettlement(
         uint256 loanId,
-        uint128 usdcCollected,
+        uint128 principalPaid,
+        uint128 interestPaid,
         uint128 collateralSold,
-        bool isFullLiquidation
+        bool isSettled,
+        bool isDefault
     ) external override onlyAuction {
         Loan storage l = loans[loanId];
-        IERC20(usdc).safeTransferFrom(liquidationAuction, address(this), usdcCollected);
+        uint128 totalDebtReceived = principalPaid + interestPaid;
 
-        address holder = IPositionNFT(positionNft).ownerOf(loanId);
-        claimable[holder] += usdcCollected;
+        if (totalDebtReceived > 0) {
+            IERC20(usdc).safeTransferFrom(liquidationAuction, address(this), totalDebtReceived);
+            address holder = IPositionNFT(positionNft).ownerOf(loanId);
+
+            uint128 interestCut = 0;
+            if (interestPaid > 0) {
+                interestCut = IFeeCollector(feeCollector).calculateInterestCut(interestPaid);
+                IERC20(usdc).forceApprove(feeCollector, interestCut);
+                IFeeCollector(feeCollector).distributeFees(usdc, interestCut);
+            }
+
+            claimable[holder] += (principalPaid + (interestPaid - interestCut));
+        }
 
         l.collateralRaw -= collateralSold;
+        l.principalRepaid += principalPaid;
+        l.interestPaid += interestPaid;
 
-        uint128 remainingPrincipal = l.principal - l.principalRepaid;
-        totalOutstandingPrincipal -= remainingPrincipal;
-        assetOutstandingPrincipal[l.collateralToken] -= remainingPrincipal;
+        totalOutstandingPrincipal -= principalPaid;
+        assetOutstandingPrincipal[l.collateralToken] -= principalPaid;
 
-        if (isFullLiquidation || l.collateralRaw == 0) {
-            l.status = uint8(LoanStatus.SettledLiquidated);
+        if (isSettled) {
+            if (isDefault) {
+                l.status = uint8(LoanStatus.SettledDefault);
+            } else {
+                l.status = uint8(LoanStatus.SettledLiquidated);
+            }
             IPositionNFT(positionNft).burn(loanId);
         } else {
-            l.status = uint8(LoanStatus.Active);
-            IPositionNFT(positionNft).setAuctionLock(loanId, false);
+            // Partial buy: auction is still in progress
+            l.status = uint8(LoanStatus.Auction);
         }
     }
 

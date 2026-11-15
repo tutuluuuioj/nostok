@@ -91,4 +91,34 @@ contract AssetRegistryTest is Test {
         registry.setAssetStatus(token, IAssetRegistry.AssetStatus.Active);
         assertEq(uint8(registry.getAssetStatus(token)), uint8(IAssetRegistry.AssetStatus.Active));
     }
+
+    function test_InvalidDiscountParameters_Reverts() public {
+        IAssetRegistry.AssetConfig memory cfg = IAssetRegistry.AssetConfig({
+            feed: feed,
+            feedDecimals: 8,
+            tier: 0,
+            maxInitLtvBps: 6000,
+            marginCallLtvBps: 7000,
+            liqLtvBps: 7800,
+            badDebtLtvBps: 9000,
+            maxDiscountBps: 99, // Below 100 bps bricks auction floor calculation!
+            closedMarketHaircutBps: 500,
+            perLoanCap: 10_000e6,
+            assetCap: 250_000e6,
+            maxStaleOpenSecs: 86400,
+            status: uint8(IAssetRegistry.AssetStatus.Active),
+            restricted: false
+        });
+
+        // Reverts when < 100 bps
+        vm.prank(owner);
+        vm.expectRevert(AssetRegistry.InvalidDiscountParameters.selector);
+        registry.setAssetConfig(token, cfg);
+
+        // Reverts when > 3000 bps (30%)
+        cfg.maxDiscountBps = 3500;
+        vm.prank(owner);
+        vm.expectRevert(AssetRegistry.InvalidDiscountParameters.selector);
+        registry.setAssetConfig(token, cfg);
+    }
 }

@@ -38,10 +38,31 @@ contract LoanCoreTest is Test {
     address public reserve = address(0x4444);
     address public mockOrderSettlement = address(0x5555);
 
-    address public borrower = address(0xAAAA);
-    address public lender = address(0xBBBB);
+    uint256 public borrowerPrivateKey = 0xA11CE;
+    address public borrower;
+    uint256 public lenderPrivateKey = 0xB0B;
+    address public lender;
+
+    bytes32 public constant EXTEND_ORDER_TYPEHASH = keccak256(
+        "ExtendOrder(uint256 loanId,uint64 newMaturity,uint32 newRateBps,uint256 nonce)"
+    );
+
+    function _hashTypedData(bytes32 structHash) internal view returns (bytes32) {
+        bytes32 domainSeparator = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256(bytes("NOSTOK Loan Core")),
+                keccak256(bytes("1")),
+                block.chainid,
+                address(core)
+            )
+        );
+        return keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+    }
 
     function setUp() public {
+        borrower = vm.addr(borrowerPrivateKey);
+        lender = vm.addr(lenderPrivateKey);
         vm.warp(1700000000); // Set baseline timestamp
 
         vm.startPrank(owner);
@@ -261,5 +282,128 @@ contract LoanCoreTest is Test {
         // Half collateral released (25 NVDAc)
         assertEq(l.collateralRaw, 25e6);
         assertEq(stockToken.balanceOf(borrower), 75e6);
+    }
+
+    function test_Extend_RequiresCounterpartyEIP712Sig_And_CapsRate() public {
+        test_OpenLoan_Success();
+        ILoanCore.Loan memory l = core.getLoan(1);
+
+        uint64 newMaturity = l.maturity + 15 days;
+        uint32 newRateBps = 1200; // 12%
+
+        // 1. Reverts if rate exceeds 40% cap (4000 bps)
+        vm.prank(borrower);
+        vm.expectRevert(LoanCore.InvalidLoanTerms.selector);
+        core.extend(1, newMaturity, 4500, "");
+
+        // 2. Reverts if extension term > 90 days from now
+        vm.prank(borrower);
+        vm.expectRevert(LoanCore.InvalidLoanTerms.selector);
+        core.extend(1, uint64(block.timestamp + 95 days), newRateBps, "");
+
+        // 3. Reverts if unauthorized third party calls
+        address attacker = address(0x9999);
+        vm.prank(attacker);
+        vm.expectRevert(LoanCore.UnauthorizedCaller.selector);
+        core.extend(1, newMaturity, newRateBps, "");
+
+        // 4. Lender signs EIP-712 approval for extension
+        bytes32 structHash = keccak256(
+            abi.encode(EXTEND_ORDER_TYPEHASH, 1, newMaturity, newRateBps, 0)
+        );
+        bytes32 digest = _hashTypedData(structHash);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(lenderPrivateKey, digest);
+        bytes memory lenderSig = abi.encodePacked(r, s, v);
+
+        // 5. Borrower submits with wrong signature reverts
+        (uint8 badV, bytes32 badR, bytes32 badS) = vm.sign(borrowerPrivateKey, digest);
+        bytes memory badSig = abi.encodePacked(badR, badS, badV);
+        vm.prank(borrower);
+        vm.expectRevert(LoanCore.InvalidSignature.selector);
+        core.extend(1, newMaturity, newRateBps, badSig);
+
+        // 6. Borrower submits with valid lender signature -> extends successfully!
+        vm.prank(borrower);
+        core.extend(1, newMaturity, newRateBps, lenderSig);
+
+        ILoanCore.Loan memory updatedLoan = core.getLoan(1);
+        assertEq(updatedLoan.maturity, newMaturity);
+        assertEq(updatedLoan.rateBps, newRateBps);
+    }
+
+    function test_PartialRepay_AccruesAndChargesInterest() public {
+        test_OpenLoan_Success();
+
+        // Warp 10 days
+        vm.warp(block.timestamp + 10 days);
+
+        uint128 initialLenderClaimable = core.getClaimable(lender);
+
+        usdc.mint(borrower, 3000e6);
+        vm.prank(borrower);
+        usdc.approve(address(core), type(uint256).max);
+
+        // Repay $2,500 (50% of principal)
+        vm.prank(borrower);
+        uint128 totalPaid = core.partialRepay(1, 2500e6);
+
+        // Total paid MUST exceed principal repayment because it accrued interest on the repaid part!
+        assertGt(totalPaid, 2500e6);
+        uint128 interestCharged = totalPaid - 2500e6;
+        assertGt(interestCharged, 0);
+
+        // Fee collector received protocol cut of the interest
+        uint128 cut = feeCollector.calculateInterestCut(interestCharged);
+        assertGt(cut, 0);
+
+        // Lender claimable increased by principal + net interest
+        assertEq(core.getClaimable(lender), initialLenderClaimable + 2500e6 + (interestCharged - cut));
+
+        ILoanCore.Loan memory l = core.getLoan(1);
+        assertEq(l.principalRepaid, 2500e6);
+        assertEq(l.interestPaid, interestCharged);
+    }
+
+    function test_SyncStatus_GracePeriod() public {
+        test_OpenLoan_Success();
+
+        // Warp to maturity (30 days) + 12 hours (within 24h grace window)
+        vm.warp(block.timestamp + 30 days + 12 hours);
+
+        ILoanCore.LoanStatus status = core.syncStatus(1);
+        assertEq(uint8(status), uint8(ILoanCore.LoanStatus.Grace));
+
+        // Penalty interest is calculated and active
+        uint128 interestDue = core.getDueInterest(1);
+        // Standard full 30d interest is ~$32.88. In grace, penalty interest spread is added.
+        assertGt(interestDue, 33e6);
+    }
+
+    function test_MinInterestDays_Dynamic() public {
+        // Open loan with custom minInterestDays = 14
+        vm.prank(mockOrderSettlement);
+        uint256 loanId = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            50e6,
+            5000e6,
+            800,
+            30,
+            6000,
+            14, // 14 minInterestDays
+            0
+        );
+
+        ILoanCore.Loan memory l = core.getLoan(loanId);
+        assertEq(l.minInterestDays, 14);
+
+        // Warp only 2 days
+        vm.warp(block.timestamp + 2 days);
+
+        // Interest charged must reflect minimum 14 days!
+        uint128 interestDue = core.getDueInterest(loanId);
+        // 14 days on $5,000 at 8% = ~$15.34 (1534246)
+        assertGt(interestDue, 15e6);
     }
 }

@@ -50,6 +50,7 @@ interface ILoanCore {
     event PartialRepaid(uint256 indexed loanId, address indexed payer, uint128 principalPaid, uint128 interestPaid, uint128 collateralReleased);
     event ToppedUp(uint256 indexed loanId, address indexed funder, uint128 additionalCollateral);
     event Extended(uint256 indexed loanId, uint64 newMaturity, uint32 newRateBps);
+    event StatusSynced(uint256 indexed loanId, LoanStatus status);
     event RolledOver(uint256 indexed oldLoanId, uint256 indexed newLoanId);
     event Claimed(address indexed recipient, uint128 amount);
     event BadDebtRecorded(uint256 indexed loanId, uint128 shortfall);
@@ -70,16 +71,24 @@ interface ILoanCore {
     function repay(uint256 loanId) external returns (uint128 totalPaid);
     function partialRepay(uint256 loanId, uint128 principalRepayAmount) external returns (uint128 totalPaid);
     function topUp(uint256 loanId, uint128 additionalCollateral) external;
-    function extend(uint256 loanId, uint64 newMaturity, uint32 newRateBps, bytes calldata lenderSig) external;
+    function extend(
+        uint256 loanId,
+        uint64 newMaturity,
+        uint32 newRateBps,
+        bytes calldata counterpartySig
+    ) external;
     function startLiquidation(uint256 loanId) external returns (uint256 auctionId);
     function startDefaultAuction(uint256 loanId) external returns (uint256 auctionId);
     function onAuctionSettlement(
         uint256 loanId,
-        uint128 usdcCollected,
+        uint128 principalPaid,
+        uint128 interestPaid,
         uint128 collateralSold,
-        bool isFullLiquidation
+        bool isSettled,
+        bool isDefault
     ) external;
     function claim(address to) external returns (uint128 claimedAmount);
+    function syncStatus(uint256 loanId) external returns (LoanStatus);
 
     function getLoan(uint256 loanId) external view returns (Loan memory);
     function getDueInterest(uint256 loanId) external view returns (uint128 interestOwed);

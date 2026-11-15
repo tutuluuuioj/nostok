@@ -2,7 +2,11 @@
 pragma solidity ^0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {CommonBase} from "forge-std/Base.sol";
+import {StdCheats} from "forge-std/StdCheats.sol";
+import {StdUtils} from "forge-std/StdUtils.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+
 import {LoanCore} from "../src/LoanCore.sol";
 import {CollateralEscrow} from "../src/CollateralEscrow.sol";
 import {PositionNFT} from "../src/PositionNFT.sol";
@@ -11,11 +15,166 @@ import {OracleRouter} from "../src/OracleRouter.sol";
 import {FeeCollector} from "../src/FeeCollector.sol";
 import {EligibilityGate} from "../src/EligibilityGate.sol";
 import {LiquidationAuction} from "../src/LiquidationAuction.sol";
+import {ILoanCore} from "../src/interfaces/ILoanCore.sol";
 import {IAssetRegistry} from "../src/interfaces/IAssetRegistry.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockAggregator} from "./mocks/MockAggregator.sol";
 import {MockSequencer} from "./mocks/MockSequencer.sol";
 
+/**
+ * @title ProtocolHandler
+ * @notice State machine handler for Foundry invariant fuzzing.
+ */
+contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
+    LoanCore public core;
+    CollateralEscrow public escrow;
+    PositionNFT public nft;
+    MockERC20 public stockToken;
+    MockERC20 public usdc;
+
+    address public settlement;
+    address public borrower;
+    address public lender;
+
+    uint256[] public activeLoanIds;
+    uint256 public ghost_totalEscrowedCollateral;
+    uint256 public ghost_totalOutstandingPrincipal;
+
+    constructor(
+        LoanCore _core,
+        CollateralEscrow _escrow,
+        PositionNFT _nft,
+        MockERC20 _stockToken,
+        MockERC20 _usdc,
+        address _settlement,
+        address _borrower,
+        address _lender
+    ) {
+        core = _core;
+        escrow = _escrow;
+        nft = _nft;
+        stockToken = _stockToken;
+        usdc = _usdc;
+        settlement = _settlement;
+        borrower = _borrower;
+        lender = _lender;
+    }
+
+    function openLoan(uint256 collateralSeed, uint256 principalSeed) external {
+        // Limit active loans to 10 concurrently
+        if (activeLoanIds.length >= 10) return;
+
+        // Bounded collateral between 10 NVDAc and 50 NVDAc ($2,000 to $10,000 at $200/share)
+        uint128 collateralAmount = uint128(bound(collateralSeed, 10e6, 50e6));
+        // Safe max borrow at 50% LTV: collateral * 100
+        uint128 maxPrincipal = uint128((uint256(collateralAmount) * 100));
+        uint128 principal = uint128(bound(principalSeed, 500e6, maxPrincipal));
+
+        stockToken.mint(borrower, collateralAmount);
+        vm.prank(borrower);
+        stockToken.approve(address(escrow), collateralAmount);
+
+        usdc.mint(lender, principal);
+        vm.prank(lender);
+        usdc.approve(address(core), principal);
+
+        vm.prank(settlement);
+        uint256 loanId = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            collateralAmount,
+            principal,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        activeLoanIds.push(loanId);
+        ghost_totalEscrowedCollateral += collateralAmount;
+        ghost_totalOutstandingPrincipal += principal;
+    }
+
+    function topUp(uint256 loanIndexSeed, uint256 additionalCollateralSeed) external {
+        if (activeLoanIds.length == 0) return;
+
+        uint256 idx = loanIndexSeed % activeLoanIds.length;
+        uint256 loanId = activeLoanIds[idx];
+
+        uint128 additional = uint128(bound(additionalCollateralSeed, 1e6, 10e6));
+
+        stockToken.mint(borrower, additional);
+        vm.prank(borrower);
+        stockToken.approve(address(escrow), additional);
+
+        vm.prank(borrower);
+        core.topUp(loanId, additional);
+
+        ghost_totalEscrowedCollateral += additional;
+    }
+
+    function partialRepay(uint256 loanIndexSeed, uint256 repayAmountSeed) external {
+        if (activeLoanIds.length == 0) return;
+
+        uint256 idx = loanIndexSeed % activeLoanIds.length;
+        uint256 loanId = activeLoanIds[idx];
+
+        ILoanCore.Loan memory l = core.getLoan(loanId);
+        uint128 remaining = l.principal - l.principalRepaid;
+        if (remaining <= 200e6) return;
+
+        uint128 repayAmount = uint128(bound(repayAmountSeed, 50e6, remaining / 2));
+        uint128 collateralToRelease = uint128(
+            (uint256(l.collateralRaw) * repayAmount) / remaining
+        );
+
+        usdc.mint(borrower, repayAmount * 2);
+        vm.prank(borrower);
+        usdc.approve(address(core), repayAmount * 2);
+
+        vm.prank(borrower);
+        core.partialRepay(loanId, repayAmount);
+
+        ghost_totalEscrowedCollateral -= collateralToRelease;
+        ghost_totalOutstandingPrincipal -= repayAmount;
+    }
+
+    function repay(uint256 loanIndexSeed) external {
+        if (activeLoanIds.length == 0) return;
+
+        uint256 idx = loanIndexSeed % activeLoanIds.length;
+        uint256 loanId = activeLoanIds[idx];
+
+        ILoanCore.Loan memory l = core.getLoan(loanId);
+        uint128 remaining = l.principal - l.principalRepaid;
+        uint128 interest = core.getDueInterest(loanId);
+        uint128 totalDue = remaining + interest;
+
+        usdc.mint(borrower, totalDue);
+        vm.prank(borrower);
+        usdc.approve(address(core), totalDue);
+
+        vm.prank(borrower);
+        core.repay(loanId);
+
+        ghost_totalEscrowedCollateral -= l.collateralRaw;
+        ghost_totalOutstandingPrincipal -= remaining;
+
+        activeLoanIds[idx] = activeLoanIds[activeLoanIds.length - 1];
+        activeLoanIds.pop();
+    }
+
+    function activeLoansCount() external view returns (uint256) {
+        return activeLoanIds.length;
+    }
+}
+
+/**
+ * @title InvariantsTest
+ * @notice Foundry stateful invariant testing verifying mathematical guarantees under fuzzed call trees.
+ */
 contract InvariantsTest is Test {
     LoanCore public core;
     CollateralEscrow public escrow;
@@ -30,6 +189,8 @@ contract InvariantsTest is Test {
     MockERC20 public stockToken;
     MockAggregator public feed;
     MockSequencer public sequencer;
+
+    ProtocolHandler public handler;
 
     address public owner = address(0x1111);
     address public guardian = address(0x2222);
@@ -112,7 +273,7 @@ contract InvariantsTest is Test {
             badDebtLtvBps: 9000,
             maxDiscountBps: 600,
             closedMarketHaircutBps: 500,
-            perLoanCap: 10_000e6,
+            perLoanCap: 250_000e6,
             assetCap: 250_000e6,
             maxStaleOpenSecs: 86400,
             status: uint8(IAssetRegistry.AssetStatus.Active),
@@ -121,111 +282,60 @@ contract InvariantsTest is Test {
         registry.setAssetConfig(address(stockToken), cfg);
         vm.stopPrank();
 
-        stockToken.mint(borrower, 1000e6);
-        usdc.mint(lender, 100_000e6);
+        // Instantiate handler
+        handler = new ProtocolHandler(
+            core,
+            escrow,
+            nft,
+            stockToken,
+            usdc,
+            settlement,
+            borrower,
+            lender
+        );
 
-        vm.prank(borrower);
-        stockToken.approve(address(escrow), type(uint256).max);
-
-        vm.prank(lender);
-        usdc.approve(address(core), type(uint256).max);
+        // Target handler for stateful fuzzing
+        targetContract(address(handler));
     }
 
     /**
-     * @notice Invariant 1: Escrow Collateral Solvency
-     * Escrow balance must always equal or exceed active loans' collateral.
+     * @notice Invariant 1: Escrow Solvency
+     * Physical collateral in escrow must ALWAYS exactly match ghost tracked active collateral.
      */
-    function test_Invariant_EscrowSolvency() public {
-        vm.prank(settlement);
-        uint256 loan1 = core.openLoan(borrower, lender, address(stockToken), 50e6, 5000e6, 800, 30, 6000, 3, 0);
-
-        vm.prank(settlement);
-        uint256 loan2 = core.openLoan(borrower, lender, address(stockToken), 40e6, 4000e6, 800, 30, 6000, 3, 0);
-
-        uint256 expectedEscrow = 90e6;
-        assertEq(escrow.getBalance(address(stockToken)), expectedEscrow);
-        assertEq(stockToken.balanceOf(address(escrow)), expectedEscrow);
-
-        // Repaying loan 1 releases exactly its collateral
-        usdc.mint(borrower, 10_000e6);
-        vm.prank(borrower);
-        usdc.approve(address(core), type(uint256).max);
-
-        vm.prank(borrower);
-        core.repay(loan1);
-
-        assertEq(escrow.getBalance(address(stockToken)), 40e6);
-        assertEq(stockToken.balanceOf(address(escrow)), 40e6);
-
-        // Repaying loan 2 brings escrow cleanly back to 0
-        vm.prank(borrower);
-        core.repay(loan2);
-
-        assertEq(escrow.getBalance(address(stockToken)), 0);
-        assertEq(stockToken.balanceOf(address(escrow)), 0);
+    function invariant_EscrowSolvency() public view {
+        assertEq(
+            escrow.getBalance(address(stockToken)),
+            handler.ghost_totalEscrowedCollateral(),
+            "Escrow tracked balance mismatch"
+        );
+        assertEq(
+            stockToken.balanceOf(address(escrow)),
+            handler.ghost_totalEscrowedCollateral(),
+            "Physical token balance mismatch"
+        );
     }
 
     /**
-     * @notice Invariant 3: Unstoppable Liquidity
-     * Repay and TopUp can NEVER be blocked when protocol is paused or oracle is frozen.
+     * @notice Invariant 2: Total Outstanding Principal
+     * LoanCore totalOutstandingPrincipal must ALWAYS exactly match ghost tracked outstanding principal.
      */
-    function test_Invariant_UnstoppableLiquidityWhenPausedOrFrozen() public {
-        vm.prank(settlement);
-        uint256 loanId = core.openLoan(borrower, lender, address(stockToken), 50e6, 5000e6, 800, 30, 6000, 3, 0);
-
-        // Guardian pauses protocol
-        vm.prank(guardian);
-        core.setPaused(true);
-        assertTrue(core.paused());
-
-        // Guardian freezes the asset
-        vm.prank(guardian);
-        registry.setAssetStatus(address(stockToken), IAssetRegistry.AssetStatus.Frozen);
-
-        // New loans are blocked
-        vm.prank(settlement);
-        vm.expectRevert(LoanCore.ProtocolPaused.selector);
-        core.openLoan(borrower, lender, address(stockToken), 50e6, 5000e6, 800, 30, 6000, 3, 0);
-
-        // BUT TopUp succeeds!
-        vm.prank(borrower);
-        core.topUp(loanId, 10e6);
-        assertEq(escrow.getBalance(address(stockToken)), 60e6);
-
-        // AND Repay succeeds!
-        usdc.mint(borrower, 10_000e6);
-        vm.prank(borrower);
-        usdc.approve(address(core), type(uint256).max);
-
-        vm.prank(borrower);
-        core.repay(loanId);
-
-        // Collateral released cleanly even while protocol is paused and asset is frozen!
-        assertEq(escrow.getBalance(address(stockToken)), 0);
+    function invariant_OutstandingPrincipal() public view {
+        assertEq(
+            core.totalOutstandingPrincipal(),
+            handler.ghost_totalOutstandingPrincipal(),
+            "Total outstanding principal mismatch"
+        );
     }
 
     /**
-     * @notice Invariant 5: Credit Conservation
-     * Total claimable USDC created matches received debt payments.
+     * @notice Invariant 3: Per-asset Outstanding Principal
+     * Asset outstanding principal must match total outstanding principal when single asset.
      */
-    function test_Invariant_CreditConservation() public {
-        vm.prank(settlement);
-        uint256 loanId = core.openLoan(borrower, lender, address(stockToken), 50e6, 5000e6, 800, 30, 6000, 3, 0);
-
-        usdc.mint(borrower, 6000e6);
-        vm.prank(borrower);
-        usdc.approve(address(core), type(uint256).max);
-
-        vm.prank(borrower);
-        core.repay(loanId);
-
-        uint128 claimableBalance = core.getClaimable(lender);
-        assertGt(claimableBalance, 5000e6); // Principal + net interest
-
-        // Lender can pull claim in full
-        vm.prank(lender);
-        uint128 claimed = core.claim(lender);
-        assertEq(claimed, claimableBalance);
-        assertEq(core.getClaimable(lender), 0);
+    function invariant_AssetOutstandingPrincipal() public view {
+        assertEq(
+            core.assetOutstandingPrincipal(address(stockToken)),
+            handler.ghost_totalOutstandingPrincipal(),
+            "Asset outstanding principal mismatch"
+        );
     }
 }

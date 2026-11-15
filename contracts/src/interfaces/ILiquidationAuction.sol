@@ -18,15 +18,15 @@ interface ILiquidationAuction {
         address collateralToken;
         uint128 collateralTotal;
         uint128 collateralRemaining;
-        uint128 debtPrincipal;
-        uint128 debtInterest;
+        uint128 debtPrincipalRemaining;
+        uint128 debtInterestRemaining;
         uint256 startPrice;
         uint256 floorPrice;
         uint64 startTime;
         uint64 duration;
         address keeper;
         AuctionStatus status;
-        bool isFullLiquidation;
+        bool isDefaultAuction;
     }
 
     event AuctionStarted(
@@ -37,7 +37,7 @@ interface ILiquidationAuction {
         uint128 collateralAmount,
         uint256 startPrice,
         uint256 floorPrice,
-        bool isFullLiquidation
+        bool isDefaultAuction
     );
 
     event AuctionBought(
@@ -66,7 +66,7 @@ interface ILiquidationAuction {
         uint256 oraclePrice,
         uint16 maxDiscountBps,
         address keeper,
-        bool isFullLiquidation
+        bool isDefaultAuction
     ) external returns (uint256 auctionId);
 
     function buy(

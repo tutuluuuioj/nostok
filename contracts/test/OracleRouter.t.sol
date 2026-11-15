@@ -138,4 +138,123 @@ contract OracleRouterTest is Test {
         (, , IOracleRouter.OracleState state) = router.getPrice(address(stockToken));
         assertEq(uint8(state), uint8(IOracleRouter.OracleState.STALE_FEED));
     }
+
+    function test_MarketHours_DST() public {
+        // Disable manual market session override so real calendar and DST calculations run
+        vm.prank(owner);
+        router.setMarketSession(false, false);
+
+        // 1. Summer EDT (July 15, 2024 - Monday): Market opens 13:30 UTC, closes 20:00 UTC
+        // 2024-07-15 12:00:00 UTC = 1721044800 (Pre-market)
+        vm.warp(1721044800);
+        assertTrue(router.isUSDaylightSaving(block.timestamp));
+        assertFalse(router.isMarketOpen());
+
+        // 2024-07-15 14:00:00 UTC = 1721052000 (Open)
+        vm.warp(1721052000);
+        assertTrue(router.isMarketOpen());
+
+        // 2024-07-15 20:30:00 UTC = 1721075400 (After-hours)
+        vm.warp(1721075400);
+        assertFalse(router.isMarketOpen());
+
+        // 2. Winter EST (January 16, 2024 - Tuesday): Market opens 14:30 UTC, closes 21:00 UTC
+        // 2024-01-16 13:45:00 UTC = 1705412700 (Pre-market in winter!)
+        vm.warp(1705412700);
+        assertFalse(router.isUSDaylightSaving(block.timestamp));
+        assertFalse(router.isMarketOpen());
+
+        // 2024-01-16 15:00:00 UTC = 1705417200 (Open in winter)
+        vm.warp(1705417200);
+        assertTrue(router.isMarketOpen());
+
+        // 2024-01-16 20:30:00 UTC = 1705437000 (Still open in winter until 21:00 UTC)
+        vm.warp(1705437000);
+        assertTrue(router.isMarketOpen());
+
+        // 2024-01-16 21:30:00 UTC = 1705440600 (Closed in winter after 21:00 UTC)
+        vm.warp(1705440600);
+        assertFalse(router.isMarketOpen());
+    }
+
+    function test_MarketHours_HolidaysAndHalfDays() public {
+        vm.prank(owner);
+        router.setMarketSession(false, false);
+
+        // July 15, 2024 14:00:00 UTC (normally open)
+        uint256 testTime = 1721052000;
+        vm.warp(testTime);
+        assertTrue(router.isMarketOpen());
+
+        // Admin declares holiday for this epoch day
+        uint256 epochDay = testTime / 86400;
+        vm.prank(owner);
+        router.setHoliday(epochDay, true);
+        assertFalse(router.isMarketOpen());
+
+        // Clear holiday
+        vm.prank(owner);
+        router.setHoliday(epochDay, false);
+        assertTrue(router.isMarketOpen());
+
+        // Set half day: closes 3h early at 17:00 UTC (61200s) instead of 20:00 UTC (72000s)
+        vm.prank(owner);
+        router.setHalfDay(epochDay, true);
+
+        // At 14:00 UTC (50400s), still open
+        vm.warp(1721052000);
+        assertTrue(router.isMarketOpen());
+
+        // At 17:30 UTC (63000s), closed early!
+        vm.warp(testTime + 12600);
+        assertFalse(router.isMarketOpen());
+    }
+
+    function test_MultiplierChange_AutoFreezesAsset() public {
+        vm.warp(block.timestamp + 7200);
+        feed.setUpdatedAt(block.timestamp);
+
+        // Initial multiplier = 1e18
+        stockToken.setUiMultiplier(1e18);
+
+        // Governance records initial multiplier
+        vm.prank(owner);
+        router.syncMultiplier(address(stockToken));
+        assertEq(router.recordedMultiplier(address(stockToken)), 1e18);
+
+        // Normal query succeeds
+        (, , IOracleRouter.OracleState state) = router.getPrice(address(stockToken));
+        assertEq(uint8(state), uint8(IOracleRouter.OracleState.VALID_OPEN));
+
+        // Token splits / corporate action changes multiplier to 2e18 without governance sync
+        stockToken.setUiMultiplier(2e18);
+
+        // OracleRouter detects split mismatch and automatically freezes!
+        (, , IOracleRouter.OracleState frozenState) = router.getPrice(address(stockToken));
+        assertEq(uint8(frozenState), uint8(IOracleRouter.OracleState.FROZEN_CORPORATE_ACTION));
+
+        // When governance reviews and syncs the new multiplier, it unfreezes
+        vm.prank(owner);
+        router.syncMultiplier(address(stockToken));
+        (, , IOracleRouter.OracleState recoveredState) = router.getPrice(address(stockToken));
+        assertEq(uint8(recoveredState), uint8(IOracleRouter.OracleState.VALID_OPEN));
+    }
+
+    function test_StaleFeed_DuringClosedHours() public {
+        vm.warp(1700000000 + 7200);
+
+        // Market is closed
+        vm.prank(owner);
+        router.setMarketSession(false, true);
+
+        // Feed updated 2 days ago (172800s <= 345600s maxStaleClosedSecs)
+        feed.setUpdatedAt(block.timestamp - 172800);
+        (, , IOracleRouter.OracleState state1) = router.getPrice(address(stockToken));
+        assertEq(uint8(state1), uint8(IOracleRouter.OracleState.VALID_CLOSED));
+
+        // Feed updated 5 days ago (432000s > 345600s maxStaleClosedSecs)
+        feed.setUpdatedAt(block.timestamp - 432000);
+        (, , IOracleRouter.OracleState state2) = router.getPrice(address(stockToken));
+        assertEq(uint8(state2), uint8(IOracleRouter.OracleState.STALE_FEED));
+    }
 }

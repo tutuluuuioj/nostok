@@ -27,6 +27,8 @@ contract LiquidationAuction is
 {
     using SafeERC20 for IERC20;
 
+    uint128 public constant MIN_BUY_USDC = 10 * 1e6; // $10 USDC min buy to prevent dust griefing
+
     address public escrow;
     address public loanCore;
     address public feeCollector;
@@ -40,6 +42,7 @@ contract LiquidationAuction is
     error AuctionNotActive();
     error InvalidAuctionAmount();
     error SlippageExceeded();
+    error BuyAmountTooSmall();
 
     modifier onlyLoanCore() {
         if (msg.sender != loanCore) revert UnauthorizedCaller();
@@ -108,15 +111,13 @@ contract LiquidationAuction is
         uint256 oraclePrice,
         uint16 maxDiscountBps,
         address keeper,
-        bool isFullLiquidation
+        bool isDefaultAuction
     ) external override onlyLoanCore returns (uint256 auctionId) {
         if (collateralAmount == 0 || oraclePrice == 0) revert InvalidAuctionAmount();
 
         auctionId = nextAuctionId++;
 
-        // Start at oracle price minus 1% (99%)
         uint256 startPrice = (oraclePrice * 99) / 100;
-        // Floor price decays down to oracle price minus max discount
         uint256 floorPrice = (oraclePrice * (10000 - maxDiscountBps)) / 10000;
 
         auctions[auctionId] = Auction({
@@ -125,15 +126,15 @@ contract LiquidationAuction is
             collateralToken: collateralToken,
             collateralTotal: collateralAmount,
             collateralRemaining: collateralAmount,
-            debtPrincipal: debtPrincipal,
-            debtInterest: debtInterest,
+            debtPrincipalRemaining: debtPrincipal,
+            debtInterestRemaining: debtInterest,
             startPrice: startPrice,
             floorPrice: floorPrice,
             startTime: uint64(block.timestamp),
             duration: 1800, // 30 minutes
             keeper: keeper,
             status: AuctionStatus.Active,
-            isFullLiquidation: isFullLiquidation
+            isDefaultAuction: isDefaultAuction
         });
 
         emit AuctionStarted(
@@ -144,7 +145,7 @@ contract LiquidationAuction is
             collateralAmount,
             startPrice,
             floorPrice,
-            isFullLiquidation
+            isDefaultAuction
         );
     }
 
@@ -181,11 +182,14 @@ contract LiquidationAuction is
         uint256 currentPrice = getCurrentPrice(auctionId);
         uint8 tokenDecimals = IERC20Metadata(a.collateralToken).decimals();
 
-        // Feed prices are 8 decimals; collateral has tokenDecimals; USDC has 6 decimals
-        // usdcCost = (collateralAmount * currentPrice * 1e6) / (10^tokenDecimals * 10^8)
         uint256 numerator = uint256(collateralAmount) * currentPrice * 1e6;
         uint256 denominator = (10 ** tokenDecimals) * 1e8;
         usdcPaid = uint128((numerator + denominator - 1) / denominator);
+
+        // Enforce min buy size unless purchasing the remainder of the auction
+        if (usdcPaid < MIN_BUY_USDC && collateralAmount != a.collateralRemaining) {
+            revert BuyAmountTooSmall();
+        }
 
         if (usdcPaid > maxUsdcPayment) revert SlippageExceeded();
 
@@ -197,8 +201,7 @@ contract LiquidationAuction is
         // Release collateral from escrow to buyer
         ICollateralEscrow(escrow).releaseCollateral(a.collateralToken, msg.sender, collateralAmount);
 
-        // Settle distribution:
-        // 1. Fee calculation
+        // Protocol & keeper fee calculation
         (uint128 protocolFee, uint128 keeperReward) = IFeeCollector(feeCollector).calculateLiquidationFee(usdcPaid);
         uint128 totalFee = protocolFee + keeperReward;
 
@@ -211,39 +214,57 @@ contract LiquidationAuction is
         }
 
         uint128 netProceeds = usdcPaid - totalFee;
-        uint128 totalDebt = a.debtPrincipal + a.debtInterest;
-        uint128 debtPayment = netProceeds > totalDebt ? totalDebt : netProceeds;
-        uint128 surplus = netProceeds > totalDebt ? netProceeds - totalDebt : 0;
 
-        // Send debt payment to LoanCore
-        IERC20(usdc).forceApprove(loanCore, debtPayment);
-        ILoanCore(loanCore).onAuctionSettlement(
-            a.loanId,
-            debtPayment,
-            collateralAmount,
-            a.isFullLiquidation
-        );
+        // Debt waterfall: Interest paid first, then principal
+        uint128 interestPayment = netProceeds > a.debtInterestRemaining
+            ? a.debtInterestRemaining
+            : netProceeds;
+        a.debtInterestRemaining -= interestPayment;
 
-        // Refund any surplus USDC directly to borrower (Core Fairness Property D3)
+        uint128 principalAvailable = netProceeds - interestPayment;
+        uint128 principalPayment = principalAvailable > a.debtPrincipalRemaining
+            ? a.debtPrincipalRemaining
+            : principalAvailable;
+        a.debtPrincipalRemaining -= principalPayment;
+
+        uint128 surplus = principalAvailable - principalPayment;
+        uint128 totalDebtPaid = interestPayment + principalPayment;
+
+        // Settle condition: auction finishes when all debt is paid OR collateral is depleted
+        bool isSettled = (a.debtPrincipalRemaining == 0 && a.debtInterestRemaining == 0) ||
+            a.collateralRemaining == 0;
+
+        // If debt is fully paid and collateral remains, refund remaining collateral to borrower
+        if (a.debtPrincipalRemaining == 0 && a.debtInterestRemaining == 0 && a.collateralRemaining > 0) {
+            uint128 leftoverCollateral = a.collateralRemaining;
+            a.collateralRemaining = 0;
+            ICollateralEscrow(escrow).releaseCollateral(a.collateralToken, a.borrower, leftoverCollateral);
+        }
+
+        // Refund any surplus USDC directly to borrower
         if (surplus > 0) {
             IERC20(usdc).safeTransfer(a.borrower, surplus);
         }
 
+        // Send debt payment to LoanCore and update state
+        if (totalDebtPaid > 0) {
+            IERC20(usdc).forceApprove(loanCore, totalDebtPaid);
+        }
+
+        ILoanCore(loanCore).onAuctionSettlement(
+            a.loanId,
+            principalPayment,
+            interestPayment,
+            collateralAmount,
+            isSettled,
+            a.isDefaultAuction
+        );
+
         emit AuctionBought(auctionId, msg.sender, collateralAmount, usdcPaid, currentPrice);
 
-        if (a.collateralRemaining == 0 || debtPayment >= totalDebt) {
+        if (isSettled) {
             a.status = AuctionStatus.Settled;
-            // If collateral remains but debt was fully settled, return leftover collateral to borrower
-            if (a.collateralRemaining > 0) {
-                ICollateralEscrow(escrow).releaseCollateral(
-                    a.collateralToken,
-                    a.borrower,
-                    a.collateralRemaining
-                );
-                a.collateralRemaining = 0;
-            }
-
-            emit AuctionSettled(auctionId, usdcPaid, debtPayment, totalFee, surplus);
+            emit AuctionSettled(auctionId, usdcPaid, totalDebtPaid, totalFee, surplus);
         }
     }
 

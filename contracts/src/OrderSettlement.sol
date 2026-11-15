@@ -36,6 +36,7 @@ contract OrderSettlement is
     mapping(bytes32 => uint128) public override getOrderFilledAmount;
     mapping(address => uint256) public override getMakerNonce;
 
+    error Unauthorized();
     error ZeroAddress();
     error OrderExpired();
     error OrderCancelledAlready();
@@ -76,7 +77,16 @@ contract OrderSettlement is
         eligibilityGate = newGate;
     }
 
-    function cancelOrder(bytes32 orderHash) external override {
+    function cancelBorrowOrder(BorrowOrder calldata order) external override {
+        if (msg.sender != order.borrower) revert Unauthorized();
+        bytes32 orderHash = hashBorrowOrder(order);
+        isOrderCancelled[orderHash] = true;
+        emit OrderCancelled(orderHash, msg.sender);
+    }
+
+    function cancelLendOffer(LendOffer calldata offer) external override {
+        if (msg.sender != offer.lender) revert Unauthorized();
+        bytes32 orderHash = hashLendOffer(offer);
         isOrderCancelled[orderHash] = true;
         emit OrderCancelled(orderHash, msg.sender);
     }

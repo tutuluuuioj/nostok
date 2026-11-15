@@ -20,6 +20,7 @@ contract AssetRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable, IA
     error ZeroAddress();
     error AssetNotSupported();
     error InvalidLtvParameters();
+    error InvalidDiscountParameters();
     error GuardianCanOnlyTighten();
 
     event GuardianUpdated(address indexed newGuardian);
@@ -60,6 +61,12 @@ contract AssetRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable, IA
             config.badDebtLtvBps > 10000
         ) {
             revert InvalidLtvParameters();
+        }
+
+        // maxDiscountBps must be between 1% (100 bps) and 30% (3000 bps)
+        // Values < 100 bps will brick the Dutch auction since start price is 99% (100 bps discount)
+        if (config.maxDiscountBps < 100 || config.maxDiscountBps > 3000) {
+            revert InvalidDiscountParameters();
         }
 
         _configs[token] = config;
