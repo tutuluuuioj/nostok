@@ -343,7 +343,7 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
         bool marketOpen = isMarketOpen();
 
         if (marketOpen) {
-            uint32 maxStale = cfg.maxStaleOpenSecs > 0 ? cfg.maxStaleOpenSecs : 21600;
+            uint32 maxStale = cfg.maxStaleOpenSecs;
             if (block.timestamp - updatedAt > maxStale) {
                 return (price, decimals, OracleState.STALE_FEED);
             }

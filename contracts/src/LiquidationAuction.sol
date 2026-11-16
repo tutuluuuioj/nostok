@@ -189,7 +189,8 @@ contract LiquidationAuction is
         bool marketOpen = IOracleRouter(router).isMarketOpen();
 
         // Require fresh Dutch auction restart during open market unless oracle feed is stale or frozen.
-        // During closed market (weekend) or stale/frozen feeds, floor buys are permitted to prevent deadlock.
+        // During closed market (weekend) or stale/frozen feeds, floor buys are permitted at any stale age
+        // to guarantee protocol solvency, avoid deadlocks, and prevent collateral from being permanently trapped.
         if (block.timestamp > a.startTime + a.duration && marketOpen && !isStaleOrFrozen) {
             revert AuctionExpired();
         }

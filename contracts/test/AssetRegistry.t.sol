@@ -190,7 +190,14 @@ contract AssetRegistryTest is Test {
             restricted: false
         });
 
+        // Reverts when 0
+        cfg.maxStaleOpenSecs = 0;
+        vm.prank(owner);
+        vm.expectRevert(IAssetRegistry.InvalidStaleParameters.selector);
+        registry.setAssetConfig(token, cfg);
+
         // Reverts when < 1800s
+        cfg.maxStaleOpenSecs = 1799;
         vm.prank(owner);
         vm.expectRevert(IAssetRegistry.InvalidStaleParameters.selector);
         registry.setAssetConfig(token, cfg);

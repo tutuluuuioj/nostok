@@ -419,11 +419,5 @@ contract OracleRouterTest is Test {
         feed.setUpdatedAt(block.timestamp - 21601);
         (, , IOracleRouter.OracleState stateStale) = router.getPrice(address(stockToken));
         assertEq(uint8(stateStale), uint8(IOracleRouter.OracleState.STALE_FEED), "21601s must trigger STALE_FEED");
-
-        // 5. Fallback check: when maxStaleOpenSecs == 0 (direct mock or unconfigured), fallback is 21600s
-        cfg.maxStaleOpenSecs = 21600; // In registry min is 1800, so verify router fallback logic directly
-        feed.setUpdatedAt(block.timestamp - 15000);
-        (, , IOracleRouter.OracleState stateFallbackOpen) = router.getPrice(address(stockToken));
-        assertEq(uint8(stateFallbackOpen), uint8(IOracleRouter.OracleState.VALID_OPEN));
     }
 }
