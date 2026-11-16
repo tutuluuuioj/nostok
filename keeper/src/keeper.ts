@@ -12,7 +12,24 @@ import type { KeeperConfig } from './config.js';
 import { runExpiredAuctionJob } from './jobs/expiredAuction.js';
 import { runLiquidationJob } from './jobs/liquidation.js';
 import { runSyncMultiplierJob } from './jobs/syncMultiplier.js';
+import { extractErrorMessage, type TxExecutionResult } from './tx.js';
 import type { KeeperContext, KeeperCycleSummary } from './types.js';
+
+export function validateChainId(
+  chainId: number,
+  config: Pick<KeeperConfig, 'isFork' | 'forkChainId'>
+): void {
+  if (!config.isFork && chainId !== 8453) {
+    throw new Error(
+      `Invalid chainId ${chainId}: expected Base Mainnet (8453). Set FORK=true and FORK_CHAIN_ID=${chainId} to run on a non-8453 fork.`
+    );
+  }
+  if (config.isFork && chainId !== config.forkChainId) {
+    throw new Error(
+      `Invalid fork chainId ${chainId}: expected FORK_CHAIN_ID=${config.forkChainId}.`
+    );
+  }
+}
 
 export async function createKeeperContext(config: KeeperConfig): Promise<KeeperContext> {
   const account = privateKeyToAccount(config.keeperPrivateKey);
@@ -21,6 +38,7 @@ export async function createKeeperContext(config: KeeperConfig): Promise<KeeperC
     transport: http(config.rpcUrl),
   });
   const chainId = await probeClient.getChainId();
+  validateChainId(chainId, config);
 
   const chain = defineChain({
     id: chainId,
@@ -61,33 +79,84 @@ export async function runKeeperCycle(ctx: KeeperContext): Promise<KeeperCycleSum
   const alertStartIdx = cycleCtx.alerts.history.length;
   const keeperAddress = cycleCtx.walletClient.account.address;
 
-  const [block, balanceWei] = await Promise.all([
-    cycleCtx.publicClient.getBlock(),
-    cycleCtx.publicClient.getBalance({ address: keeperAddress }),
-  ]);
+  let blockNumber = 0n;
+  let blockTimestamp = 0n;
+  let balanceWei = 0n;
 
-  console.log(
-    `[CYCLE] block=${block.number} ts=${block.timestamp} keeper=${keeperAddress} eth=${formatEther(balanceWei)} dryRun=${cycleCtx.config.dryRun}`
-  );
+  try {
+    const block = await cycleCtx.publicClient.getBlock();
+    blockNumber = block.number;
+    blockTimestamp = block.timestamp;
+  } catch (err) {
+    const reason = extractErrorMessage(err);
+    console.error(`[CYCLE_ERROR] Failed to fetch latest block: ${reason}`);
+    await cycleCtx.alerts.send('RPC_ERROR', 'Failed to fetch latest block header', { reason });
+  }
 
-  if (balanceWei < cycleCtx.config.minKeeperEthWei) {
-    await cycleCtx.alerts.send('LOW_ETH_BALANCE', 'Keeper ETH balance is below configured threshold', {
+  try {
+    balanceWei = await cycleCtx.publicClient.getBalance({ address: keeperAddress });
+    console.log(
+      `[CYCLE] block=${blockNumber} ts=${blockTimestamp} keeper=${keeperAddress} eth=${formatEther(balanceWei)} dryRun=${cycleCtx.config.dryRun}`
+    );
+
+    if (balanceWei < cycleCtx.config.minKeeperEthWei) {
+      await cycleCtx.alerts.send('LOW_ETH_BALANCE', 'Keeper ETH balance is below configured threshold', {
+        keeperAddress,
+        balanceEth: formatEther(balanceWei),
+        thresholdEth: formatEther(cycleCtx.config.minKeeperEthWei),
+      });
+    }
+  } catch (err) {
+    const reason = extractErrorMessage(err);
+    console.error(`[CYCLE_ERROR] Failed to check keeper ETH balance: ${reason}`);
+    await cycleCtx.alerts.send('RPC_ERROR', 'Failed to fetch keeper ETH balance', {
       keeperAddress,
-      balanceEth: formatEther(balanceWei),
-      thresholdEth: formatEther(cycleCtx.config.minKeeperEthWei),
+      reason,
     });
   }
 
-  const syncMultiplierResults = await runSyncMultiplierJob(cycleCtx);
-  const liquidationResults = await runLiquidationJob(cycleCtx);
-  const expiredAuctionResults = await runExpiredAuctionJob(cycleCtx);
+  let syncMultiplierResults: TxExecutionResult[] = [];
+  try {
+    syncMultiplierResults = await runSyncMultiplierJob(cycleCtx);
+  } catch (err) {
+    const reason = extractErrorMessage(err);
+    console.error(`[JOB_ERROR] syncMultiplier job failed: ${reason}`);
+    await cycleCtx.alerts.send('RPC_ERROR', 'syncMultiplier job threw an unexpected error', {
+      job: 'syncMultiplier',
+      reason,
+    });
+  }
+
+  let liquidationResults: TxExecutionResult[] = [];
+  try {
+    liquidationResults = await runLiquidationJob(cycleCtx);
+  } catch (err) {
+    const reason = extractErrorMessage(err);
+    console.error(`[JOB_ERROR] liquidation job failed: ${reason}`);
+    await cycleCtx.alerts.send('RPC_ERROR', 'liquidation job threw an unexpected error', {
+      job: 'liquidation',
+      reason,
+    });
+  }
+
+  let expiredAuctionResults: TxExecutionResult[] = [];
+  try {
+    expiredAuctionResults = await runExpiredAuctionJob(cycleCtx);
+  } catch (err) {
+    const reason = extractErrorMessage(err);
+    console.error(`[JOB_ERROR] expiredAuction job failed: ${reason}`);
+    await cycleCtx.alerts.send('RPC_ERROR', 'expiredAuction job threw an unexpected error', {
+      job: 'expiredAuction',
+      reason,
+    });
+  }
 
   const alertsEmitted = cycleCtx.alerts.history.slice(alertStartIdx);
 
   return {
     timestamp: new Date().toISOString(),
-    blockNumber: block.number,
-    blockTimestamp: block.timestamp,
+    blockNumber,
+    blockTimestamp,
     keeperAddress,
     keeperEthBalanceWei: balanceWei,
     syncMultiplierResults,

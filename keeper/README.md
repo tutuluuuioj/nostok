@@ -6,8 +6,9 @@ TypeScript + `viem` keeper service (Node >= 20) for the NOSTOK tokenized equity 
 
 1. **`syncMultiplier` (`src/jobs/syncMultiplier.ts`)**
    - Polls `token.uiMultiplier()` and `OracleRouter.recordedMultiplier(token)` for each listed asset in `ASSET_LIST`.
+   - If `recordedMultiplier == 0` (baseline not yet recorded), simulates and calls permissionless `OracleRouter.syncMultiplier(token)` to set the first baseline.
    - If multiplier drift is `> 0%` and `< 5%` (`< 500 bps`), simulates and calls `OracleRouter.syncMultiplier(token)` to ratchet dividend drift cleanly.
-   - If multiplier jump is `>= 5%` (`>= 500 bps`) or `recordedMultiplier == 0` (`FROZEN_CORPORATE_ACTION`), **does not** call `syncMultiplier` and emits a `FROZEN_SPLIT` alert instead so Owner/Guardian multisigs can verify and unfreeze post-split.
+   - If multiplier jump is `>= 5%` (`>= 500 bps`), **does not** call `syncMultiplier` and emits a `FROZEN_SPLIT` alert instead so Owner/Guardian multisigs can verify and unfreeze post-split.
 
 2. **`liquidation` (`src/jobs/liquidation.ts`)**
    - Scans loans `1..nextLoanId - 1` with `LoanStatus.Active (0)` or `LoanStatus.Grace (1)`.
@@ -24,14 +25,12 @@ TypeScript + `viem` keeper service (Node >= 20) for the NOSTOK tokenized equity 
    - Simulates and calls `LiquidationAuction.restartOrCancelAuction(auctionId)` only when permitted.
    - Floor buys and flash-buy arbitrage are intentionally not enabled yet.
 
-4. **Alerts & Pre-Broadcast Simulation (`src/alerts.ts`, `src/tx.ts`)**
-   - Every state-changing transaction is simulated via `publicClient.simulateContract(...)` before signing/sending; reverting simulations are skipped and logged.
-   - `DRY_RUN=true` by default (simulates only, never sends transactions). Set `DRY_RUN=false` explicitly to broadcast.
-   - Structured console alerts + optional `TELEGRAM_WEBHOOK_URL` webhook delivery for:
-     - `FROZEN_SPLIT` (`>= 5%` corporate action split / frozen asset)
-     - `STALE_FEED` (Chainlink feed staleness detected)
-     - `FAILED_TX` (simulation revert or reverted transaction receipt)
-     - `LOW_ETH_BALANCE` (keeper ETH balance below `MIN_KEEPER_ETH`)
+4. **Resilience, Guardrails & Alerts (`src/keeper.ts`, `src/alerts.ts`, `src/tx.ts`)**
+   - **Startup Chain ID Check:** Refuses to start unless `chainId == 8453` (Base Mainnet) or `FORK=true` with matching `FORK_CHAIN_ID`.
+   - **Failure Isolation:** Every job and every individual asset/loan/auction inside each job runs inside its own `try / catch`, logging + alerting (`RPC_ERROR`) without interrupting other items or jobs.
+   - **Gas Cap & Stuck-Tx Replacement:** Skips sending transactions (with `HIGH_GAS_PRICE` alert) when `eth_gasPrice` exceeds `MAX_GAS_PRICE_GWEI`; waits up to `TX_TIMEOUT_MS` for receipt confirmation and attempts a fee-bumped replacement transaction (+`TX_BUMP_BPS` on the same nonce, capped by `MAX_GAS_PRICE_GWEI`) or emits a `STUCK_TX` alert.
+   - **Pre-Broadcast Simulation & Default Dry Run:** Every transaction is simulated via `publicClient.simulateContract(...)` before signing/sending; `DRY_RUN=true` by default.
+   - Structured console alerts + optional `TELEGRAM_WEBHOOK_URL` webhook delivery for `FROZEN_SPLIT`, `STALE_FEED`, `FAILED_TX`, `LOW_ETH_BALANCE`, `HIGH_GAS_PRICE`, `STUCK_TX`, and `RPC_ERROR`.
 
 ---
 
@@ -72,12 +71,15 @@ cp .env.example .env
 
 Environment variables:
 - `RPC_URL`: RPC endpoint (e.g. `http://127.0.0.1:8545` for local Anvil fork).
+- `FORK` / `FORK_CHAIN_ID`: Keeper requires `chainId == 8453` on startup unless `FORK=true` (in which case it requires `chainId == FORK_CHAIN_ID`, defaulting to `8453`).
 - `KEEPER_PRIVATE_KEY`: Required signer private key (**env var only**; rejected if placed in JSON config, never logged).
 - `ORACLE_ROUTER_ADDRESS`, `ASSET_REGISTRY_ADDRESS`, `LOAN_CORE_ADDRESS`, `LIQUIDATION_AUCTION_ADDRESS`: Deployed contract addresses.
 - `ASSET_LIST`: Comma-separated list of listed collateral token addresses.
 - `POLL_INTERVAL_MS`: Poll loop interval in milliseconds (default `15000`).
 - `DRY_RUN`: Defaults to `true` (simulate only). Set `DRY_RUN=false` to broadcast transactions.
 - `MIN_KEEPER_ETH`: Minimum ETH balance before emitting `LOW_ETH_BALANCE` alert (default `0.01`).
+- `MAX_GAS_PRICE_GWEI`: Skip transactions and emit `HIGH_GAS_PRICE` alert if current gas price exceeds cap (default `50`).
+- `TX_TIMEOUT_MS` / `TX_BUMP_BPS`: Wait timeout before treating a pending tx as stuck (default `30000` ms) and fee bump basis points for same-nonce replacement (default `2000`, i.e., +20%).
 - `TELEGRAM_WEBHOOK_URL`, `TELEGRAM_CHAT_ID`: Optional webhook alert target.
 - `CONFIG_PATH`: Optional JSON file path (see `config.example.json`) for non-secret settings.
 

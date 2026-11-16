@@ -19,7 +19,7 @@ import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { base } from 'viem/chains';
 import { AuctionStatus, LoanStatus, OracleState, loanCoreAbi, liquidationAuctionAbi, oracleRouterAbi } from '../src/abi.js';
 import { loadConfig } from '../src/config.js';
-import { createKeeperContext, runKeeperCycle } from '../src/keeper.js';
+import { createKeeperContext, runKeeperCycle, validateChainId } from '../src/keeper.js';
 import { executeContractAction } from '../src/tx.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -464,6 +464,112 @@ async function runTests(): Promise<void> {
     console.log('PASS TEST 0: DRY_RUN=true simulated syncMultiplier cleanly with zero transactions sent.');
 
     // -------------------------------------------------------------------------
+    // TEST 0b: Startup chainId verification (requires 8453 or FORK + FORK_CHAIN_ID)
+    // -------------------------------------------------------------------------
+    console.log('\n=== TEST 0b: Startup chainId verification ===');
+    assert.throws(
+      () => validateChainId(31337, { isFork: false, forkChainId: 8453 }),
+      /Invalid chainId 31337: expected Base Mainnet \(8453\)/,
+      'Non-8453 chainId must throw when FORK is false'
+    );
+    await assert.rejects(
+      () => createKeeperContext({ ...defaultConfig, isFork: true, forkChainId: 99999 }),
+      /Invalid fork chainId 8453: expected FORK_CHAIN_ID=99999/,
+      'Mismatched FORK_CHAIN_ID must reject on startup'
+    );
+    const validForkCtx = await createKeeperContext({ ...defaultConfig, isFork: true, forkChainId: 8453 });
+    assert.equal(validForkCtx.publicClient.chain.id, 8453);
+    console.log('PASS TEST 0b: Startup chainId validation accepts 8453 and rejects mismatches cleanly.');
+
+    // -------------------------------------------------------------------------
+    // TEST 0c: Zero baseline (recordedMultiplier == 0) permissionless sync
+    // -------------------------------------------------------------------------
+    console.log('\n=== TEST 0c: Permissionless syncMultiplier on recordedMultiplier == 0 ===');
+    const metacInitialMult = 1000313792289598084n; // real Base METAc multiplier scale
+    const metacDeployHash = await deployerClient.deployContract({
+      abi: mockB20Artifact.abi,
+      bytecode: mockB20Artifact.bytecode,
+      args: ['Coinbase Wrapped META', 'METAc', 18, metacInitialMult],
+    });
+    const metacReceipt = await publicClient.waitForTransactionReceipt({ hash: metacDeployHash });
+    const metac = metacReceipt.contractAddress!;
+
+    // Temporarily point AssetRegistry.oracleRouter to an EOA so listing METAc leaves recordedMultiplier[metac] == 0
+    const setRouterAbi = parseAbi(['function setOracleRouter(address router)']);
+    const tmpRouterHash = await timelockClient.sendTransaction({
+      account: deployed.nostokTimelock,
+      to: deployed.assetRegistry,
+      data: encodeFunctionData({ abi: setRouterAbi, functionName: 'setOracleRouter', args: [ADDRESSES.reserve] }),
+    });
+    await publicClient.waitForTransactionReceipt({ hash: tmpRouterHash });
+
+    const metacCfgHash = await timelockClient.sendTransaction({
+      account: deployed.nostokTimelock,
+      to: deployed.assetRegistry,
+      data: encodeFunctionData({
+        abi: setCfgAbi,
+        functionName: 'setAssetConfig',
+        args: [
+          metac,
+          {
+            feed: nvdaFeed,
+            feedDecimals: 8,
+            tier: 0,
+            maxInitLtvBps: 6000,
+            marginCallLtvBps: 7000,
+            liqLtvBps: 7800,
+            badDebtLtvBps: 9000,
+            maxDiscountBps: 600,
+            closedMarketHaircutBps: 500,
+            perLoanCap: 50_000_000_000n,
+            assetCap: 100_000_000_000n,
+            maxStaleOpenSecs: 21600,
+            status: 0,
+            restricted: false,
+          },
+        ],
+      }),
+    });
+    await publicClient.waitForTransactionReceipt({ hash: metacCfgHash });
+
+    const restoreRouterHash = await timelockClient.sendTransaction({
+      account: deployed.nostokTimelock,
+      to: deployed.assetRegistry,
+      data: encodeFunctionData({ abi: setRouterAbi, functionName: 'setOracleRouter', args: [deployed.oracleRouter] }),
+    });
+    await publicClient.waitForTransactionReceipt({ hash: restoreRouterHash });
+
+    const zeroRecBefore = await publicClient.readContract({
+      address: deployed.oracleRouter,
+      abi: oracleRouterAbi,
+      functionName: 'recordedMultiplier',
+      args: [metac],
+    });
+    assert.equal(zeroRecBefore, 0n, 'METAc initial recordedMultiplier should start at 0');
+
+    const initSyncCtx = await createKeeperContext({
+      ...defaultConfig,
+      dryRun: false,
+      assets: [metac],
+    });
+    const zeroSyncSummary = await runKeeperCycle(initSyncCtx);
+    assert.equal(zeroSyncSummary.syncMultiplierResults.length, 1);
+    assert.equal(zeroSyncSummary.syncMultiplierResults[0].executed, true);
+    assert.equal(
+      zeroSyncSummary.alertsEmitted.some((a) => a.type === 'FROZEN_SPLIT'),
+      false,
+      'Must call permissionless syncMultiplier instead of only alerting FROZEN_SPLIT when recordedMultiplier == 0'
+    );
+    const metacRecAfter = await publicClient.readContract({
+      address: deployed.oracleRouter,
+      abi: oracleRouterAbi,
+      functionName: 'recordedMultiplier',
+      args: [metac],
+    });
+    assert.equal(metacRecAfter, metacInitialMult, 'Keeper must initialize recordedMultiplier permissionlessly');
+    console.log(`PASS TEST 0c: Keeper simulated and called syncMultiplier for zero baseline (0 -> ${metacRecAfter})`);
+
+    // -------------------------------------------------------------------------
     // TEST (a): Syncing a small multiplier drift (>0% and <5%)
     // -------------------------------------------------------------------------
     console.log('\n=== TEST (a): Sync small multiplier drift (>0% and <5%) ===');
@@ -887,6 +993,315 @@ async function runTests(): Promise<void> {
 
     console.log(
       `PASS TEST (e): STALE_FEED, LOW_ETH_BALANCE, FAILED_TX alerts & webhooks verified; startDefaultAuction(2) started Auction #2 (isDefaultAuction=true).`
+    );
+
+    // -------------------------------------------------------------------------
+    // TEST (f): MAX_GAS_PRICE_GWEI cap & stuck tx timeout / replacement handling
+    // -------------------------------------------------------------------------
+    console.log('\n=== TEST (f): MAX_GAS_PRICE_GWEI cap & stuck tx timeout/replacement ===');
+    const metacDrift1 = 1005315361251046074n; // +0.5% drift on METAc
+    const metacDriftTx1 = await deployerClient.writeContract({
+      address: metac,
+      abi: mockB20Artifact.abi,
+      functionName: 'setUIMultiplier',
+      args: [metacDrift1],
+    });
+    await publicClient.waitForTransactionReceipt({ hash: metacDriftTx1 });
+
+    // Part 1: High gas cap skip + alert
+    const webhooksBeforeGasCap = webhook.received.length;
+    const highGasCtx = await createKeeperContext({
+      ...liveConfig,
+      assets: [metac],
+      maxGasPriceWei: 1n, // 1 wei forces eth_gasPrice > maxGasPriceWei
+    });
+    const gasCapSummary = await runKeeperCycle(highGasCtx);
+    assert.equal(gasCapSummary.syncMultiplierResults.length, 1);
+    assert.equal(gasCapSummary.syncMultiplierResults[0].executed, false);
+    assert.equal(gasCapSummary.syncMultiplierResults[0].skippedGasCap, true);
+    assert.ok(
+      gasCapSummary.alertsEmitted.some((a) => a.type === 'HIGH_GAS_PRICE'),
+      'Expected HIGH_GAS_PRICE alert'
+    );
+    assert.ok(
+      webhook.received.slice(webhooksBeforeGasCap).some((w) => w.type === 'HIGH_GAS_PRICE'),
+      'Expected HIGH_GAS_PRICE webhook alert'
+    );
+
+    // Part 2: Stuck tx timeout -> fee-bumped replacement succeeds without blocking
+    let automineDisabled = false;
+    try {
+      await rpcCall('anvil_setAutomine', [false]);
+      automineDisabled = true;
+
+      // Re-enable automine after initial 500ms tx timeout fires so the replacement tx mines inside its wait window
+      const timer = setTimeout(() => {
+        void (async () => {
+          try {
+            await rpcCall('anvil_setAutomine', [true]);
+            automineDisabled = false;
+            await rpcCall('evm_mine', []);
+          } catch {
+            // handled in finally
+          }
+        })();
+      }, 750);
+
+      const repRes = await executeContractAction({
+        label: 'OracleRouter.syncMultiplier(METAc)',
+        address: deployed.oracleRouter,
+        abi: oracleRouterAbi,
+        functionName: 'syncMultiplier',
+        args: [metac],
+        publicClient: liveCtx.publicClient,
+        walletClient: liveCtx.walletClient,
+        dryRun: false,
+        alerts: liveCtx.alerts,
+        maxGasPriceWei: liveConfig.maxGasPriceWei,
+        txTimeoutMs: 500,
+        txBumpBps: 2500,
+      });
+      clearTimeout(timer);
+
+      assert.equal(repRes.executed, true, 'Replacement tx should confirm after initial tx times out');
+      assert.ok(repRes.replacedTxHash, 'Replacement result must record replacedTxHash');
+      assert.notEqual(repRes.txHash, repRes.replacedTxHash, 'Replacement txHash must differ from original stuck tx');
+      assert.ok(
+        liveCtx.alerts.history.some((a) => a.type === 'STUCK_TX'),
+        'Expected STUCK_TX alert on replacement'
+      );
+
+      // Part 3: Unmined replacement also times out -> logs/alerts STUCK_TX cleanly without throwing
+      const metacDrift2 = 1010341938057301304n; // another +0.5% drift
+      if (automineDisabled) {
+        await rpcCall('anvil_setAutomine', [true]);
+        automineDisabled = false;
+      }
+      const metacDriftTx2 = await deployerClient.writeContract({
+        address: metac,
+        abi: mockB20Artifact.abi,
+        functionName: 'setUIMultiplier',
+        args: [metacDrift2],
+      });
+      await publicClient.waitForTransactionReceipt({ hash: metacDriftTx2 });
+
+      await rpcCall('anvil_setAutomine', [false]);
+      automineDisabled = true;
+
+      const stuckAlertBefore = liveCtx.alerts.history.length;
+      const stuckFailRes = await executeContractAction({
+        label: 'OracleRouter.syncMultiplier(METAc-stuck)',
+        address: deployed.oracleRouter,
+        abi: oracleRouterAbi,
+        functionName: 'syncMultiplier',
+        args: [metac],
+        publicClient: liveCtx.publicClient,
+        walletClient: liveCtx.walletClient,
+        dryRun: false,
+        alerts: liveCtx.alerts,
+        maxGasPriceWei: liveConfig.maxGasPriceWei,
+        txTimeoutMs: 250,
+        txBumpBps: 2500,
+      });
+      assert.equal(stuckFailRes.executed, false, 'Timed out replacement must not hang or throw');
+      assert.ok(
+        liveCtx.alerts.history.slice(stuckAlertBefore).some((a) => a.type === 'STUCK_TX'),
+        'Expected STUCK_TX alert when replacement also times out'
+      );
+    } finally {
+      if (automineDisabled) {
+        await rpcCall('anvil_setAutomine', [true]);
+        await rpcCall('evm_mine', []);
+      }
+    }
+    console.log('PASS TEST (f): MAX_GAS_PRICE_GWEI skip/alert and STUCK_TX timeout/replacement verified.');
+
+    // -------------------------------------------------------------------------
+    // TEST (g): Isolate failures per loan and per job without halting the round
+    // -------------------------------------------------------------------------
+    console.log('\n=== TEST (g): Failure isolation (faulty loan read + faulty job) ===');
+    // Reset METAc drift by syncing remaining drift cleanly, then ensure fresh NVDAc supply for Loans #3 and #4
+    const resyncMetac = await executeContractAction({
+      label: 'OracleRouter.syncMultiplier(METAc)',
+      address: deployed.oracleRouter,
+      abi: oracleRouterAbi,
+      functionName: 'syncMultiplier',
+      args: [metac],
+      publicClient: liveCtx.publicClient,
+      walletClient: liveCtx.walletClient,
+      dryRun: false,
+      alerts: liveCtx.alerts,
+      maxGasPriceWei: liveConfig.maxGasPriceWei,
+    });
+    assert.equal(resyncMetac.executed, true);
+
+    const extraMintHash = await deployerClient.writeContract({
+      address: nvdac,
+      abi: mockB20Artifact.abi,
+      functionName: 'mint',
+      args: [ADDRESSES.borrower, 30n * 10n ** 18n],
+    });
+    await publicClient.waitForTransactionReceipt({ hash: extraMintHash });
+
+    const extraAppHash = await borrowerClient.writeContract({
+      address: nvdac,
+      abi: erc20ApproveAbi,
+      functionName: 'approve',
+      args: [deployed.collateralEscrow, 100n * 10n ** 18n],
+    });
+    await publicClient.waitForTransactionReceipt({ hash: extraAppHash });
+
+    const bNonceTx2 = await borrowerClient.writeContract({
+      address: deployed.orderSettlement,
+      abi: parseAbi(['function bumpNonce() returns (uint256)']),
+      functionName: 'bumpNonce',
+    });
+    await publicClient.waitForTransactionReceipt({ hash: bNonceTx2 });
+
+    const block3 = await publicClient.getBlock();
+    const order3 = {
+      borrower: ADDRESSES.borrower,
+      collateralToken: nvdac,
+      collateralAmount: 20n * 10n ** 18n, // 20 NVDAc @ $98 = $1,960 total (10 NVDAc per 550 USDC fill)
+      minUsdc: 1_100_000_000n, // 1,100 USDC total (56.12% LTV <= 60%)
+      maxRateBps: 1000,
+      termDays: 14,
+      maxLtvBps: 6000,
+      minFill: 500_000_000n,
+      expiry: block3.timestamp + 3600n,
+      nonce: 2n,
+      yieldMode: 0,
+      allowInKindSettlement: false,
+    } as const;
+
+    const sig3 = await borrowerAccount.signTypedData({
+      domain: {
+        name: 'NOSTOK Order Settlement',
+        version: '1',
+        chainId: 8453,
+        verifyingContract: deployed.orderSettlement,
+      },
+      types: {
+        BorrowOrder: [
+          { name: 'borrower', type: 'address' },
+          { name: 'collateralToken', type: 'address' },
+          { name: 'collateralAmount', type: 'uint128' },
+          { name: 'minUsdc', type: 'uint128' },
+          { name: 'maxRateBps', type: 'uint32' },
+          { name: 'termDays', type: 'uint16' },
+          { name: 'maxLtvBps', type: 'uint16' },
+          { name: 'minFill', type: 'uint128' },
+          { name: 'expiry', type: 'uint64' },
+          { name: 'nonce', type: 'uint256' },
+          { name: 'yieldMode', type: 'uint8' },
+          { name: 'allowInKindSettlement', type: 'bool' },
+        ],
+      },
+      primaryType: 'BorrowOrder',
+      message: order3,
+    });
+
+    // Open Loan #3 (550 USDC / 10 NVDAc) and Loan #4 (550 USDC / 10 NVDAc)
+    const fillHash3 = await lenderClient.writeContract({
+      address: deployed.orderSettlement,
+      abi: fillOrderAbi,
+      functionName: 'fillBorrowOrder',
+      args: [order3, sig3, 550_000_000n],
+    });
+    await publicClient.waitForTransactionReceipt({ hash: fillHash3 });
+
+    const fillHash4 = await lenderClient.writeContract({
+      address: deployed.orderSettlement,
+      abi: fillOrderAbi,
+      functionName: 'fillBorrowOrder',
+      args: [order3, sig3, 550_000_000n],
+    });
+    await publicClient.waitForTransactionReceipt({ hash: fillHash4 });
+
+    // Drop NVDA/USD price from $98 -> $65 (10 NVDAc = $650 => LTV ~84.62% >= 78% liqLtvBps)
+    const drop65Tx = await deployerClient.writeContract({
+      address: nvdaFeed,
+      abi: mockAggArtifact.abi,
+      functionName: 'setPrice',
+      args: [65_00000000n],
+    });
+    await publicClient.waitForTransactionReceipt({ hash: drop65Tx });
+
+    // Sub-test g1: Inject an RPC failure specifically on Loan #3's getLoan read; Loan #4 MUST still be liquidated
+    const origReadContract = liveCtx.publicClient.readContract.bind(liveCtx.publicClient);
+    const faultyLoanClient = {
+      ...liveCtx.publicClient,
+      readContract: (async (parameters: Parameters<typeof liveCtx.publicClient.readContract>[0]) => {
+        if (
+          parameters.functionName === 'getLoan' &&
+          Array.isArray(parameters.args) &&
+          parameters.args[0] === 3n
+        ) {
+          throw new Error('Injected RPC failure reading Loan #3');
+        }
+        return origReadContract(parameters);
+      }) as typeof liveCtx.publicClient.readContract,
+    };
+
+    const g1Ctx = { ...liveCtx, publicClient: faultyLoanClient };
+    const summaryG1 = await runKeeperCycle(g1Ctx);
+
+    assert.ok(
+      summaryG1.alertsEmitted.some(
+        (a) => a.type === 'RPC_ERROR' && a.details.loanId === '3'
+      ),
+      'Expected RPC_ERROR alert for failing Loan #3'
+    );
+    assert.ok(
+      summaryG1.liquidationResults.some(
+        (r) => r.action === 'LoanCore.startLiquidation(4)' && r.executed === true
+      ),
+      'Expected Loan #4 to still be liquidated despite Loan #3 RPC read throwing'
+    );
+
+    const loan3Check = await publicClient.readContract({
+      address: deployed.loanCore,
+      abi: loanCoreAbi,
+      functionName: 'getLoan',
+      args: [3n],
+    });
+    const loan4Check = await publicClient.readContract({
+      address: deployed.loanCore,
+      abi: loanCoreAbi,
+      functionName: 'getLoan',
+      args: [4n],
+    });
+    assert.equal(loan3Check.status, LoanStatus.Active, 'Loan #3 was skipped after its RPC read threw');
+    assert.equal(loan4Check.status, LoanStatus.Auction, 'Loan #4 must be liquidated in the same round');
+
+    // Sub-test g2: Job-level failure isolation — expiredAuction job throws on nextAuctionId, liquidation still runs Loan #3
+    const faultyJobClient = {
+      ...liveCtx.publicClient,
+      readContract: (async (parameters: Parameters<typeof liveCtx.publicClient.readContract>[0]) => {
+        if (parameters.functionName === 'nextAuctionId') {
+          throw new Error('Injected RPC failure in expiredAuction job');
+        }
+        return origReadContract(parameters);
+      }) as typeof liveCtx.publicClient.readContract,
+    };
+    const g2Ctx = { ...liveCtx, publicClient: faultyJobClient };
+    const summaryG2 = await runKeeperCycle(g2Ctx);
+
+    assert.ok(
+      summaryG2.alertsEmitted.some(
+        (a) => a.type === 'RPC_ERROR' && a.details.job === 'expiredAuction'
+      ),
+      'Expected RPC_ERROR alert for failing expiredAuction job'
+    );
+    assert.ok(
+      summaryG2.liquidationResults.some(
+        (r) => r.action === 'LoanCore.startLiquidation(3)' && r.executed === true
+      ),
+      'Expected liquidation job to liquidate Loan #3 cleanly even when expiredAuction job fails'
+    );
+
+    console.log(
+      'PASS TEST (g): Faulty loan #3 logged + alerted RPC_ERROR while loan #4 was liquidated in the same round; faulty expiredAuction job did not crash round.'
     );
 
     console.log('\nALL KEEPER BASE MAINNET FORK INTEGRATION TESTS PASSED.');

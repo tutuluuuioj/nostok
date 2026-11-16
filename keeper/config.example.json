@@ -1,5 +1,7 @@
 {
   "rpcUrl": "http://127.0.0.1:8545",
+  "fork": false,
+  "forkChainId": 8453,
   "oracleRouter": "0x0000000000000000000000000000000000000000",
   "assetRegistry": "0x0000000000000000000000000000000000000000",
   "loanCore": "0x0000000000000000000000000000000000000000",
@@ -7,5 +9,8 @@
   "assets": [],
   "pollIntervalMs": 15000,
   "minKeeperEth": "0.01",
+  "maxGasPriceGwei": "50",
+  "txTimeoutMs": 30000,
+  "txBumpBps": 2000,
   "dryRun": true
 }

@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
-import { type Address, type Hex, getAddress, isAddress, parseEther } from 'viem';
+import { type Address, type Hex, getAddress, isAddress, parseEther, parseGwei } from 'viem';
 
 export interface KeeperFileConfig {
   rpcUrl?: string;
@@ -13,6 +13,11 @@ export interface KeeperFileConfig {
   pollIntervalMs?: number;
   dryRun?: boolean;
   minKeeperEth?: string;
+  fork?: boolean;
+  forkChainId?: number;
+  maxGasPriceGwei?: string;
+  txTimeoutMs?: number;
+  txBumpBps?: number;
   telegramWebhookUrl?: string;
   telegramChatId?: string;
 }
@@ -28,6 +33,11 @@ export interface KeeperConfig {
   pollIntervalMs: number;
   dryRun: boolean;
   minKeeperEthWei: bigint;
+  isFork: boolean;
+  forkChainId: number;
+  maxGasPriceWei: bigint;
+  txTimeoutMs: number;
+  txBumpBps: number;
   telegramWebhookUrl?: string;
   telegramChatId?: string;
 }
@@ -130,6 +140,46 @@ export function loadConfig(overrides: KeeperConfigOverrides = {}): KeeperConfig 
     overrides.minKeeperEthWei ??
     parseEther(process.env.MIN_KEEPER_ETH ?? fileConfig.minKeeperEth ?? '0.01');
 
+  let isFork = false;
+  if (overrides.isFork !== undefined) {
+    isFork = overrides.isFork;
+  } else if (process.env.FORK !== undefined) {
+    const val = process.env.FORK.trim().toLowerCase();
+    isFork = val === 'true' || val === '1' || val === 'yes';
+  } else if (fileConfig.fork !== undefined) {
+    isFork = Boolean(fileConfig.fork);
+  }
+
+  const rawForkChainId = process.env.FORK_CHAIN_ID
+    ? Number(process.env.FORK_CHAIN_ID)
+    : fileConfig.forkChainId ?? 8453;
+  const forkChainId = overrides.forkChainId ?? rawForkChainId;
+  if (!Number.isInteger(forkChainId) || forkChainId <= 0) {
+    throw new Error(`Invalid FORK_CHAIN_ID: ${forkChainId}`);
+  }
+
+  const rawMaxGasGwei = process.env.MAX_GAS_PRICE_GWEI?.trim() ?? fileConfig.maxGasPriceGwei ?? '50';
+  const maxGasPriceWei = overrides.maxGasPriceWei ?? parseGwei(rawMaxGasGwei);
+  if (maxGasPriceWei <= 0n) {
+    throw new Error(`Invalid MAX_GAS_PRICE_GWEI: ${rawMaxGasGwei}`);
+  }
+
+  const rawTxTimeoutMs = process.env.TX_TIMEOUT_MS
+    ? Number(process.env.TX_TIMEOUT_MS)
+    : fileConfig.txTimeoutMs ?? 30_000;
+  const txTimeoutMs = overrides.txTimeoutMs ?? rawTxTimeoutMs;
+  if (!Number.isFinite(txTimeoutMs) || txTimeoutMs <= 0) {
+    throw new Error(`Invalid TX_TIMEOUT_MS: ${txTimeoutMs}`);
+  }
+
+  const rawTxBumpBps = process.env.TX_BUMP_BPS
+    ? Number(process.env.TX_BUMP_BPS)
+    : fileConfig.txBumpBps ?? 2000;
+  const txBumpBps = overrides.txBumpBps ?? rawTxBumpBps;
+  if (!Number.isFinite(txBumpBps) || txBumpBps < 0) {
+    throw new Error(`Invalid TX_BUMP_BPS: ${txBumpBps}`);
+  }
+
   const telegramWebhookUrl =
     overrides.telegramWebhookUrl ??
     (process.env.TELEGRAM_WEBHOOK_URL?.trim() || fileConfig.telegramWebhookUrl);
@@ -149,6 +199,11 @@ export function loadConfig(overrides: KeeperConfigOverrides = {}): KeeperConfig 
     pollIntervalMs,
     dryRun,
     minKeeperEthWei,
+    isFork,
+    forkChainId,
+    maxGasPriceWei,
+    txTimeoutMs,
+    txBumpBps,
     telegramWebhookUrl,
     telegramChatId,
   };

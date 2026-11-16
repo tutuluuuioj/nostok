@@ -1,4 +1,11 @@
-export type AlertType = 'FROZEN_SPLIT' | 'STALE_FEED' | 'FAILED_TX' | 'LOW_ETH_BALANCE';
+export type AlertType =
+  | 'FROZEN_SPLIT'
+  | 'STALE_FEED'
+  | 'FAILED_TX'
+  | 'LOW_ETH_BALANCE'
+  | 'HIGH_GAS_PRICE'
+  | 'STUCK_TX'
+  | 'RPC_ERROR';
 
 export interface KeeperAlert {
   type: AlertType;
@@ -31,7 +38,7 @@ export class AlertManager {
     this.history.push(alert);
 
     const logLine = `[ALERT][${alert.timestamp}][${type}] ${message} ${JSON.stringify(details)}`;
-    if (type === 'FAILED_TX' || type === 'FROZEN_SPLIT') {
+    if (type === 'FAILED_TX' || type === 'FROZEN_SPLIT' || type === 'RPC_ERROR' || type === 'STUCK_TX') {
       console.error(logLine);
     } else {
       console.warn(logLine);
