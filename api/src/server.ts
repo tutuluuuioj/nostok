@@ -16,7 +16,7 @@ import {
 import type { ApiConfig } from './config.js';
 import { type ReadOnlyDatabase, openReadOnlyDatabase, toBigInt } from './db.js';
 import { formatAmount, formatRawString } from './format.js';
-import { computeLoanQuote } from './quote.js';
+import { RpcUnavailableError, computeLoanQuote } from './quote.js';
 import {
   assetsQuerySchema,
   auctionsQuerySchema,
@@ -31,10 +31,30 @@ const USDC_DECIMALS = 6;
 const RATE_DECIMALS = 18;
 const FEED_DECIMALS_DEFAULT = 8;
 
+interface AssetLiveSnapshot {
+  livePrice: bigint;
+  livePriceDec: number;
+  oracleState: number;
+  assetOutstanding: bigint;
+  liveRecMult: bigint;
+  liveUiMult: bigint | null;
+  livePerLoanCap: bigint | null;
+  liveAssetCap: bigint | null;
+  liveStatus: number | null;
+}
+
+interface AssetsBlockCacheEntry {
+  blockNumber: bigint;
+  globalCap: bigint;
+  totalOutstanding: bigint;
+  perAsset: Map<string, AssetLiveSnapshot>;
+}
+
 export interface ApiContext {
   config: ApiConfig;
   publicClient: PublicClient<Transport, Chain>;
   db: ReadOnlyDatabase;
+  assetBlockCache?: AssetsBlockCacheEntry;
 }
 
 class HttpError extends Error {
@@ -59,22 +79,49 @@ class IpRateLimiter {
   private readonly buckets = new Map<string, RateBucket>();
   private readonly maxRequests: number;
   private readonly windowMs: number;
+  private readonly maxBuckets: number;
+  private readonly evictionTimer: NodeJS.Timeout;
 
-  constructor(maxRequests: number, windowMs: number) {
+  constructor(maxRequests: number, windowMs: number, maxBuckets: number) {
     this.maxRequests = maxRequests;
     this.windowMs = windowMs;
+    this.maxBuckets = maxBuckets;
+    const sweepIntervalMs = Math.max(1000, Math.min(windowMs, 60_000));
+    this.evictionTimer = setInterval(() => {
+      this.evictExpired();
+    }, sweepIntervalMs);
+    this.evictionTimer.unref();
+  }
+
+  private evictExpired(): void {
+    const now = Date.now();
+    for (const [k, b] of this.buckets.entries()) {
+      if (b.resetAtMs <= now) {
+        this.buckets.delete(k);
+      }
+    }
   }
 
   check(ip: string): { allowed: boolean; remaining: number; resetEpochSec: number; retryAfterSec: number } {
     const now = Date.now();
-    if (this.buckets.size > 10_000) {
-      for (const [k, b] of this.buckets.entries()) {
-        if (b.resetAtMs <= now) this.buckets.delete(k);
-      }
+    let bucket = this.buckets.get(ip);
+    if (bucket && bucket.resetAtMs <= now) {
+      this.buckets.delete(ip);
+      bucket = undefined;
     }
 
-    let bucket = this.buckets.get(ip);
-    if (!bucket || bucket.resetAtMs <= now) {
+    if (!bucket) {
+      if (this.buckets.size >= this.maxBuckets) {
+        this.evictExpired();
+      }
+      if (this.buckets.size >= this.maxBuckets) {
+        return {
+          allowed: false,
+          remaining: 0,
+          resetEpochSec: Math.ceil((now + this.windowMs) / 1000),
+          retryAfterSec: Math.max(1, Math.ceil(this.windowMs / 1000)),
+        };
+      }
       bucket = { count: 0, resetAtMs: now + this.windowMs };
       this.buckets.set(ip, bucket);
     }
@@ -86,6 +133,31 @@ class IpRateLimiter {
     const retryAfterSec = Math.max(1, Math.ceil((bucket.resetAtMs - now) / 1000));
     return { allowed, remaining, resetEpochSec, retryAfterSec };
   }
+
+  close(): void {
+    clearInterval(this.evictionTimer);
+  }
+}
+
+export function resolveClientIp(req: IncomingMessage, trustProxyHops: number): string {
+  const remote = req.socket.remoteAddress ?? 'unknown';
+  if (trustProxyHops <= 0) {
+    return remote;
+  }
+  const xff = req.headers['x-forwarded-for'];
+  const headerStr = Array.isArray(xff) ? xff.join(',') : xff;
+  if (!headerStr || headerStr.trim().length === 0) {
+    return remote;
+  }
+  const ips = headerStr
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (ips.length === 0) {
+    return remote;
+  }
+  const idx = ips.length >= trustProxyHops ? ips.length - trustProxyHops : 0;
+  return ips[idx];
 }
 
 function validateChainId(chainId: number, config: Pick<ApiConfig, 'isFork' | 'forkChainId'>): void {
@@ -111,6 +183,7 @@ export async function createApiContext(
     id: chainId,
     name: chainId === base.id ? base.name : `Nostok Chain ${chainId}`,
     nativeCurrency: base.nativeCurrency,
+    contracts: chainId === base.id ? base.contracts : undefined,
     rpcUrls: { default: { http: [config.rpcUrl] } },
   });
 
@@ -144,6 +217,41 @@ function sendJson(res: ServerResponse, statusCode: number, body: unknown): void 
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Cache-Control', 'no-store');
   res.end(payload);
+}
+
+/**
+ * Rejects unquoted JSON numeric literals above Number.MAX_SAFE_INTEGER before JSON.parse
+ * so values like 1e21 or 9007199254740993 are never silently rounded or coerced into 500s.
+ */
+export function assertSafeJsonNumbers(rawJson: string): void {
+  const withoutStrings = rawJson.replace(/"(?:\\.|[^"\\])*"/g, '""');
+  const numMatches = withoutStrings.match(/-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g) ?? [];
+  for (const token of numMatches) {
+    if (/[eE.]/.test(token)) {
+      const parsed = Number(token);
+      if (!Number.isFinite(parsed) || Math.abs(parsed) > Number.MAX_SAFE_INTEGER) {
+        throw new HttpError(
+          400,
+          'VALIDATION_ERROR',
+          'JSON numeric value exceeds Number.MAX_SAFE_INTEGER; encode large numbers as decimal strings'
+        );
+      }
+      continue;
+    }
+    try {
+      const asBig = BigInt(token);
+      if (asBig > BigInt(Number.MAX_SAFE_INTEGER) || asBig < BigInt(Number.MIN_SAFE_INTEGER)) {
+        throw new HttpError(
+          400,
+          'VALIDATION_ERROR',
+          'JSON integer exceeds Number.MAX_SAFE_INTEGER; encode large numbers as decimal strings'
+        );
+      }
+    } catch (err) {
+      if (err instanceof HttpError) throw err;
+      throw new HttpError(400, 'VALIDATION_ERROR', 'Invalid JSON numeric literal');
+    }
+  }
 }
 
 async function readJsonBody(req: IncomingMessage, maxBytes: number): Promise<unknown> {
@@ -191,9 +299,14 @@ async function readJsonBody(req: IncomingMessage, maxBytes: number): Promise<unk
         return;
       }
       try {
+        assertSafeJsonNumbers(raw);
         resolve(JSON.parse(raw));
-      } catch {
-        reject(new HttpError(400, 'INVALID_JSON', 'Malformed JSON request body'));
+      } catch (err) {
+        if (err instanceof HttpError) {
+          reject(err);
+        } else {
+          reject(new HttpError(400, 'INVALID_JSON', 'Malformed JSON request body'));
+        }
       }
     });
 
@@ -368,10 +481,12 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
 
   if (filters.status === 'cancelled') {
     conditions.push('o.cancelled = TRUE');
+  } else if (filters.status === 'partially_filled') {
+    conditions.push('o.cancelled = FALSE AND o.filled_usdc > 0 AND o.min_usdc > 0 AND o.filled_usdc < o.min_usdc');
   } else if (filters.status === 'filled') {
-    conditions.push('o.cancelled = FALSE AND o.filled_usdc > 0');
-  } else if (filters.status === 'open') {
-    conditions.push('o.cancelled = FALSE AND o.filled_usdc = 0');
+    conditions.push(
+      'o.cancelled = FALSE AND o.filled_usdc > 0 AND (o.min_usdc = 0 OR o.filled_usdc >= o.min_usdc)'
+    );
   }
 
   if (filters.maker) {
@@ -382,12 +497,15 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
   if (filters.asset) {
     params.push(filters.asset);
     conditions.push(
-      `EXISTS (
-        SELECT 1
-        FROM order_fills ofi
-        JOIN loans l ON l.loan_id = ofi.loan_id
-        WHERE ofi.order_hash = o.order_hash
-          AND LOWER(l.collateral_token) = LOWER($${params.length})
+      `(
+        LOWER(o.collateral_token) = LOWER($${params.length})
+        OR EXISTS (
+          SELECT 1
+          FROM order_fills ofi
+          JOIN loans l ON l.loan_id = ofi.loan_id
+          WHERE ofi.order_hash = o.order_hash
+            AND LOWER(l.collateral_token) = LOWER($${params.length})
+        )
       )`
     );
   }
@@ -403,7 +521,11 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
   const rowsRes = await ctx.db.query<{
     order_hash: string;
     maker: string;
+    collateral_token: string | null;
+    collateral_symbol: string | null;
+    min_usdc: string;
     filled_usdc: string;
+    order_type: string;
     cancelled: boolean;
     maker_nonce: string;
     first_seen_block: string;
@@ -413,13 +535,18 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
     `SELECT
        o.order_hash,
        o.maker,
+       o.collateral_token,
+       a.symbol AS collateral_symbol,
+       o.min_usdc::TEXT AS min_usdc,
        o.filled_usdc::TEXT AS filled_usdc,
+       o.order_type,
        o.cancelled,
        o.maker_nonce::TEXT AS maker_nonce,
        o.first_seen_block::TEXT AS first_seen_block,
        o.last_updated_block::TEXT AS last_updated_block,
        (SELECT COUNT(*)::INT FROM order_fills ofi WHERE ofi.order_hash = o.order_hash) AS fills_count
      FROM orders o
+     LEFT JOIN assets a ON LOWER(a.token) = LOWER(o.collateral_token)
      ${whereClause}
      ORDER BY o.last_updated_block DESC, o.order_hash ASC
      LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`,
@@ -492,12 +619,23 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
 
   const data = rowsRes.rows.map((r) => {
     const filled = BigInt(r.filled_usdc);
-    const derivedStatus = r.cancelled ? 'cancelled' : filled > 0n ? 'filled' : 'open';
+    const minUsdc = BigInt(r.min_usdc);
+    const remaining = minUsdc > filled ? minUsdc - filled : 0n;
+    const derivedStatus = r.cancelled
+      ? 'cancelled'
+      : minUsdc > 0n && filled < minUsdc
+        ? 'partially_filled'
+        : 'filled';
     return {
       order_hash: r.order_hash,
       maker: getAddress(r.maker),
+      order_type: r.order_type,
+      collateral_token: r.collateral_token ? getAddress(r.collateral_token) : null,
+      collateral_symbol: r.collateral_symbol,
       status: derivedStatus,
+      min_usdc: formatAmount(minUsdc, USDC_DECIMALS, 'USDC'),
       filled_usdc: formatAmount(filled, USDC_DECIMALS, 'USDC'),
+      remaining_usdc: formatAmount(remaining, USDC_DECIMALS, 'USDC'),
       cancelled: r.cancelled,
       maker_nonce: r.maker_nonce,
       fills_count: Number(r.fills_count),
@@ -863,6 +1001,157 @@ async function handleAuctions(ctx: ApiContext, queryObj: Record<string, string>)
   };
 }
 
+async function fetchLiveAssetsStateForBlock(
+  ctx: ApiContext,
+  tokens: Address[],
+  chainHead: bigint
+): Promise<AssetsBlockCacheEntry> {
+  const existing = ctx.assetBlockCache;
+  if (
+    existing &&
+    existing.blockNumber === chainHead &&
+    tokens.every((t) => existing.perAsset.has(t.toLowerCase()))
+  ) {
+    return existing;
+  }
+
+  const contracts = [
+    {
+      address: ctx.config.loanCore,
+      abi: loanCoreAbi,
+      functionName: 'globalUsdcCap',
+    } as const,
+    {
+      address: ctx.config.loanCore,
+      abi: loanCoreAbi,
+      functionName: 'totalOutstandingPrincipal',
+    } as const,
+    ...tokens.flatMap((tokenAddr) => [
+      {
+        address: ctx.config.assetRegistry,
+        abi: assetRegistryAbi,
+        functionName: 'isAssetSupported',
+        args: [tokenAddr],
+      } as const,
+      {
+        address: ctx.config.loanCore,
+        abi: loanCoreAbi,
+        functionName: 'assetOutstandingPrincipal',
+        args: [tokenAddr],
+      } as const,
+      {
+        address: ctx.config.oracleRouter,
+        abi: oracleRouterAbi,
+        functionName: 'recordedMultiplier',
+        args: [tokenAddr],
+      } as const,
+      {
+        address: ctx.config.assetRegistry,
+        abi: assetRegistryAbi,
+        functionName: 'getAssetConfig',
+        args: [tokenAddr],
+      } as const,
+      {
+        address: ctx.config.oracleRouter,
+        abi: oracleRouterAbi,
+        functionName: 'getPrice',
+        args: [tokenAddr],
+      } as const,
+      {
+        address: tokenAddr,
+        abi: erc20MetaAbi,
+        functionName: 'uiMultiplier',
+      } as const,
+    ]),
+  ];
+
+  let results;
+  try {
+    results = await ctx.publicClient.multicall({
+      contracts,
+      allowFailure: true,
+      blockNumber: chainHead,
+      multicallAddress: base.contracts.multicall3.address,
+    });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new RpcUnavailableError(`Multicall failed on /assets: ${reason}`);
+  }
+
+  if (results[0].status === 'failure' || results[1].status === 'failure') {
+    throw new RpcUnavailableError('LoanCore cap read failed on /assets');
+  }
+
+  const globalCap = results[0].result as bigint;
+  const totalOutstanding = results[1].result as bigint;
+  const perAsset = new Map<string, AssetLiveSnapshot>(
+    existing && existing.blockNumber === chainHead ? existing.perAsset : undefined
+  );
+
+  const STRIDE = 6;
+  for (let i = 0; i < tokens.length; i++) {
+    const baseIdx = 2 + i * STRIDE;
+    const tokenAddr = tokens[i];
+    const supportedRes = results[baseIdx];
+    const assetOutRes = results[baseIdx + 1];
+    const recMultRes = results[baseIdx + 2];
+    const cfgRes = results[baseIdx + 3];
+    const priceRes = results[baseIdx + 4];
+    const uiMultRes = results[baseIdx + 5];
+
+    const supported = supportedRes.status === 'success' ? (supportedRes.result as boolean) : false;
+    const assetOutstanding = assetOutRes.status === 'success' ? (assetOutRes.result as bigint) : 0n;
+    const liveRecMult = recMultRes.status === 'success' ? (recMultRes.result as bigint) : 0n;
+    const liveUiMult = uiMultRes.status === 'success' ? (uiMultRes.result as bigint) : null;
+
+    let livePrice = 0n;
+    let livePriceDec = FEED_DECIMALS_DEFAULT;
+    let oracleState: number = OracleState.STALE_FEED;
+    let livePerLoanCap: bigint | null = null;
+    let liveAssetCap: bigint | null = null;
+    let liveStatus: number | null = null;
+
+    if (supported && cfgRes.status === 'success') {
+      const cfg = cfgRes.result as {
+        perLoanCap: bigint;
+        assetCap: bigint;
+        status: number;
+      };
+      livePerLoanCap = cfg.perLoanCap;
+      liveAssetCap = cfg.assetCap;
+      liveStatus = Number(cfg.status);
+    }
+
+    if (supported && priceRes.status === 'success') {
+      const pr = priceRes.result as readonly [bigint, number, number];
+      livePrice = pr[0];
+      livePriceDec = Number(pr[1]);
+      oracleState = Number(pr[2]);
+    }
+
+    perAsset.set(tokenAddr.toLowerCase(), {
+      livePrice,
+      livePriceDec,
+      oracleState,
+      assetOutstanding,
+      liveRecMult,
+      liveUiMult,
+      livePerLoanCap,
+      liveAssetCap,
+      liveStatus,
+    });
+  }
+
+  const cacheEntry: AssetsBlockCacheEntry = {
+    blockNumber: chainHead,
+    globalCap,
+    totalOutstanding,
+    perAsset,
+  };
+  ctx.assetBlockCache = cacheEntry;
+  return cacheEntry;
+}
+
 async function handleAssets(ctx: ApiContext, queryObj: Record<string, string>) {
   const pag = parseOrThrow(buildPaginationSchema(ctx.config.maxPageLimit), queryObj);
   const filters = parseOrThrow(assetsQuerySchema, queryObj);
@@ -939,154 +1228,85 @@ async function handleAssets(ctx: ApiContext, queryObj: Record<string, string>) {
     dataParams
   );
 
-  const chainHead = await ctx.publicClient.getBlockNumber();
-  const [globalCap, totalOutstanding] = await Promise.all([
-    ctx.publicClient.readContract({
-      address: ctx.config.loanCore,
-      abi: loanCoreAbi,
-      functionName: 'globalUsdcCap',
-      blockNumber: chainHead,
-    }),
-    ctx.publicClient.readContract({
-      address: ctx.config.loanCore,
-      abi: loanCoreAbi,
-      functionName: 'totalOutstandingPrincipal',
-      blockNumber: chainHead,
-    }),
-  ]);
+  let chainHead: bigint;
+  try {
+    chainHead = await ctx.publicClient.getBlockNumber();
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new RpcUnavailableError(`Failed to fetch chain head on /assets: ${reason}`);
+  }
 
-  const data = await Promise.all(
-    rowsRes.rows.map(async (r) => {
-      const tokenAddr = getAddress(r.token);
-      const tokenDecimals = r.decimals !== null ? Number(r.decimals) : 18;
-      const feedDecimalsDefault = r.feed_decimals !== null ? Number(r.feed_decimals) : FEED_DECIMALS_DEFAULT;
+  const pageTokens = rowsRes.rows.map((r) => getAddress(r.token));
+  const liveSnapshot = await fetchLiveAssetsStateForBlock(ctx, pageTokens, chainHead);
+  const { globalCap, totalOutstanding, perAsset } = liveSnapshot;
 
-      let livePrice = 0n;
-      let livePriceDec = feedDecimalsDefault;
-      let oracleState: number = OracleState.STALE_FEED;
-      let assetOutstanding = 0n;
-      let liveRecMult = r.recorded_multiplier ? toBigInt(r.recorded_multiplier) : 0n;
-      let liveUiMult: bigint | null = null;
-      let livePerLoanCap = r.per_loan_cap ? toBigInt(r.per_loan_cap) : 0n;
-      let liveAssetCap = r.asset_cap ? toBigInt(r.asset_cap) : 0n;
-      let liveStatus = r.status !== null ? Number(r.status) : 0;
+  const data = rowsRes.rows.map((r) => {
+    const tokenAddr = getAddress(r.token);
+    const tokenDecimals = r.decimals !== null ? Number(r.decimals) : 18;
+    const feedDecimalsDefault = r.feed_decimals !== null ? Number(r.feed_decimals) : FEED_DECIMALS_DEFAULT;
+    const live = perAsset.get(tokenAddr.toLowerCase());
 
-      try {
-        const [supported, assetOut, recMult] = await Promise.all([
-          ctx.publicClient.readContract({
-            address: ctx.config.assetRegistry,
-            abi: assetRegistryAbi,
-            functionName: 'isAssetSupported',
-            args: [tokenAddr],
-            blockNumber: chainHead,
-          }),
-          ctx.publicClient.readContract({
-            address: ctx.config.loanCore,
-            abi: loanCoreAbi,
-            functionName: 'assetOutstandingPrincipal',
-            args: [tokenAddr],
-            blockNumber: chainHead,
-          }),
-          ctx.publicClient.readContract({
-            address: ctx.config.oracleRouter,
-            abi: oracleRouterAbi,
-            functionName: 'recordedMultiplier',
-            args: [tokenAddr],
-            blockNumber: chainHead,
-          }),
-        ]);
-        assetOutstanding = assetOut;
-        liveRecMult = recMult;
+    const livePrice = live?.livePrice ?? 0n;
+    const livePriceDec = live?.livePriceDec ?? feedDecimalsDefault;
+    const oracleState = live?.oracleState ?? OracleState.STALE_FEED;
+    const assetOutstanding = live?.assetOutstanding ?? 0n;
+    const liveRecMult =
+      live?.liveRecMult ?? (r.recorded_multiplier ? toBigInt(r.recorded_multiplier) : 0n);
+    const liveUiMult = live?.liveUiMult ?? null;
+    const livePerLoanCap =
+      live?.livePerLoanCap ?? (r.per_loan_cap ? toBigInt(r.per_loan_cap) : 0n);
+    const liveAssetCap = live?.liveAssetCap ?? (r.asset_cap ? toBigInt(r.asset_cap) : 0n);
+    const liveStatus = live?.liveStatus ?? (r.status !== null ? Number(r.status) : 0);
 
-        if (supported) {
-          const [cfg, priceRes] = await Promise.all([
-            ctx.publicClient.readContract({
-              address: ctx.config.assetRegistry,
-              abi: assetRegistryAbi,
-              functionName: 'getAssetConfig',
-              args: [tokenAddr],
-              blockNumber: chainHead,
-            }),
-            ctx.publicClient.readContract({
-              address: ctx.config.oracleRouter,
-              abi: oracleRouterAbi,
-              functionName: 'getPrice',
-              args: [tokenAddr],
-              blockNumber: chainHead,
-            }),
-          ]);
-          livePerLoanCap = cfg.perLoanCap;
-          liveAssetCap = cfg.assetCap;
-          liveStatus = Number(cfg.status);
-          livePrice = priceRes[0];
-          livePriceDec = Number(priceRes[1]);
-          oracleState = Number(priceRes[2]);
-        }
-      } catch {
-        // Keep DB snapshot fields if an unlisted/legacy token cannot be read onchain
-      }
+    const globalRemaining = globalCap > totalOutstanding ? globalCap - totalOutstanding : 0n;
+    const assetRemaining =
+      liveAssetCap > 0n
+        ? liveAssetCap > assetOutstanding
+          ? liveAssetCap - assetOutstanding
+          : 0n
+        : globalRemaining;
 
-      try {
-        liveUiMult = await ctx.publicClient.readContract({
-          address: tokenAddr,
-          abi: erc20MetaAbi,
-          functionName: 'uiMultiplier',
-          blockNumber: chainHead,
-        });
-      } catch {
-        liveUiMult = null;
-      }
-
-      const globalRemaining = globalCap > totalOutstanding ? globalCap - totalOutstanding : 0n;
-      const assetRemaining =
-        liveAssetCap > 0n
-          ? liveAssetCap > assetOutstanding
-            ? liveAssetCap - assetOutstanding
-            : 0n
-          : globalRemaining;
-
-      return {
-        token: tokenAddr,
-        symbol: r.symbol,
-        decimals: tokenDecimals,
-        feed: r.feed ? getAddress(r.feed) : null,
-        tier: r.tier !== null ? Number(r.tier) : null,
-        status: liveStatus,
-        status_name: ASSET_STATUS_NAMES[liveStatus] ?? `UNKNOWN(${liveStatus})`,
-        restricted: r.restricted,
-        ltv: {
-          max_init_ltv_bps: r.max_init_ltv_bps !== null ? Number(r.max_init_ltv_bps) : null,
-          margin_call_ltv_bps: r.margin_call_ltv_bps !== null ? Number(r.margin_call_ltv_bps) : null,
-          liq_ltv_bps: r.liq_ltv_bps !== null ? Number(r.liq_ltv_bps) : null,
-          bad_debt_ltv_bps: r.bad_debt_ltv_bps !== null ? Number(r.bad_debt_ltv_bps) : null,
-          max_discount_bps: r.max_discount_bps !== null ? Number(r.max_discount_bps) : null,
-          closed_market_haircut_bps:
-            r.closed_market_haircut_bps !== null ? Number(r.closed_market_haircut_bps) : null,
-        },
-        caps: {
-          per_loan_cap: formatAmount(livePerLoanCap, USDC_DECIMALS, 'USDC'),
-          asset_cap: formatAmount(liveAssetCap, USDC_DECIMALS, 'USDC'),
-          asset_outstanding_principal: formatAmount(assetOutstanding, USDC_DECIMALS, 'USDC'),
-          asset_remaining: formatAmount(assetRemaining, USDC_DECIMALS, 'USDC'),
-          global_usdc_cap: formatAmount(globalCap, USDC_DECIMALS, 'USDC'),
-          global_remaining: formatAmount(globalRemaining, USDC_DECIMALS, 'USDC'),
-        },
-        multiplier: {
-          recorded: formatAmount(liveRecMult, RATE_DECIMALS),
-          ui: liveUiMult !== null ? formatAmount(liveUiMult, RATE_DECIMALS) : null,
-        },
-        oracle: {
-          price: formatAmount(livePrice, livePriceDec, 'USD'),
-          state: oracleState,
-          state_name: ORACLE_STATE_NAMES[oracleState] ?? `UNKNOWN(${oracleState})`,
-          max_stale_open_secs: r.max_stale_open_secs !== null ? Number(r.max_stale_open_secs) : null,
-        },
-        escrow_balance: formatRawString(r.escrow_balance_raw, tokenDecimals, r.symbol ?? undefined),
-        updated_block: r.updated_block,
-        live_block_number: chainHead.toString(),
-      };
-    })
-  );
+    return {
+      token: tokenAddr,
+      symbol: r.symbol,
+      decimals: tokenDecimals,
+      feed: r.feed ? getAddress(r.feed) : null,
+      tier: r.tier !== null ? Number(r.tier) : null,
+      status: liveStatus,
+      status_name: ASSET_STATUS_NAMES[liveStatus] ?? `UNKNOWN(${liveStatus})`,
+      restricted: r.restricted,
+      ltv: {
+        max_init_ltv_bps: r.max_init_ltv_bps !== null ? Number(r.max_init_ltv_bps) : null,
+        margin_call_ltv_bps: r.margin_call_ltv_bps !== null ? Number(r.margin_call_ltv_bps) : null,
+        liq_ltv_bps: r.liq_ltv_bps !== null ? Number(r.liq_ltv_bps) : null,
+        bad_debt_ltv_bps: r.bad_debt_ltv_bps !== null ? Number(r.bad_debt_ltv_bps) : null,
+        max_discount_bps: r.max_discount_bps !== null ? Number(r.max_discount_bps) : null,
+        closed_market_haircut_bps:
+          r.closed_market_haircut_bps !== null ? Number(r.closed_market_haircut_bps) : null,
+      },
+      caps: {
+        per_loan_cap: formatAmount(livePerLoanCap, USDC_DECIMALS, 'USDC'),
+        asset_cap: formatAmount(liveAssetCap, USDC_DECIMALS, 'USDC'),
+        asset_outstanding_principal: formatAmount(assetOutstanding, USDC_DECIMALS, 'USDC'),
+        asset_remaining: formatAmount(assetRemaining, USDC_DECIMALS, 'USDC'),
+        global_usdc_cap: formatAmount(globalCap, USDC_DECIMALS, 'USDC'),
+        global_remaining: formatAmount(globalRemaining, USDC_DECIMALS, 'USDC'),
+      },
+      multiplier: {
+        recorded: formatAmount(liveRecMult, RATE_DECIMALS),
+        ui: liveUiMult !== null ? formatAmount(liveUiMult, RATE_DECIMALS) : null,
+      },
+      oracle: {
+        price: formatAmount(livePrice, livePriceDec, 'USD'),
+        state: oracleState,
+        state_name: ORACLE_STATE_NAMES[oracleState] ?? `UNKNOWN(${oracleState})`,
+        max_stale_open_secs: r.max_stale_open_secs !== null ? Number(r.max_stale_open_secs) : null,
+      },
+      escrow_balance: formatRawString(r.escrow_balance_raw, tokenDecimals, r.symbol ?? undefined),
+      updated_block: r.updated_block,
+      live_block_number: chainHead.toString(),
+    };
+  });
 
   return {
     statusCode: 200,
@@ -1100,9 +1320,13 @@ async function handleAssets(ctx: ApiContext, queryObj: Record<string, string>) {
 }
 
 export function createApiServer(ctx: ApiContext): http.Server {
-  const rateLimiter = new IpRateLimiter(ctx.config.rateLimitMax, ctx.config.rateLimitWindowMs);
+  const rateLimiter = new IpRateLimiter(
+    ctx.config.rateLimitMax,
+    ctx.config.rateLimitWindowMs,
+    ctx.config.rateLimitMaxBuckets
+  );
 
-  return http.createServer(async (req, res) => {
+  const server = http.createServer(async (req, res) => {
     setCorsHeaders(req, res, ctx.config.corsOrigins);
 
     if (req.method === 'OPTIONS') {
@@ -1111,7 +1335,7 @@ export function createApiServer(ctx: ApiContext): http.Server {
       return;
     }
 
-    const clientIp = req.socket.remoteAddress ?? 'unknown';
+    const clientIp = resolveClientIp(req, ctx.config.trustProxyHops);
     const rl = rateLimiter.check(clientIp);
     res.setHeader('X-RateLimit-Limit', String(ctx.config.rateLimitMax));
     res.setHeader('X-RateLimit-Remaining', String(rl.remaining));
@@ -1203,6 +1427,17 @@ export function createApiServer(ctx: ApiContext): http.Server {
         return;
       }
 
+      if (err instanceof RpcUnavailableError) {
+        console.warn('[API_RPC_UNAVAILABLE]', err.message);
+        sendJson(res, 503, {
+          error: {
+            code: 'RPC_UNAVAILABLE',
+            message: 'Blockchain RPC node is unavailable; please retry shortly.',
+          },
+        });
+        return;
+      }
+
       // Sanitized internal error response: never leak stack traces or SQL/RPC secrets
       console.error('[API_ERROR]', err instanceof Error ? err.message : String(err));
       sendJson(res, 500, {
@@ -1213,4 +1448,10 @@ export function createApiServer(ctx: ApiContext): http.Server {
       });
     }
   });
+
+  server.on('close', () => {
+    rateLimiter.close();
+  });
+
+  return server;
 }

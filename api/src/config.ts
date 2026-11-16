@@ -15,6 +15,8 @@ export interface ApiConfig {
   corsOrigins: string[];
   rateLimitMax: number;
   rateLimitWindowMs: number;
+  rateLimitMaxBuckets: number;
+  trustProxyHops: number;
   maxBodyBytes: number;
   maxPageLimit: number;
   maxHealthyLagBlocks: number;
@@ -44,6 +46,15 @@ function parsePositiveInt(raw: string | undefined, fallback: number, name: strin
   const num = Number(raw);
   if (!Number.isInteger(num) || num <= 0) {
     throw new Error(`Invalid positive integer for ${name}: ${raw}`);
+  }
+  return num;
+}
+
+function parseNonNegativeInt(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const num = Number(raw);
+  if (!Number.isInteger(num) || num < 0) {
+    throw new Error(`Invalid non-negative integer for ${name}: ${raw}`);
   }
   return num;
 }
@@ -86,6 +97,11 @@ export function loadApiConfig(overrides: ApiConfigOverrides = {}): ApiConfig {
   const rateLimitWindowMs =
     overrides.rateLimitWindowMs ??
     parsePositiveInt(process.env.RATE_LIMIT_WINDOW_MS, 60_000, 'RATE_LIMIT_WINDOW_MS');
+  const rateLimitMaxBuckets =
+    overrides.rateLimitMaxBuckets ??
+    parsePositiveInt(process.env.RATE_LIMIT_MAX_BUCKETS, 10_000, 'RATE_LIMIT_MAX_BUCKETS');
+  const trustProxyHops =
+    overrides.trustProxyHops ?? parseNonNegativeInt(process.env.TRUST_PROXY, 0, 'TRUST_PROXY');
   const maxBodyBytes = overrides.maxBodyBytes ?? parsePositiveInt(process.env.MAX_BODY_BYTES, 65_536, 'MAX_BODY_BYTES');
   const maxPageLimit = overrides.maxPageLimit ?? parsePositiveInt(process.env.MAX_PAGE_LIMIT, 100, 'MAX_PAGE_LIMIT');
   const maxHealthyLagBlocks =
@@ -102,6 +118,8 @@ export function loadApiConfig(overrides: ApiConfigOverrides = {}): ApiConfig {
     corsOrigins,
     rateLimitMax,
     rateLimitWindowMs,
+    rateLimitMaxBuckets,
+    trustProxyHops,
     maxBodyBytes,
     maxPageLimit,
     maxHealthyLagBlocks,

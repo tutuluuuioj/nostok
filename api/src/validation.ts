@@ -1,4 +1,4 @@
-import { type Address, getAddress, isAddress } from 'viem';
+import { type Address, type Hex, getAddress, isAddress } from 'viem';
 import { z } from 'zod';
 
 /**
@@ -12,23 +12,37 @@ export const checksumAddressSchema = z
   })
   .transform((val) => val as Address);
 
+export function safeParseBigInt(val: string): bigint | null {
+  try {
+    return BigInt(val);
+  } catch {
+    return null;
+  }
+}
+
 export const unsignedBigIntStringSchema = z
-  .string()
+  .string({
+    invalid_type_error: 'Amount must be provided as a decimal string',
+  })
   .trim()
-  .regex(/^\d+$/, 'Must be a non-negative integer string')
+  .regex(/^\d+$/, 'Must be a non-negative base-10 integer string')
   .refine((val) => val.length <= 78, 'Integer string exceeds uint256 width')
   .refine((val) => {
-    try {
-      return BigInt(val) >= 0n;
-    } catch {
-      return false;
-    }
+    const parsed = safeParseBigInt(val);
+    return parsed !== null && parsed >= 0n;
   }, 'Invalid integer value');
 
-export const positiveBigIntStringSchema = unsignedBigIntStringSchema.refine(
-  (val) => BigInt(val) > 0n,
-  'Amount must be greater than zero'
-);
+export const positiveBigIntStringSchema = unsignedBigIntStringSchema.refine((val) => {
+  const parsed = safeParseBigInt(val);
+  return parsed !== null && parsed > 0n;
+}, 'Amount must be greater than zero');
+
+export const hexBytesSchema = z
+  .string()
+  .trim()
+  .regex(/^0x([0-9a-fA-F]{2})*$/, 'Attestation must be an even-length 0x hex string')
+  .refine((val) => val.length <= 4098, 'Attestation hex payload too large')
+  .transform((val) => val.toLowerCase() as Hex);
 
 export function buildPaginationSchema(maxLimit: number) {
   return z
@@ -75,7 +89,7 @@ export function buildPaginationSchema(maxLimit: number) {
 }
 
 export const ordersQuerySchema = z.object({
-  status: z.enum(['open', 'filled', 'cancelled']).optional(),
+  status: z.enum(['cancelled', 'partially_filled', 'filled']).optional(),
   maker: checksumAddressSchema.optional(),
   asset: checksumAddressSchema.optional(),
 });
@@ -150,7 +164,10 @@ const ASSET_STATUS_MAP: Record<string, number> = {
   reduceonly: 1,
   reduce_only: 1,
   '2': 2,
-  frozen: 2,
+  winddown: 2,
+  wind_down: 2,
+  '3': 3,
+  frozen: 3,
 };
 
 export const assetsQuerySchema = z.object({
@@ -159,7 +176,7 @@ export const assetsQuerySchema = z.object({
     .trim()
     .transform((s) => s.toLowerCase())
     .refine((s) => s in ASSET_STATUS_MAP, {
-      message: 'status must be Active(0), ReduceOnly(1), or Frozen(2)',
+      message: 'status must be Active(0), ReduceOnly(1), WindDown(2), or Frozen(3)',
     })
     .transform((s) => ASSET_STATUS_MAP[s])
     .optional(),
@@ -170,9 +187,9 @@ export const assetsQuerySchema = z.object({
 export const quoteRequestSchema = z
   .object({
     asset: checksumAddressSchema,
-    collateral_amount: z.union([positiveBigIntStringSchema, z.number().int().positive().transform(String)]).optional(),
-    collateralAmount: z.union([positiveBigIntStringSchema, z.number().int().positive().transform(String)]).optional(),
-    principal: z.union([positiveBigIntStringSchema, z.number().int().positive().transform(String)]).optional(),
+    collateral_amount: positiveBigIntStringSchema.optional(),
+    collateralAmount: positiveBigIntStringSchema.optional(),
+    principal: positiveBigIntStringSchema.optional(),
     term_days: z.coerce.number().int('term_days must be an integer').min(1, 'term_days must be >= 1').max(3650).optional(),
     termDays: z.coerce.number().int('termDays must be an integer').min(1, 'termDays must be >= 1').max(3650).optional(),
     apr_bps: z.coerce.number().int('apr_bps must be an integer').min(0, 'apr_bps must be >= 0').max(100_000).optional(),
@@ -185,6 +202,10 @@ export const quoteRequestSchema = z
     existingElapsedDays: z.coerce.number().int().min(0).max(3650).optional(),
     borrower: checksumAddressSchema.optional(),
     lender: checksumAddressSchema.optional(),
+    borrower_attestation: hexBytesSchema.optional(),
+    borrowerAttestation: hexBytesSchema.optional(),
+    lender_attestation: hexBytesSchema.optional(),
+    lenderAttestation: hexBytesSchema.optional(),
   })
   .superRefine((val, ctx) => {
     const col = val.collateral_amount ?? val.collateralAmount;
@@ -192,7 +213,7 @@ export const quoteRequestSchema = z
     if (col === undefined && prin === undefined) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: 'Either collateral_amount or principal must be provided',
+        message: 'Either collateral_amount or principal must be provided as a decimal string',
       });
     }
     if (val.term_days === undefined && val.termDays === undefined) {
@@ -207,20 +228,37 @@ export const quoteRequestSchema = z
         message: 'apr_bps is required',
       });
     }
+    if (col !== undefined && safeParseBigInt(col) === null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Invalid collateral_amount integer string',
+      });
+    }
+    if (prin !== undefined && safeParseBigInt(prin) === null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Invalid principal integer string',
+      });
+    }
   })
-  .transform((val) => ({
-    asset: val.asset,
-    collateralAmount: val.collateral_amount ?? val.collateralAmount
-      ? BigInt((val.collateral_amount ?? val.collateralAmount)!)
-      : undefined,
-    principal: val.principal !== undefined ? BigInt(val.principal) : undefined,
-    termDays: (val.term_days ?? val.termDays)!,
-    aprBps: (val.apr_bps ?? val.aprBps)!,
-    maxLtvBps: val.max_ltv_bps ?? val.maxLtvBps,
-    minInterestDays: val.min_interest_days ?? val.minInterestDays ?? 3,
-    existingElapsedDays: val.existing_elapsed_days ?? val.existingElapsedDays ?? 0,
-    borrower: val.borrower,
-    lender: val.lender,
-  }));
+  .transform((val) => {
+    const colStr = val.collateral_amount ?? val.collateralAmount;
+    const collateralAmount = colStr !== undefined ? (safeParseBigInt(colStr) ?? 0n) : undefined;
+    const principal = val.principal !== undefined ? (safeParseBigInt(val.principal) ?? 0n) : undefined;
+    return {
+      asset: val.asset,
+      collateralAmount,
+      principal,
+      termDays: (val.term_days ?? val.termDays)!,
+      aprBps: (val.apr_bps ?? val.aprBps)!,
+      maxLtvBps: val.max_ltv_bps ?? val.maxLtvBps,
+      minInterestDays: val.min_interest_days ?? val.minInterestDays ?? 3,
+      existingElapsedDays: val.existing_elapsed_days ?? val.existingElapsedDays ?? 0,
+      borrower: val.borrower,
+      lender: val.lender,
+      borrowerAttestation: (val.borrower_attestation ?? val.borrowerAttestation ?? '0x') as Hex,
+      lenderAttestation: (val.lender_attestation ?? val.lenderAttestation ?? '0x') as Hex,
+    };
+  });
 
 export type QuoteInput = z.infer<typeof quoteRequestSchema>;

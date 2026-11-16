@@ -19,6 +19,11 @@ api/.env.*
 !api/.env.example
 api/node_modules
 api/dist
+risk/.env
+risk/.env.*
+!risk/.env.example
+risk/node_modules
+risk/dist
 contracts/out
 contracts/cache
 contracts/broadcast

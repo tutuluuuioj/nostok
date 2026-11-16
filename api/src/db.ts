@@ -9,7 +9,7 @@ export interface QueryResultRow {
 
 /**
  * Strict read-only database interface exposed to the API.
- * Contains NO write helpers and enforces SELECT-only SQL statements.
+ * Contains NO write helpers and enforces single-statement SELECT/WITH SQL queries.
  */
 export interface ReadOnlyDatabase {
   query<T extends QueryResultRow = QueryResultRow>(
@@ -19,14 +19,53 @@ export interface ReadOnlyDatabase {
   close(): Promise<void>;
 }
 
-const FORBIDDEN_SQL_PATTERN = /\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|GRANT|REVOKE|COPY|VACUUM|CALL|DO)\b/i;
+const FORBIDDEN_SQL_PATTERN =
+  /\b(INTO|MERGE|SET|RESET|BEGIN|START|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|LOCK|PREPARE|EXECUTE|DEALLOCATE|LISTEN|NOTIFY|UNLISTEN|LOAD|IMPORT|SECURITY|REINDEX|CLUSTER|REFRESH|COMMENT|DISCARD|SHOW|EXPLAIN|ANALYZE|INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|GRANT|REVOKE|COPY|VACUUM|CALL|DO|FOR\s+UPDATE|FOR\s+SHARE|set_config)\b|\b(pg_|lo_|dblink)[a-zA-Z0-9_]*/i;
 
 export function assertReadOnlySql(sql: string): void {
-  const trimmed = sql.trim();
-  const withoutComments = trimmed.replace(/^(--[^\n]*\n|\/\*[\s\S]*?\*\/\s*)+/g, '').trim();
-  if (!/^(SELECT|WITH)\b/i.test(withoutComments) || FORBIDDEN_SQL_PATTERN.test(withoutComments)) {
+  if (typeof sql !== 'string' || sql.trim().length === 0) {
     throw new Error('Read-only API database permits SELECT queries only.');
   }
+  if (sql.includes(';') || sql.includes('$$') || /(--|\/\*|\*\/)/.test(sql)) {
+    throw new Error('Read-only API database permits single-statement SELECT queries only.');
+  }
+
+  const trimmed = sql.trim();
+  const firstTokenMatch = trimmed.match(/^([a-zA-Z_]+)/);
+  const firstToken = firstTokenMatch?.[1]?.toUpperCase();
+  if (firstToken !== 'SELECT' && firstToken !== 'WITH') {
+    throw new Error('Read-only API database permits SELECT or WITH queries only.');
+  }
+
+  // Strip quoted string literals when checking for disallowed keywords/functions
+  const withoutStrings = trimmed.replace(/'(?:''|[^'])*'/g, "''");
+  if (FORBIDDEN_SQL_PATTERN.test(withoutStrings)) {
+    throw new Error('Read-only API database rejected disallowed SQL keyword or function.');
+  }
+}
+
+const DROP_PG_CODES = new Set(['57P01', '57P02', '57P03', '08000', '08003', '08006']);
+const DROP_MSG_SNIPPETS = [
+  'connection terminated',
+  'terminating connection',
+  'client has encountered a connection error',
+  'econnreset',
+  'epipe',
+  'socket hang up',
+  'connection closed',
+];
+
+export function isConnectionDropError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const obj = err as { code?: unknown; message?: unknown; cause?: unknown };
+  if (typeof obj.code === 'string' && DROP_PG_CODES.has(obj.code.toUpperCase())) {
+    return true;
+  }
+  const msg = typeof obj.message === 'string' ? obj.message.toLowerCase() : '';
+  if (DROP_MSG_SNIPPETS.some((s) => msg.includes(s))) {
+    return true;
+  }
+  return obj.cause ? isConnectionDropError(obj.cause) : false;
 }
 
 export function toBigInt(val: unknown): bigint {
@@ -42,15 +81,26 @@ export function toBigInt(val: unknown): bigint {
 }
 
 class ReadOnlyPostgresPool implements ReadOnlyDatabase {
-  private readonly pool: pg.Pool;
+  readonly pool: pg.Pool;
 
   constructor(connectionString: string) {
     const rawMax = Number(process.env.PG_POOL_MAX ?? 5);
     const max = Number.isInteger(rawMax) && rawMax > 0 ? rawMax : 5;
+    const rawIdle = Number(process.env.PG_IDLE_TIMEOUT_MS ?? 30_000);
+    const idleTimeoutMillis = Number.isInteger(rawIdle) && rawIdle >= 0 ? rawIdle : 30_000;
+    const rawStmtTimeout = Number(process.env.PG_STATEMENT_TIMEOUT_MS ?? 15_000);
+    const statementTimeout =
+      Number.isInteger(rawStmtTimeout) && rawStmtTimeout > 0 ? rawStmtTimeout : 15_000;
+
     this.pool = new Pool({
       connectionString,
       max,
+      idleTimeoutMillis,
+      statement_timeout: statementTimeout,
       options: '-c default_transaction_read_only=on',
+    });
+    this.pool.on('error', (err) => {
+      console.error('[API_DB_POOL_ERROR] Idle PostgreSQL client error:', err.message);
     });
   }
 
@@ -59,8 +109,17 @@ class ReadOnlyPostgresPool implements ReadOnlyDatabase {
     params: unknown[] = []
   ): Promise<{ rows: T[] }> {
     assertReadOnlySql(sql);
-    const res = await this.pool.query<T>(sql, params);
-    return { rows: res.rows };
+    try {
+      const res = await this.pool.query<T>(sql, params);
+      return { rows: res.rows };
+    } catch (err) {
+      if (isConnectionDropError(err)) {
+        console.warn('[API_DB_RETRY] PostgreSQL connection dropped during query; retrying once...');
+        const res = await this.pool.query<T>(sql, params);
+        return { rows: res.rows };
+      }
+      throw err;
+    }
   }
 
   async close(): Promise<void> {

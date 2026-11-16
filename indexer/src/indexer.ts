@@ -10,6 +10,7 @@ import {
   ExecutionRevertedError,
   createPublicClient,
   decodeEventLog,
+  decodeFunctionData,
   defineChain,
   getAddress,
   http,
@@ -748,14 +749,78 @@ async function reconcilePosition(
   );
 }
 
+interface DirtyOrderMeta {
+  maker: Address;
+  minUsdc?: bigint;
+  collateralToken?: Address;
+  orderType?: 'borrow' | 'lend';
+}
+
+async function resolveOrderMetaFromTx(
+  publicClient: PublicClient<Transport, Chain>,
+  txHash: Hex,
+  cache: Map<Hex, Omit<DirtyOrderMeta, 'maker'> | null>
+): Promise<Omit<DirtyOrderMeta, 'maker'> | null> {
+  const key = txHash.toLowerCase() as Hex;
+  if (cache.has(key)) {
+    return cache.get(key) ?? null;
+  }
+
+  try {
+    const tx = await publicClient.getTransaction({ hash: txHash });
+    const decoded = decodeFunctionData({ abi: orderSettlementAbi, data: tx.input });
+    let meta: Omit<DirtyOrderMeta, 'maker'> | null = null;
+
+    if (
+      decoded.functionName === 'fillBorrowOrder' ||
+      decoded.functionName === 'fillBorrowOrderWithAttestations' ||
+      decoded.functionName === 'cancelBorrowOrder'
+    ) {
+      const order = decoded.args[0];
+      const tok = normalizeAddress(order.collateralToken);
+      meta = {
+        minUsdc: BigInt(order.minUsdc),
+        collateralToken: tok !== zeroAddress ? tok : undefined,
+        orderType: 'borrow',
+      };
+    } else if (
+      decoded.functionName === 'fillLendOffer' ||
+      decoded.functionName === 'fillLendOfferWithAttestations'
+    ) {
+      const offer = decoded.args[0];
+      const tok = normalizeAddress(decoded.args[2]);
+      meta = {
+        minUsdc: BigInt(offer.usdcAmount),
+        collateralToken: tok !== zeroAddress ? tok : undefined,
+        orderType: 'lend',
+      };
+    } else if (decoded.functionName === 'cancelLendOffer') {
+      const offer = decoded.args[0];
+      const allowed = normalizeAddress(offer.allowedCollateral);
+      meta = {
+        minUsdc: BigInt(offer.usdcAmount),
+        collateralToken: allowed !== zeroAddress ? allowed : undefined,
+        orderType: 'lend',
+      };
+    }
+
+    cache.set(key, meta);
+    return meta;
+  } catch {
+    cache.set(key, null);
+    return null;
+  }
+}
+
 async function reconcileOrder(
   publicClient: PublicClient<Transport, Chain>,
   db: Queryable,
   config: IndexerConfig,
   orderHash: Hex,
-  maker: Address,
+  meta: DirtyOrderMeta,
   blockNumber: bigint
 ): Promise<void> {
+  const { maker } = meta;
   const [cancelled, filledUsdc, makerNonce] = await Promise.all([
     readAtBlock(
       (bn) =>
@@ -795,19 +860,40 @@ async function reconcileOrder(
     ),
   ]);
 
+  let collateralToken = meta.collateralToken ?? null;
+  if (!collateralToken) {
+    const fallbackRes = await db.query<{ collateral_token: string | null }>(
+      `SELECT l.collateral_token
+       FROM order_fills ofi
+       JOIN loans l ON l.loan_id = ofi.loan_id
+       WHERE ofi.order_hash = $1
+       LIMIT 1`,
+      [orderHash.toLowerCase()]
+    );
+    if (fallbackRes.rows[0]?.collateral_token) {
+      collateralToken = getAddress(fallbackRes.rows[0].collateral_token);
+    }
+  }
+
   await db.query(
     `INSERT INTO orders (
-      order_hash, maker, filled_usdc, cancelled, maker_nonce, first_seen_block, last_updated_block
-    ) VALUES ($1, $2, $3, $4, $5, $6, $6)
+      order_hash, maker, collateral_token, min_usdc, filled_usdc, order_type, cancelled, maker_nonce, first_seen_block, last_updated_block
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
     ON CONFLICT (order_hash) DO UPDATE SET
+      collateral_token = COALESCE(EXCLUDED.collateral_token, orders.collateral_token),
+      min_usdc = CASE WHEN EXCLUDED.min_usdc > 0 THEN EXCLUDED.min_usdc ELSE orders.min_usdc END,
       filled_usdc = EXCLUDED.filled_usdc,
+      order_type = COALESCE(EXCLUDED.order_type, orders.order_type),
       cancelled = EXCLUDED.cancelled,
       maker_nonce = EXCLUDED.maker_nonce,
       last_updated_block = EXCLUDED.last_updated_block`,
     [
       orderHash.toLowerCase(),
       getAddress(maker),
+      collateralToken,
+      (meta.minUsdc ?? 0n).toString(),
       filledUsdc.toString(),
+      meta.orderType ?? 'borrow',
       cancelled,
       makerNonce.toString(),
       blockNumber.toString(),
@@ -1037,7 +1123,7 @@ export async function detectAndHandleReorg(
         db,
         config,
         row.order_hash as Hex,
-        getAddress(row.maker),
+        { maker: getAddress(row.maker) },
         reconcileBlock
       );
     }
@@ -1257,8 +1343,9 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
     const dirtyLoans = new Map<bigint, Address | undefined>();
     const dirtyAuctions = new Set<bigint>();
     const dirtyPositions = new Set<bigint>();
-    const dirtyOrders = new Map<Hex, Address>();
+    const dirtyOrders = new Map<Hex, DirtyOrderMeta>();
     const dirtyAssets = new Set<Address>();
+    const orderTxCache = new Map<Hex, Omit<DirtyOrderMeta, 'maker'> | null>();
 
     await db.transaction(async (tx) => {
       await tx.query(
@@ -1472,7 +1559,14 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
           switch (decoded.eventName) {
             case 'OrderFilled': {
               const args = decoded.args;
-              dirtyOrders.set(args.orderHash, normalizeAddress(args.maker));
+              const txMeta = await resolveOrderMetaFromTx(publicClient, txHash, orderTxCache);
+              const existing = dirtyOrders.get(args.orderHash);
+              dirtyOrders.set(args.orderHash, {
+                maker: normalizeAddress(args.maker),
+                minUsdc: txMeta?.minUsdc ?? existing?.minUsdc,
+                collateralToken: txMeta?.collateralToken ?? existing?.collateralToken,
+                orderType: txMeta?.orderType ?? existing?.orderType,
+              });
               await tx.query(
                 `INSERT INTO order_fills (
                   order_hash, maker, taker, loan_id, fill_amount_usdc, collateral_amount,
@@ -1503,6 +1597,7 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
                 contractAddress: source,
                 eventName: 'OrderFilled',
                 loanId: args.loanId,
+                token: txMeta?.collateralToken ?? null,
                 actor: args.maker,
                 counterparty: args.taker,
                 amountRaw: args.fillAmountUsdc,
@@ -1514,7 +1609,14 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
             }
             case 'OrderCancelled': {
               const args = decoded.args;
-              dirtyOrders.set(args.orderHash, normalizeAddress(args.maker));
+              const txMeta = await resolveOrderMetaFromTx(publicClient, txHash, orderTxCache);
+              const existing = dirtyOrders.get(args.orderHash);
+              dirtyOrders.set(args.orderHash, {
+                maker: normalizeAddress(args.maker),
+                minUsdc: txMeta?.minUsdc ?? existing?.minUsdc,
+                collateralToken: txMeta?.collateralToken ?? existing?.collateralToken,
+                orderType: txMeta?.orderType ?? existing?.orderType,
+              });
               await insertLoanEvent(tx, {
                 blockNumber: bn,
                 blockHash,
@@ -1522,6 +1624,7 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
                 logIndex,
                 contractAddress: source,
                 eventName: 'OrderCancelled',
+                token: txMeta?.collateralToken ?? null,
                 actor: args.maker,
                 payload: args,
                 blockTimestamp: block.timestamp,
@@ -1881,8 +1984,8 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
       for (const loanId of dirtyPositions) {
         await reconcilePosition(publicClient, tx, config, loanId, bn);
       }
-      for (const [orderHash, maker] of dirtyOrders.entries()) {
-        await reconcileOrder(publicClient, tx, config, orderHash, maker, bn);
+      for (const [orderHash, orderMeta] of dirtyOrders.entries()) {
+        await reconcileOrder(publicClient, tx, config, orderHash, orderMeta, bn);
       }
       for (const token of dirtyAssets) {
         await reconcileAsset(publicClient, tx, config, token, bn);

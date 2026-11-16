@@ -1,23 +1,26 @@
 export const OracleState = {
   VALID_OPEN: 0,
   VALID_CLOSED: 1,
-  STALE_FEED: 2,
-  FROZEN_CORPORATE_ACTION: 3,
+  FROZEN_CORPORATE_ACTION: 2,
+  STALE_FEED: 3,
   INVALID_SEQUENCER: 4,
+  DISPUTED: 5,
 } as const;
 
 export const ORACLE_STATE_NAMES: Record<number, string> = {
   0: 'VALID_OPEN',
   1: 'VALID_CLOSED',
-  2: 'STALE_FEED',
-  3: 'FROZEN_CORPORATE_ACTION',
+  2: 'FROZEN_CORPORATE_ACTION',
+  3: 'STALE_FEED',
   4: 'INVALID_SEQUENCER',
+  5: 'DISPUTED',
 };
 
 export const ASSET_STATUS_NAMES: Record<number, string> = {
   0: 'Active',
   1: 'ReduceOnly',
-  2: 'Frozen',
+  2: 'WindDown',
+  3: 'Frozen',
 };
 
 export const LOAN_STATUS_NAMES: Record<number, string> = {

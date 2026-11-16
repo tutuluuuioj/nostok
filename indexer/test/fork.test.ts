@@ -577,6 +577,8 @@ async function runTests(): Promise<void> {
       const fillRows = await ctx.db.query('SELECT * FROM order_fills WHERE loan_id = 1');
       assert.equal(orderRows.rows.length, 1);
       assert.equal(toBigInt(orderRows.rows[0].filled_usdc), 800_000_000n);
+      assert.equal(toBigInt(orderRows.rows[0].min_usdc), 800_000_000n);
+      assert.equal(String(orderRows.rows[0].collateral_token).toLowerCase(), nvdac.toLowerCase());
       assert.equal(fillRows.rows.length, 1);
 
       const posRows1 = await ctx.db.query('SELECT * FROM positions WHERE loan_id = 1');
@@ -1682,7 +1684,19 @@ async function runTests(): Promise<void> {
             'SELECT * FROM claims WHERE block_number = 999999999'
           );
           assert.equal(rolledBackClaim.rows.length, 0, 'Rolled-back Postgres transaction must leave no rows');
-          console.log('PASS STEP 18: PostgresPoolAdapter (postgres:// via pglite-socket) sync, types, and rollback verified.');
+
+          // Simulate backend termination (57P01) on idle pooled connection + active socket drop & reconnect
+          const pgAdapterPool = (ctxPg.db as unknown as { pool: { emit: (ev: string, err: Error) => void; _clients?: Array<{ connection?: { stream?: { destroy: () => void } } }> } }).pool;
+          pgAdapterPool.emit(
+            'error',
+            Object.assign(new Error('terminating connection due to administrator command'), { code: '57P01' })
+          );
+          // Destroy live socket under pool client so next query triggers reconnect retry transparently
+          const liveSocket = pgAdapterPool._clients?.[0]?.connection?.stream;
+          if (liveSocket) liveSocket.destroy();
+          const recoveredQuery = await ctxPg.db.query<{ cnt: number }>('SELECT COUNT(*)::INT AS cnt FROM loans');
+          assert.equal(Number(recoveredQuery.rows[0].cnt), 2, 'Next query after connection drop must succeed cleanly');
+          console.log('PASS STEP 18: PostgresPoolAdapter (postgres:// via pglite-socket) sync, types, rollback, and drop recovery verified.');
         } finally {
           await ctxPg.db.close();
         }

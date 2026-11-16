@@ -63,25 +63,81 @@ class PGliteAdapter implements DatabaseAdapter {
   }
 }
 
+const DROP_PG_CODES = new Set(['57P01', '57P02', '57P03', '08000', '08003', '08006']);
+const DROP_MSG_SNIPPETS = [
+  'connection terminated',
+  'terminating connection',
+  'client has encountered a connection error',
+  'econnreset',
+  'epipe',
+  'socket hang up',
+  'connection closed',
+];
+
+export function isConnectionDropError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const obj = err as { code?: unknown; message?: unknown; cause?: unknown };
+  if (typeof obj.code === 'string' && DROP_PG_CODES.has(obj.code.toUpperCase())) {
+    return true;
+  }
+  const msg = typeof obj.message === 'string' ? obj.message.toLowerCase() : '';
+  if (DROP_MSG_SNIPPETS.some((s) => msg.includes(s))) {
+    return true;
+  }
+  return obj.cause ? isConnectionDropError(obj.cause) : false;
+}
+
 class PostgresPoolAdapter implements DatabaseAdapter {
-  private readonly pool: pg.Pool;
+  readonly pool: pg.Pool;
 
   constructor(connectionString: string) {
     const rawMax = Number(process.env.PG_POOL_MAX ?? 1);
     const max = Number.isInteger(rawMax) && rawMax > 0 ? rawMax : 1;
-    this.pool = new Pool({ connectionString, max });
+    const rawIdle = Number(process.env.PG_IDLE_TIMEOUT_MS ?? 30_000);
+    const idleTimeoutMillis = Number.isInteger(rawIdle) && rawIdle >= 0 ? rawIdle : 30_000;
+    const rawStmtTimeout = Number(process.env.PG_STATEMENT_TIMEOUT_MS ?? 15_000);
+    const statementTimeout =
+      Number.isInteger(rawStmtTimeout) && rawStmtTimeout > 0 ? rawStmtTimeout : 15_000;
+
+    this.pool = new Pool({
+      connectionString,
+      max,
+      idleTimeoutMillis,
+      statement_timeout: statementTimeout,
+    });
+    this.pool.on('error', (err) => {
+      console.error('[INDEXER_DB_POOL_ERROR] Idle PostgreSQL client error:', err.message);
+    });
   }
 
   async exec(sql: string): Promise<void> {
-    await this.pool.query(sql);
+    try {
+      await this.pool.query(sql);
+    } catch (err) {
+      if (isConnectionDropError(err)) {
+        console.warn('[INDEXER_DB_RETRY] Connection dropped during exec; retrying once...');
+        await this.pool.query(sql);
+        return;
+      }
+      throw err;
+    }
   }
 
   async query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params: unknown[] = []
   ): Promise<{ rows: T[] }> {
-    const res = await this.pool.query<T>(sql, params);
-    return { rows: res.rows };
+    try {
+      const res = await this.pool.query<T>(sql, params);
+      return { rows: res.rows };
+    } catch (err) {
+      if (isConnectionDropError(err)) {
+        console.warn('[INDEXER_DB_RETRY] Connection dropped during query; retrying once...');
+        const res = await this.pool.query<T>(sql, params);
+        return { rows: res.rows };
+      }
+      throw err;
+    }
   }
 
   async transaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
@@ -214,12 +270,18 @@ export async function initSchema(db: DatabaseAdapter): Promise<void> {
     CREATE TABLE IF NOT EXISTS orders (
       order_hash TEXT PRIMARY KEY,
       maker TEXT NOT NULL,
+      collateral_token TEXT,
+      min_usdc NUMERIC(78, 0) NOT NULL DEFAULT 0,
       filled_usdc NUMERIC(78, 0) NOT NULL DEFAULT 0,
+      order_type TEXT NOT NULL DEFAULT 'borrow',
       cancelled BOOLEAN NOT NULL DEFAULT FALSE,
       maker_nonce NUMERIC(78, 0) NOT NULL DEFAULT 0,
       first_seen_block BIGINT NOT NULL,
       last_updated_block BIGINT NOT NULL
     );
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS collateral_token TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS min_usdc NUMERIC(78, 0) NOT NULL DEFAULT 0;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_type TEXT NOT NULL DEFAULT 'borrow';
 
     CREATE TABLE IF NOT EXISTS order_fills (
       id BIGSERIAL PRIMARY KEY,

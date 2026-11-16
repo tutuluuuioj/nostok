@@ -17,14 +17,36 @@ import { type FormattedAmount, ceilDiv, formatAmount, formatRay18 } from './form
 import type { QuoteInput } from './validation.js';
 
 const USDC_DECIMALS = 6;
+const UINT128_MAX = (1n << 128n) - 1n;
 const LOAN_MIN_PRINCIPAL_RAW = 500n * 1_000_000n; // $500 USDC (LoanCore.sol:211)
 const MAX_TOTAL_TERM_DAYS = 90; // LoanCore.sol:211 & :527
-const MIN_TERM_DAYS = 7; // LoanCore.sol:211
+const MIN_NEW_LOAN_TERM_DAYS = 7; // LoanCore.sol:211
 const MAX_APR_BPS = 4000; // 40.00% APR (LoanCore.sol:211 & :526)
 const MIN_INTEREST_DAYS_LOW = 1; // LoanCore.sol:215
 const MIN_INTEREST_DAYS_HIGH = 30; // LoanCore.sol:215
 
+export class RpcUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RpcUnavailableError';
+  }
+}
+
+async function rpcRead<T>(fn: () => Promise<T>, label: string): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new RpcUnavailableError(`RPC read failed (${label}): ${reason}`);
+  }
+}
+
 export interface QuoteRejection {
+  code: string;
+  message: string;
+}
+
+export interface QuoteWarning {
   code: string;
   message: string;
 }
@@ -32,6 +54,7 @@ export interface QuoteRejection {
 export interface QuoteResponse {
   accepted: boolean;
   rejection_reasons: QuoteRejection[];
+  warnings: QuoteWarning[];
   block_number: string;
   indexed_block_number: string | null;
   freshness_timestamp: string;
@@ -71,6 +94,7 @@ export interface QuoteResponse {
     net_proceeds: FormattedAmount;
     interest_maturity: FormattedAmount;
     min_interest_floor: FormattedAmount;
+    origination_debt: FormattedAmount;
     protocol_interest_cut: FormattedAmount;
     protocol_interest_cut_bps: number;
     lender_net_interest: FormattedAmount;
@@ -79,6 +103,7 @@ export interface QuoteResponse {
   risk: {
     initial_ltv_bps: number;
     health_factor: { raw: string; formatted: string; decimals: number };
+    liquidation_price: FormattedAmount;
     liquidation_price_at_origination: FormattedAmount;
     liquidation_price_at_maturity: FormattedAmount;
     liquidation_fee_bps: number;
@@ -129,13 +154,27 @@ export async function computeLoanQuote(params: {
   const { publicClient, db, config, input } = params;
   const freshnessTimestamp = new Date().toISOString();
 
-  const blockNumber = await publicClient.getBlockNumber();
+  const blockNumber = await rpcRead(() => publicClient.getBlockNumber(), 'getBlockNumber');
   const stateRow = await db
     .query<{ last_indexed_block: string }>('SELECT last_indexed_block::TEXT AS last_indexed_block FROM indexer_state WHERE id = 1')
     .catch(() => ({ rows: [] as Array<{ last_indexed_block: string }> }));
   const indexedBlockNumber = stateRow.rows[0]?.last_indexed_block ?? null;
 
   const rejections: QuoteRejection[] = [];
+  const warnings: QuoteWarning[] = [];
+
+  if (input.principal !== undefined && input.principal > UINT128_MAX) {
+    rejections.push({
+      code: 'PRINCIPAL_EXCEEDS_UINT128_MAX',
+      message: `Requested principal (${input.principal}) exceeds uint128 maximum (${UINT128_MAX})`,
+    });
+  }
+  if (input.collateralAmount !== undefined && input.collateralAmount > UINT128_MAX) {
+    rejections.push({
+      code: 'COLLATERAL_EXCEEDS_UINT128_MAX',
+      message: `Requested collateral (${input.collateralAmount}) exceeds uint128 maximum (${UINT128_MAX})`,
+    });
+  }
 
   // Read global protocol parameters at the exact quote blockNumber
   const [
@@ -149,69 +188,73 @@ export async function computeLoanQuote(params: {
     minBuyUsdc,
     permissionlessMode,
     supported,
-  ] = await Promise.all([
-    publicClient.readContract({
-      address: config.loanCore,
-      abi: loanCoreAbi,
-      functionName: 'paused',
-      blockNumber,
-    }),
-    publicClient.readContract({
-      address: config.loanCore,
-      abi: loanCoreAbi,
-      functionName: 'globalUsdcCap',
-      blockNumber,
-    }),
-    publicClient.readContract({
-      address: config.loanCore,
-      abi: loanCoreAbi,
-      functionName: 'totalOutstandingPrincipal',
-      blockNumber,
-    }),
-    publicClient.readContract({
-      address: config.loanCore,
-      abi: loanCoreAbi,
-      functionName: 'SECONDS_PER_YEAR',
-      blockNumber,
-    }),
-    publicClient.readContract({
-      address: config.feeCollector,
-      abi: feeCollectorAbi,
-      functionName: 'originationFeeBps',
-      blockNumber,
-    }),
-    publicClient.readContract({
-      address: config.feeCollector,
-      abi: feeCollectorAbi,
-      functionName: 'interestCutBps',
-      blockNumber,
-    }),
-    publicClient.readContract({
-      address: config.feeCollector,
-      abi: feeCollectorAbi,
-      functionName: 'liquidationFeeBps',
-      blockNumber,
-    }),
-    publicClient.readContract({
-      address: config.liquidationAuction,
-      abi: liquidationAuctionAbi,
-      functionName: 'MIN_BUY_USDC',
-      blockNumber,
-    }),
-    publicClient.readContract({
-      address: config.eligibilityGate,
-      abi: eligibilityGateAbi,
-      functionName: 'permissionlessMode',
-      blockNumber,
-    }),
-    publicClient.readContract({
-      address: config.assetRegistry,
-      abi: assetRegistryAbi,
-      functionName: 'isAssetSupported',
-      args: [input.asset],
-      blockNumber,
-    }),
-  ]);
+  ] = await rpcRead(
+    () =>
+      Promise.all([
+        publicClient.readContract({
+          address: config.loanCore,
+          abi: loanCoreAbi,
+          functionName: 'paused',
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address: config.loanCore,
+          abi: loanCoreAbi,
+          functionName: 'globalUsdcCap',
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address: config.loanCore,
+          abi: loanCoreAbi,
+          functionName: 'totalOutstandingPrincipal',
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address: config.loanCore,
+          abi: loanCoreAbi,
+          functionName: 'SECONDS_PER_YEAR',
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address: config.feeCollector,
+          abi: feeCollectorAbi,
+          functionName: 'originationFeeBps',
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address: config.feeCollector,
+          abi: feeCollectorAbi,
+          functionName: 'interestCutBps',
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address: config.feeCollector,
+          abi: feeCollectorAbi,
+          functionName: 'liquidationFeeBps',
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address: config.liquidationAuction,
+          abi: liquidationAuctionAbi,
+          functionName: 'MIN_BUY_USDC',
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address: config.eligibilityGate,
+          abi: eligibilityGateAbi,
+          functionName: 'permissionlessMode',
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address: config.assetRegistry,
+          abi: assetRegistryAbi,
+          functionName: 'isAssetSupported',
+          args: [input.asset],
+          blockNumber,
+        }),
+      ]),
+    'globalProtocolParams'
+  );
 
   if (paused) {
     rejections.push({ code: 'PROTOCOL_PAUSED', message: 'LoanCore protocol is currently paused' });
@@ -237,7 +280,6 @@ export async function computeLoanQuote(params: {
     tokenDecimals = Number(dec);
     tokenSymbol = sym;
   } catch {
-    // Fallback metadata from indexer assets table if non-standard token call fails
     const assetRow = await db.query<{ symbol: string | null; decimals: number | null }>(
       'SELECT symbol, decimals FROM assets WHERE LOWER(token) = LOWER($1)',
       [input.asset]
@@ -256,6 +298,7 @@ export async function computeLoanQuote(params: {
     return {
       accepted: false,
       rejection_reasons: rejections,
+      warnings,
       block_number: blockNumber.toString(),
       indexed_block_number: indexedBlockNumber,
       freshness_timestamp: freshnessTimestamp,
@@ -295,6 +338,7 @@ export async function computeLoanQuote(params: {
         net_proceeds: formatAmount(0n, USDC_DECIMALS, 'USDC'),
         interest_maturity: formatAmount(0n, USDC_DECIMALS, 'USDC'),
         min_interest_floor: formatAmount(0n, USDC_DECIMALS, 'USDC'),
+        origination_debt: formatAmount(0n, USDC_DECIMALS, 'USDC'),
         protocol_interest_cut: formatAmount(0n, USDC_DECIMALS, 'USDC'),
         protocol_interest_cut_bps: Number(interestCutBpsRaw),
         lender_net_interest: formatAmount(0n, USDC_DECIMALS, 'USDC'),
@@ -303,6 +347,7 @@ export async function computeLoanQuote(params: {
       risk: {
         initial_ltv_bps: 0,
         health_factor: formatRay18(0n),
+        liquidation_price: formatAmount(0n, 8, 'USD'),
         liquidation_price_at_origination: formatAmount(0n, 8, 'USD'),
         liquidation_price_at_maturity: formatAmount(0n, 8, 'USD'),
         liquidation_fee_bps: Number(liquidationFeeBpsRaw),
@@ -322,36 +367,40 @@ export async function computeLoanQuote(params: {
     };
   }
 
-  const [cfg, assetOutstanding, priceResult, recordedMultiplier] = await Promise.all([
-    publicClient.readContract({
-      address: config.assetRegistry,
-      abi: assetRegistryAbi,
-      functionName: 'getAssetConfig',
-      args: [input.asset],
-      blockNumber,
-    }),
-    publicClient.readContract({
-      address: config.loanCore,
-      abi: loanCoreAbi,
-      functionName: 'assetOutstandingPrincipal',
-      args: [input.asset],
-      blockNumber,
-    }),
-    publicClient.readContract({
-      address: config.oracleRouter,
-      abi: oracleRouterAbi,
-      functionName: 'getPrice',
-      args: [input.asset],
-      blockNumber,
-    }),
-    publicClient.readContract({
-      address: config.oracleRouter,
-      abi: oracleRouterAbi,
-      functionName: 'recordedMultiplier',
-      args: [input.asset],
-      blockNumber,
-    }),
-  ]);
+  const [cfg, assetOutstanding, priceResult, recordedMultiplier] = await rpcRead(
+    () =>
+      Promise.all([
+        publicClient.readContract({
+          address: config.assetRegistry,
+          abi: assetRegistryAbi,
+          functionName: 'getAssetConfig',
+          args: [input.asset],
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address: config.loanCore,
+          abi: loanCoreAbi,
+          functionName: 'assetOutstandingPrincipal',
+          args: [input.asset],
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address: config.oracleRouter,
+          abi: oracleRouterAbi,
+          functionName: 'getPrice',
+          args: [input.asset],
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address: config.oracleRouter,
+          abi: oracleRouterAbi,
+          functionName: 'recordedMultiplier',
+          args: [input.asset],
+          blockNumber,
+        }),
+      ]),
+    `assetParams(${input.asset})`
+  );
 
   const [oraclePrice, oracleDecimalsRaw, oracleStateRaw] = priceResult;
   const oracleDecimals = Number(oracleDecimalsRaw);
@@ -376,46 +425,54 @@ export async function computeLoanQuote(params: {
     });
   }
 
-  // Check optional counterparty eligibility if addresses supplied
-  if (!permissionlessMode) {
-    if (input.borrower && input.borrower !== zeroAddress) {
-      const ok = await publicClient.readContract({
-        address: config.eligibilityGate,
-        abi: eligibilityGateAbi,
-        functionName: 'isEligible',
-        args: [input.borrower, '0x'],
-        blockNumber,
+  // Requirement 2: ALWAYS check EligibilityGate.isEligible (even when permissionlessMode is true,
+  // because revoked accounts are still rejected; pass optional signed attestation bytes as context).
+  if (input.borrower && input.borrower !== zeroAddress) {
+    const ok = await rpcRead(
+      () =>
+        publicClient.readContract({
+          address: config.eligibilityGate,
+          abi: eligibilityGateAbi,
+          functionName: 'isEligible',
+          args: [input.borrower!, input.borrowerAttestation],
+          blockNumber,
+        }),
+      'eligibilityGate.isEligible(borrower)'
+    );
+    if (!ok) {
+      rejections.push({
+        code: 'BORROWER_INELIGIBLE',
+        message: `Borrower ${input.borrower} failed EligibilityGate check (revoked or missing allowlist/attestation)`,
       });
-      if (!ok) {
-        rejections.push({
-          code: 'BORROWER_INELIGIBLE',
-          message: `Borrower ${input.borrower} is not allowlisted/eligible on EligibilityGate (signed attestation required)`,
-        });
-      }
     }
-    if (input.lender && input.lender !== zeroAddress) {
-      const ok = await publicClient.readContract({
-        address: config.eligibilityGate,
-        abi: eligibilityGateAbi,
-        functionName: 'isEligible',
-        args: [input.lender, '0x'],
-        blockNumber,
+  }
+  if (input.lender && input.lender !== zeroAddress) {
+    const ok = await rpcRead(
+      () =>
+        publicClient.readContract({
+          address: config.eligibilityGate,
+          abi: eligibilityGateAbi,
+          functionName: 'isEligible',
+          args: [input.lender!, input.lenderAttestation],
+          blockNumber,
+        }),
+      'eligibilityGate.isEligible(lender)'
+    );
+    if (!ok) {
+      rejections.push({
+        code: 'LENDER_INELIGIBLE',
+        message: `Lender ${input.lender} failed EligibilityGate check (revoked or missing allowlist/attestation)`,
       });
-      if (!ok) {
-        rejections.push({
-          code: 'LENDER_INELIGIBLE',
-          message: `Lender ${input.lender} is not allowlisted/eligible on EligibilityGate (signed attestation required)`,
-        });
-      }
     }
   }
 
-  // Validate loan terms matching LoanCore.openLoan & extend
+  // Validate loan terms: 7-day minimum applies ONLY to new loans (existingElapsedDays === 0), not extensions
   const totalTermDays = input.existingElapsedDays + input.termDays;
-  if (input.termDays < MIN_TERM_DAYS || input.termDays > MAX_TOTAL_TERM_DAYS) {
+  const minTermForMode = input.existingElapsedDays === 0 ? MIN_NEW_LOAN_TERM_DAYS : 1;
+  if (input.termDays < minTermForMode || input.termDays > MAX_TOTAL_TERM_DAYS) {
     rejections.push({
       code: 'TERM_OUT_OF_RANGE',
-      message: `term_days must be between ${MIN_TERM_DAYS} and ${MAX_TOTAL_TERM_DAYS} days`,
+      message: `term_days must be between ${minTermForMode} and ${MAX_TOTAL_TERM_DAYS} days`,
     });
   } else if (totalTermDays > MAX_TOTAL_TERM_DAYS) {
     rejections.push({
@@ -487,6 +544,25 @@ export async function computeLoanQuote(params: {
     }
   }
 
+  if (
+    quotedPrincipal > UINT128_MAX &&
+    !rejections.some((r) => r.code === 'PRINCIPAL_EXCEEDS_UINT128_MAX')
+  ) {
+    rejections.push({
+      code: 'PRINCIPAL_EXCEEDS_UINT128_MAX',
+      message: `Derived principal (${quotedPrincipal}) exceeds uint128 maximum (${UINT128_MAX})`,
+    });
+  }
+  if (
+    collateralRequired > UINT128_MAX &&
+    !rejections.some((r) => r.code === 'COLLATERAL_EXCEEDS_UINT128_MAX')
+  ) {
+    rejections.push({
+      code: 'COLLATERAL_EXCEEDS_UINT128_MAX',
+      message: `Collateral amount (${collateralRequired}) exceeds uint128 maximum (${UINT128_MAX})`,
+    });
+  }
+
   // Evaluate exact onchain getValue for the quoted/provided collateral
   let grossValueUsdc = computeGrossUsdc(collateralRequired, oraclePrice, tokenDecimals, oracleDecimals);
   let effectiveValueUsdc = computeEffectiveUsdc(
@@ -494,14 +570,18 @@ export async function computeLoanQuote(params: {
     oracleState,
     Number(cfg.closedMarketHaircutBps)
   );
-  if (oracleUsable && collateralRequired > 0n) {
-    const [onchainGross, onchainEff] = await publicClient.readContract({
-      address: config.oracleRouter,
-      abi: oracleRouterAbi,
-      functionName: 'getValue',
-      args: [input.asset, collateralRequired],
-      blockNumber,
-    });
+  if (oracleUsable && collateralRequired > 0n && collateralRequired <= UINT128_MAX) {
+    const [onchainGross, onchainEff] = await rpcRead(
+      () =>
+        publicClient.readContract({
+          address: config.oracleRouter,
+          abi: oracleRouterAbi,
+          functionName: 'getValue',
+          args: [input.asset, collateralRequired],
+          blockNumber,
+        }),
+      'oracleRouter.getValue'
+    );
     grossValueUsdc = onchainGross;
     effectiveValueUsdc = onchainEff;
   }
@@ -514,7 +594,7 @@ export async function computeLoanQuote(params: {
     });
   }
   if (quotedPrincipal < minBuyUsdc) {
-    rejections.push({
+    warnings.push({
       code: 'BELOW_MIN_BUY_USDC',
       message: `Principal ${quotedPrincipal} is below LiquidationAuction MIN_BUY_USDC (${minBuyUsdc} raw USDC)`,
     });
@@ -545,18 +625,22 @@ export async function computeLoanQuote(params: {
   }
 
   // Fees & interest math matching FeeCollector.sol and LoanCore.sol
-  const uint128Max = (1n << 128n) - 1n;
-  const clampedPrincipal = quotedPrincipal <= uint128Max ? quotedPrincipal : uint128Max;
   const originationFee =
-    clampedPrincipal > 0n
-      ? await publicClient.readContract({
-          address: config.feeCollector,
-          abi: feeCollectorAbi,
-          functionName: 'calculateOriginationFee',
-          args: [clampedPrincipal],
-          blockNumber,
-        })
-      : 0n;
+    quotedPrincipal > 0n && quotedPrincipal <= UINT128_MAX
+      ? await rpcRead(
+          () =>
+            publicClient.readContract({
+              address: config.feeCollector,
+              abi: feeCollectorAbi,
+              functionName: 'calculateOriginationFee',
+              args: [quotedPrincipal],
+              blockNumber,
+            }),
+          'feeCollector.calculateOriginationFee'
+        )
+      : quotedPrincipal > 0n
+        ? ceilDiv(quotedPrincipal * BigInt(originationFeeBpsRaw), 10_000n)
+        : 0n;
   const netProceeds = quotedPrincipal > originationFee ? quotedPrincipal - originationFee : 0n;
 
   const interestDenom = 10_000n * secondsPerYear;
@@ -572,37 +656,45 @@ export async function computeLoanQuote(params: {
         )
       : 0n;
 
-  const clampedInterest = maturityInterest <= uint128Max ? maturityInterest : uint128Max;
   const protocolInterestCut =
-    clampedInterest > 0n
-      ? await publicClient.readContract({
-          address: config.feeCollector,
-          abi: feeCollectorAbi,
-          functionName: 'calculateInterestCut',
-          args: [clampedInterest],
-          blockNumber,
-        })
-      : 0n;
+    maturityInterest > 0n && maturityInterest <= UINT128_MAX
+      ? await rpcRead(
+          () =>
+            publicClient.readContract({
+              address: config.feeCollector,
+              abi: feeCollectorAbi,
+              functionName: 'calculateInterestCut',
+              args: [maturityInterest],
+              blockNumber,
+            }),
+          'feeCollector.calculateInterestCut'
+        )
+      : maturityInterest > 0n
+        ? ceilDiv(maturityInterest * BigInt(interestCutBpsRaw), 10_000n)
+        : 0n;
   const lenderNetInterest = maturityInterest - protocolInterestCut;
+  const originationDebt = quotedPrincipal + minInterestFloor;
   const totalRepayment = quotedPrincipal + maturityInterest;
 
-  // Risk metrics
+  // Risk metrics matching LoanCore.startLiquidation:
+  // debt = principal + minInterestFloor (at origination) vs GROSS collateral value.
   const initialLtvBps =
-    effectiveValueUsdc > 0n ? Number((quotedPrincipal * 10_000n) / effectiveValueUsdc) : 0;
+    grossValueUsdc > 0n ? Number((originationDebt * 10_000n) / grossValueUsdc) : 0;
   const liqLtvBps = BigInt(cfg.liqLtvBps);
   const healthFactorRaw =
-    quotedPrincipal > 0n && effectiveValueUsdc > 0n
-      ? (effectiveValueUsdc * liqLtvBps * 10n ** 14n) / quotedPrincipal
+    originationDebt > 0n && grossValueUsdc > 0n
+      ? (grossValueUsdc * liqLtvBps * 10n ** 14n) / originationDebt
       : 0n;
 
   const priceScale = 10n ** BigInt(tokenDecimals) * 10n ** BigInt(oracleDecimals);
+  // Rounded UP via ceilDiv so liquidation_price reflects the earliest oracle threshold triggering liqLtvBps
   const liqPriceOrig =
-    collateralRequired > 0n && liqLtvBps > 0n && quotedPrincipal > 0n
-      ? (quotedPrincipal * 10_000n * priceScale) / (liqLtvBps * collateralRequired * 1_000_000n)
+    collateralRequired > 0n && liqLtvBps > 0n && originationDebt > 0n
+      ? ceilDiv(originationDebt * 10_000n * priceScale, liqLtvBps * collateralRequired * 1_000_000n)
       : 0n;
   const liqPriceMat =
     collateralRequired > 0n && liqLtvBps > 0n && totalRepayment > 0n
-      ? (totalRepayment * 10_000n * priceScale) / (liqLtvBps * collateralRequired * 1_000_000n)
+      ? ceilDiv(totalRepayment * 10_000n * priceScale, liqLtvBps * collateralRequired * 1_000_000n)
       : 0n;
 
   const globalRemaining = globalCap > totalOutstanding ? globalCap - totalOutstanding : 0n;
@@ -612,6 +704,7 @@ export async function computeLoanQuote(params: {
   return {
     accepted: rejections.length === 0,
     rejection_reasons: rejections,
+    warnings,
     block_number: blockNumber.toString(),
     indexed_block_number: indexedBlockNumber,
     freshness_timestamp: freshnessTimestamp,
@@ -651,6 +744,7 @@ export async function computeLoanQuote(params: {
       net_proceeds: formatAmount(netProceeds, USDC_DECIMALS, 'USDC'),
       interest_maturity: formatAmount(maturityInterest, USDC_DECIMALS, 'USDC'),
       min_interest_floor: formatAmount(minInterestFloor, USDC_DECIMALS, 'USDC'),
+      origination_debt: formatAmount(originationDebt, USDC_DECIMALS, 'USDC'),
       protocol_interest_cut: formatAmount(protocolInterestCut, USDC_DECIMALS, 'USDC'),
       protocol_interest_cut_bps: Number(interestCutBpsRaw),
       lender_net_interest: formatAmount(lenderNetInterest, USDC_DECIMALS, 'USDC'),
@@ -659,6 +753,7 @@ export async function computeLoanQuote(params: {
     risk: {
       initial_ltv_bps: initialLtvBps,
       health_factor: formatRay18(healthFactorRaw),
+      liquidation_price: formatAmount(liqPriceOrig, oracleDecimals, 'USD'),
       liquidation_price_at_origination: formatAmount(liqPriceOrig, oracleDecimals, 'USD'),
       liquidation_price_at_maturity: formatAmount(liqPriceMat, oracleDecimals, 'USD'),
       liquidation_fee_bps: Number(liquidationFeeBpsRaw),
