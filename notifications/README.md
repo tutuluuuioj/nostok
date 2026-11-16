@@ -10,11 +10,11 @@ Per-wallet notification service delivering margin call, liquidation, auction, ma
   * Production `DATABASE_URL` uses its own tables prefixed with `notif_*` (`notif_nonces`, `notif_subscriptions`, `notif_preferences`, `notif_deliveries`, `notif_dead_letters`, `notif_cursor`, `notif_alert_episodes`, `notif_revoked_sessions`). A dedicated `nostok_notif` DB role should have `SELECT/INSERT/UPDATE/DELETE` privileges **only** on `notif_*` tables and zero write privileges on indexer tables (`assertNotifTableSql` also enforces this at the application layer).
   * Consumes Risk Monitor state (`GET /risk/loans`, `GET /risk/alerts`) when `RISK_API_URL` is set, with direct read-only on-chain fallback if the risk monitor is unreachable.
 * **Webhook SSRF Protection & HMAC Payload Signing:**
-  * Webhook targets require `https://`, reject localhost, private, loopback, link-local, metadata (`169.254.169.254`), IPv6, and encoded IP forms (hex, octal, decimal, shorthand), resolve & validate DNS before socket connection, pin the validated IPv4 at connect time, disable redirects (`redirect: 'manual'`), apply per-host circuit breakers, and sign webhook payloads with `X-Nostok-Timestamp` + `X-Nostok-Signature` (`HMAC-SHA256`).
+  * Webhook targets require `https://` on an allowlisted port (default `443`), reject localhost, private, loopback, link-local, metadata (`169.254.169.254`), `192.88.99.0/24`, IPv6, and encoded IP forms (hex, octal, decimal, shorthand), filter DNS records to IPv4 `A` records (allowing dual-stack hosts without IPv6 blockage), validate & pin the resolved IPv4 at connect time, enforce overall request deadlines and response size caps, disable redirects (`redirect: 'manual'`), apply per-provider/target host circuit breakers, and sign webhook payloads with `X-Nostok-Timestamp` + `X-Nostok-Signature` (`HMAC-SHA256`).
 * **Minimal PII, Ownership Verification & Encryption at Rest:**
-  * Enforces per-wallet subscription caps (default `5`), requires confirmation code/token verification for email and Telegram subscriptions before activation, encrypts targets with **AES-256-GCM** (`ENCRYPTION_KEYS` / `ENCRYPTION_KEY_ID`) + keyed lookup hashes (`PII_HASH_SECRET`), enforces distinct high-entropy secrets, and supports `DELETE /user/data`.
+  * Enforces per-wallet subscription caps (default `5`), per-target confirmation limits (`3/hour` across wallets), 5-attempt verification-code lockout using dedicated `CONFIRM_SECRET` HMAC hashing, requires confirmation verification for email and Telegram before activation, encrypts targets with **AES-256-GCM** (`ENCRYPTION_KEYS` / `ENCRYPTION_KEY_ID`) + keyed lookup hashes (`PII_HASH_SECRET`), enforces distinct high-entropy secrets, and supports `DELETE /user/data`.
 * **SIWE (EIP-4361) Wallet Ownership Proof & Session Revocation:**
-  * `POST /auth/nonce` and `POST /auth/verify` are rate-limited per IP and per wallet, support EOA & EIP-1271 signatures, issue JWT-style HMAC sessions with `jti` claims, and support server-side revocation via `POST /auth/logout`.
+  * `POST /auth/nonce` is rate-limited per IP and `POST /auth/verify` applies per-IP limiting pre-auth and per-wallet limiting only after SIWE signature verification succeeds (preventing attacker wallet lockout across IPs); supports EOA & EIP-1271 signatures, issues JWT-style HMAC sessions with `jti` claims, and supports server-side revocation via `POST /auth/logout`.
 
 ---
 
@@ -27,6 +27,7 @@ Per-wallet notification service delivering margin call, liquidation, auction, ma
 | `liquidation_started` | `critical` | **Yes** | `AuctionStarted` indexed event |
 | `auction_bid` | `info` | No | `AuctionBought` indexed event |
 | `auction_settled` | `critical` | **Yes** | `AuctionSettled` indexed event |
+| `auction_cancelled` | `warning` | No | `AuctionCancelled` indexed event |
 | `maturity_reminder_3d` | `warning` | No | Active loan `maturity - block.timestamp <= 72h` |
 | `maturity_reminder_1d` | `warning` | No | Active loan `maturity - block.timestamp <= 24h` |
 | `maturity_reminder_6h` | `critical` | **Yes** | Active loan `maturity - block.timestamp <= 6h` |
@@ -50,6 +51,7 @@ Per-wallet notification service delivering margin call, liquidation, auction, ma
 * `GET /subscriptions/confirm?token=...`, `POST /subscriptions/confirm` — Confirm subscription ownership via `{ token }` or `{ subscription_id, code }`.
 * `GET /preferences`, `PUT /preferences` — Configure per-alert-type enable/disable flags, UTC `quiet_hours_start` / `quiet_hours_end`, and per-user `max_per_hour`.
 * `GET /deliveries`, `GET /dead-letters` — Authenticated wallet paginated delivery & generic DLQ inspection (`last_error: "delivery failed"`).
+* `POST /dead-letters/redrive` — Requeue dead-lettered deliveries back to `pending` (`x-admin-secret` for operators or authenticated SIWE owner for their own rows).
 * `GET /unsubscribe?token=...` — Read-only verification preview (`confirmation_required: true`); `POST /unsubscribe` executes the subscription disable.
 * `DELETE /user/data` — Deletes all `notif_*` records for the authenticated wallet.
 

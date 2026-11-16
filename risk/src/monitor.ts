@@ -456,6 +456,7 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
   let assetLiveResults: AssetRiskSnapshot[] = [];
   const assetByLower = new Map<string, AssetRiskSnapshot>();
   let loanSnapshots: LoanRiskSnapshot[] = [];
+  const preserveKeys = new Set<string>();
 
   try {
     if (!ctx.state.chainIdVerified) {
@@ -595,6 +596,24 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
       const roundRes = mcRes[baseIdx + 7];
 
       if (cfgRes.status === 'failure' || priceRes.status === 'failure') {
+        ctx.state.rpcErrorsTotal += 1;
+        const failedTokenKey = tokenAddr.toLowerCase();
+        for (const prefix of [
+          'oracle_stale',
+          'sequencer_invalid',
+          'oracle_disputed',
+          'oracle_price_deviation',
+          'corporate_action_freeze',
+          'multiplier_drift',
+          'asset_cap_util',
+          'escrow_mismatch',
+          'escrow_surplus',
+        ]) {
+          preserveKeys.add(`${prefix}:${failedTokenKey}`);
+        }
+        preserveKeys.add(`asset_status:${failedTokenKey}:frozen`);
+        preserveKeys.add(`asset_status:${failedTokenKey}:wind_down`);
+        preserveKeys.add(`asset_status:${failedTokenKey}:reduce_only`);
         continue;
       }
 
@@ -846,6 +865,8 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
       // informational notice and auto-resolve so they never stay active forever.
       if (escrowMatchesOpenLoans === 'unknown' || erc20EscrowBal === null || escrowLedgerBal === null) {
         ctx.state.surplusSeenAtMsByAsset.delete(tokenKey);
+        preserveKeys.add(`escrow_mismatch:${tokenKey}`);
+        preserveKeys.add(`escrow_surplus:${tokenKey}`);
       } else if (!escrowMatchesOpenLoans) {
         ctx.state.surplusSeenAtMsByAsset.delete(tokenKey);
         observations.push({
@@ -1231,7 +1252,7 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
     ctx.state.lastScanError = null;
     ctx.state.latestLoans = loanSnapshots;
 
-    await ctx.alerts.syncObservations(observations, nowMs);
+    await ctx.alerts.syncObservations(observations, nowMs, preserveKeys);
 
     const counts: Record<LoanRiskStatus, number> = {
       healthy: 0,

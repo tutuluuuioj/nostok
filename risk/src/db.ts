@@ -389,12 +389,47 @@ class ReadOnlyPostgresPool implements ReadOnlyDatabase {
   }
 }
 
+function getConfiguredStatementTimeoutMs(overrideMs?: number): number {
+  if (overrideMs !== undefined && Number.isInteger(overrideMs) && overrideMs > 0) {
+    return overrideMs;
+  }
+  const rawStmtTimeout = Number(process.env.PG_STATEMENT_TIMEOUT_MS ?? 5_000);
+  return Number.isInteger(rawStmtTimeout) && rawStmtTimeout > 0 ? rawStmtTimeout : 5_000;
+}
+
+async function runTxWithStatementTimeout<T extends QueryResultRow>(
+  execTx: (isTimedOut: () => boolean) => Promise<{ rows: T[] }>,
+  timeoutMs: number
+): Promise<{ rows: T[] }> {
+  let timedOut = false;
+  let timer: NodeJS.Timeout | undefined;
+  const txPromise = execTx(() => timedOut);
+  // Prevent unhandled rejection when timeoutPromise wins the race and txPromise rejects later
+  txPromise.catch(() => {});
+
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      reject(new Error(`Read-only query exceeded statement_timeout (${timeoutMs}ms)`));
+    }, timeoutMs);
+    timer.unref?.();
+  });
+
+  try {
+    return await Promise.race([txPromise, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 class ReadOnlyPGliteAdapter implements ReadOnlyDatabase {
   private readonly db: PGlite;
+  private readonly statementTimeout: number;
   private mutex: Promise<void> = Promise.resolve();
 
-  constructor(dataDir: string) {
+  constructor(dataDir: string, statementTimeoutMs?: number) {
     this.db = new PGlite(dataDir === 'memory://' ? undefined : dataDir);
+    this.statementTimeout = getConfiguredStatementTimeoutMs(statementTimeoutMs);
   }
 
   async query<T extends QueryResultRow = QueryResultRow>(
@@ -404,15 +439,21 @@ class ReadOnlyPGliteAdapter implements ReadOnlyDatabase {
     assertReadOnlySql(sql);
     const run = async (): Promise<{ rows: T[] }> => {
       await this.db.waitReady;
-      await this.db.query('BEGIN READ ONLY');
-      try {
-        const res = await this.db.query<T>(sql, params);
-        await this.db.query('COMMIT');
-        return { rows: res.rows };
-      } catch (err) {
-        await this.db.query('ROLLBACK').catch(() => {});
-        throw err;
-      }
+      return runTxWithStatementTimeout<T>(async (isTimedOut) => {
+        await this.db.query('BEGIN READ ONLY');
+        try {
+          await this.db.query(`SET LOCAL statement_timeout = ${this.statementTimeout}`);
+          const res = await this.db.query<T>(sql, params);
+          if (isTimedOut()) {
+            throw new Error(`Read-only query exceeded statement_timeout (${this.statementTimeout}ms)`);
+          }
+          await this.db.query('COMMIT');
+          return { rows: res.rows };
+        } catch (err) {
+          await this.db.query('ROLLBACK').catch(() => {});
+          throw err;
+        }
+      }, this.statementTimeout);
     };
     const next = this.mutex.then(run, run);
     this.mutex = next.then(
@@ -434,23 +475,32 @@ export function wrapQueryableAsReadOnly(
       params?: unknown[]
     ): Promise<{ rows: T[] }>;
     close?: () => Promise<void>;
-  }
+  },
+  opts?: { statementTimeoutMs?: number; skipSetLocalStatementTimeout?: boolean }
 ): ReadOnlyDatabase {
   let mutex: Promise<void> = Promise.resolve();
+  const statementTimeout = getConfiguredStatementTimeoutMs(opts?.statementTimeoutMs);
   return {
     async query<T extends QueryResultRow = QueryResultRow>(sql: string, params: unknown[] = []) {
       assertReadOnlySql(sql);
-      const run = async (): Promise<{ rows: T[] }> => {
-        await queryable.query('BEGIN READ ONLY');
-        try {
-          const res = await queryable.query<T>(sql, params);
-          await queryable.query('COMMIT');
-          return res;
-        } catch (err) {
-          await queryable.query('ROLLBACK').catch(() => {});
-          throw err;
-        }
-      };
+      const run = async (): Promise<{ rows: T[] }> =>
+        runTxWithStatementTimeout<T>(async (isTimedOut) => {
+          await queryable.query('BEGIN READ ONLY');
+          try {
+            if (!opts?.skipSetLocalStatementTimeout) {
+              await queryable.query(`SET LOCAL statement_timeout = ${statementTimeout}`);
+            }
+            const res = await queryable.query<T>(sql, params);
+            if (isTimedOut()) {
+              throw new Error(`Read-only query exceeded statement_timeout (${statementTimeout}ms)`);
+            }
+            await queryable.query('COMMIT');
+            return res;
+          } catch (err) {
+            await queryable.query('ROLLBACK').catch(() => {});
+            throw err;
+          }
+        }, statementTimeout);
       const next = mutex.then(run, run);
       mutex = next.then(
         () => {},
@@ -468,12 +518,13 @@ export function wrapQueryableAsReadOnly(
 
 export async function openReadOnlyDatabase(
   databaseUrl: string,
-  allowDegradedBoot = true
+  allowDegradedBoot = true,
+  opts?: { statementTimeoutMs?: number }
 ): Promise<{ db: ReadOnlyDatabase; bootError?: string }> {
   const isExternalPg = /^postgres(ql)?:\/\//i.test(databaseUrl);
   const db: ReadOnlyDatabase = isExternalPg
     ? new ReadOnlyPostgresPool(databaseUrl)
-    : new ReadOnlyPGliteAdapter(databaseUrl || 'memory://');
+    : new ReadOnlyPGliteAdapter(databaseUrl || 'memory://', opts?.statementTimeoutMs);
 
   try {
     await db.query('SELECT 1 AS ok');

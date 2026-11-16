@@ -25,7 +25,7 @@ import { loadConfig as loadIndexerConfig } from '../../indexer/src/config.js';
 import { createIndexerContext, runIndexerSync } from '../../indexer/src/indexer.js';
 import { AlertEngine, type RiskAlert } from '../src/alerts.js';
 import { loadRiskConfig } from '../src/config.js';
-import { assertReadOnlySql, wrapQueryableAsReadOnly } from '../src/db.js';
+import { assertReadOnlySql, openReadOnlyDatabase, wrapQueryableAsReadOnly } from '../src/db.js';
 import {
   type LoanRiskSnapshot,
   type RiskSummarySnapshot,
@@ -1033,6 +1033,25 @@ async function runTests(): Promise<void> {
           .some((a) => a.dedup_key === `escrow_mismatch:${nvdac.toLowerCase()}` && a.severity === 'critical')
       );
 
+      // While escrow_mismatch is already active, a transient failed escrow read ("unknown") MUST preserve it (Fix #9)
+      const preserveSnapId = await rpcCall<string>('evm_snapshot', []);
+      try {
+        await rpcCall('anvil_setCode', [deployed.collateralEscrow, '0xfe']);
+        t += 5_000;
+        const unknownWhileMismatchSummary = await runRiskScan(riskCtx, t);
+        assert.equal(unknownWhileMismatchSummary.assets[0].escrow_matches_open_loans, 'unknown');
+        assert.ok(
+          riskCtx.alerts
+            .getActiveAlerts()
+            .some(
+              (a) => a.dedup_key === `escrow_mismatch:${nvdac.toLowerCase()}` && a.severity === 'critical'
+            ),
+          'Active critical escrow_mismatch alert MUST be preserved when escrow read transiently returns unknown'
+        );
+      } finally {
+        await rpcCall('evm_revert', [preserveSnapId]);
+      }
+
       // Restore exact 10 NVDAc in escrow
       await publicClient.waitForTransactionReceipt({
         hash: await deployerClient.writeContract({
@@ -1636,6 +1655,34 @@ async function runTests(): Promise<void> {
         fs.rmSync(epgDir, { recursive: true, force: true });
       }
       console.log('PASS Scenario (i): Real PostgreSQL pg_terminate_backend & recovery verified.');
+
+      // Scenario (j): Read-only PGlite & wrapped queryable statement_timeout enforcement
+      const { db: pgliteRoDb } = await openReadOnlyDatabase('memory://', false, { statementTimeoutMs: 60 });
+      try {
+        const fastRes = await pgliteRoDb.query<{ one: number; st: string }>(
+          "SELECT 1 AS one, current_setting('statement_timeout') AS st"
+        );
+        assert.equal(fastRes.rows[0].one, 1);
+        assert.equal(fastRes.rows[0].st, '60ms', 'PGlite read-only TX must apply SET LOCAL statement_timeout');
+      } finally {
+        await pgliteRoDb.close();
+      }
+      const slowQueryable = {
+        async query<T extends Record<string, unknown>>(sql: string): Promise<{ rows: T[] }> {
+          if (sql.startsWith('BEGIN') || sql.startsWith('SET LOCAL') || sql === 'COMMIT' || sql === 'ROLLBACK') {
+            return { rows: [] };
+          }
+          await new Promise((r) => setTimeout(r, 250));
+          return { rows: [] };
+        },
+      };
+      const timedRo = wrapQueryableAsReadOnly(slowQueryable, { statementTimeoutMs: 40 });
+      await assert.rejects(
+        () => timedRo.query('SELECT * FROM assets'),
+        /statement_timeout/i,
+        'Read-only adapter must abort queries exceeding statement_timeout'
+      );
+      console.log('PASS Scenario (j): Read-only PGlite & adapter statement_timeout enforcement verified.');
 
       console.log('\nALL WS2.4 RISK MONITOR BASE MAINNET FORK INTEGRATION TESTS PASSED.');
     } finally {

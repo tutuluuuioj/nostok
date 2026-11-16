@@ -18,9 +18,11 @@ export interface NotificationsConfig {
   encryptionKeyId: string;
   encryptionKeys: Record<string, string>;
   unsubscribeSecret: string;
+  confirmSecret: string;
   sessionSecret: string;
   piiHashSecret: string;
   webhookSigningSecret: string;
+  adminSecret?: string;
   publicBaseUrl: string;
   smtpApiUrl?: string;
   smtpApiKey?: string;
@@ -30,9 +32,16 @@ export interface NotificationsConfig {
   pollIntervalMs: number;
   outboundTimeoutMs: number;
   maxDeliveryAttempts: number;
+  maxCriticalDeliveryAttempts: number;
   retryBaseMs: number;
+  sendingLeaseMs: number;
+  episodeClearDampingMs: number;
+  allowedWebhookPorts: number[];
   userRateLimitPerHour: number;
   maxSubscriptionsPerWallet: number;
+  maxVerifyAttempts: number;
+  confirmRateLimitMax: number;
+  confirmTargetPerHourMax: number;
   authNonceRateLimitMax: number;
   authVerifyRateLimitMax: number;
   subscriptionsRateLimitMax: number;
@@ -94,6 +103,19 @@ function parsePositiveInt(raw: string | undefined, fallback: number, name: strin
     throw new Error(`Invalid positive integer for ${name}: ${raw}`);
   }
   return num;
+}
+
+function parsePortList(raw: string | undefined, fallback: number[]): number[] {
+  if (!raw || raw.trim() === '') return fallback;
+  const ports = raw
+    .split(',')
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((p) => Number(p));
+  if (ports.length === 0 || ports.some((p) => !Number.isInteger(p) || p < 1 || p > 65_535)) {
+    throw new Error(`Invalid ALLOWED_WEBHOOK_PORTS: ${raw}`);
+  }
+  return Array.from(new Set(ports));
 }
 
 function parseNonNegativeInt(raw: string | undefined, fallback: number, name: string): number {
@@ -241,6 +263,10 @@ export function loadNotificationsConfig(
     overrides.unsubscribeSecret ?? process.env.UNSUBSCRIBE_SECRET,
     'UNSUBSCRIBE_SECRET'
   );
+  const confirmSecret = requireSecret(
+    overrides.confirmSecret ?? process.env.CONFIRM_SECRET,
+    'CONFIRM_SECRET'
+  );
   const sessionSecret = requireSecret(
     overrides.sessionSecret ?? process.env.SESSION_SECRET,
     'SESSION_SECRET'
@@ -253,13 +279,23 @@ export function loadNotificationsConfig(
     overrides.webhookSigningSecret ?? process.env.WEBHOOK_SIGNING_SECRET,
     'WEBHOOK_SIGNING_SECRET'
   );
+  const rawAdminSecret =
+    overrides.adminSecret !== undefined ? overrides.adminSecret : process.env.ADMIN_SECRET?.trim();
+  const adminSecret =
+    rawAdminSecret && rawAdminSecret.length > 0
+      ? assertSecretEntropy(rawAdminSecret, 'ADMIN_SECRET', { minLen: 24, minUnique: 8, minEntropyBits: 2.8 })
+      : undefined;
 
   const secretCheckMap: Record<string, string> = {
     UNSUBSCRIBE_SECRET: unsubscribeSecret,
+    CONFIRM_SECRET: confirmSecret,
     SESSION_SECRET: sessionSecret,
     PII_HASH_SECRET: piiHashSecret,
     WEBHOOK_SIGNING_SECRET: webhookSigningSecret,
   };
+  if (adminSecret) {
+    secretCheckMap.ADMIN_SECRET = adminSecret;
+  }
   for (const [kId, kVal] of Object.entries(encryptionKeys)) {
     secretCheckMap[`ENCRYPTION_KEYS[${kId}]`] = kVal;
   }
@@ -269,6 +305,17 @@ export function loadNotificationsConfig(
     overrides.corsOrigins !== undefined
       ? parseCorsOrigins(overrides.corsOrigins.join(','), isFork)
       : parseCorsOrigins(process.env.CORS_ORIGINS, isFork);
+
+  const allowedWebhookPortsRaw = overrides.allowedWebhookPorts ?? parsePortList(process.env.ALLOWED_WEBHOOK_PORTS, [443]);
+  const maxDeliveryAttempts =
+    overrides.maxDeliveryAttempts ??
+    parsePositiveInt(process.env.MAX_DELIVERY_ATTEMPTS, 3, 'MAX_DELIVERY_ATTEMPTS');
+  const maxCriticalDeliveryAttempts =
+    overrides.maxCriticalDeliveryAttempts ??
+    parsePositiveInt(process.env.MAX_CRITICAL_DELIVERY_ATTEMPTS, 6, 'MAX_CRITICAL_DELIVERY_ATTEMPTS');
+  if (maxCriticalDeliveryAttempts < 6) {
+    throw new Error('MAX_CRITICAL_DELIVERY_ATTEMPTS must be at least 6');
+  }
 
   return {
     port,
@@ -290,9 +337,11 @@ export function loadNotificationsConfig(
     encryptionKeyId,
     encryptionKeys,
     unsubscribeSecret,
+    confirmSecret,
     sessionSecret,
     piiHashSecret,
     webhookSigningSecret,
+    adminSecret,
     publicBaseUrl,
     smtpApiUrl,
     smtpApiKey: overrides.smtpApiKey ?? process.env.SMTP_API_KEY?.trim(),
@@ -304,17 +353,29 @@ export function loadNotificationsConfig(
     outboundTimeoutMs:
       overrides.outboundTimeoutMs ??
       parsePositiveInt(process.env.OUTBOUND_TIMEOUT_MS, 5_000, 'OUTBOUND_TIMEOUT_MS'),
-    maxDeliveryAttempts:
-      overrides.maxDeliveryAttempts ??
-      parsePositiveInt(process.env.MAX_DELIVERY_ATTEMPTS, 3, 'MAX_DELIVERY_ATTEMPTS'),
+    maxDeliveryAttempts,
+    maxCriticalDeliveryAttempts,
     retryBaseMs:
-      overrides.retryBaseMs ?? parsePositiveInt(process.env.RETRY_BASE_MS, 1_000, 'RETRY_BASE_MS'),
+      overrides.retryBaseMs ?? parsePositiveInt(process.env.RETRY_BASE_MS, 60_000, 'RETRY_BASE_MS'),
+    sendingLeaseMs:
+      overrides.sendingLeaseMs ?? parsePositiveInt(process.env.SENDING_LEASE_MS, 120_000, 'SENDING_LEASE_MS'),
+    episodeClearDampingMs:
+      overrides.episodeClearDampingMs ??
+      parseNonNegativeInt(process.env.EPISODE_CLEAR_DAMPING_MS, 120_000, 'EPISODE_CLEAR_DAMPING_MS'),
+    allowedWebhookPorts: allowedWebhookPortsRaw,
     userRateLimitPerHour:
       overrides.userRateLimitPerHour ??
       parsePositiveInt(process.env.USER_RATE_LIMIT_PER_HOUR, 30, 'USER_RATE_LIMIT_PER_HOUR'),
     maxSubscriptionsPerWallet:
       overrides.maxSubscriptionsPerWallet ??
       parsePositiveInt(process.env.MAX_SUBSCRIPTIONS_PER_WALLET, 5, 'MAX_SUBSCRIPTIONS_PER_WALLET'),
+    maxVerifyAttempts:
+      overrides.maxVerifyAttempts ?? parsePositiveInt(process.env.MAX_VERIFY_ATTEMPTS, 5, 'MAX_VERIFY_ATTEMPTS'),
+    confirmRateLimitMax:
+      overrides.confirmRateLimitMax ?? parsePositiveInt(process.env.CONFIRM_RATE_LIMIT_MAX, 10, 'CONFIRM_RATE_LIMIT_MAX'),
+    confirmTargetPerHourMax:
+      overrides.confirmTargetPerHourMax ??
+      parsePositiveInt(process.env.CONFIRM_TARGET_PER_HOUR_MAX, 3, 'CONFIRM_TARGET_PER_HOUR_MAX'),
     authNonceRateLimitMax:
       overrides.authNonceRateLimitMax ??
       parsePositiveInt(process.env.AUTH_NONCE_RATE_LIMIT_MAX, 20, 'AUTH_NONCE_RATE_LIMIT_MAX'),

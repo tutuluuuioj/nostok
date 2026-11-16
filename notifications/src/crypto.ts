@@ -123,6 +123,13 @@ export class PiiCipher {
       .update(`${wallet.toLowerCase()}|${channel}|${normalizedTarget}`)
       .digest('hex');
   }
+
+  computeGlobalTargetHash(channel: string, normalizedTarget: string): string {
+    return crypto
+      .createHmac('sha256', this.hashKey)
+      .update(`global|${channel}|${normalizedTarget}`)
+      .digest('hex');
+  }
 }
 
 export function maskTarget(channel: 'email' | 'telegram' | 'webhook', plaintext: string): string {
@@ -268,8 +275,16 @@ interface ConfirmSubPayload {
   exp: number;
 }
 
-export function hashVerificationCode(code: string): string {
-  return crypto.createHash('sha256').update(code.trim(), 'utf8').digest('hex');
+export function hashVerificationCode(
+  confirmSecret: string,
+  subId: string,
+  wallet: string,
+  code: string
+): string {
+  return crypto
+    .createHmac('sha256', confirmSecret)
+    .update(`${wallet.toLowerCase()}|${subId}|${code.trim()}`, 'utf8')
+    .digest('hex');
 }
 
 export function signConfirmSubscriptionToken(

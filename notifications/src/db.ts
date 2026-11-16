@@ -660,6 +660,38 @@ class NotifPGliteAdapter implements NotifDatabase {
   }
 }
 
+function getConfiguredStatementTimeoutMs(overrideMs?: number): number {
+  if (overrideMs !== undefined && Number.isInteger(overrideMs) && overrideMs > 0) {
+    return overrideMs;
+  }
+  const rawStmtTimeout = Number(process.env.PG_STATEMENT_TIMEOUT_MS ?? 5_000);
+  return Number.isInteger(rawStmtTimeout) && rawStmtTimeout > 0 ? rawStmtTimeout : 5_000;
+}
+
+async function runTxWithStatementTimeout<T extends QueryResultRow>(
+  execTx: (isTimedOut: () => boolean) => Promise<{ rows: T[] }>,
+  timeoutMs: number
+): Promise<{ rows: T[] }> {
+  let timedOut = false;
+  let timer: NodeJS.Timeout | undefined;
+  const txPromise = execTx(() => timedOut);
+  txPromise.catch(() => {});
+
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      reject(new Error(`Read-only query exceeded statement_timeout (${timeoutMs}ms)`));
+    }, timeoutMs);
+    timer.unref?.();
+  });
+
+  try {
+    return await Promise.race([txPromise, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export function wrapIndexerQueryableAsReadOnly(
   queryable: {
     query<T extends QueryResultRow = QueryResultRow>(
@@ -667,23 +699,32 @@ export function wrapIndexerQueryableAsReadOnly(
       params?: unknown[]
     ): Promise<{ rows: T[] }>;
     close?: () => Promise<void>;
-  }
+  },
+  opts?: { statementTimeoutMs?: number; skipSetLocalStatementTimeout?: boolean }
 ): ReadOnlyIndexerDatabase {
   let mutex: Promise<void> = Promise.resolve();
+  const statementTimeout = getConfiguredStatementTimeoutMs(opts?.statementTimeoutMs);
   return {
     async query<T extends QueryResultRow = QueryResultRow>(sql: string, params: unknown[] = []) {
       assertReadOnlySql(sql);
-      const run = async (): Promise<{ rows: T[] }> => {
-        await queryable.query('BEGIN READ ONLY');
-        try {
-          const res = await queryable.query<T>(sql, params);
-          await queryable.query('COMMIT');
-          return res;
-        } catch (err) {
-          await queryable.query('ROLLBACK').catch(() => {});
-          throw err;
-        }
-      };
+      const run = async (): Promise<{ rows: T[] }> =>
+        runTxWithStatementTimeout<T>(async (isTimedOut) => {
+          await queryable.query('BEGIN READ ONLY');
+          try {
+            if (!opts?.skipSetLocalStatementTimeout) {
+              await queryable.query(`SET LOCAL statement_timeout = ${statementTimeout}`);
+            }
+            const res = await queryable.query<T>(sql, params);
+            if (isTimedOut()) {
+              throw new Error(`Read-only query exceeded statement_timeout (${statementTimeout}ms)`);
+            }
+            await queryable.query('COMMIT');
+            return res;
+          } catch (err) {
+            await queryable.query('ROLLBACK').catch(() => {});
+            throw err;
+          }
+        }, statementTimeout);
       const next = mutex.then(run, run);
       mutex = next.then(
         () => {},
@@ -697,7 +738,10 @@ export function wrapIndexerQueryableAsReadOnly(
   };
 }
 
-export async function openReadOnlyIndexerDatabase(databaseUrl: string): Promise<ReadOnlyIndexerDatabase> {
+export async function openReadOnlyIndexerDatabase(
+  databaseUrl: string,
+  opts?: { statementTimeoutMs?: number }
+): Promise<ReadOnlyIndexerDatabase> {
   if (/^postgres(ql)?:\/\//i.test(databaseUrl)) {
     const db = new ReadOnlyPostgresPool(databaseUrl);
     await db.query('SELECT 1 AS ok');
@@ -705,10 +749,13 @@ export async function openReadOnlyIndexerDatabase(databaseUrl: string): Promise<
   }
   const pg = new PGlite(databaseUrl === 'memory://' ? undefined : databaseUrl);
   await pg.waitReady;
-  return wrapIndexerQueryableAsReadOnly({
-    query: (sql, params) => pg.query(sql, params),
-    close: () => pg.close(),
-  });
+  return wrapIndexerQueryableAsReadOnly(
+    {
+      query: (sql, params) => pg.query(sql, params),
+      close: () => pg.close(),
+    },
+    opts
+  );
 }
 
 export async function openNotifDatabase(databaseUrl: string): Promise<NotifDatabase> {
@@ -742,6 +789,7 @@ export async function initNotifSchema(db: NotifDatabase): Promise<void> {
       verified BOOLEAN NOT NULL DEFAULT FALSE,
       verify_code_hash TEXT,
       verify_expires_at BIGINT,
+      verify_attempts INT NOT NULL DEFAULT 0,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE (wallet, channel, target_hash)
@@ -749,6 +797,7 @@ export async function initNotifSchema(db: NotifDatabase): Promise<void> {
     ALTER TABLE notif_subscriptions ADD COLUMN IF NOT EXISTS verified BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE notif_subscriptions ADD COLUMN IF NOT EXISTS verify_code_hash TEXT;
     ALTER TABLE notif_subscriptions ADD COLUMN IF NOT EXISTS verify_expires_at BIGINT;
+    ALTER TABLE notif_subscriptions ADD COLUMN IF NOT EXISTS verify_attempts INT NOT NULL DEFAULT 0;
     CREATE INDEX IF NOT EXISTS idx_notif_subs_wallet ON notif_subscriptions (wallet);
 
     CREATE TABLE IF NOT EXISTS notif_preferences (
@@ -775,10 +824,14 @@ export async function initNotifSchema(db: NotifDatabase): Promise<void> {
       attempts INT NOT NULL DEFAULT 0,
       next_attempt_at BIGINT NOT NULL,
       last_error TEXT,
+      claimed_at BIGINT,
+      lease_until BIGINT,
       created_at BIGINT NOT NULL,
       sent_at BIGINT,
       UNIQUE (subscription_id, dedup_key)
     );
+    ALTER TABLE notif_deliveries ADD COLUMN IF NOT EXISTS claimed_at BIGINT;
+    ALTER TABLE notif_deliveries ADD COLUMN IF NOT EXISTS lease_until BIGINT;
     CREATE INDEX IF NOT EXISTS idx_notif_deliv_wallet ON notif_deliveries (wallet);
     CREATE INDEX IF NOT EXISTS idx_notif_deliv_status ON notif_deliveries (status, next_attempt_at);
 
@@ -808,8 +861,10 @@ export async function initNotifSchema(db: NotifDatabase): Promise<void> {
       active BOOLEAN NOT NULL DEFAULT FALSE,
       episode INT NOT NULL DEFAULT 0,
       last_value_bps INT,
+      clear_since BIGINT,
       updated_at BIGINT NOT NULL
     );
+    ALTER TABLE notif_alert_episodes ADD COLUMN IF NOT EXISTS clear_since BIGINT;
 
     CREATE TABLE IF NOT EXISTS notif_revoked_sessions (
       jti TEXT PRIMARY KEY,

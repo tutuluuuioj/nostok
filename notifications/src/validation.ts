@@ -7,6 +7,7 @@ export const ALL_ALERT_TYPES = [
   'liquidation_started',
   'auction_bid',
   'auction_settled',
+  'auction_cancelled',
   'maturity_reminder_3d',
   'maturity_reminder_1d',
   'maturity_reminder_6h',
@@ -110,3 +111,10 @@ export function buildPaginationSchema(maxLimit: number) {
       offset: val.offset ?? (val.cursor !== undefined ? Number(val.cursor) : 0),
     }));
 }
+
+export const redriveDeadLettersSchema = z.object({
+  dead_letter_ids: z.array(z.string().trim().min(4).max(128)).max(100).optional(),
+  delivery_ids: z.array(z.string().trim().min(4).max(128)).max(100).optional(),
+  wallet: checksumAddressSchema.optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+});

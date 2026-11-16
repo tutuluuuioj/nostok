@@ -33,8 +33,13 @@ export interface WebhookHttpRequestOpts {
   headers: Record<string, string>;
   body: string;
   timeoutMs: number;
+  maxResponseBytes?: number;
   redirect: 'manual';
+  /** Internal/testing override for custom HTTP transport simulation */
+  _requestImpl?: typeof https.request;
 }
+
+export const MAX_WEBHOOK_RESPONSE_BYTES = 16_384;
 
 export type WebhookHttpRequester = (
   opts: WebhookHttpRequestOpts
@@ -58,6 +63,7 @@ export function isBlockedIpv4(ip: string): boolean {
   if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local & cloud metadata 169.254.169.254
   if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 RFC1918
   if (a === 192 && b === 0 && (c === 0 || c === 2)) return true; // IETF protocol / TEST-NET-1
+  if (a === 192 && b === 88 && c === 99) return true; // 192.88.99.0/24 6to4 relay anycast
   if (a === 192 && b === 168) return true; // 192.168.0.0/16 RFC1918
   if (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) return true; // benchmarking / TEST-NET-2
   if (a === 203 && b === 0 && c === 113) return true; // TEST-NET-3
@@ -109,7 +115,11 @@ function assertCleanWebhookRawHost(rawTarget: string): void {
   }
 }
 
-export function validateChannelTarget(channel: NotificationChannel, rawTarget: string): string {
+export function validateChannelTarget(
+  channel: NotificationChannel,
+  rawTarget: string,
+  allowedWebhookPorts: number[] = [443]
+): string {
   const target = rawTarget.trim();
   if (channel === 'email') {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(target) || target.length > 254) {
@@ -154,14 +164,19 @@ export function validateChannelTarget(channel: NotificationChannel, rawTarget: s
   if (net.isIP(host) === 4 && isBlockedIpv4(host)) {
     throw new Error('Webhook IP address is blocked (private, loopback, link-local, or metadata)');
   }
+  const port = u.port ? Number(u.port) : 443;
+  if (!Number.isInteger(port) || !allowedWebhookPorts.includes(port)) {
+    throw new Error(`Webhook port ${port} is not allowed (permitted: ${allowedWebhookPorts.join(', ')})`);
+  }
   return u.toString();
 }
 
 export async function resolveAndValidateWebhookTarget(
   rawTarget: string,
-  dnsLookup: DnsLookupFn = defaultDnsLookup
+  dnsLookup: DnsLookupFn = defaultDnsLookup,
+  allowedWebhookPorts: number[] = [443]
 ): Promise<{ url: URL; pinnedIp: string }> {
-  const normalized = validateChannelTarget('webhook', rawTarget);
+  const normalized = validateChannelTarget('webhook', rawTarget, allowedWebhookPorts);
   const url = new URL(normalized);
   if (net.isIP(url.hostname) === 4) {
     if (isBlockedIpv4(url.hostname)) {
@@ -171,30 +186,53 @@ export async function resolveAndValidateWebhookTarget(
   }
 
   const records = await dnsLookup(url.hostname);
-  if (!records || records.length === 0) {
-    throw new Error('Webhook DNS lookup returned no addresses');
+  // Dual-stack hosts publish both A (family 4) and AAAA (family 6) records; ignore AAAA and pin IPv4 only.
+  const ipv4Records = (records ?? []).filter((rec) => rec.family === 4);
+  if (ipv4Records.length === 0) {
+    throw new Error('Webhook DNS lookup returned no IPv4 addresses');
   }
-  for (const rec of records) {
-    if (rec.family !== 4 || net.isIP(rec.address) !== 4) {
-      throw new Error('Webhook DNS resolved to blocked IPv6/non-IPv4 address');
-    }
-    if (isBlockedIpv4(rec.address)) {
+  for (const rec of ipv4Records) {
+    if (net.isIP(rec.address) !== 4 || isBlockedIpv4(rec.address)) {
       throw new Error('Webhook DNS resolved to blocked private, loopback, link-local, or metadata IPv4 address');
     }
   }
-  return { url, pinnedIp: records[0].address };
+  return { url, pinnedIp: ipv4Records[0].address };
 }
 
-async function defaultWebhookRequester(opts: WebhookHttpRequestOpts): Promise<{ status: number }> {
+export async function defaultWebhookRequester(
+  opts: WebhookHttpRequestOpts
+): Promise<{ status: number }> {
+  const requestImpl = opts._requestImpl ?? https.request;
+  const maxResponseBytes = opts.maxResponseBytes ?? MAX_WEBHOOK_RESPONSE_BYTES;
   return new Promise<{ status: number }>((resolve, reject) => {
-    const req = https.request(
+    let settled = false;
+    let req: ReturnType<typeof https.request> | null = null;
+    const finish = (err: Error | null, status?: number) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadlineTimer);
+      if (err) reject(err);
+      else resolve({ status: status ?? 0 });
+    };
+
+    const deadlineTimer = setTimeout(() => {
+      const err = new Error(`Webhook request exceeded overall deadline (${opts.timeoutMs}ms)`);
+      if (req && !req.destroyed) {
+        req.destroy(err);
+      }
+      finish(err);
+    }, opts.timeoutMs);
+    deadlineTimer.unref?.();
+
+    const targetPort = opts.url.port ? Number(opts.url.port) : opts._requestImpl ? 80 : 443;
+    req = requestImpl(
       {
-        protocol: 'https:',
+        protocol: opts._requestImpl ? opts.url.protocol : 'https:',
         hostname: opts.url.hostname,
-        port: opts.url.port ? Number(opts.url.port) : 443,
+        port: targetPort,
         path: `${opts.url.pathname}${opts.url.search}`,
         method: 'POST',
-        servername: opts.url.hostname,
+        servername: opts._requestImpl ? undefined : opts.url.hostname,
         lookup: (_hostname, lookupOpts, cb) => {
           if (lookupOpts && (lookupOpts as { all?: boolean }).all) {
             cb(null, [{ address: opts.pinnedIp, family: 4 }]);
@@ -209,19 +247,50 @@ async function defaultWebhookRequester(opts: WebhookHttpRequestOpts): Promise<{ 
         timeout: opts.timeoutMs,
       },
       (res) => {
-        res.resume();
+        let receivedBytes = 0;
+        res.on('data', (chunk: Buffer | string) => {
+          receivedBytes += typeof chunk === 'string' ? Buffer.byteLength(chunk, 'utf8') : chunk.length;
+          if (receivedBytes > maxResponseBytes) {
+            const err = new Error(`Webhook response exceeded ${maxResponseBytes} bytes`);
+            res.destroy(err);
+            req?.destroy(err);
+            finish(err);
+          }
+        });
+        res.on('error', (err) => {
+          finish(err instanceof Error ? err : new Error(String(err)));
+        });
         res.on('end', () => {
-          resolve({ status: res.statusCode ?? 0 });
+          finish(null, res.statusCode ?? 0);
         });
       }
     );
     req.on('timeout', () => {
-      req.destroy(new Error('Webhook request timed out'));
+      const err = new Error('Webhook request socket timed out');
+      req?.destroy(err);
+      finish(err);
     });
-    req.on('error', reject);
+    req.on('error', (err) => {
+      finish(err instanceof Error ? err : new Error(String(err)));
+    });
     req.write(opts.body, 'utf8');
     req.end();
   });
+}
+
+async function runWithOverallDeadline<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label} exceeded overall deadline (${timeoutMs}ms)`));
+    }, timeoutMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export function createDefaultTransports(cfg: {
@@ -232,11 +301,13 @@ export function createDefaultTransports(cfg: {
   telegramApiBase: string;
   outboundTimeoutMs: number;
   webhookSigningSecret: string;
+  allowedWebhookPorts?: number[];
   dnsLookup?: DnsLookupFn;
   webhookRequester?: WebhookHttpRequester;
 }): ChannelTransports {
   const dnsLookup = cfg.dnsLookup ?? defaultDnsLookup;
   const requester = cfg.webhookRequester ?? defaultWebhookRequester;
+  const allowedWebhookPorts = cfg.allowedWebhookPorts ?? [443];
 
   return {
     async sendEmail(msg) {
@@ -247,19 +318,24 @@ export function createDefaultTransports(cfg: {
       if (cfg.smtpApiKey) {
         headers.Authorization = `Bearer ${cfg.smtpApiKey}`;
       }
-      const res = await fetch(cfg.smtpApiUrl, {
-        method: 'POST',
-        redirect: 'manual',
-        headers,
-        body: JSON.stringify({
-          from: cfg.emailFrom,
-          to: msg.target,
-          subject: `[NOSTOK] ${msg.title}`,
-          text: `${msg.message}\n\nUnsubscribe: ${msg.unsubscribeUrl}`,
-          headers: { 'List-Unsubscribe': `<${msg.unsubscribeUrl}>` },
+      const res = await runWithOverallDeadline(
+        fetch(cfg.smtpApiUrl, {
+          method: 'POST',
+          redirect: 'manual',
+          headers,
+          body: JSON.stringify({
+            from: cfg.emailFrom,
+            to: msg.target,
+            subject: `[NOSTOK] ${msg.title}`,
+            text: `${msg.message}\n\nUnsubscribe: ${msg.unsubscribeUrl}`,
+            headers: { 'List-Unsubscribe': `<${msg.unsubscribeUrl}>` },
+          }),
+          signal: AbortSignal.timeout(cfg.outboundTimeoutMs),
         }),
-        signal: AbortSignal.timeout(cfg.outboundTimeoutMs),
-      });
+        cfg.outboundTimeoutMs,
+        'Email transport'
+      );
+      await res.body?.cancel().catch(() => {});
       if (res.status >= 300 && res.status < 400) {
         throw new Error('Email transport redirect blocked');
       }
@@ -273,17 +349,22 @@ export function createDefaultTransports(cfg: {
         throw new Error('TELEGRAM_BOT_TOKEN not configured for telegram channel');
       }
       const url = `${cfg.telegramApiBase}/bot${cfg.telegramBotToken}/sendMessage`;
-      const res = await fetch(url, {
-        method: 'POST',
-        redirect: 'manual',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: msg.target,
-          text: `*NOSTOK Alert (${msg.severity.toUpperCase()})*\n${msg.title}\n${msg.message}\n\nUnsubscribe: ${msg.unsubscribeUrl}`,
-          disable_web_page_preview: true,
+      const res = await runWithOverallDeadline(
+        fetch(url, {
+          method: 'POST',
+          redirect: 'manual',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: msg.target,
+            text: `*NOSTOK Alert (${msg.severity.toUpperCase()})*\n${msg.title}\n${msg.message}\n\nUnsubscribe: ${msg.unsubscribeUrl}`,
+            disable_web_page_preview: true,
+          }),
+          signal: AbortSignal.timeout(cfg.outboundTimeoutMs),
         }),
-        signal: AbortSignal.timeout(cfg.outboundTimeoutMs),
-      });
+        cfg.outboundTimeoutMs,
+        'Telegram transport'
+      );
+      await res.body?.cancel().catch(() => {});
       if (res.status >= 300 && res.status < 400) {
         throw new Error('Telegram transport redirect blocked');
       }
@@ -293,7 +374,11 @@ export function createDefaultTransports(cfg: {
     },
 
     async sendWebhook(msg) {
-      const { url, pinnedIp } = await resolveAndValidateWebhookTarget(msg.target, dnsLookup);
+      const { url, pinnedIp } = await resolveAndValidateWebhookTarget(
+        msg.target,
+        dnsLookup,
+        allowedWebhookPorts
+      );
       const rawBody = JSON.stringify({
         event: msg.alertType,
         severity: msg.severity,
@@ -306,19 +391,24 @@ export function createDefaultTransports(cfg: {
       const tsSec = msg.timestampSec ?? Math.floor(Date.now() / 1000);
       const sig = signWebhookPayload(cfg.webhookSigningSecret, tsSec, rawBody);
 
-      const res = await requester({
-        url,
-        pinnedIp,
-        headers: {
-          'Content-Type': 'application/json',
-          Host: url.host,
-          'X-Nostok-Timestamp': sig.timestampHeader,
-          'X-Nostok-Signature': sig.signatureHeader,
-        },
-        body: rawBody,
-        timeoutMs: cfg.outboundTimeoutMs,
-        redirect: 'manual',
-      });
+      const res = await runWithOverallDeadline(
+        requester({
+          url,
+          pinnedIp,
+          headers: {
+            'Content-Type': 'application/json',
+            Host: url.host,
+            'X-Nostok-Timestamp': sig.timestampHeader,
+            'X-Nostok-Signature': sig.signatureHeader,
+          },
+          body: rawBody,
+          timeoutMs: cfg.outboundTimeoutMs,
+          maxResponseBytes: MAX_WEBHOOK_RESPONSE_BYTES,
+          redirect: 'manual',
+        }),
+        cfg.outboundTimeoutMs + 250,
+        'Webhook transport'
+      );
       if (res.status >= 300 && res.status < 400) {
         throw new Error('Webhook redirect blocked');
       }

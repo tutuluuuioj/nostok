@@ -34,20 +34,27 @@ import {
   type NotificationOutboundMessage,
   type WebhookHttpRequestOpts,
   createDefaultTransports,
+  defaultWebhookRequester,
   resolveAndValidateWebhookTarget,
   validateChannelTarget,
 } from '../src/channels.js';
 import { loadNotificationsConfig } from '../src/config.js';
 import {
   PiiCipher,
+  signConfirmSubscriptionToken,
   verifyWebhookPayloadSignature,
 } from '../src/crypto.js';
 import {
   assertNotifTableSql,
   assertReadOnlySql,
+  openReadOnlyIndexerDatabase,
   wrapIndexerQueryableAsReadOnly,
 } from '../src/db.js';
-import { createNotificationsContext, runNotificationsCycle } from '../src/engine.js';
+import {
+  createNotificationsContext,
+  processDeliveryQueue,
+  runNotificationsCycle,
+} from '../src/engine.js';
 import { createNotificationsServer } from '../src/server.js';
 import { formatSiweMessage } from '../src/siwe.js';
 
@@ -574,15 +581,23 @@ async function runTests(): Promise<void> {
       if (lower === 'rebind-ipv6.example') {
         return [{ address: '::1', family: 6 }];
       }
+      if (lower === 'dualstack.nostok-test.example') {
+        return [
+          { address: '2606:4700:4700::1111', family: 6 },
+          { address: '93.184.216.34', family: 4 },
+        ];
+      }
       return [{ address: '93.184.216.35', family: 4 }];
     };
 
     const key1 = crypto.randomBytes(32).toString('hex');
     const key2 = crypto.randomBytes(32).toString('hex');
     const unsubSecret = crypto.randomBytes(32).toString('hex');
+    const confirmSecret = crypto.randomBytes(32).toString('hex');
     const sessionSecret = crypto.randomBytes(32).toString('hex');
     const piiHashSecret = crypto.randomBytes(32).toString('hex');
     const webhookSigningSecret = crypto.randomBytes(32).toString('hex');
+    const adminSecret = crypto.randomBytes(32).toString('hex');
 
     const notifCfg = loadNotificationsConfig({
       rpcUrl: LOCAL_RPC_URL,
@@ -596,15 +611,24 @@ async function runTests(): Promise<void> {
       encryptionKeyId: 'k1',
       encryptionKeys: { k1: key1, k2: key2 },
       unsubscribeSecret: unsubSecret,
+      confirmSecret,
       sessionSecret,
       piiHashSecret,
       webhookSigningSecret,
+      adminSecret,
       publicBaseUrl: 'http://127.0.0.1:3003',
       corsOrigins: ['https://app.nostok.xyz'],
       maxDeliveryAttempts: 3,
+      maxCriticalDeliveryAttempts: 6,
       retryBaseMs: 100,
+      sendingLeaseMs: 120_000,
+      episodeClearDampingMs: 30_000,
+      allowedWebhookPorts: [443],
       userRateLimitPerHour: 200,
       maxSubscriptionsPerWallet: 5,
+      maxVerifyAttempts: 5,
+      confirmRateLimitMax: 20,
+      confirmTargetPerHourMax: 3,
       authNonceRateLimitMax: 100,
       authVerifyRateLimitMax: 100,
       subscriptionsRateLimitMax: 100,
@@ -743,6 +767,22 @@ async function runTests(): Promise<void> {
             sessionSecret: notifCfg.unsubscribeSecret,
           }),
         /distinct/i
+      );
+      assert.throws(
+        () =>
+          loadNotificationsConfig({
+            ...notifCfg,
+            confirmSecret: notifCfg.unsubscribeSecret,
+          }),
+        /distinct/i
+      );
+      assert.throws(
+        () =>
+          loadNotificationsConfig({
+            ...notifCfg,
+            maxCriticalDeliveryAttempts: 3,
+          }),
+        /at least 6/i
       );
 
       assert.throws(() => assertReadOnlySql('DELETE FROM loans'), /SELECT/i);
@@ -2023,10 +2063,10 @@ async function runTests(): Promise<void> {
       );
       assert.equal(corruptDlv.rows[0].status, 'dead_letter');
       assert.equal(corruptDlv.rows[0].last_error, 'delivery failed');
-      dlqTime += 5_000;
-      await runNotificationsCycle(notifCtx, dlqTime); // attempt 2 -> retry
-      dlqTime += 10_000;
-      await runNotificationsCycle(notifCtx, dlqTime); // attempt 3 -> dead_letter!
+      dlqTime += 35_000;
+      await runNotificationsCycle(notifCtx, dlqTime); // attempt 2 (after 30s cooldown) -> retry
+      dlqTime += 35_000;
+      await runNotificationsCycle(notifCtx, dlqTime); // attempt 3 (after 30s cooldown) -> dead_letter!
       forceFailEmail = false;
 
       const dlqRes = await httpJson<{
@@ -2144,6 +2184,769 @@ async function runTests(): Promise<void> {
       assert.equal(hugeRes.body.error.code, 'PAYLOAD_TOO_LARGE');
 
       console.log('PASS TEST 5: Quiet hours re-queue, critical bypass, decrypt catch, circuit breaker, generic DLQ, POST unsub, & DELETE /user/data verified.');
+
+      // -----------------------------------------------------------------------
+      // TEST 6: Phase 2 Security & Reliability Hardening Suite
+      // -----------------------------------------------------------------------
+      console.log('\n=== TEST 6: Hardening tests (slow-drip/timeout, outage retry/redrive, lease reclaim, brute-force, cap drain, email bombing, login DoS, dual-stack DNS, AuctionCancelled, damping, statement_timeout) ===');
+
+      // 6.1 Slow-drip HTTP server + response size cap + never-resolving Promise.race in queue
+      const slowDripServer = http.createServer((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.write('partial-1');
+        const iv = setInterval(() => {
+          if (!res.destroyed) {
+            res.write('.');
+          }
+        }, 50);
+        iv.unref?.();
+        res.on('close', () => clearInterval(iv));
+      });
+      await new Promise<void>((r) => slowDripServer.listen(0, '127.0.0.1', r));
+      const slowPort = (slowDripServer.address() as net.AddressInfo).port;
+
+      const bigBodyServer = http.createServer((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('X'.repeat(8192));
+      });
+      await new Promise<void>((r) => bigBodyServer.listen(0, '127.0.0.1', r));
+      const bigPort = (bigBodyServer.address() as net.AddressInfo).port;
+
+      try {
+        const tSlow0 = Date.now();
+        await assert.rejects(
+          () =>
+            defaultWebhookRequester({
+              url: new URL(`http://127.0.0.1:${slowPort}/slow`),
+              pinnedIp: '127.0.0.1',
+              headers: { 'Content-Type': 'application/json' },
+              body: '{}',
+              timeoutMs: 250,
+              redirect: 'manual',
+              _requestImpl: http.request,
+            }),
+          /deadline|timed out/i,
+          'Slow-drip webhook must reject on overall wall-clock deadline despite active socket drips'
+        );
+        assert.ok(Date.now() - tSlow0 < 1_000, 'Overall webhook deadline must abort promptly');
+
+        await assert.rejects(
+          () =>
+            defaultWebhookRequester({
+              url: new URL(`http://127.0.0.1:${bigPort}/big`),
+              pinnedIp: '127.0.0.1',
+              headers: { 'Content-Type': 'application/json' },
+              body: '{}',
+              timeoutMs: 2_000,
+              maxResponseBytes: 1024,
+              redirect: 'manual',
+              _requestImpl: http.request,
+            }),
+          /exceeded 1024 bytes/i,
+          'Oversized webhook response body must be rejected'
+        );
+      } finally {
+        await new Promise<void>((r) => slowDripServer.close(() => r()));
+        await new Promise<void>((r) => bigBodyServer.close(() => r()));
+      }
+
+      // Never-resolving transport inside processDeliveryQueue must time out via Promise.race and move to retry
+      const hangKey = generatePrivateKey();
+      const hangWallet = privateKeyToAccount(hangKey).address.toLowerCase();
+      const hangCipherHook = notifCtx.cipher.encrypt('https://hooks.nostok-test.example/hang');
+      const hangCipherEmail = notifCtx.cipher.encrypt('hang@nostok.xyz');
+      await notifCtx.notifDb.query(
+        `INSERT INTO notif_subscriptions (id, wallet, channel, target_ciphertext, key_id, target_hash, enabled, verified)
+         VALUES
+           ('sub_hang_hook', $1, 'webhook', $2, $3, 'hang_h_1', TRUE, TRUE),
+           ('sub_hang_ok_mail', $1, 'email', $4, $5, 'hang_e_1', TRUE, TRUE)`,
+        [hangWallet, hangCipherHook.ciphertext, hangCipherHook.keyId, hangCipherEmail.ciphertext, hangCipherEmail.keyId]
+      );
+      const tHang = Date.now() + 100_000_000;
+      await notifCtx.notifDb.query(
+        `INSERT INTO notif_deliveries (
+           id, wallet, subscription_id, channel, alert_type, severity, dedup_key,
+           title, message, payload_json, status, attempts, next_attempt_at, created_at
+         ) VALUES
+           ('dlv_never_resolves', $1, 'sub_hang_hook', 'webhook', 'loan_repaid', 'info', 'hang_k_1',
+            'hang', 'hang', '{}', 'pending', 0, $2, $2),
+           ('dlv_alongside_hang', $1, 'sub_hang_ok_mail', 'email', 'loan_repaid', 'info', 'hang_k_2',
+            'ok', 'ok', '{}', 'pending', 0, $2, $2)`,
+        [hangWallet, tHang.toString()]
+      );
+      const hangEmailSent: NotificationOutboundMessage[] = [];
+      const hangCtx: typeof notifCtx = {
+        ...notifCtx,
+        config: { ...notifCtx.config, outboundTimeoutMs: 120 },
+        state: { ...notifCtx.state, circuitBreakers: new Map() },
+        transports: {
+          async sendEmail(m) {
+            hangEmailSent.push(m);
+          },
+          async sendTelegram() {},
+          async sendWebhook() {
+            return new Promise<void>(() => {});
+          },
+        },
+      };
+      const tHangStart = Date.now();
+      const hangStats = await processDeliveryQueue(hangCtx, tHang);
+      assert.ok(Date.now() - tHangStart < 1_500, 'processDeliveryQueue must bound never-resolving sends via Promise.race');
+      assert.equal(hangStats.sent, 1);
+      assert.equal(hangStats.retried, 1);
+      const hangRowAfter = await notifCtx.notifDb.query<{ status: string }>(
+        "SELECT status FROM notif_deliveries WHERE id = 'dlv_never_resolves'"
+      );
+      assert.equal(hangRowAfter.rows[0].status, 'retry');
+      assert.equal(hangEmailSent.length, 1, 'Healthy delivery in queue must succeed despite hung webhook');
+
+      // 6.2 Per-host circuit breaker, zero attempt increment when open, 6+ critical retries, short outage delivery & DLQ redrive
+      const cbWallet = privateKeyToAccount(generatePrivateKey()).address.toLowerCase();
+      const cbHookA = notifCtx.cipher.encrypt('https://host-down.nostok-test.example/a');
+      const cbHookB = notifCtx.cipher.encrypt('https://host-up.nostok-test.example/b');
+      const cbEmailDomA = notifCtx.cipher.encrypt('a@down-domain.example');
+      const cbEmailDomB = notifCtx.cipher.encrypt('b@up-domain.example');
+      await notifCtx.notifDb.query(
+        `INSERT INTO notif_subscriptions (id, wallet, channel, target_ciphertext, key_id, target_hash, enabled, verified)
+         VALUES
+           ('sub_cb_a', $1, 'webhook', $2, $3, 'cba', TRUE, TRUE),
+           ('sub_cb_b', $1, 'webhook', $4, $5, 'cbb', TRUE, TRUE),
+           ('sub_cb_ea', $1, 'email', $6, $7, 'cbea', TRUE, TRUE),
+           ('sub_cb_eb', $1, 'email', $8, $9, 'cbeb', TRUE, TRUE)`,
+        [
+          cbWallet,
+          cbHookA.ciphertext,
+          cbHookA.keyId,
+          cbHookB.ciphertext,
+          cbHookB.keyId,
+          cbEmailDomA.ciphertext,
+          cbEmailDomA.keyId,
+          cbEmailDomB.ciphertext,
+          cbEmailDomB.keyId,
+        ]
+      );
+      let outageStartMs = tHang + 50_000;
+      await notifCtx.notifDb.query(
+        `INSERT INTO notif_deliveries (
+           id, wallet, subscription_id, channel, alert_type, severity, dedup_key,
+           title, message, payload_json, status, attempts, next_attempt_at, created_at
+         ) VALUES
+           ('dlv_crit_outage', $1, 'sub_cb_a', 'webhook', 'liquidation_started', 'critical', 'crit_out_1',
+            'crit', 'crit', '{}', 'pending', 0, $2, $2),
+           ('dlv_cb_open_seed1', $1, 'sub_cb_ea', 'email', 'loan_repaid', 'info', 'cbea_1',
+            'e', 'e', '{}', 'pending', 0, $2, $2),
+           ('dlv_cb_open_seed2', $1, 'sub_cb_ea', 'email', 'loan_repaid', 'info', 'cbea_2',
+            'e', 'e', '{}', 'pending', 0, $2, $2),
+           ('dlv_cb_email_isolated', $1, 'sub_cb_eb', 'email', 'loan_repaid', 'info', 'cbeb_1',
+            'e', 'e', '{}', 'pending', 0, $2, $2)`,
+        [cbWallet, outageStartMs.toString()]
+      );
+      let providerDown = true;
+      const outageSentIds: string[] = [];
+      const outageCtx: typeof notifCtx = {
+        ...notifCtx,
+        config: {
+          ...notifCtx.config,
+          retryBaseMs: 200,
+          circuitBreakerThreshold: 2,
+          circuitBreakerCooldownMs: 3_000,
+          maxDeliveryAttempts: 3,
+          maxCriticalDeliveryAttempts: 6,
+          deliveryConcurrency: 1,
+        },
+        state: { ...notifCtx.state, circuitBreakers: new Map() },
+        transports: {
+          async sendEmail(m) {
+            if (m.target.endsWith('@down-domain.example')) {
+              throw new Error('503 email domain down');
+            }
+            outageSentIds.push(m.subscriptionId);
+          },
+          async sendTelegram() {},
+          async sendWebhook(m) {
+            if (providerDown && m.target.includes('host-down.nostok-test.example')) {
+              throw new Error('503 provider down');
+            }
+            outageSentIds.push(m.subscriptionId);
+          },
+        },
+      };
+      // Attempt 1 & 2 open breaker for @down-domain.example; @up-domain.example STILL sends (isolated hostKey!)
+      await processDeliveryQueue(outageCtx, outageStartMs);
+      assert.ok(outageSentIds.includes('sub_cb_eb'), 'Per-target email domain must NOT share failed domain breaker');
+      // Trip webhook breaker on host-down (attempt 1, then attempt 2 at +200ms opens circuit for 3000ms)
+      outageStartMs += 500;
+      await processDeliveryQueue(outageCtx, outageStartMs);
+      const breakerState = outageCtx.state.circuitBreakers.get('webhook:host-down.nostok-test.example');
+      assert.ok(breakerState && breakerState.openUntilMs > outageStartMs, 'Webhook host circuit breaker must open');
+
+      // While circuit is OPEN, running another cycle must reschedule WITHOUT incrementing attempts
+      await notifCtx.notifDb.query(
+        "UPDATE notif_deliveries SET next_attempt_at = $1 WHERE id = 'dlv_crit_outage'",
+        [(outageStartMs + 100).toString()]
+      );
+      const attemptsBeforeOpen = Number(
+        (
+          await notifCtx.notifDb.query<{ attempts: number }>(
+            "SELECT attempts FROM notif_deliveries WHERE id = 'dlv_crit_outage'"
+          )
+        ).rows[0].attempts
+      );
+      await processDeliveryQueue(outageCtx, outageStartMs + 200);
+      const rowDuringOpen = (
+        await notifCtx.notifDb.query<{ status: string; attempts: number }>(
+          "SELECT status, attempts FROM notif_deliveries WHERE id = 'dlv_crit_outage'"
+        )
+      ).rows[0];
+      assert.equal(rowDuringOpen.status, 'retry');
+      assert.equal(
+        Number(rowDuringOpen.attempts),
+        attemptsBeforeOpen,
+        'Open circuit breaker must reschedule WITHOUT incrementing attempts'
+      );
+
+      // Provider recovers after 3s outage -> critical alert is delivered!
+      providerDown = false;
+      outageStartMs += 3_500;
+      await processDeliveryQueue(outageCtx, outageStartMs);
+      const rowAfterRecover = (
+        await notifCtx.notifDb.query<{ status: string }>(
+          "SELECT status FROM notif_deliveries WHERE id = 'dlv_crit_outage'"
+        )
+      ).rows[0];
+      assert.equal(rowAfterRecover.status, 'sent', 'Critical alert must succeed after short outage recovers');
+
+      // Verify critical alert gets 6+ attempts before DLQ, then test POST /dead-letters/redrive
+      providerDown = true;
+      await notifCtx.notifDb.query(
+        `INSERT INTO notif_deliveries (
+           id, wallet, subscription_id, channel, alert_type, severity, dedup_key,
+           title, message, payload_json, status, attempts, next_attempt_at, created_at
+         ) VALUES (
+           'dlv_crit_6_attempts', $1, 'sub_cb_a', 'webhook', 'liquidation_started', 'critical', 'crit_6_att',
+           'crit6', 'crit6', '{}', 'pending', 0, $2, $2
+         )`,
+        [cbWallet, outageStartMs.toString()]
+      );
+      outageCtx.config.circuitBreakerCooldownMs = 50;
+      outageCtx.config.circuitBreakerThreshold = 100;
+      for (let step = 1; step <= 5; step++) {
+        outageStartMs += 100_000;
+        await processDeliveryQueue(outageCtx, outageStartMs);
+        const r = (
+          await notifCtx.notifDb.query<{ status: string; attempts: number }>(
+            "SELECT status, attempts FROM notif_deliveries WHERE id = 'dlv_crit_6_attempts'"
+          )
+        ).rows[0];
+        assert.equal(r.status, 'retry', `Critical attempt ${step}/6 must NOT dead-letter yet`);
+        assert.equal(Number(r.attempts), step);
+      }
+      outageStartMs += 200_000;
+      await processDeliveryQueue(outageCtx, outageStartMs);
+      const r6 = (
+        await notifCtx.notifDb.query<{ status: string; attempts: number }>(
+          "SELECT status, attempts FROM notif_deliveries WHERE id = 'dlv_crit_6_attempts'"
+        )
+      ).rows[0];
+      assert.equal(r6.status, 'dead_letter', 'Critical alert moves to DLQ only on 6th attempt');
+      assert.equal(Number(r6.attempts), 6);
+
+      // Admin redrive endpoint (wrong secret -> 401; valid x-admin-secret -> redrives cleanly and delivers on next run)
+      const badRedrive = await httpJson(
+        'POST',
+        `${notifUrl}/dead-letters/redrive`,
+        { delivery_ids: ['dlv_crit_6_attempts'] },
+        { 'x-admin-secret': 'wrong-admin-secret-value-here' }
+      );
+      assert.equal(badRedrive.status, 401);
+
+      const okRedrive = await httpJson<{ status: string; redriven_count: number; delivery_ids: string[] }>(
+        'POST',
+        `${notifUrl}/dead-letters/redrive`,
+        { delivery_ids: ['dlv_crit_6_attempts'] },
+        { 'x-admin-secret': adminSecret }
+      );
+      assert.equal(okRedrive.status, 200);
+      assert.equal(okRedrive.body.redriven_count, 1);
+      assert.deepEqual(okRedrive.body.delivery_ids, ['dlv_crit_6_attempts']);
+
+      providerDown = false;
+      await processDeliveryQueue(notifCtx, Date.now() + 1_000);
+      const rRedriven = (
+        await notifCtx.notifDb.query<{ status: string }>(
+          "SELECT status FROM notif_deliveries WHERE id = 'dlv_crit_6_attempts'"
+        )
+      ).rows[0];
+      assert.equal(rRedriven.status, 'sent', 'Redriven dead letter must deliver successfully');
+
+      // 6.3 Stuck 'sending' row lease reclaim after worker crash
+      const nowLeaseMs = Date.now() + 500_000;
+      await notifCtx.notifDb.query(
+        `INSERT INTO notif_deliveries (
+           id, wallet, subscription_id, channel, alert_type, severity, dedup_key,
+           title, message, payload_json, status, attempts, next_attempt_at, claimed_at, lease_until, created_at
+         ) VALUES
+           ('dlv_stuck_expired', $1, 'sub_cb_b', 'webhook', 'loan_repaid', 'info', 'stuck_exp_1',
+            'stuck', 'stuck', '{}', 'sending', 0, $2, $2, $3, $2),
+           ('dlv_sending_active', $1, 'sub_cb_b', 'webhook', 'loan_repaid', 'info', 'stuck_act_1',
+            'active', 'active', '{}', 'sending', 0, $2, $4, $5, $2)`,
+        [
+          cbWallet,
+          (nowLeaseMs - 200_000).toString(),
+          (nowLeaseMs - 30_000).toString(),
+          (nowLeaseMs - 10_000).toString(),
+          (nowLeaseMs + 110_000).toString(),
+        ]
+      );
+      const leaseSentTargets: string[] = [];
+      await processDeliveryQueue(
+        {
+          ...notifCtx,
+          state: { ...notifCtx.state, circuitBreakers: new Map() },
+          transports: {
+            async sendEmail() {},
+            async sendTelegram() {},
+            async sendWebhook(m) {
+              leaseSentTargets.push(m.title);
+            },
+          },
+        },
+        nowLeaseMs
+      );
+      assert.equal(
+        leaseSentTargets.includes('stuck'),
+        true,
+        'Expired sending lease must be reclaimed and delivered'
+      );
+      assert.equal(
+        leaseSentTargets.includes('active'),
+        false,
+        'Non-expired sending lease must NOT be double-sent'
+      );
+
+      // 6.4 Confirm-code brute-force lockout (5 wrong attempts invalidates code) + separate confirmSecret check
+      const bfKey = generatePrivateKey();
+      const bfAcct = privateKeyToAccount(bfKey);
+      const bfWallet = bfAcct.address;
+      const bfNonce = await getNonce(bfWallet);
+      const bfSiwe = formatSiweMessage({
+        domain: 'app.nostok.xyz',
+        address: bfWallet,
+        uri: 'https://app.nostok.xyz',
+        chainId: 8453,
+        nonce: bfNonce,
+        issuedAt: nowIso,
+        expirationTime: futureIso,
+      });
+      const bfAuth = await httpJson<{ token: string }>('POST', `${notifUrl}/auth/verify`, {
+        message: bfSiwe,
+        signature: await bfAcct.signMessage({ message: bfSiwe }),
+      });
+      const bfTok = bfAuth.body.token;
+      const bfSub = await httpJson<{ id: string }>(
+        'POST',
+        `${notifUrl}/subscriptions`,
+        { channel: 'email', target: 'bruteforce-test@nostok.xyz' },
+        { Authorization: `Bearer ${bfTok}` }
+      );
+      assert.equal(bfSub.status, 201);
+      const bfEmailMsg = deliveredEmails.find((m) => m.subscriptionId === bfSub.body.id)!;
+      const realCode = String(bfEmailMsg.payload.verification_code);
+
+      // Token signed with unsubscribeSecret instead of confirmSecret must fail
+      const forgedUnsubAsConfirm = signConfirmSubscriptionToken(
+        unsubSecret,
+        bfSub.body.id,
+        bfWallet,
+        '0'.repeat(64)
+      );
+      const badSecretConfirm = await httpJson('POST', `${notifUrl}/subscriptions/confirm`, {
+        token: forgedUnsubAsConfirm,
+      });
+      assert.equal(badSecretConfirm.status, 400);
+
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        const wrongCode = realCode === '999999' ? '888888' : '999999';
+        const failTry = await httpJson(
+          'POST',
+          `${notifUrl}/subscriptions/confirm`,
+          { subscription_id: bfSub.body.id, code: wrongCode },
+          { Authorization: `Bearer ${bfTok}` }
+        );
+        assert.equal(failTry.status, 400);
+      }
+      // On 6th try even with the REAL code, it MUST remain invalidated/locked!
+      const after5Wrong = await httpJson(
+        'POST',
+        `${notifUrl}/subscriptions/confirm`,
+        { subscription_id: bfSub.body.id, code: realCode },
+        { Authorization: `Bearer ${bfTok}` }
+      );
+      assert.equal(after5Wrong.status, 400, 'Verification code must be invalidated after 5 failed attempts');
+
+      // 6.5 Quiet-hours drain counts hourly cap by sent_at/next_attempt_at & skips cleared stateful alerts + rate-limit drain
+      const qCapKey = generatePrivateKey();
+      const qCapAcct = privateKeyToAccount(qCapKey);
+      const qCapWallet = qCapAcct.address.toLowerCase();
+      const qCapNonce = await getNonce(qCapAcct.address);
+      const qCapSiwe = formatSiweMessage({
+        domain: 'app.nostok.xyz',
+        address: qCapAcct.address,
+        uri: 'https://app.nostok.xyz',
+        chainId: 8453,
+        nonce: qCapNonce,
+        issuedAt: nowIso,
+        expirationTime: futureIso,
+      });
+      const qCapTok = (
+        await httpJson<{ token: string }>('POST', `${notifUrl}/auth/verify`, {
+          message: qCapSiwe,
+          signature: await qCapAcct.signMessage({ message: qCapSiwe }),
+        })
+      ).body.token;
+      const qCapSub = await httpJson<{ id: string }>(
+        'POST',
+        `${notifUrl}/subscriptions`,
+        { channel: 'webhook', target: 'https://hooks.nostok-test.example/qcap' },
+        { Authorization: `Bearer ${qCapTok}` }
+      );
+      assert.equal(qCapSub.status, 201);
+      await httpJson(
+        'PUT',
+        `${notifUrl}/preferences`,
+        { quiet_hours_start: null, quiet_hours_end: null, max_per_hour: 2 },
+        { Authorization: `Bearer ${qCapTok}` }
+      );
+      const drainBaseNow = Date.now() + 20_000_000;
+      const oldQuietCreatedAt = drainBaseNow - 7_200_000; // 2h ago (> 1h)
+      await notifCtx.notifDb.query(
+        `INSERT INTO notif_deliveries (
+           id, wallet, subscription_id, channel, alert_type, severity, dedup_key,
+           title, message, payload_json, status, attempts, next_attempt_at, created_at
+         ) VALUES
+           ('dlv_q_cleared_mc', $1, $2, 'webhook', 'loan_margin_call', 'warning', 'margin_call:999:ep:1',
+            'stale mc', 'stale mc', '{}', 'suppressed_quiet_hours', 0, $3, $3),
+           ('dlv_q_evt_1', $1, $2, 'webhook', 'loan_repaid', 'info', 'q_evt_1',
+            'e1', 'e1', '{}', 'suppressed_quiet_hours', 0, $3, $3),
+           ('dlv_q_evt_2', $1, $2, 'webhook', 'loan_repaid', 'info', 'q_evt_2',
+            'e2', 'e2', '{}', 'suppressed_quiet_hours', 0, $3, $3),
+           ('dlv_q_evt_3', $1, $2, 'webhook', 'loan_repaid', 'info', 'q_evt_3',
+            'e3', 'e3', '{}', 'suppressed_quiet_hours', 0, $3, $3),
+           ('dlv_q_evt_4', $1, $2, 'webhook', 'loan_repaid', 'info', 'q_evt_4',
+            'e4', 'e4', '{}', 'suppressed_quiet_hours', 0, $3, $3)`,
+        [qCapWallet, qCapSub.body.id, oldQuietCreatedAt.toString()]
+      );
+      await runNotificationsCycle(notifCtx, drainBaseNow);
+      const clearedRow = (
+        await notifCtx.notifDb.query<{ status: string }>(
+          "SELECT status FROM notif_deliveries WHERE id = 'dlv_q_cleared_mc'"
+        )
+      ).rows[0];
+      assert.equal(
+        clearedRow.status,
+        'expired_cleared',
+        'Cleared stateful condition from quiet hours must transition to expired_cleared instead of sending'
+      );
+      const qEvtRows1 = await notifCtx.notifDb.query<{ id: string; status: string }>(
+        "SELECT id, status FROM notif_deliveries WHERE id LIKE 'dlv_q_evt_%' ORDER BY id ASC"
+      );
+      assert.equal(qEvtRows1.rows[0].status, 'sent');
+      assert.equal(qEvtRows1.rows[1].status, 'sent');
+      assert.equal(
+        qEvtRows1.rows[2].status,
+        'suppressed_rate_limit',
+        '3rd drained row must be capped by max_per_hour = 2'
+      );
+      assert.equal(qEvtRows1.rows[3].status, 'suppressed_rate_limit');
+
+      // Run 5 seconds later: rows 1 & 2 had sent_at = drainBaseNow so rows 3 & 4 STILL must wait!
+      await runNotificationsCycle(notifCtx, drainBaseNow + 5_000);
+      const qEvtRowsStill = await notifCtx.notifDb.query<{ status: string }>(
+        "SELECT status FROM notif_deliveries WHERE id IN ('dlv_q_evt_3', 'dlv_q_evt_4')"
+      );
+      assert.ok(qEvtRowsStill.rows.every((r) => r.status === 'suppressed_rate_limit'));
+
+      // Run > 1 hour later: budget opens up and delayed rate-limited events are drained & delivered!
+      await runNotificationsCycle(notifCtx, drainBaseNow + 3_605_000);
+      const qEvtRowsAfterHour = await notifCtx.notifDb.query<{ status: string }>(
+        "SELECT status FROM notif_deliveries WHERE id IN ('dlv_q_evt_3', 'dlv_q_evt_4')"
+      );
+      assert.ok(
+        qEvtRowsAfterHour.rows.every((r) => r.status === 'sent'),
+        'Delayed suppressed_rate_limit event alerts must drain and send once hourly budget opens'
+      );
+
+      // 6.6 Email bombing protection (3/hour limit per target across DIFFERENT wallets)
+      const sharedBombEmail = 'victim-bomb@nostok.xyz';
+      for (let wIdx = 1; wIdx <= 4; wIdx++) {
+        const wKey = generatePrivateKey();
+        const wAcct = privateKeyToAccount(wKey);
+        const wNonce = await getNonce(wAcct.address);
+        const wSiwe = formatSiweMessage({
+          domain: 'app.nostok.xyz',
+          address: wAcct.address,
+          uri: 'https://app.nostok.xyz',
+          chainId: 8453,
+          nonce: wNonce,
+          issuedAt: nowIso,
+          expirationTime: futureIso,
+        });
+        const wTok = (
+          await httpJson<{ token: string }>('POST', `${notifUrl}/auth/verify`, {
+            message: wSiwe,
+            signature: await wAcct.signMessage({ message: wSiwe }),
+          })
+        ).body.token;
+        const subRes = await httpJson<{ error?: { code: string } }>(
+          'POST',
+          `${notifUrl}/subscriptions`,
+          { channel: 'email', target: sharedBombEmail },
+          { Authorization: `Bearer ${wTok}` }
+        );
+        if (wIdx <= 3) {
+          assert.equal(subRes.status, 201, `Target confirmation ${wIdx}/3 across wallets should succeed`);
+        } else {
+          assert.equal(subRes.status, 429, '4th confirmation email to same target across wallets must be blocked');
+          assert.equal(subRes.body.error?.code, 'RATE_LIMIT_EXCEEDED');
+        }
+      }
+
+      // 6.7 No pre-auth login lockout across IPs
+      const victimKey = generatePrivateKey();
+      const victimAcct = privateKeyToAccount(victimKey);
+      const attackerKey = generatePrivateKey();
+      const attackerAcct = privateKeyToAccount(attackerKey);
+      const loginDosSrv = createNotificationsServer({
+        ...notifCtx,
+        config: {
+          ...notifCtx.config,
+          trustProxyHops: 1,
+          authNonceRateLimitMax: 2,
+          authVerifyRateLimitMax: 2,
+        },
+      });
+      await new Promise<void>((r) => loginDosSrv.listen(0, '127.0.0.1', r));
+      const loginDosUrl = `http://127.0.0.1:${(loginDosSrv.address() as net.AddressInfo).port}`;
+      try {
+        // Attacker at IP 198.51.100.10 spams /auth/nonce & bad /auth/verify naming victim address
+        for (let k = 0; k < 4; k++) {
+          await httpJson(
+            'POST',
+            `${loginDosUrl}/auth/nonce`,
+            { wallet_address: victimAcct.address },
+            { 'X-Forwarded-For': '198.51.100.10' }
+          );
+          const forgedSiwe = formatSiweMessage({
+            domain: 'app.nostok.xyz',
+            address: victimAcct.address,
+            uri: 'https://app.nostok.xyz',
+            chainId: 8453,
+            nonce: 'nonexistent' + String(k).padStart(8, '0'),
+            issuedAt: nowIso,
+            expirationTime: futureIso,
+          });
+          await httpJson(
+            'POST',
+            `${loginDosUrl}/auth/verify`,
+            {
+              message: forgedSiwe,
+              signature: await attackerAcct.signMessage({ message: forgedSiwe }),
+            },
+            { 'X-Forwarded-For': '198.51.100.10' }
+          );
+        }
+
+        // Legitimate victim at IP 203.0.113.20 MUST still be able to request nonce & log in cleanly!
+        const victimNonceRes = await httpJson<{ nonce: string }>(
+          'POST',
+          `${loginDosUrl}/auth/nonce`,
+          { wallet_address: victimAcct.address },
+          { 'X-Forwarded-For': '203.0.113.20' }
+        );
+        assert.equal(victimNonceRes.status, 200, 'Victim /auth/nonce from clean IP must NOT be locked out by attacker');
+        const victimSiwe = formatSiweMessage({
+          domain: 'app.nostok.xyz',
+          address: victimAcct.address,
+          uri: 'https://app.nostok.xyz',
+          chainId: 8453,
+          nonce: victimNonceRes.body.nonce,
+          issuedAt: nowIso,
+          expirationTime: futureIso,
+        });
+        const victimVerifyRes = await httpJson<{ token: string }>(
+          'POST',
+          `${loginDosUrl}/auth/verify`,
+          {
+            message: victimSiwe,
+            signature: await victimAcct.signMessage({ message: victimSiwe }),
+          },
+          { 'X-Forwarded-For': '203.0.113.20' }
+        );
+        assert.equal(victimVerifyRes.status, 200, 'Victim /auth/verify from clean IP must NOT be locked out by attacker');
+        assert.ok(victimVerifyRes.body.token);
+      } finally {
+        await new Promise<void>((r) => loginDosSrv.close(() => r()));
+      }
+
+      // 6.8 Dual-stack DNS (A + AAAA succeeds and pins A IP), 192.88.99.0/24 blocked, non-443 port blocked
+      const dualResolved = await resolveAndValidateWebhookTarget(
+        'https://dualstack.nostok-test.example/hook',
+        mockDnsLookup
+      );
+      assert.equal(dualResolved.pinnedIp, '93.184.216.34', 'Dual-stack A + AAAA host must succeed and pin IPv4 A record');
+      assert.throws(() => validateChannelTarget('webhook', 'https://192.88.99.1/hook'), /blocked/i);
+      assert.throws(
+        () => validateChannelTarget('webhook', 'https://hooks.nostok-test.example:8443/hook'),
+        /port 8443 is not allowed/i
+      );
+
+      // 6.9 AuctionCancelled alert + oracle_stale clear damping + PGlite/adapter statement_timeout
+      // Open a real on-chain loan for ADDRESSES.borrower (whose prior data was wiped in 5E) and re-subscribe webhook
+      const dampLoanId = await openLoan(600_000_000n, 14);
+      await runIndexerSync(idxCtx);
+      const acHook = notifCtx.cipher.encrypt('https://hooks.nostok-test.example/ac');
+      await notifCtx.notifDb.query(
+        `INSERT INTO notif_subscriptions (id, wallet, channel, target_ciphertext, key_id, target_hash, enabled, verified)
+         VALUES ('sub_ac_1', $1, 'webhook', $2, $3, 'ac_h_1', TRUE, TRUE)`,
+        [ADDRESSES.borrower.toLowerCase(), acHook.ciphertext, acHook.keyId]
+      );
+      const acDeliveries: NotificationOutboundMessage[] = [];
+      const dampingCtx: typeof notifCtx = {
+        ...notifCtx,
+        config: { ...notifCtx.config, episodeClearDampingMs: 30_000 },
+        state: { ...notifCtx.state, circuitBreakers: new Map() },
+        transports: {
+          async sendEmail() {},
+          async sendTelegram() {},
+          async sendWebhook(m) {
+            acDeliveries.push(m);
+          },
+        },
+      };
+      // Insert AuctionCancelled event linked to real open dampLoanId into indexer DB
+      await idxCtx.db.query(
+        `INSERT INTO loan_events (
+           block_number, block_hash, tx_hash, log_index, contract_address, event_name, loan_id, payload, block_timestamp
+         ) VALUES (999999999, '0xdead', '0xabc', 0, $1, 'AuctionCancelled', $2, $3, 1700000000)`,
+        [deployed.liquidationAuction.toLowerCase(), dampLoanId.toString(), JSON.stringify({ auctionId: '777' })]
+      );
+      const dampT0 = drainBaseNow + 3_700_000;
+      await runNotificationsCycle(dampingCtx, dampT0);
+      assert.ok(
+        acDeliveries.some(
+          (m) =>
+            m.wallet.toLowerCase() === ADDRESSES.borrower.toLowerCase() &&
+            m.alertType === 'auction_cancelled' &&
+            String(m.payload.loan_id) === dampLoanId.toString()
+        ),
+        'AuctionCancelled event must emit auction_cancelled alert'
+      );
+
+      // Episode clear damping check on oracle_stale:
+      // 1) Trigger oracle_stale via synthetic Risk API state
+      const dampRiskAlerts: Array<{
+        dedup_key: string;
+        category: string;
+        severity: string;
+        status: string;
+        title: string;
+        message: string;
+        details: Record<string, unknown>;
+      }> = [
+        {
+          dedup_key: `oracle_stale:${nvdac.toLowerCase()}`,
+          category: 'oracle',
+          severity: 'warning',
+          status: 'active',
+          title: 'Stale oracle',
+          message: 'Stale',
+          details: { token: nvdac.toLowerCase() },
+        },
+      ];
+      const dampMockSrv = http.createServer((req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        if (req.url?.startsWith('/risk/loans')) {
+          res.end(JSON.stringify({ data: [], pagination: { has_more: false } }));
+        } else {
+          res.end(JSON.stringify({ data: dampRiskAlerts }));
+        }
+      });
+      await new Promise<void>((r) => dampMockSrv.listen(0, '127.0.0.1', r));
+      const dampMockPort = (dampMockSrv.address() as net.AddressInfo).port;
+      try {
+        dampingCtx.config.riskApiUrl = `http://127.0.0.1:${dampMockPort}`;
+        await runNotificationsCycle(dampingCtx, dampT0 + 1_000); // triggers :ep:1
+        const countEp1 = acDeliveries.filter((m) => m.alertType === 'oracle_stale').length;
+        assert.ok(countEp1 >= 1, 'Expected at least 1 oracle_stale episode-1 delivery');
+
+        // Clear for only 5s (< 30s damping), then flap back to stale -> MUST NOT fire :ep:2!
+        dampRiskAlerts.length = 0;
+        await runNotificationsCycle(dampingCtx, dampT0 + 6_000); // stamps clear_since = dampT0 + 6_000
+        dampRiskAlerts.push({
+          dedup_key: `oracle_stale:${nvdac.toLowerCase()}`,
+          category: 'oracle',
+          severity: 'warning',
+          status: 'active',
+          title: 'Stale oracle',
+          message: 'Stale again',
+          details: { token: nvdac.toLowerCase() },
+        });
+        await runNotificationsCycle(dampingCtx, dampT0 + 11_000);
+        assert.equal(
+          acDeliveries.filter((m) => m.alertType === 'oracle_stale').length,
+          countEp1,
+          'Brief clear shorter than episodeClearDampingMs must NOT emit duplicate episode alert'
+        );
+
+        // Now stay continuously clear past 30s damping window -> re-arms -> next stale sends :ep:2!
+        dampRiskAlerts.length = 0;
+        await runNotificationsCycle(dampingCtx, dampT0 + 15_000); // stamps clear_since = dampT0 + 15_000
+        await runNotificationsCycle(dampingCtx, dampT0 + 46_000); // 31s >= 30s -> clears active=FALSE
+        dampRiskAlerts.push({
+          dedup_key: `oracle_stale:${nvdac.toLowerCase()}`,
+          category: 'oracle',
+          severity: 'warning',
+          status: 'active',
+          title: 'Stale oracle 2',
+          message: 'Genuine new stale',
+          details: { token: nvdac.toLowerCase() },
+        });
+        await runNotificationsCycle(dampingCtx, dampT0 + 50_000);
+        assert.equal(
+          acDeliveries.filter((m) => m.alertType === 'oracle_stale').length,
+          countEp1 * 2,
+          'Continuous clear >= episodeClearDampingMs must re-arm new episode'
+        );
+      } finally {
+        dampingCtx.config.riskApiUrl = riskApiUrl;
+        await new Promise<void>((r) => dampMockSrv.close(() => r()));
+      }
+
+      // Statement timeout check on PGlite read-only indexer adapter + slow mock queryable
+      const roIdxPglite = await openReadOnlyIndexerDatabase('memory://', { statementTimeoutMs: 60 });
+      try {
+        const stRes = await roIdxPglite.query<{ st: string }>(
+          "SELECT current_setting('statement_timeout') AS st"
+        );
+        assert.equal(stRes.rows[0].st, '60ms');
+      } finally {
+        await roIdxPglite.close();
+      }
+      const slowIdxRo = wrapIndexerQueryableAsReadOnly(
+        {
+          async query<T extends Record<string, unknown>>(sql: string): Promise<{ rows: T[] }> {
+            if (sql.startsWith('BEGIN') || sql.startsWith('SET LOCAL') || sql === 'COMMIT' || sql === 'ROLLBACK') {
+              return { rows: [] };
+            }
+            await new Promise((r) => setTimeout(r, 200));
+            return { rows: [] };
+          },
+        },
+        { statementTimeoutMs: 40 }
+      );
+      await assert.rejects(() => slowIdxRo.query('SELECT 1 AS ok'), /statement_timeout/i);
+
+      console.log('PASS TEST 6: All Phase 2 hardening fixes & low-priority safeguards verified.');
       console.log('\nALL WS2.6 USER NOTIFICATIONS BASE MAINNET FORK INTEGRATION TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
