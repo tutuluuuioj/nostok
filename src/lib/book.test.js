@@ -22,6 +22,7 @@ import {
 import { termSheet } from './money.js';
 import {
   DEFAULT_COLLATERAL_BUFFER_BPS,
+  computeBorrowApprovalAmountRaw,
   decodeContractRevert,
   formatTokenUnitsDisplay,
   formatWeb3Error,
@@ -312,10 +313,27 @@ assert.equal(resolvedDefault.minRequiredCollateralRaw, 8333333333333333334n);
 assert.equal(resolvedDefault.bufferBps, DEFAULT_COLLATERAL_BUFFER_BPS);
 assert.equal(resolvedDefault.bufferedCollateralRaw, 8750000000000000001n);
 assert.equal(resolvedDefault.collateralAmountRaw, 8750000000000000001n);
+assert.equal(resolvedDefault.maxFills, 1n);
+assert.equal(resolvedDefault.approvalSlackRaw, 1n);
+assert.equal(resolvedDefault.requiredApprovalRaw, 8750000000000000002n);
 assert.equal(
   resolveExactBorrowAmounts(quoteSample, { bufferBps: 0 }).collateralAmountRaw,
   8333333333333333334n
 );
+const resolvedMulti = resolveExactBorrowAmounts(
+  {
+    amounts: {
+      ...quoteSample.amounts,
+      principal: { raw: '2000000000', formatted: '2000', decimals: 6, symbol: 'USDC' },
+    },
+  },
+  { minFillRaw: '600000000' }
+);
+assert.equal(resolvedMulti.maxFills, 4n);
+assert.equal(resolvedMulti.approvalSlackRaw, 4n);
+assert.equal(resolvedMulti.requiredApprovalRaw, resolvedMulti.collateralAmountRaw + 4n);
+assert.equal(computeBorrowApprovalAmountRaw('1000', '1500000000', '500000000').approvalSlackRaw, 3n);
+assert.equal(computeBorrowApprovalAmountRaw('1000', '1000000000', '500000000').approvalSlackRaw, 2n);
 assert.throws(
   () => resolveExactBorrowAmounts(quoteSample, { userCollateralRaw: '8333333000000000000' }),
   /below API rounded-up minimum/i

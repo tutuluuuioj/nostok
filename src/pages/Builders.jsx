@@ -15,7 +15,7 @@ export function Builders() {
       </PreviewBanner>
       <section className="block">
         <h2>Borrow order</h2>
-        <p>Borrower, stock token, raw collateral amount, minimum USDC, maximum rate, term in days, maximum LTV, minimum fill, expiry, nonce, yield mode, in-kind flag, and an eligibility proof when the gate requires one.</p>
+        <p>Borrower, stock token, raw collateral amount, minimum USDC, maximum rate, term in days, maximum LTV, minimum fill, expiry, nonce, yield mode, and an eligibility proof when the gate requires one.</p>
       </section>
       <section className="block">
         <h2>Lend offer</h2>
@@ -35,7 +35,6 @@ export function Builders() {
           maxLtv: sample.maxLtvBps / 100,
           minFill: sample.minFillCents / 100,
           yieldMode: sample.yieldMode,
-          inKind: sample.inKind,
         }, null, 2)}</pre>
       </section>
       <section className="block">

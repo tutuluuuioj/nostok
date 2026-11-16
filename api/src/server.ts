@@ -95,6 +95,14 @@ export interface RelaySignedOrderRecord {
   signedOrder: Record<string, unknown>;
   signature: Hex;
   submittedAt: string;
+  submittedIp: string;
+  submittedAtMs: number;
+  cachedFilled: bigint;
+  cachedCancelled: boolean;
+  cachedMakerNonce: bigint;
+  cachedStatus: 'open' | 'partially_filled' | 'filled' | 'cancelled' | 'expired' | 'nonce_bumped';
+  cachedBlockNumber: bigint;
+  lastRefreshedAtMs: number;
 }
 
 export interface ApiContext {
@@ -528,7 +536,60 @@ async function handleHealth(ctx: ApiContext) {
 }
 
 const MAX_SIGNED_ORDERS = 2000;
+const MAX_ORDERS_PER_MAKER = 20;
+const MAX_ORDERS_PER_IP = 50;
+const RELAY_STATE_CACHE_TTL_MS = 2000;
+const MAX_RELAY_REFRESH_PER_REQ = 100;
+const RELAY_MULTICALL_CHUNK = 150;
 const FALLBACK_SIGNED_ORDERS = new WeakMap<ApiContext, Map<string, RelaySignedOrderRecord>>();
+
+interface RelayHeadCacheState {
+  blockNumber: bigint;
+  timestamp: bigint;
+  inFlightBlock: Promise<{ number: bigint; timestamp: bigint }> | null;
+  inFlightRefresh: Map<string, Promise<void>>;
+}
+const RELAY_HEAD_CACHE = new WeakMap<ApiContext, RelayHeadCacheState>();
+
+function getRelayHeadState(ctx: ApiContext): RelayHeadCacheState {
+  let state = RELAY_HEAD_CACHE.get(ctx);
+  if (!state) {
+    state = {
+      blockNumber: 0n,
+      timestamp: 0n,
+      inFlightBlock: null,
+      inFlightRefresh: new Map(),
+    };
+    RELAY_HEAD_CACHE.set(ctx, state);
+  }
+  return state;
+}
+
+async function getLatestBlockForRelay(
+  ctx: ApiContext,
+  fallbackBlock: bigint
+): Promise<{ number: bigint; timestamp: bigint }> {
+  const headState = getRelayHeadState(ctx);
+  if (headState.inFlightBlock) {
+    return headState.inFlightBlock;
+  }
+  const p = ctx.publicClient
+    .getBlock({ blockTag: 'latest' })
+    .then((b) => {
+      headState.blockNumber = b.number;
+      headState.timestamp = b.timestamp;
+      return { number: b.number, timestamp: b.timestamp };
+    })
+    .catch(() => ({
+      number: headState.blockNumber > 0n ? headState.blockNumber : fallbackBlock,
+      timestamp: headState.timestamp > 0n ? headState.timestamp : BigInt(Math.floor(Date.now() / 1000)),
+    }))
+    .finally(() => {
+      headState.inFlightBlock = null;
+    });
+  headState.inFlightBlock = p;
+  return p;
+}
 
 function getSignedOrdersMap(ctx: ApiContext): Map<string, RelaySignedOrderRecord> {
   if (ctx.signedOrders) return ctx.signedOrders;
@@ -538,6 +599,14 @@ function getSignedOrdersMap(ctx: ApiContext): Map<string, RelaySignedOrderRecord
     FALLBACK_SIGNED_ORDERS.set(ctx, existing);
   }
   return existing;
+}
+
+export function sanitizeTokenSymbol(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0 || trimmed.length > 16) return null;
+  if (!/^[A-Za-z0-9._-]+$/.test(trimmed)) return null;
+  return trimmed;
 }
 
 interface LiveRelayOrderState {
@@ -552,43 +621,14 @@ interface LiveRelayOrderState {
   blockNumber: bigint;
 }
 
-async function readLiveRelayOrderState(
-  ctx: ApiContext,
+function deriveRelayLiveState(
   rec: RelaySignedOrderRecord,
   chainNowSec: bigint,
   chainBlockNum: bigint
-): Promise<LiveRelayOrderState> {
-  let filled = 0n;
-  let cancelled = false;
-  let currentMakerNonce = BigInt(rec.nonce);
-  try {
-    const [fRes, cRes, nRes] = await Promise.all([
-      ctx.publicClient.readContract({
-        address: ctx.config.orderSettlement,
-        abi: orderSettlementAbi,
-        functionName: 'getOrderFilledAmount',
-        args: [rec.orderHash],
-      }),
-      ctx.publicClient.readContract({
-        address: ctx.config.orderSettlement,
-        abi: orderSettlementAbi,
-        functionName: 'isOrderCancelled',
-        args: [rec.orderHash],
-      }),
-      ctx.publicClient.readContract({
-        address: ctx.config.orderSettlement,
-        abi: orderSettlementAbi,
-        functionName: 'getMakerNonce',
-        args: [rec.maker],
-      }),
-    ]);
-    filled = BigInt(fRes);
-    cancelled = Boolean(cRes);
-    currentMakerNonce = BigInt(nRes);
-  } catch {
-    // Fallback conservatively if RPC call fails transiently
-  }
-
+): LiveRelayOrderState {
+  const filled = rec.cachedFilled ?? 0n;
+  const cancelled = Boolean(rec.cachedCancelled);
+  const currentMakerNonce = rec.cachedMakerNonce ?? BigInt(rec.nonce);
   const total = BigInt(rec.totalUsdc);
   const remaining = total > filled ? total - filled : 0n;
   const expired = BigInt(rec.expiry) <= chainNowSec;
@@ -605,6 +645,7 @@ async function readLiveRelayOrderState(
             ? 'partially_filled'
             : 'open';
 
+  rec.cachedStatus = status;
   return {
     record: rec,
     filled,
@@ -614,8 +655,127 @@ async function readLiveRelayOrderState(
     nonceBumped,
     currentMakerNonce,
     status,
-    blockNumber: chainBlockNum,
+    blockNumber: rec.cachedBlockNumber > 0n ? rec.cachedBlockNumber : chainBlockNum,
   };
+}
+
+async function batchRefreshRelayRecords(
+  ctx: ApiContext,
+  records: RelaySignedOrderRecord[],
+  chainNowSec: bigint,
+  chainBlockNum: bigint
+): Promise<void> {
+  if (records.length === 0) return;
+  const headState = getRelayHeadState(ctx);
+  const nowMs = Date.now();
+  const capped = records.slice(0, MAX_RELAY_REFRESH_PER_REQ);
+  const stale = capped.filter(
+    (rec) =>
+      rec.cachedBlockNumber !== chainBlockNum ||
+      nowMs - rec.lastRefreshedAtMs > RELAY_STATE_CACHE_TTL_MS
+  );
+  if (stale.length === 0) return;
+
+  const batchKey = `${chainBlockNum.toString()}:${stale.map((r) => r.orderHash.toLowerCase()).join(',')}`;
+  const inFlight = headState.inFlightRefresh.get(batchKey);
+  if (inFlight) {
+    await inFlight;
+    return;
+  }
+
+  const runPromise = (async () => {
+    const uniqueMakers = Array.from(new Set(stale.map((r) => getAddress(r.maker))));
+    const calls: Array<{
+      address: Address;
+      abi: typeof orderSettlementAbi;
+      functionName: 'getOrderFilledAmount' | 'isOrderCancelled' | 'getMakerNonce';
+      args: readonly [Hex] | readonly [Address];
+    }> = [];
+
+    for (const r of stale) {
+      calls.push({
+        address: ctx.config.orderSettlement,
+        abi: orderSettlementAbi,
+        functionName: 'getOrderFilledAmount',
+        args: [r.orderHash],
+      });
+      calls.push({
+        address: ctx.config.orderSettlement,
+        abi: orderSettlementAbi,
+        functionName: 'isOrderCancelled',
+        args: [r.orderHash],
+      });
+    }
+    const makerStartIdx = calls.length;
+    for (const m of uniqueMakers) {
+      calls.push({
+        address: ctx.config.orderSettlement,
+        abi: orderSettlementAbi,
+        functionName: 'getMakerNonce',
+        args: [m],
+      });
+    }
+
+    type McResult = { status: 'success'; result: unknown } | { status: 'failure'; error: unknown };
+    const results: McResult[] = [];
+
+    try {
+      for (let i = 0; i < calls.length; i += RELAY_MULTICALL_CHUNK) {
+        const chunk = calls.slice(i, i + RELAY_MULTICALL_CHUNK);
+        const resChunk = await ctx.publicClient.multicall({
+          contracts: chunk as unknown as readonly [],
+          allowFailure: true,
+        });
+        results.push(...(resChunk as unknown as McResult[]));
+      }
+    } catch {
+      // Fallback only if client/chain has no multicall; still bounded to capped slice
+      const fb = await Promise.all(
+        calls.map(async (c): Promise<McResult> => {
+          try {
+            const val = await ctx.publicClient.readContract(c as never);
+            return { status: 'success', result: val };
+          } catch (error) {
+            return { status: 'failure', error };
+          }
+        })
+      );
+      results.push(...fb);
+    }
+
+    const makerNonceMap = new Map<string, bigint>();
+    for (let mIdx = 0; mIdx < uniqueMakers.length; mIdx++) {
+      const mcRes = results[makerStartIdx + mIdx];
+      if (mcRes && mcRes.status === 'success') {
+        makerNonceMap.set(uniqueMakers[mIdx].toLowerCase(), BigInt(mcRes.result as bigint));
+      }
+    }
+
+    const doneAtMs = Date.now();
+    for (let idx = 0; idx < stale.length; idx++) {
+      const rec = stale[idx];
+      const fRes = results[idx * 2];
+      const cRes = results[idx * 2 + 1];
+      if (fRes && fRes.status === 'success') {
+        rec.cachedFilled = BigInt(fRes.result as bigint);
+      }
+      if (cRes && cRes.status === 'success') {
+        rec.cachedCancelled = Boolean(cRes.result);
+      }
+      const mNonce = makerNonceMap.get(rec.maker.toLowerCase());
+      if (mNonce !== undefined) {
+        rec.cachedMakerNonce = mNonce;
+      }
+      rec.cachedBlockNumber = chainBlockNum;
+      rec.lastRefreshedAtMs = doneAtMs;
+      deriveRelayLiveState(rec, chainNowSec, chainBlockNum);
+    }
+  })().finally(() => {
+    headState.inFlightRefresh.delete(batchKey);
+  });
+
+  headState.inFlightRefresh.set(batchKey, runPromise);
+  await runPromise;
 }
 
 function formatRelayOrderEnvelope(live: LiveRelayOrderState, fills: unknown[] = []) {
@@ -658,7 +818,7 @@ function formatRelayOrderEnvelope(live: LiveRelayOrderState, fills: unknown[] = 
   };
 }
 
-async function handlePostOrder(ctx: ApiContext, rawBody: unknown) {
+async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'unknown') {
   const input = parseOrThrow(postOrderSchema, rawBody);
   const signedMap = getSignedOrdersMap(ctx);
 
@@ -808,6 +968,85 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown) {
     throw new HttpError(400, 'ORDER_EXPIRED', 'Order expiry timestamp is in the past');
   }
 
+  // Validate collateral token against AssetRegistry & resolve indexed symbol before storing
+  let collateralSymbol: string | null = null;
+  let collateralDecimals = 18;
+  if (collateralToken) {
+    let isSupported = false;
+    let assetCfg: { maxInitLtvBps: number; perLoanCap: bigint; status: number } | null = null;
+    try {
+      isSupported = Boolean(
+        await ctx.publicClient.readContract({
+          address: ctx.config.assetRegistry,
+          abi: assetRegistryAbi,
+          functionName: 'isAssetSupported',
+          args: [collateralToken],
+        })
+      );
+      if (isSupported) {
+        assetCfg = (await ctx.publicClient.readContract({
+          address: ctx.config.assetRegistry,
+          abi: assetRegistryAbi,
+          functionName: 'getAssetConfig',
+          args: [collateralToken],
+        })) as unknown as { maxInitLtvBps: number; perLoanCap: bigint; status: number };
+      }
+    } catch (err) {
+      throw new RpcUnavailableError(err instanceof Error ? err.message : String(err));
+    }
+
+    if (!isSupported || !assetCfg) {
+      throw new HttpError(
+        400,
+        'UNSUPPORTED_COLLATERAL_ASSET',
+        `Collateral token ${collateralToken} is not registered in AssetRegistry`
+      );
+    }
+    if (Number(assetCfg.status) !== 0) {
+      throw new HttpError(
+        400,
+        'COLLATERAL_ASSET_NOT_ACTIVE',
+        `Collateral token ${collateralToken} is not Active in AssetRegistry`
+      );
+    }
+    if (input.order_type === 'borrow') {
+      if (maxLtvBps > Number(assetCfg.maxInitLtvBps)) {
+        throw new HttpError(
+          400,
+          'LTV_EXCEEDS_ASSET_MAX',
+          `Order maxLtvBps (${maxLtvBps}) exceeds asset maxInitLtvBps (${assetCfg.maxInitLtvBps})`
+        );
+      }
+      if (BigInt(assetCfg.perLoanCap) > 0n && totalUsdc > BigInt(assetCfg.perLoanCap)) {
+        throw new HttpError(
+          400,
+          'PER_LOAN_CAP_EXCEEDED',
+          `Order principal (${totalUsdc}) exceeds asset perLoanCap (${assetCfg.perLoanCap})`
+        );
+      }
+    }
+
+    const assetRes = await ctx.db.query<{ symbol: string | null; decimals: number | null }>(
+      'SELECT symbol, decimals FROM assets WHERE LOWER(token) = LOWER($1) LIMIT 1',
+      [collateralToken]
+    );
+    if (assetRes.rows[0]) {
+      collateralSymbol = sanitizeTokenSymbol(assetRes.rows[0].symbol);
+      collateralDecimals = Number(assetRes.rows[0].decimals ?? 18);
+    } else {
+      try {
+        const [sym, dec] = await Promise.all([
+          ctx.publicClient.readContract({ address: collateralToken, abi: erc20MetaAbi, functionName: 'symbol' }),
+          ctx.publicClient.readContract({ address: collateralToken, abi: erc20MetaAbi, functionName: 'decimals' }),
+        ]);
+        collateralSymbol = sanitizeTokenSymbol(sym);
+        collateralDecimals = Number(dec);
+      } catch {
+        // leave null/18 fallback
+      }
+    }
+  }
+
   let cancelled = false;
   let currentMakerNonce = 0n;
   let filled = 0n;
@@ -853,43 +1092,60 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown) {
     throw new HttpError(400, 'ORDER_ALREADY_FILLED', 'Order has already been completely filled on-chain');
   }
 
-  let collateralSymbol: string | null = null;
-  let collateralDecimals = 18;
-  if (collateralToken) {
-    const assetRes = await ctx.db.query<{ symbol: string | null; decimals: number | null }>(
-      'SELECT symbol, decimals FROM assets WHERE LOWER(token) = LOWER($1) LIMIT 1',
-      [collateralToken]
+  const orderHashLower = orderHash.toLowerCase();
+  const makerLower = maker.toLowerCase();
+
+  // Prune globally expired / finalized entries (and this maker's older bumped-nonce orders) first
+  for (const [k, existing] of signedMap.entries()) {
+    if (
+      BigInt(existing.expiry) <= blk.timestamp ||
+      existing.cachedCancelled ||
+      existing.cachedStatus === 'filled' ||
+      (existing.maker.toLowerCase() === makerLower && BigInt(existing.nonce) !== currentMakerNonce)
+    ) {
+      signedMap.delete(k);
+    }
+  }
+
+  // Enforce per-maker active cap (evict ONLY the same maker's oldest order, never another maker's)
+  const sameMakerEntries = Array.from(signedMap.entries())
+    .filter(([k, e]) => k !== orderHashLower && e.maker.toLowerCase() === makerLower)
+    .sort((a, b) => (a[1].submittedAtMs ?? 0) - (b[1].submittedAtMs ?? 0));
+  while (sameMakerEntries.length >= MAX_ORDERS_PER_MAKER) {
+    const oldest = sameMakerEntries.shift();
+    if (oldest) signedMap.delete(oldest[0]);
+  }
+
+  // Enforce per-IP cap so one IP rotating wallets cannot exhaust the global relay
+  if (!signedMap.has(orderHashLower)) {
+    const ipEntries = Array.from(signedMap.entries()).filter(
+      ([k, e]) => k !== orderHashLower && e.submittedIp === clientIp
     );
-    if (assetRes.rows[0]) {
-      collateralSymbol = assetRes.rows[0].symbol ?? null;
-      collateralDecimals = Number(assetRes.rows[0].decimals ?? 18);
+    if (ipEntries.length >= MAX_ORDERS_PER_IP) {
+      throw new HttpError(
+        429,
+        'RATE_LIMIT_EXCEEDED',
+        `Too many active signed orders (${MAX_ORDERS_PER_IP}) submitted from this IP address.`
+      );
+    }
+  }
+
+  // Never evict another maker's valid open order at global capacity
+  if (!signedMap.has(orderHashLower) && signedMap.size >= MAX_SIGNED_ORDERS) {
+    if (sameMakerEntries.length > 0) {
+      const oldest = sameMakerEntries.shift();
+      if (oldest) signedMap.delete(oldest[0]);
     } else {
-      try {
-        const [sym, dec] = await Promise.all([
-          ctx.publicClient.readContract({ address: collateralToken, abi: erc20MetaAbi, functionName: 'symbol' }),
-          ctx.publicClient.readContract({ address: collateralToken, abi: erc20MetaAbi, functionName: 'decimals' }),
-        ]);
-        collateralSymbol = String(sym);
-        collateralDecimals = Number(dec);
-      } catch {
-        // leave null/18 fallback
-      }
+      throw new HttpError(
+        429,
+        'ORDERBOOK_CAPACITY_EXCEEDED',
+        'Signed order relay has reached active capacity; retry after existing orders expire or fill.'
+      );
     }
   }
 
-  // Evict stale entries if near capacity
-  if (signedMap.size >= MAX_SIGNED_ORDERS && !signedMap.has(orderHash.toLowerCase())) {
-    for (const [k, existing] of signedMap.entries()) {
-      if (BigInt(existing.expiry) <= blk.timestamp) {
-        signedMap.delete(k);
-      }
-    }
-    if (signedMap.size >= MAX_SIGNED_ORDERS) {
-      const oldestKey = signedMap.keys().next().value;
-      if (oldestKey) signedMap.delete(oldestKey);
-    }
-  }
-
+  const nowMs = Date.now();
+  const initialStatus: LiveRelayOrderState['status'] = filled > 0n ? 'partially_filled' : 'open';
   const record: RelaySignedOrderRecord = {
     orderHash,
     orderType: input.order_type,
@@ -908,26 +1164,102 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown) {
     yieldMode,
     signedOrder: signedOrderPlain,
     signature: input.signature as Hex,
-    submittedAt: new Date().toISOString(),
+    submittedAt: new Date(nowMs).toISOString(),
+    submittedIp: clientIp,
+    submittedAtMs: nowMs,
+    cachedFilled: filled,
+    cachedCancelled: false,
+    cachedMakerNonce: currentMakerNonce,
+    cachedStatus: initialStatus,
+    cachedBlockNumber: blk.number,
+    lastRefreshedAtMs: nowMs,
   };
-  signedMap.set(orderHash.toLowerCase(), record);
+  signedMap.set(orderHashLower, record);
 
-  const liveState: LiveRelayOrderState = {
-    record,
-    filled,
-    remaining: totalUsdc - filled,
-    cancelled: false,
-    expired: false,
-    nonceBumped: false,
-    currentMakerNonce,
-    status: filled > 0n ? 'partially_filled' : 'open',
-    blockNumber: blk.number,
-  };
-
+  const liveState = deriveRelayLiveState(record, blk.timestamp, blk.number);
   return {
     statusCode: 201,
     body: formatRelayOrderEnvelope(liveState, []),
   };
+}
+
+function formatDbOrderRow(
+  r: {
+    order_hash: string;
+    maker: string;
+    collateral_token: string | null;
+    collateral_symbol: string | null;
+    min_usdc: string;
+    filled_usdc: string;
+    order_type: string;
+    cancelled: boolean;
+    maker_nonce: string;
+    first_seen_block: string;
+    last_updated_block: string;
+    fills_count: number;
+  },
+  fillsByOrder: Map<string, unknown[]>,
+  liveRelay: LiveRelayOrderState | undefined
+) {
+  const filled = liveRelay ? liveRelay.filled : BigInt(r.filled_usdc);
+  const minUsdc = BigInt(r.min_usdc);
+  const cancelled = liveRelay ? liveRelay.cancelled : r.cancelled;
+  const remaining = minUsdc > filled ? minUsdc - filled : 0n;
+  const derivedStatus = cancelled
+    ? 'cancelled'
+    : liveRelay?.nonceBumped
+      ? 'nonce_bumped'
+      : minUsdc === 0n
+        ? 'unknown'
+        : filled < minUsdc
+          ? liveRelay && filled === 0n && !liveRelay.expired
+            ? 'open'
+            : 'partially_filled'
+          : 'filled';
+
+  const baseRow: Record<string, unknown> = {
+    order_hash: r.order_hash,
+    maker: getAddress(r.maker),
+    order_type: r.order_type,
+    collateral_token: r.collateral_token ? getAddress(r.collateral_token) : null,
+    collateral_symbol: r.collateral_symbol,
+    status: derivedStatus,
+    min_usdc: formatAmount(minUsdc, USDC_DECIMALS, 'USDC'),
+    filled_usdc: formatAmount(filled, USDC_DECIMALS, 'USDC'),
+    remaining_usdc: minUsdc > 0n ? formatAmount(remaining, USDC_DECIMALS, 'USDC') : null,
+    cancelled,
+    maker_nonce: r.maker_nonce,
+    fills_count: Number(r.fills_count),
+    fills: fillsByOrder.get(r.order_hash) ?? [],
+    first_seen_block: r.first_seen_block,
+    last_updated_block: r.last_updated_block,
+  };
+
+  if (liveRelay) {
+    const rec = liveRelay.record;
+    baseRow.collateral_amount = rec.collateralAmount
+      ? formatAmount(BigInt(rec.collateralAmount), rec.collateralDecimals, rec.collateralSymbol ?? undefined)
+      : null;
+    baseRow.rate_bps = rec.rateBps;
+    if (rec.orderType === 'borrow') {
+      baseRow.max_rate_bps = rec.rateBps;
+    } else {
+      baseRow.min_rate_bps = rec.rateBps;
+      baseRow.allowed_collateral = rec.collateralToken ?? zeroAddress;
+    }
+    baseRow.term_days = rec.termDays;
+    baseRow.max_ltv_bps = rec.maxLtvBps;
+    baseRow.min_fill = formatAmount(BigInt(rec.minFill), USDC_DECIMALS, 'USDC');
+    baseRow.expiry = rec.expiry;
+    baseRow.nonce = rec.nonce;
+    baseRow.current_maker_nonce = liveRelay.currentMakerNonce.toString();
+    baseRow.yield_mode = rec.yieldMode;
+    baseRow.signed_order = rec.signedOrder;
+    baseRow.signature = rec.signature;
+    baseRow.submitted_at = rec.submittedAt;
+  }
+
+  return baseRow;
 }
 
 async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
@@ -980,8 +1312,7 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const hasSignedOrders = signedMap.size > 0;
 
-  let total = 0;
-  let dbRows: Array<{
+  type DbOrderRow = {
     order_hash: string;
     maker: string;
     collateral_token: string | null;
@@ -994,78 +1325,11 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
     first_seen_block: string;
     last_updated_block: string;
     fills_count: number;
-  }> = [];
+  };
 
-  if (!hasSignedOrders) {
-    const countRes = await ctx.db.query<{ cnt: number }>(
-      `SELECT COUNT(*)::INT AS cnt FROM orders o ${whereClause}`,
-      params
-    );
-    total = Number(countRes.rows[0]?.cnt ?? 0);
-
-    const dataParams = [...params, pag.limit, pag.offset];
-    const rowsRes = await ctx.db.query<typeof dbRows[number]>(
-      `SELECT
-         o.order_hash,
-         o.maker,
-         o.collateral_token,
-         a.symbol AS collateral_symbol,
-         o.min_usdc::TEXT AS min_usdc,
-         o.filled_usdc::TEXT AS filled_usdc,
-         o.order_type,
-         o.cancelled,
-         o.maker_nonce::TEXT AS maker_nonce,
-         o.first_seen_block::TEXT AS first_seen_block,
-         o.last_updated_block::TEXT AS last_updated_block,
-         (SELECT COUNT(*)::INT FROM order_fills ofi WHERE ofi.order_hash = o.order_hash) AS fills_count
-       FROM orders o
-       LEFT JOIN assets a ON LOWER(a.token) = LOWER(o.collateral_token)
-       ${whereClause}
-       ORDER BY o.last_updated_block DESC, o.order_hash ASC
-       LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`,
-      dataParams
-    );
-    dbRows = rowsRes.rows;
-  } else {
-    const rowsRes = await ctx.db.query<typeof dbRows[number]>(
-      `SELECT
-         o.order_hash,
-         o.maker,
-         o.collateral_token,
-         a.symbol AS collateral_symbol,
-         o.min_usdc::TEXT AS min_usdc,
-         o.filled_usdc::TEXT AS filled_usdc,
-         o.order_type,
-         o.cancelled,
-         o.maker_nonce::TEXT AS maker_nonce,
-         o.first_seen_block::TEXT AS first_seen_block,
-         o.last_updated_block::TEXT AS last_updated_block,
-         (SELECT COUNT(*)::INT FROM order_fills ofi WHERE ofi.order_hash = o.order_hash) AS fills_count
-       FROM orders o
-       LEFT JOIN assets a ON LOWER(a.token) = LOWER(o.collateral_token)
-       ${whereClause}
-       ORDER BY o.last_updated_block DESC, o.order_hash ASC`,
-      params
-    );
-    dbRows = rowsRes.rows;
-  }
-
-  const hashes = dbRows.map((r) => r.order_hash);
-  const fillsByOrder = new Map<
-    string,
-    Array<{
-      loan_id: string;
-      collateral_token: string | null;
-      collateral_symbol: string | null;
-      fill_amount_usdc: ReturnType<typeof formatAmount>;
-      collateral_amount: ReturnType<typeof formatAmount>;
-      taker: string;
-      block_number: string;
-      tx_hash: string;
-    }>
-  >();
-
-  if (hashes.length > 0) {
+  const fetchFillsMap = async (hashes: string[]) => {
+    const fillsByOrder = new Map<string, unknown[]>();
+    if (hashes.length === 0) return fillsByOrder;
     const placeholders = hashes.map((_, idx) => `$${idx + 1}`).join(', ');
     const fillsRes = await ctx.db.query<{
       order_hash: string;
@@ -1112,139 +1376,55 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
       });
       fillsByOrder.set(f.order_hash, arr);
     }
-  }
+    return fillsByOrder;
+  };
+
+  const countRes = await ctx.db.query<{ cnt: number }>(
+    `SELECT COUNT(*)::INT AS cnt FROM orders o ${whereClause}`,
+    params
+  );
+  const dbTotal = Number(countRes.rows[0]?.cnt ?? 0);
 
   if (!hasSignedOrders) {
-    const data = dbRows.map((r) => {
-      const filled = BigInt(r.filled_usdc);
-      const minUsdc = BigInt(r.min_usdc);
-      const remaining = minUsdc > filled ? minUsdc - filled : 0n;
-      const derivedStatus = r.cancelled
-        ? 'cancelled'
-        : minUsdc === 0n
-          ? 'unknown'
-          : filled < minUsdc
-            ? 'partially_filled'
-            : 'filled';
-      return {
-        order_hash: r.order_hash,
-        maker: getAddress(r.maker),
-        order_type: r.order_type,
-        collateral_token: r.collateral_token ? getAddress(r.collateral_token) : null,
-        collateral_symbol: r.collateral_symbol,
-        status: derivedStatus,
-        min_usdc: formatAmount(minUsdc, USDC_DECIMALS, 'USDC'),
-        filled_usdc: formatAmount(filled, USDC_DECIMALS, 'USDC'),
-        remaining_usdc: minUsdc > 0n ? formatAmount(remaining, USDC_DECIMALS, 'USDC') : null,
-        cancelled: r.cancelled,
-        maker_nonce: r.maker_nonce,
-        fills_count: Number(r.fills_count),
-        fills: fillsByOrder.get(r.order_hash) ?? [],
-        first_seen_block: r.first_seen_block,
-        last_updated_block: r.last_updated_block,
-      };
-    });
-
+    const dataParams = [...params, pag.limit, pag.offset];
+    const rowsRes = await ctx.db.query<DbOrderRow>(
+      `SELECT
+         o.order_hash,
+         o.maker,
+         o.collateral_token,
+         a.symbol AS collateral_symbol,
+         o.min_usdc::TEXT AS min_usdc,
+         o.filled_usdc::TEXT AS filled_usdc,
+         o.order_type,
+         o.cancelled,
+         o.maker_nonce::TEXT AS maker_nonce,
+         o.first_seen_block::TEXT AS first_seen_block,
+         o.last_updated_block::TEXT AS last_updated_block,
+         (SELECT COUNT(*)::INT FROM order_fills ofi WHERE ofi.order_hash = o.order_hash) AS fills_count
+       FROM orders o
+       LEFT JOIN assets a ON LOWER(a.token) = LOWER(o.collateral_token)
+       ${whereClause}
+       ORDER BY o.last_updated_block DESC, o.order_hash ASC
+       LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`,
+      dataParams
+    );
+    const fillsByOrder = await fetchFillsMap(rowsRes.rows.map((r) => r.order_hash));
+    const data = rowsRes.rows.map((r) => formatDbOrderRow(r, fillsByOrder, undefined));
     return {
       statusCode: 200,
       body: {
         ...meta,
-        pagination: buildPaginationEnvelope(pag.limit, pag.offset, data.length, total),
+        pagination: buildPaginationEnvelope(pag.limit, pag.offset, data.length, dbTotal),
         data,
       },
     };
   }
 
-  // Merge live verified relay orders with indexed DB order rows
-  let blk = { number: BigInt(meta.block_number || '0'), timestamp: BigInt(Math.floor(Date.now() / 1000)) };
-  try {
-    const liveBlk = await ctx.publicClient.getBlock({ blockTag: 'latest' });
-    blk = { number: liveBlk.number, timestamp: liveBlk.timestamp };
-  } catch {
-    // use metadata fallback if head query fails
-  }
+  // Merge verified signed relay orders using batched multicall capped to requested page + TTL cache + DB LIMIT
+  const blk = await getLatestBlockForRelay(ctx, BigInt(meta.block_number || '0'));
 
-  const relayStates = new Map<string, LiveRelayOrderState>();
-  await Promise.all(
-    Array.from(signedMap.entries()).map(async ([k, rec]) => {
-      const st = await readLiveRelayOrderState(ctx, rec, blk.timestamp, blk.number);
-      relayStates.set(k, st);
-    })
-  );
-
-  const seenHashes = new Set<string>();
-  const dbFormatted: Array<Record<string, unknown>> = [];
-  for (const r of dbRows) {
-    const key = r.order_hash.toLowerCase();
-    seenHashes.add(key);
-    const liveRelay = relayStates.get(key);
-    const filled = liveRelay ? liveRelay.filled : BigInt(r.filled_usdc);
-    const minUsdc = BigInt(r.min_usdc);
-    const cancelled = liveRelay ? liveRelay.cancelled : r.cancelled;
-    const remaining = minUsdc > filled ? minUsdc - filled : 0n;
-    const derivedStatus = cancelled
-      ? 'cancelled'
-      : liveRelay?.nonceBumped
-        ? 'nonce_bumped'
-        : minUsdc === 0n
-          ? 'unknown'
-          : filled < minUsdc
-            ? liveRelay && filled === 0n && !liveRelay.expired
-              ? 'open'
-              : 'partially_filled'
-            : 'filled';
-
-    if (filters.status && derivedStatus !== filters.status) continue;
-
-    const baseRow: Record<string, unknown> = {
-      order_hash: r.order_hash,
-      maker: getAddress(r.maker),
-      order_type: r.order_type,
-      collateral_token: r.collateral_token ? getAddress(r.collateral_token) : null,
-      collateral_symbol: r.collateral_symbol,
-      status: derivedStatus,
-      min_usdc: formatAmount(minUsdc, USDC_DECIMALS, 'USDC'),
-      filled_usdc: formatAmount(filled, USDC_DECIMALS, 'USDC'),
-      remaining_usdc: minUsdc > 0n ? formatAmount(remaining, USDC_DECIMALS, 'USDC') : null,
-      cancelled,
-      maker_nonce: r.maker_nonce,
-      fills_count: Number(r.fills_count),
-      fills: fillsByOrder.get(r.order_hash) ?? [],
-      first_seen_block: r.first_seen_block,
-      last_updated_block: r.last_updated_block,
-    };
-
-    if (liveRelay) {
-      const rec = liveRelay.record;
-      baseRow.collateral_amount = rec.collateralAmount
-        ? formatAmount(BigInt(rec.collateralAmount), rec.collateralDecimals, rec.collateralSymbol ?? undefined)
-        : null;
-      baseRow.rate_bps = rec.rateBps;
-      if (rec.orderType === 'borrow') {
-        baseRow.max_rate_bps = rec.rateBps;
-      } else {
-        baseRow.min_rate_bps = rec.rateBps;
-        baseRow.allowed_collateral = rec.collateralToken ?? zeroAddress;
-      }
-      baseRow.term_days = rec.termDays;
-      baseRow.max_ltv_bps = rec.maxLtvBps;
-      baseRow.min_fill = formatAmount(BigInt(rec.minFill), USDC_DECIMALS, 'USDC');
-      baseRow.expiry = rec.expiry;
-      baseRow.nonce = rec.nonce;
-      baseRow.current_maker_nonce = liveRelay.currentMakerNonce.toString();
-      baseRow.yield_mode = rec.yieldMode;
-      baseRow.signed_order = rec.signedOrder;
-      baseRow.signature = rec.signature;
-      baseRow.submitted_at = rec.submittedAt;
-    }
-
-    dbFormatted.push(baseRow);
-  }
-
-  const relayOnlyRows: Array<Record<string, unknown>> = [];
-  for (const [k, live] of relayStates.entries()) {
-    if (seenHashes.has(k)) continue;
-    const rec = live.record;
+  const filterMatchedRelays: RelaySignedOrderRecord[] = [];
+  for (const rec of signedMap.values()) {
     if (filters.maker && rec.maker.toLowerCase() !== filters.maker.toLowerCase()) continue;
     if (filters.order_type && rec.orderType !== filters.order_type) continue;
     if (filters.asset) {
@@ -1254,19 +1434,106 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
         continue;
       }
     }
-    if (filters.status) {
-      if (live.status !== filters.status) continue;
-    } else if (!filters.include_inactive && live.status !== 'open' && live.status !== 'partially_filled') {
-      // Hide expired / nonce_bumped / cancelled / filled unindexed relay stubs from public open book unless requested
-      continue;
-    }
-
-    relayOnlyRows.push(formatRelayOrderEnvelope(live, []));
+    filterMatchedRelays.push(rec);
   }
 
-  const merged = [...relayOnlyRows, ...dbFormatted];
-  total = merged.length;
-  const pageData = merged.slice(pag.offset, pag.offset + pag.limit);
+  // Determine which filtered relays are already indexed in ctx.db.orders (bounded chunks, zero full-table scan)
+  const indexedRelayHashSet = new Set<string>();
+  if (filterMatchedRelays.length > 0 && dbTotal > 0) {
+    const relayHashes = filterMatchedRelays.map((r) => r.orderHash.toLowerCase());
+    for (let i = 0; i < relayHashes.length; i += 500) {
+      const chunk = relayHashes.slice(i, i + 500);
+      const ph = chunk.map((_, idx) => `$${idx + 1}`).join(', ');
+      const idxHitRes = await ctx.db.query<{ h: string }>(
+        `SELECT LOWER(order_hash) AS h FROM orders WHERE LOWER(order_hash) IN (${ph})`,
+        chunk
+      );
+      for (const row of idxHitRes.rows) {
+        indexedRelayHashSet.add(row.h);
+      }
+    }
+  }
+
+  const relayOnlyCandidates = filterMatchedRelays.filter(
+    (rec) => !indexedRelayHashSet.has(rec.orderHash.toLowerCase())
+  );
+
+  // If the filtered candidate list is small (<= 100), refresh them all in one multicall so status filters & counts are exact.
+  // If > 100 (e.g. 2000 relayed orders), only refresh the requested page slice (<= pag.limit) via multicall + TTL cache!
+  if (relayOnlyCandidates.length <= MAX_RELAY_REFRESH_PER_REQ) {
+    await batchRefreshRelayRecords(ctx, relayOnlyCandidates, blk.timestamp, blk.number);
+  } else {
+    const tentativeActive = relayOnlyCandidates.filter((rec) => {
+      const st = deriveRelayLiveState(rec, blk.timestamp, blk.number);
+      if (filters.status) return st.status === filters.status;
+      if (filters.include_inactive) return true;
+      return st.status === 'open' || st.status === 'partially_filled';
+    });
+    const pageCandidates = tentativeActive.slice(pag.offset, pag.offset + pag.limit);
+    await batchRefreshRelayRecords(ctx, pageCandidates, blk.timestamp, blk.number);
+  }
+
+  const relayOnlyStates = relayOnlyCandidates
+    .map((rec) => deriveRelayLiveState(rec, blk.timestamp, blk.number))
+    .filter((live) => {
+      if (filters.status) return live.status === filters.status;
+      if (filters.include_inactive) return true;
+      return live.status === 'open' || live.status === 'partially_filled';
+    });
+
+  const relayCount = relayOnlyStates.length;
+  const total = relayCount + dbTotal;
+  const relaySlice = relayOnlyStates.slice(pag.offset, pag.offset + pag.limit);
+  const neededFromDb = Math.max(0, pag.limit - relaySlice.length);
+  const dbOffset = Math.max(0, pag.offset - relayCount);
+
+  let dbRows: DbOrderRow[] = [];
+  if (neededFromDb > 0 && dbTotal > dbOffset) {
+    const dataParams = [...params, neededFromDb, dbOffset];
+    const rowsRes = await ctx.db.query<DbOrderRow>(
+      `SELECT
+         o.order_hash,
+         o.maker,
+         o.collateral_token,
+         a.symbol AS collateral_symbol,
+         o.min_usdc::TEXT AS min_usdc,
+         o.filled_usdc::TEXT AS filled_usdc,
+         o.order_type,
+         o.cancelled,
+         o.maker_nonce::TEXT AS maker_nonce,
+         o.first_seen_block::TEXT AS first_seen_block,
+         o.last_updated_block::TEXT AS last_updated_block,
+         (SELECT COUNT(*)::INT FROM order_fills ofi WHERE ofi.order_hash = o.order_hash) AS fills_count
+       FROM orders o
+       LEFT JOIN assets a ON LOWER(a.token) = LOWER(o.collateral_token)
+       ${whereClause}
+       ORDER BY o.last_updated_block DESC, o.order_hash ASC
+       LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`,
+      dataParams
+    );
+    dbRows = rowsRes.rows;
+  }
+
+  const dbRelaysOnPage = dbRows
+    .map((r) => signedMap.get(r.order_hash.toLowerCase()))
+    .filter((r): r is RelaySignedOrderRecord => Boolean(r));
+  if (dbRelaysOnPage.length > 0) {
+    await batchRefreshRelayRecords(ctx, dbRelaysOnPage, blk.timestamp, blk.number);
+  }
+  const dbRelayStates = new Map<string, LiveRelayOrderState>();
+  for (const rec of dbRelaysOnPage) {
+    dbRelayStates.set(rec.orderHash.toLowerCase(), deriveRelayLiveState(rec, blk.timestamp, blk.number));
+  }
+
+  const fillsByOrder = await fetchFillsMap(dbRows.map((r) => r.order_hash));
+  const dbFormatted = dbRows.map((r) =>
+    formatDbOrderRow(r, fillsByOrder, dbRelayStates.get(r.order_hash.toLowerCase()))
+  );
+
+  const pageData = [
+    ...relaySlice.map((live) => formatRelayOrderEnvelope(live, [])),
+    ...dbFormatted,
+  ];
 
   return {
     statusCode: 200,
@@ -2074,7 +2341,7 @@ export function createApiServer(ctx: ApiContext): http.Server {
 
       if (pathname === '/orders' && req.method === 'POST') {
         const rawBody = await readJsonBody(req, Math.min(ctx.config.maxBodyBytes, 16_384));
-        const result = await handlePostOrder(ctx, rawBody);
+        const result = await handlePostOrder(ctx, rawBody, clientIp);
         sendJson(res, result.statusCode, result.body);
         return;
       }

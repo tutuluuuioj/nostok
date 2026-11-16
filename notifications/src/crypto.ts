@@ -379,7 +379,7 @@ export function signBlockSenderToken(
   subId: string,
   wallet: string,
   canonicalTargetHash: string,
-  ttlSecs = 30 * 86_400,
+  ttlSecs = 86_400,
   nowMs = Date.now()
 ): string {
   const payload: BlockSenderPayload = {
@@ -398,7 +398,7 @@ export function verifyBlockSenderToken(
   secret: string,
   token: string,
   nowMs = Date.now()
-): { subId: string; wallet: string; canonicalTargetHash: string } {
+): { subId: string; wallet: string; canonicalTargetHash: string; exp: number } {
   const parts = token.split('.');
   if (parts.length !== 2) throw new Error('Invalid block token format');
   const [body, sig] = parts;
@@ -420,7 +420,7 @@ export function verifyBlockSenderToken(
   if (typeof parsed.exp !== 'number' || Math.floor(nowMs / 1000) > parsed.exp) {
     throw new Error('Block token expired');
   }
-  return { subId: parsed.subId, wallet: parsed.wallet, canonicalTargetHash: parsed.cth };
+  return { subId: parsed.subId, wallet: parsed.wallet, canonicalTargetHash: parsed.cth, exp: parsed.exp };
 }
 
 export function signWebhookPayload(

@@ -1438,8 +1438,8 @@ async function runTests(): Promise<void> {
       const postApproveMeta = await readBorrowAllowanceAndNonce(ADDRESSES.borrower, nvdac, { cfg });
       assert.equal(
         BigInt(postApproveMeta.allowanceRaw),
-        exact700.collateralAmountRaw,
-        'Approval MUST grant exact rounded-up raw API collateral amount, never infinite or floored'
+        exact700.requiredApprovalRaw,
+        'Approval MUST grant signed raw collateral + ceil(principal/minFill) wei slack, never infinite or floored'
       );
 
       const onchainOrderHash = await publicClient.readContract({
@@ -1616,7 +1616,10 @@ async function runTests(): Promise<void> {
       });
       assert.equal(quote1000.accepted, true);
       const exact1000ZeroBuf = resolveExactBorrowAmounts(quote1000, { bufferBps: 0 });
-      const exact1000Buffered = resolveExactBorrowAmounts(quote1000, { bufferBps: DEFAULT_COLLATERAL_BUFFER_BPS });
+      const exact1000Buffered = resolveExactBorrowAmounts(quote1000, {
+        bufferBps: DEFAULT_COLLATERAL_BUFFER_BPS,
+        minFillRaw: '500000000',
+      });
       assert.ok(exact1000Buffered.collateralAmountRaw > exact1000ZeroBuf.collateralAmountRaw);
 
       await publicClient.waitForTransactionReceipt({
@@ -1694,8 +1697,8 @@ async function runTests(): Promise<void> {
       const bufAllowMeta = await readBorrowAllowanceAndNonce(ADDRESSES.borrower, nvdac, { cfg });
       assert.equal(
         BigInt(bufAllowMeta.allowanceRaw),
-        exact1000Buffered.collateralAmountRaw,
-        'Approve MUST grant exact buffered collateral amount'
+        exact1000Buffered.requiredApprovalRaw,
+        'Approve MUST grant exact buffered collateral amount + partial-fill ceiling slack'
       );
       // Approve enough to cover $800 fill on Order A + $500+$500 fills on Order B
       await publicClient.waitForTransactionReceipt({
@@ -1754,7 +1757,7 @@ async function runTests(): Promise<void> {
           address: nvdac,
           abi: approveAbi,
           functionName: 'approve',
-          args: [deployed.collateralEscrow, exact1000Buffered.collateralAmountRaw],
+          args: [deployed.collateralEscrow, exact1000Buffered.requiredApprovalRaw],
         }),
       });
       const bufferedOrderPriceTick = await prepareAndSignBorrowOrder({
@@ -1975,6 +1978,160 @@ async function runTests(): Promise<void> {
       assert.equal(bumpedApiRow?.status, 'nonce_bumped');
       console.log('PASS M5: Orderbook POST /orders relay, persisted storage, paste-JSON cancel, & bumpNonce verified.');
 
+      // Item 2: Multi-fill ERC-20 allowance covers ceil(totalUsdc/minFill) wei slack across 500+500 ($1000), 500x3 ($1500), 700+700+600 ($2000) without manual top-up
+      await publicClient.waitForTransactionReceipt({
+        hash: await rawWalletClient.sendTransaction({
+          account: deployed.nostokTimelock,
+          to: deployed.loanCore,
+          data: encodeFunctionData({
+            abi: parseAbi(['function setGlobalCap(uint128 newCap)']),
+            functionName: 'setGlobalCap',
+            args: [30_000_000_000n],
+          }),
+        }),
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await rawWalletClient.sendTransaction({
+          account: deployed.nostokTimelock,
+          to: deployed.assetRegistry,
+          data: encodeFunctionData({
+            abi: [
+              {
+                type: 'function',
+                name: 'setAssetConfig',
+                stateMutability: 'nonpayable',
+                inputs: [
+                  { name: 'token', type: 'address' },
+                  {
+                    name: 'config',
+                    type: 'tuple',
+                    components: [
+                      { name: 'feed', type: 'address' },
+                      { name: 'feedDecimals', type: 'uint8' },
+                      { name: 'tier', type: 'uint8' },
+                      { name: 'maxInitLtvBps', type: 'uint16' },
+                      { name: 'marginCallLtvBps', type: 'uint16' },
+                      { name: 'liqLtvBps', type: 'uint16' },
+                      { name: 'badDebtLtvBps', type: 'uint16' },
+                      { name: 'maxDiscountBps', type: 'uint16' },
+                      { name: 'closedMarketHaircutBps', type: 'uint16' },
+                      { name: 'perLoanCap', type: 'uint128' },
+                      { name: 'assetCap', type: 'uint128' },
+                      { name: 'maxStaleOpenSecs', type: 'uint32' },
+                      { name: 'status', type: 'uint8' },
+                      { name: 'restricted', type: 'bool' },
+                    ],
+                  },
+                ],
+                outputs: [],
+              },
+            ],
+            functionName: 'setAssetConfig',
+            args: [
+              nvdac,
+              {
+                feed: nvdaFeed,
+                feedDecimals: 8,
+                tier: 0,
+                maxInitLtvBps: 6000,
+                marginCallLtvBps: 7000,
+                liqLtvBps: 7800,
+                badDebtLtvBps: 9000,
+                maxDiscountBps: 600,
+                closedMarketHaircutBps: 500,
+                perLoanCap: 3_000_000_000n,
+                assetCap: 20_000_000_000n,
+                maxStaleOpenSecs: 21600,
+                status: 0,
+                restricted: false,
+              },
+            ],
+          }),
+        }),
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdac,
+          abi: mockB20Artifact.abi,
+          functionName: 'mint',
+          args: [ADDRESSES.borrower, 200n * 10n ** 18n],
+        }),
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await rawWalletClient.sendTransaction({
+          account: BASE_USDC_WHALE,
+          to: BASE_USDC,
+          data: encodeFunctionData({
+            abi: parseAbi(['function transfer(address to, uint256 value) returns (bool)']),
+            functionName: 'transfer',
+            args: [ADDRESSES.lender, 15_000_000_000n],
+          }),
+        }),
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await lenderClient.writeContract({
+          address: BASE_USDC,
+          abi: approveAbi,
+          functionName: 'approve',
+          args: [deployed.loanCore, 25_000_000_000n],
+        }),
+      });
+
+      const multiFillCases = [
+        { label: '500+500 of $1000', principalRaw: '1000000000', minFillRaw: '500000000', fills: [500_000_000n, 500_000_000n] },
+        { label: '500x3 of $1500', principalRaw: '1500000000', minFillRaw: '500000000', fills: [500_000_000n, 500_000_000n, 500_000_000n] },
+        { label: '700+700+600 of $2000', principalRaw: '2000000000', minFillRaw: '600000000', fills: [700_000_000n, 700_000_000n, 600_000_000n] },
+      ];
+      for (const mf of multiFillCases) {
+        await publicClient.waitForTransactionReceipt({
+          hash: await borrowerClient.writeContract({
+            address: nvdac,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.collateralEscrow, 0n],
+          }),
+        });
+        const prep = await prepareAndSignBorrowOrder({
+          address: ADDRESSES.borrower,
+          collateralToken: nvdac,
+          principalRaw: mf.principalRaw,
+          minFillRaw: mf.minFillRaw,
+          maxRateBps: 900,
+          termDays: 30,
+          maxLtvBps: 6000,
+          expiryDays: 7,
+          autoApprove: true,
+          storage: mockStorage,
+          provider: walletProvider,
+          cfg,
+        });
+        assert.ok(prep.approvalTxHash, `${mf.label}: autoApprove must approve exact collateral + slack`);
+        const expectedSlack = (BigInt(mf.principalRaw) + BigInt(mf.minFillRaw) - 1n) / BigInt(mf.minFillRaw);
+        assert.equal(
+          BigInt(prep.exactAmounts.requiredApprovalRaw),
+          prep.order.collateralAmount + expectedSlack,
+          `${mf.label}: allowance must include ceil(totalUsdc/minFill) wei slack`
+        );
+        for (const fillAmt of mf.fills) {
+          await publicClient.waitForTransactionReceipt({
+            hash: await lenderClient.writeContract({
+              address: deployed.orderSettlement,
+              abi: fillOrderAbi,
+              functionName: 'fillBorrowOrder',
+              args: [prep.order, prep.signature, fillAmt],
+            }),
+          });
+        }
+        const totalFilled = await publicClient.readContract({
+          address: deployed.orderSettlement,
+          abi: orderSettlementAbi,
+          functionName: 'getOrderFilledAmount',
+          args: [prep.orderHash],
+        });
+        assert.equal(totalFilled, BigInt(mf.principalRaw), `${mf.label}: final fill must succeed without ERC20InsufficientAllowance`);
+      }
+      console.log('PASS Item 2: Multi-fill BorrowOrders (500+500/$1000, 500x3/$1500, 700+700+600/$2000) all fill cleanly with autoApprove slack.');
+
       // M2 Frontend Pages + Low Borrow UI + Low vite build --mode guard
       const confirmPageHtml = renderToStaticMarkup(
         createElement(
@@ -1993,6 +2150,24 @@ async function runTests(): Promise<void> {
       );
       assert.match(blockPageHtml, /Block this sender wallet only/);
       assert.match(blockPageHtml, /Block this address entirely \(all wallets\)/);
+      assert.match(blockPageHtml, /does not stop existing verified subscriptions/i);
+
+      const lendPageHtml = renderToStaticMarkup(
+        createElement(
+          StoreProvider,
+          null,
+          createElement(MemoryRouter, { initialEntries: ['/lend'] }, createElement(Shell, null, createElement(Lend)))
+        )
+      );
+      assert.ok(!/in-kind|inkind/i.test(lendPageHtml), 'Unused in-kind checkbox must be removed from Lend.jsx');
+      const buildersPageHtml = renderToStaticMarkup(
+        createElement(
+          StoreProvider,
+          null,
+          createElement(MemoryRouter, { initialEntries: ['/builders'] }, createElement(Shell, null, createElement(Builders)))
+        )
+      );
+      assert.ok(!/in-kind|inKind/i.test(buildersPageHtml), 'Unused in-kind/inKind flag must be removed from Builders.jsx');
 
       const borrowPageHtml = renderToStaticMarkup(
         createElement(

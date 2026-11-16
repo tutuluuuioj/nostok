@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Choice, Field, Page, PreviewBanner, Sheet, TextInput } from '../components/ui.jsx';
+import { Field, Page, PreviewBanner, Sheet, TextInput } from '../components/ui.jsx';
 import { ASSETS } from '../lib/data.js';
 import { formatApr, formatHundredths, formatUsd, parseDays, parseDollars, parsePercent } from '../lib/format.js';
 import { termSheet } from '../lib/money.js';
@@ -15,7 +15,6 @@ export function Lend() {
   const [minFill, setMinFill] = useState('500');
   const [expiry, setExpiry] = useState('2');
   const [picked, setPicked] = useState(['NVDAc', 'MSFTc']);
-  const [inKind, setInKind] = useState(false);
   const [yieldOn, setYieldOn] = useState(false);
 
   const principal = parseDollars(usdc);
@@ -102,9 +101,6 @@ export function Lend() {
               <span>On. Deferred until yield integration is enabled.</span>
             </label>
           </fieldset>
-          <Choice id="inkind" checked={inKind} onChange={setInKind}>
-            Allow in-kind settlement if the borrower allows it too.
-          </Choice>
           <p className="hint">Lend offer posting is disabled until WS3.4 live OrderSettlement integration.</p>
         </div>
         <Sheet

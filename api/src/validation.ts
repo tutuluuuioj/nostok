@@ -119,15 +119,28 @@ const positiveUintStringOrSafeIntSchema = uintStringOrSafeIntSchema.refine((val)
   return parsed !== null && parsed > 0n;
 }, 'Amount must be greater than zero');
 
+const MAX_UINT128 = (1n << 128n) - 1n;
+const MIN_PRINCIPAL_USDC = 500_000_000n;
+
+const positiveUint128StringOrSafeIntSchema = positiveUintStringOrSafeIntSchema.refine((val) => {
+  const parsed = safeParseBigInt(val);
+  return parsed !== null && parsed > 0n && parsed <= MAX_UINT128;
+}, 'Amount exceeds uint128 bounds');
+
+const principalUsdcStringOrSafeIntSchema = positiveUint128StringOrSafeIntSchema.refine((val) => {
+  const parsed = safeParseBigInt(val);
+  return parsed !== null && parsed >= MIN_PRINCIPAL_USDC;
+}, 'USDC principal / minFill must be at least $500.00 (500000000 raw USDC)');
+
 export const borrowOrderPayloadSchema = z.object({
   borrower: addressLikeSchema,
   collateralToken: addressLikeSchema,
-  collateralAmount: positiveUintStringOrSafeIntSchema,
-  minUsdc: positiveUintStringOrSafeIntSchema,
-  maxRateBps: z.coerce.number().int().min(0).max(100_000),
-  termDays: z.coerce.number().int().min(1).max(3650),
-  maxLtvBps: z.coerce.number().int().min(1).max(10_000),
-  minFill: positiveUintStringOrSafeIntSchema,
+  collateralAmount: positiveUint128StringOrSafeIntSchema,
+  minUsdc: principalUsdcStringOrSafeIntSchema,
+  maxRateBps: z.coerce.number().int().min(0, 'maxRateBps must be >= 0').max(4000, 'maxRateBps cannot exceed 4000 (40.00% APR)'),
+  termDays: z.coerce.number().int().min(7, 'termDays must be between 7 and 90').max(90, 'termDays must be between 7 and 90'),
+  maxLtvBps: z.coerce.number().int().min(100, 'maxLtvBps must be >= 100').max(9000, 'maxLtvBps cannot exceed 9000'),
+  minFill: principalUsdcStringOrSafeIntSchema,
   expiry: positiveUintStringOrSafeIntSchema,
   nonce: uintStringOrSafeIntSchema,
   yieldMode: z.coerce.number().int().min(0).max(255).default(0),
@@ -136,12 +149,12 @@ export const borrowOrderPayloadSchema = z.object({
 
 export const lendOfferPayloadSchema = z.object({
   lender: addressLikeSchema,
-  usdcAmount: positiveUintStringOrSafeIntSchema,
-  minRateBps: z.coerce.number().int().min(0).max(100_000),
-  termDays: z.coerce.number().int().min(1).max(3650),
+  usdcAmount: principalUsdcStringOrSafeIntSchema,
+  minRateBps: z.coerce.number().int().min(0, 'minRateBps must be >= 0').max(4000, 'minRateBps cannot exceed 4000 (40.00% APR)'),
+  termDays: z.coerce.number().int().min(7, 'termDays must be between 7 and 90').max(90, 'termDays must be between 7 and 90'),
   allowedCollateral: addressLikeSchema,
-  maxLtvBps: z.coerce.number().int().min(1).max(10_000),
-  minFill: positiveUintStringOrSafeIntSchema,
+  maxLtvBps: z.coerce.number().int().min(100, 'maxLtvBps must be >= 100').max(9000, 'maxLtvBps cannot exceed 9000'),
+  minFill: principalUsdcStringOrSafeIntSchema,
   expiry: positiveUintStringOrSafeIntSchema,
   nonce: uintStringOrSafeIntSchema,
   yieldMode: z.coerce.number().int().min(0).max(255).default(0),

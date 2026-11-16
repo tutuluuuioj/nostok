@@ -295,71 +295,64 @@ async function authenticateRequest(
   throw new HttpError(401, 'UNAUTHORIZED', 'Missing Authorization Bearer token or SIWE signature');
 }
 
-async function hasOnchainSybilCost(ctx: NotificationsContext, wallet: Address): Promise<boolean> {
+export const MIN_SYBIL_COST_ETH_WEI = 10_000_000_000_000_000n; // 0.01 ETH on Base
+const SYBIL_COST_CACHE_TTL_MS = 15_000;
+const SYBIL_COST_CACHE_MAX_ENTRIES = 10_000;
+const BLOCK_EXISTING_SUBS_NOTE =
+  'Blocking prevents new subscription requests and removes unverified pending requests, but does NOT stop existing verified subscriptions (use the alert email unsubscribe link or Wallet settings to disable those).';
+
+type SybilCostCacheEntry = { qualified: boolean; expiresAtMs: number };
+
+function blockTokenJti(rawToken: string): string {
+  return 'blk_' + crypto.createHash('sha256').update(rawToken, 'utf8').digest('hex').slice(0, 48);
+}
+
+async function hasOnchainSybilCost(
+  ctx: NotificationsContext,
+  wallet: Address,
+  cache?: Map<string, SybilCostCacheEntry>
+): Promise<boolean> {
   const walletLower = wallet.toLowerCase();
-
-  try {
-    const verifiedSub = await ctx.notifDb.query<{ one: number }>(
-      'SELECT 1 AS one FROM notif_subscriptions WHERE wallet = $1 AND verified = TRUE LIMIT 1',
-      [walletLower]
-    );
-    if (verifiedSub.rows.length > 0) return true;
-  } catch {
-    // continue checks
-  }
-
-  try {
-    const [loanRes, orderRes, posRes, claimRes] = await Promise.all([
-      ctx.indexerDb.query<{ one: number }>(
-        'SELECT 1 AS one FROM loans WHERE LOWER(borrower) = $1 OR LOWER(lender) = $1 LIMIT 1',
-        [walletLower]
-      ),
-      ctx.indexerDb.query<{ one: number }>(
-        'SELECT 1 AS one FROM orders WHERE LOWER(maker) = $1 LIMIT 1',
-        [walletLower]
-      ),
-      ctx.indexerDb.query<{ one: number }>(
-        'SELECT 1 AS one FROM positions WHERE LOWER(owner) = $1 LIMIT 1',
-        [walletLower]
-      ),
-      ctx.indexerDb.query<{ one: number }>(
-        'SELECT 1 AS one FROM claims WHERE LOWER(recipient) = $1 LIMIT 1',
-        [walletLower]
-      ),
-    ]);
-    if (
-      loanRes.rows.length > 0 ||
-      orderRes.rows.length > 0 ||
-      posRes.rows.length > 0 ||
-      claimRes.rows.length > 0
-    ) {
-      return true;
+  const nowMs = Date.now();
+  if (cache) {
+    const cached = cache.get(walletLower);
+    if (cached && cached.expiresAtMs > nowMs) {
+      return cached.qualified;
     }
-  } catch {
-    // continue to RPC check
+    cache.delete(walletLower);
   }
 
   let timer: NodeJS.Timeout | undefined;
   try {
-    const rpcCheck = Promise.all([
-      ctx.publicClient.getBalance({ address: wallet }),
-      ctx.publicClient.getTransactionCount({ address: wallet }),
-      ctx.publicClient.getCode({ address: wallet }),
-    ]);
+    const rpcCheck = ctx.publicClient.getBalance({ address: wallet });
     const timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => reject(new Error('sybil cost RPC check timeout')), 2500);
     });
-    const [bal, txCount, code] = await Promise.race([rpcCheck, timeout]);
-    if (bal > 0n || txCount > 0 || (code !== undefined && code !== '0x')) {
-      return true;
+    const bal = await Promise.race([rpcCheck, timeout]);
+    const qualified = bal >= MIN_SYBIL_COST_ETH_WEI;
+    if (cache) {
+      if (cache.size >= SYBIL_COST_CACHE_MAX_ENTRIES) {
+        for (const [k, v] of cache.entries()) {
+          if (v.expiresAtMs <= nowMs) cache.delete(k);
+        }
+        if (cache.size >= SYBIL_COST_CACHE_MAX_ENTRIES) {
+          const oldestKey = cache.keys().next().value;
+          if (oldestKey) cache.delete(oldestKey);
+        }
+      }
+      cache.set(walletLower, {
+        qualified,
+        expiresAtMs: nowMs + SYBIL_COST_CACHE_TTL_MS,
+      });
     }
+    return qualified;
   } catch {
+    // Keep strict global cap whenever RPC is unreachable/errors; never cache RPC errors.
+    cache?.delete(walletLower);
     return false;
   } finally {
     if (timer) clearTimeout(timer);
   }
-
-  return false;
 }
 
 export function createNotificationsServer(ctx: NotificationsContext): http.Server {
@@ -408,6 +401,12 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
     3_600_000,
     ctx.config.rateLimitMaxBuckets
   );
+  const confirmTargetSybilLimiter = new IpRateLimiter(
+    ctx.config.confirmTargetGlobalPerHourMax,
+    3_600_000,
+    ctx.config.rateLimitMaxBuckets
+  );
+  const sybilCostCache = new Map<string, SybilCostCacheEntry>();
   const confirmTargetResendLimiter = new IpRateLimiter(
     Math.max(1, Math.min(3, Math.floor(ctx.config.confirmTargetGlobalPerHourMax / 2))),
     3_600_000,
@@ -736,8 +735,15 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             `IP confirmation sends to ${input.channel} target`
           );
 
-          const walletHasSybilCost = await hasOnchainSybilCost(ctx, wallet);
-          if (!walletHasSybilCost) {
+          const walletHasSybilCost = await hasOnchainSybilCost(ctx, wallet, sybilCostCache);
+          if (walletHasSybilCost) {
+            enforceScopedRateLimit(
+              res,
+              confirmTargetSybilLimiter,
+              canonicalTargetHash,
+              `confirmation sends to ${input.channel} target`
+            );
+          } else {
             const nowMs = Date.now();
             let seenEntry = pendingWalletsByTarget.get(canonicalTargetHash);
             if (seenEntry && seenEntry.resetAtMs <= nowMs) {
@@ -835,7 +841,7 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             created.id,
             wallet,
             canonicalTargetHash,
-            30 * 86_400
+            86_400
           );
           const blockUrl = `${ctx.config.publicBaseUrl}/subscriptions/block?token=${encodeURIComponent(blockToken)}`;
           const siweAppOrigin = ctx.config.siweUri ? ctx.config.siweUri.replace(/\/+$/, '') : ctx.config.publicBaseUrl;
@@ -855,7 +861,7 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             alertType: 'subscription_verification',
             severity: 'info' as const,
             title: 'Confirm your NOSTOK alert subscription',
-            message: `Verification code: ${verificationCode}. Confirm link: ${confirmUrl}. Not me, block this address: ${blockUrl}`,
+            message: `Verification code: ${verificationCode}. Confirm link: ${confirmUrl}. Not me, block this address: ${blockUrl} (link valid 24h, single-use; stops new requests only, not existing verified subscriptions).`,
             payload: {
               subscription_id: created.id,
               verification_code: verificationCode,
@@ -891,11 +897,19 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
       if (pathname === '/subscriptions/block' && req.method === 'GET') {
         enforceScopedRateLimit(res, confirmIpLimiter, clientIp, '/subscriptions/block IP');
         const rawToken = parseOrThrow(unsubscribeBodySchema, { token: queryObj.token }).token;
-        let verified: { subId: string; wallet: string; canonicalTargetHash: string };
+        let verified: { subId: string; wallet: string; canonicalTargetHash: string; exp: number };
         try {
           verified = verifyBlockSenderToken(ctx.config.confirmSecret, rawToken);
         } catch (err) {
           throw new HttpError(400, 'VALIDATION_ERROR', err instanceof Error ? err.message : 'Invalid token');
+        }
+        const tokenJti = blockTokenJti(rawToken);
+        const usedRes = await ctx.notifDb.query<{ jti: string }>(
+          'SELECT jti FROM notif_revoked_sessions WHERE jti = $1 LIMIT 1',
+          [tokenJti]
+        );
+        if (usedRes.rows.length > 0) {
+          throw new HttpError(400, 'BLOCK_TOKEN_ALREADY_USED', 'This single-use block link has already been used.');
         }
         const checksumWallet = getAddress(verified.wallet);
         if (prefersHtmlResponse(req)) {
@@ -907,6 +921,7 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             'Block NOSTOK Alert Sender',
             `<h1>Didn't request this alert subscription?</h1>
 <p>A verification email was requested for wallet <code>${escWallet}</code>.</p>
+<p class="hint">${escapeHtml(BLOCK_EXISTING_SUBS_NOTE)}</p>
 <div class="actions">
   <form method="POST" action="/subscriptions/block">
     <input type="hidden" name="token" value="${escToken}" />
@@ -917,7 +932,7 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
     <input type="hidden" name="token" value="${escToken}" />
     <input type="hidden" name="scope" value="target_all" />
     <input type="hidden" name="block_all" value="true" />
-    <button type="submit" class="danger">Block this address entirely (all wallets)</button>
+    <button type="submit" class="danger">Block this address entirely (new requests)</button>
   </form>
 </div>`
           );
@@ -929,6 +944,8 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
           subscription_id: verified.subId,
           blocked_wallet: checksumWallet,
           supported_scopes: ['wallet', 'target_all'],
+          stops_existing_verified_subscriptions: false,
+          note: BLOCK_EXISTING_SUBS_NOTE,
         });
         return;
       }
@@ -942,12 +959,27 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             : { token: queryObj.token };
         const parsedBlock = parseOrThrow(blockSenderSchema, bodyObj);
         const blockAll = parsedBlock.scope === 'target_all' || parsedBlock.block_all === true;
-        let verified: { subId: string; wallet: string; canonicalTargetHash: string };
+        let verified: { subId: string; wallet: string; canonicalTargetHash: string; exp: number };
         try {
           verified = verifyBlockSenderToken(ctx.config.confirmSecret, parsedBlock.token);
         } catch (err) {
           throw new HttpError(400, 'VALIDATION_ERROR', err instanceof Error ? err.message : 'Invalid token');
         }
+        const nowSec = Math.floor(Date.now() / 1000);
+        const tokenJti = blockTokenJti(parsedBlock.token);
+        const consumed = await ctx.notifDb.query<{ jti: string }>(
+          `INSERT INTO notif_revoked_sessions (jti, wallet, expires_at, revoked_at)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (jti) DO NOTHING
+           RETURNING jti`,
+          [tokenJti, verified.wallet.toLowerCase(), verified.exp.toString(), nowSec.toString()]
+        );
+        if (consumed.rows.length === 0) {
+          throw new HttpError(400, 'BLOCK_TOKEN_ALREADY_USED', 'This single-use block link has already been used.');
+        }
+        await ctx.notifDb.query('DELETE FROM notif_revoked_sessions WHERE expires_at < $1', [
+          (nowSec - 3600).toString(),
+        ]);
         const walletLower = verified.wallet.toLowerCase();
         await ctx.notifDb.query(
           `INSERT INTO notif_blocked_senders (wallet, canonical_target_hash)
@@ -1002,6 +1034,7 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             for (const r of bulkDel.rows) deletedIds.push(r.id);
           }
           confirmTargetGlobalLimiter.refund(verified.canonicalTargetHash);
+          confirmTargetSybilLimiter.refund(verified.canonicalTargetHash);
           confirmTargetResendLimiter.refund(verified.canonicalTargetHash);
           pendingWalletsByTarget.delete(verified.canonicalTargetHash);
         } else if (delRes.rows.length > 0) {
@@ -1016,10 +1049,10 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
           sendHtmlPage(
             res,
             200,
-            blockAll ? 'Address Blocked Entirely' : 'Sender Wallet Blocked',
+            blockAll ? 'Address Blocked From New Requests' : 'Sender Wallet Blocked',
             blockAll
-              ? `<h1>Address opted out of all NOSTOK notifications</h1><p>No wallet can send confirmation or alert emails to this address again.</p>`
-              : `<h1>Sender wallet blocked</h1><p>Wallet <code>${escapeHtml(checksumWallet)}</code> can no longer send confirmation requests to this address.</p>`
+              ? `<h1>Address blocked from new alert requests</h1><p>No wallet can create new alert subscriptions or send confirmation emails to this address (${deletedIds.length} unverified pending request(s) removed). ${escapeHtml(BLOCK_EXISTING_SUBS_NOTE)}</p>`
+              : `<h1>Sender wallet blocked</h1><p>Wallet <code>${escapeHtml(checksumWallet)}</code> can no longer send confirmation requests to this address. ${escapeHtml(BLOCK_EXISTING_SUBS_NOTE)}</p>`
           );
           return;
         }
@@ -1030,6 +1063,8 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
           subscription_id: verified.subId,
           blocked_wallet: checksumWallet,
           deleted_pending_count: deletedIds.length,
+          stops_existing_verified_subscriptions: false,
+          note: BLOCK_EXISTING_SUBS_NOTE,
         });
         return;
       }
@@ -1539,7 +1574,9 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
     confirmTargetWalletLimiter.close();
     confirmTargetIpLimiter.close();
     confirmTargetGlobalLimiter.close();
+    confirmTargetSybilLimiter.close();
     confirmTargetResendLimiter.close();
+    sybilCostCache.clear();
     clearInterval(pendingWalletsTimer);
     confirmIpLimiter.close();
     confirmWalletLimiter.close();

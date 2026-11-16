@@ -294,14 +294,20 @@ export function Borrow() {
         collateralStr.trim() && assetObj
           ? parseDecimalToRaw(collateralStr, Number(assetObj.decimals ?? 18))
           : null;
+      const minFillRawParsed = minFillStr.trim()
+        ? parseDecimalToRaw(minFillStr, USDC_DECIMALS)
+        : null;
+      const safeMinFillRaw =
+        minFillRawParsed && BigInt(minFillRawParsed) > 0n ? minFillRawParsed : null;
       return resolveExactBorrowAmounts(quoteResult, {
         userCollateralRaw: userCol,
         bufferBps: parsedBufferBps ?? DEFAULT_COLLATERAL_BUFFER_BPS,
+        minFillRaw: safeMinFillRaw,
       });
     } catch {
       return null;
     }
-  }, [assetObj, collateralStr, parsedBufferBps, quoteResult]);
+  }, [assetObj, collateralStr, minFillStr, parsedBufferBps, quoteResult]);
 
   const partialRemainderWarning = useMemo(() => {
     const prinRawStr = exactQuoteAmounts
@@ -335,10 +341,10 @@ export function Borrow() {
   const allowanceRawBig = tokenMeta.data ? BigInt(tokenMeta.data.allowanceRaw) : 0n;
   const balanceRawBig = tokenMeta.data ? BigInt(tokenMeta.data.balanceRaw) : 0n;
   const needsApproval = Boolean(
-    exactQuoteAmounts && allowanceRawBig < exactQuoteAmounts.collateralAmountRaw
+    exactQuoteAmounts && allowanceRawBig < exactQuoteAmounts.requiredApprovalRaw
   );
   const insufficientBalance = Boolean(
-    exactQuoteAmounts && tokenMeta.data && balanceRawBig < exactQuoteAmounts.collateralAmountRaw
+    exactQuoteAmounts && tokenMeta.data && balanceRawBig < exactQuoteAmounts.requiredApprovalRaw
   );
 
   async function handleApproveCollateral() {
@@ -367,18 +373,19 @@ export function Borrow() {
       const exact = resolveExactBorrowAmounts(activeQuote, {
         userCollateralRaw: parsed.collateralRaw,
         bufferBps: parsed.bufferBps,
+        minFillRaw: parsed.minFillRaw,
       });
       const res = await approveCollateralForBorrow({
         address: web3.address,
         collateralToken: assetObj.token,
-        requiredCollateralRaw: exact.collateralAmountRaw,
+        requiredCollateralRaw: exact.requiredApprovalRaw,
         cfg: web3.config,
       });
       await loadAllowanceAndNonce();
       setActionNotice(
         res.alreadyApproved
           ? `CollateralEscrow already approved for ${res.allowanceRaw} raw units.`
-          : `Approved CollateralEscrow for ${exact.collateralAmountRaw.toString()} raw ${assetObj.symbol} units (tx ${res.txHash}).`
+          : `Approved CollateralEscrow for ${exact.requiredApprovalRaw.toString()} raw ${assetObj.symbol} units (signed ${exact.collateralAmountRaw.toString()} + ${exact.approvalSlackRaw.toString()} wei partial-fill slack, tx ${res.txHash}).`
       );
     } catch (err) {
       setActionError(formatWeb3Error(err));
@@ -935,6 +942,12 @@ export function Borrow() {
                 : null,
               exactQuoteAmounts
                 ? {
+                    label: `Approval required (+${exactQuoteAmounts.approvalSlackRaw.toString()} wei fill slack)`,
+                    value: `${exactQuoteAmounts.requiredApprovalRaw.toString()} raw (covers ${exactQuoteAmounts.maxFills.toString()} max fill(s))`,
+                  }
+                : null,
+              exactQuoteAmounts
+                ? {
                     label: 'Origination fee / net proceeds',
                     value: `${formatApiAmount(quoteResult.amounts.origination_fee, { prefixUsd: true })} / ${formatApiAmount(quoteResult.amounts.net_proceeds, { prefixUsd: true })}`,
                   }
@@ -949,7 +962,7 @@ export function Borrow() {
           />
           {insufficientBalance ? (
             <p className="err" style={{ marginTop: 12 }}>
-              Wallet {assetObj?.symbol} balance ({tokenMeta.data.balanceRaw} raw) is below buffered collateral {exactQuoteAmounts.collateralAmountRaw.toString()} raw.
+              Wallet {assetObj?.symbol} balance ({tokenMeta.data.balanceRaw} raw) is below required {exactQuoteAmounts.requiredApprovalRaw.toString()} raw (signed collateral + {exactQuoteAmounts.approvalSlackRaw.toString()} wei fill slack).
             </p>
           ) : null}
           {quoteResult && !quoteResult.accepted ? (

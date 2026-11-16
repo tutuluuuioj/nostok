@@ -109,7 +109,7 @@ export function SubscriptionAction({ mode = 'confirm' }) {
       }
       lede={
         isBlock
-          ? 'Block the specific wallet that requested alerts for this address, or block your entire email address across all NOSTOK wallets permanently.'
+          ? 'Block the specific wallet that requested alerts for this address, or block your entire address across new NOSTOK requests. Note: blocking does not stop existing verified subscriptions — use the unsubscribe link in any alert email or Wallet settings to disable those.'
           : 'Review the wallet and subscription ID below, then confirm via POST to activate delivery.'
       }
     >
@@ -151,11 +151,11 @@ export function SubscriptionAction({ mode = 'confirm' }) {
               {isBlock ? (
                 result.scope === 'target_all' || result.block_all ? (
                   <>
-                    <strong>Address blocked entirely.</strong> No wallet can send NOSTOK verification or alert emails to this address ({result.deleted_pending_count ?? 0} pending request(s) removed).
+                    <strong>Address blocked from new alert requests.</strong> No wallet can create new NOSTOK alert subscriptions for this address ({result.deleted_pending_count ?? 0} unverified pending request(s) removed). Blocking does not stop existing verified subscriptions — use the unsubscribe link in any alert email or <Link to="/wallet">Wallet &amp; alert settings</Link>.
                   </>
                 ) : (
                   <>
-                    <strong>Sender wallet blocked.</strong> Wallet <code>{result.blocked_wallet}</code> can no longer send requests to this address.
+                    <strong>Sender wallet blocked.</strong> Wallet <code>{result.blocked_wallet}</code> can no longer send requests to this address. Blocking does not stop existing verified subscriptions.
                   </>
                 )
               ) : (

@@ -813,9 +813,45 @@ export async function fetchLoanQuote({
  * partial fills and minor oracle price ticks do not revert LtvExceeded on-chain.
  * Never parses floored UI display strings for transaction or EIP-712 payload values.
  */
+/**
+ * Computes the ERC-20 allowance required on CollateralEscrow so multi-fill
+ * settlement never reverts with ERC20InsufficientAllowance due to per-fill
+ * pro-rata collateral ceiling rounding (`ceil(collateralAmount * fillUsdc / minUsdc)`).
+ */
+export function computeBorrowApprovalAmountRaw(
+  collateralAmountRaw,
+  principalRaw,
+  minFillRaw = null
+) {
+  const signedCollateralRaw = BigInt(collateralAmountRaw);
+  const totalUsdcRaw = BigInt(principalRaw);
+  if (signedCollateralRaw <= 0n || totalUsdcRaw <= 0n) {
+    throw new Error('Collateral and principal raw amounts must be positive.');
+  }
+  const hasMinFill =
+    minFillRaw !== null && minFillRaw !== undefined && String(minFillRaw).trim() !== '';
+  const rawMinFill = hasMinFill ? BigInt(minFillRaw) : totalUsdcRaw;
+  if (rawMinFill <= 0n) {
+    throw new Error('Minimum fill raw amount must be positive.');
+  }
+  const effectiveMinFill = rawMinFill > totalUsdcRaw ? totalUsdcRaw : rawMinFill;
+  const maxFills = (totalUsdcRaw + effectiveMinFill - 1n) / effectiveMinFill;
+  const approvalSlackRaw = maxFills;
+  return {
+    signedCollateralRaw,
+    maxFills,
+    approvalSlackRaw,
+    requiredApprovalRaw: signedCollateralRaw + approvalSlackRaw,
+  };
+}
+
 export function resolveExactBorrowAmounts(
   quote,
-  { userCollateralRaw = null, bufferBps = DEFAULT_COLLATERAL_BUFFER_BPS } = {}
+  {
+    userCollateralRaw = null,
+    bufferBps = DEFAULT_COLLATERAL_BUFFER_BPS,
+    minFillRaw = null,
+  } = {}
 ) {
   if (!quote?.amounts?.principal?.raw || !quote?.amounts?.collateral_required?.raw) {
     throw new Error('Quote response is missing exact raw principal or collateral_required amounts.');
@@ -841,12 +877,21 @@ export function resolveExactBorrowAmounts(
     collateralAmountRaw = provided;
   }
 
+  const approvalSizing = computeBorrowApprovalAmountRaw(
+    collateralAmountRaw,
+    principalRaw,
+    minFillRaw
+  );
+
   return {
     principalRaw,
     minRequiredCollateralRaw,
     bufferedCollateralRaw,
     bufferBps: cleanBufferBps,
     collateralAmountRaw,
+    maxFills: approvalSizing.maxFills,
+    approvalSlackRaw: approvalSizing.approvalSlackRaw,
+    requiredApprovalRaw: approvalSizing.requiredApprovalRaw,
     originationFeeRaw: BigInt(quote.amounts.origination_fee?.raw ?? 0n),
     netProceedsRaw: BigInt(quote.amounts.net_proceeds?.raw ?? 0n),
     interestMaturityRaw: BigInt(quote.amounts.interest_maturity?.raw ?? 0n),
@@ -1467,6 +1512,7 @@ export async function prepareAndSignBorrowOrder({
   const exact = resolveExactBorrowAmounts(quote, {
     userCollateralRaw: collateralAmountRaw,
     bufferBps: collateralBufferBps,
+    minFillRaw: minFillRaw ?? quote.amounts.principal.raw,
   });
   const minFillBig = BigInt(minFillRaw ?? exact.principalRaw);
   if (minFillBig < 500_000_000n) {
@@ -1476,21 +1522,23 @@ export async function prepareAndSignBorrowOrder({
     throw new Error('Minimum fill cannot exceed principal amount.');
   }
 
-  if (BigInt(walletMeta.balanceRaw) < exact.collateralAmountRaw) {
+  if (BigInt(walletMeta.balanceRaw) < exact.requiredApprovalRaw) {
     throw new Error(
-      `Insufficient ${walletMeta.symbol} balance: have ${walletMeta.balanceRaw} raw units, need ${exact.collateralAmountRaw.toString()} raw units.`
+      `Insufficient ${walletMeta.symbol} balance: have ${walletMeta.balanceRaw} raw units, need ${exact.requiredApprovalRaw.toString()} raw units (signed collateral + ${exact.approvalSlackRaw.toString()} wei partial-fill slack).`
     );
   }
 
   let approvalTxHash = null;
-  if (BigInt(walletMeta.allowanceRaw) < exact.collateralAmountRaw) {
+  if (BigInt(walletMeta.allowanceRaw) < exact.requiredApprovalRaw) {
     if (!autoApprove) {
-      throw new Error('CollateralEscrow allowance is below required collateral; approve exact collateral first.');
+      throw new Error(
+        `CollateralEscrow allowance is below required ${exact.requiredApprovalRaw.toString()} raw units (signed + ${exact.approvalSlackRaw.toString()} wei fill slack); approve collateral first.`
+      );
     }
     const appRes = await approveCollateralForBorrow({
       address: wallet,
       collateralToken: token,
-      requiredCollateralRaw: exact.collateralAmountRaw,
+      requiredCollateralRaw: exact.requiredApprovalRaw,
       provider,
       cfg,
       publicClient,
@@ -1555,6 +1603,9 @@ export async function prepareAndSignBorrowOrder({
     bufferedCollateralRaw: exact.bufferedCollateralRaw.toString(),
     bufferBps: exact.bufferBps,
     collateralAmountRaw: exact.collateralAmountRaw.toString(),
+    maxFills: exact.maxFills.toString(),
+    approvalSlackRaw: exact.approvalSlackRaw.toString(),
+    requiredApprovalRaw: exact.requiredApprovalRaw.toString(),
     originationFeeRaw: exact.originationFeeRaw.toString(),
     netProceedsRaw: exact.netProceedsRaw.toString(),
     totalRepaymentAtMaturityRaw: exact.totalRepaymentAtMaturityRaw.toString(),

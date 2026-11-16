@@ -25,7 +25,12 @@ import { loanCoreAbi } from '../src/abi.js';
 import { loadApiConfig } from '../src/config.js';
 import { assertReadOnlySql, openReadOnlyDatabase, wrapQueryableAsReadOnly } from '../src/db.js';
 import { type QuoteResponse } from '../src/quote.js';
-import { createApiContext, createApiServer } from '../src/server.js';
+import {
+  type RelaySignedOrderRecord,
+  createApiContext,
+  createApiServer,
+  sanitizeTokenSymbol,
+} from '../src/server.js';
 import { loadConfig as loadIndexerConfig } from '../../indexer/src/config.js';
 import { createIndexerContext, runIndexerSync } from '../../indexer/src/indexer.js';
 
@@ -1849,7 +1854,275 @@ async function runTests(): Promise<void> {
       assert.ok(bumpedEntry);
       assert.equal(bumpedEntry.status, 'nonce_bumped');
 
-      console.log('PASS TEST 7: POST /orders verification, GET /orders merge, bumpNonce sync, and security headers verified.');
+      // Item 3: Validation bounds, AssetRegistry check, symbol sanitization, maker/IP/capacity anti-spam & Item 1: 2000-order multicall GET benchmark
+      const signBorrowForTest = async (
+        acct: ReturnType<typeof privateKeyToAccount>,
+        overrides: Partial<typeof borrowOrderRelay>
+      ) => {
+        const ord = { ...borrowOrderRelay, borrower: acct.address, ...overrides };
+        const sig = await acct.signTypedData({
+          domain: {
+            name: 'NOSTOK Order Settlement',
+            version: '1',
+            chainId: 8453,
+            verifyingContract: deployed.orderSettlement,
+          },
+          types: {
+            BorrowOrder: [
+              { name: 'borrower', type: 'address' },
+              { name: 'collateralToken', type: 'address' },
+              { name: 'collateralAmount', type: 'uint128' },
+              { name: 'minUsdc', type: 'uint128' },
+              { name: 'maxRateBps', type: 'uint32' },
+              { name: 'termDays', type: 'uint16' },
+              { name: 'maxLtvBps', type: 'uint16' },
+              { name: 'minFill', type: 'uint128' },
+              { name: 'expiry', type: 'uint64' },
+              { name: 'nonce', type: 'uint256' },
+              { name: 'yieldMode', type: 'uint8' },
+              { name: 'allowInKindSettlement', type: 'bool' },
+            ],
+          },
+          primaryType: 'BorrowOrder',
+          message: {
+            ...ord,
+            collateralAmount: BigInt(ord.collateralAmount),
+            minUsdc: BigInt(ord.minUsdc),
+            minFill: BigInt(ord.minFill),
+            expiry: BigInt(ord.expiry),
+            nonce: BigInt(ord.nonce),
+          },
+        });
+        return { ord, sig };
+      };
+
+      const spamSigner1 = privateKeyToAccount(generatePrivateKey());
+      // Validation bounds rejected (rate > 4000, term < 7 / > 90, minUsdc < $500)
+      for (const badField of [
+        { maxRateBps: 100000 },
+        { termDays: 3650 },
+        { termDays: 3 },
+        { minUsdc: '100000000', minFill: '100000000' },
+      ]) {
+        const resBad = await postJson<{ error: { code: string } }>(`${baseUrl}/orders`, {
+          order_type: 'borrow',
+          order: { ...borrowOrderRelay, borrower: spamSigner1.address, nonce: '0', ...badField },
+          signature: borrowRelaySig,
+        });
+        assert.equal(resBad.status, 400, `Out-of-range order payload ${JSON.stringify(badField)} must return 400`);
+        assert.equal(resBad.body.error.code, 'VALIDATION_ERROR');
+      }
+
+      // Unregistered collateral rejected before storing
+      const badAsset = await signBorrowForTest(spamSigner1, { collateralToken: ADDRESSES.treasury, nonce: '0' });
+      const badAssetRes = await postJson<{ error: { code: string } }>(`${baseUrl}/orders`, {
+        order_type: 'borrow',
+        order: badAsset.ord,
+        signature: badAsset.sig,
+      });
+      assert.equal(badAssetRes.status, 400);
+      assert.equal(badAssetRes.body.error.code, 'UNSUPPORTED_COLLATERAL_ASSET');
+
+      // maxLtvBps > asset maxInitLtvBps and minUsdc > perLoanCap rejected
+      const badLtv = await signBorrowForTest(spamSigner1, { maxLtvBps: 8500, nonce: '0' });
+      const badLtvRes = await postJson<{ error: { code: string } }>(`${baseUrl}/orders`, {
+        order_type: 'borrow',
+        order: badLtv.ord,
+        signature: badLtv.sig,
+      });
+      assert.equal(badLtvRes.status, 400);
+      assert.equal(badLtvRes.body.error.code, 'LTV_EXCEEDS_ASSET_MAX');
+
+      const badCap = await signBorrowForTest(spamSigner1, { minUsdc: '4000000000', nonce: '0' });
+      const badCapRes = await postJson<{ error: { code: string } }>(`${baseUrl}/orders`, {
+        order_type: 'borrow',
+        order: badCap.ord,
+        signature: badCap.sig,
+      });
+      assert.equal(badCapRes.status, 400);
+      assert.equal(badCapRes.body.error.code, 'PER_LOAN_CAP_EXCEEDED');
+
+      // Symbol sanitization strips >16 chars and HTML/XSS payloads
+      assert.equal(sanitizeTokenSymbol(`<img src=x onerror="alert(1)">${'A'.repeat(520)}`), null);
+      assert.equal(sanitizeTokenSymbol('TOOLONGSYMBOLNAME17'), null);
+      assert.equal(sanitizeTokenSymbol('NVDAc'), 'NVDAc');
+
+      // Anti-spam caps (20/maker, 50/IP, 2000 capacity) + 2000-order GET /orders?limit=5 multicall benchmark
+      let multicallCount = 0;
+      let directReadCount = 0;
+      const instrumentedClient = new Proxy(apiCtx.publicClient, {
+        get(target, prop, receiver) {
+          if (prop === 'multicall') {
+            return (...args: unknown[]) => {
+              multicallCount += 1;
+              return (target.multicall as (...a: unknown[]) => unknown)(...args);
+            };
+          }
+          if (prop === 'readContract') {
+            return (...args: unknown[]) => {
+              directReadCount += 1;
+              return (target.readContract as (...a: unknown[]) => unknown)(...args);
+            };
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+      const spamSignedMap = new Map<string, RelaySignedOrderRecord>();
+      const spamCtx = {
+        ...apiCtx,
+        publicClient: instrumentedClient,
+        signedOrders: spamSignedMap,
+        config: {
+          ...apiCtx.config,
+          trustProxyHops: 1,
+          rateLimitMax: 5000,
+        },
+      };
+      const spamServer = createApiServer(spamCtx);
+      await new Promise<void>((r) => spamServer.listen(0, '127.0.0.1', r));
+      const spamUrl = `http://127.0.0.1:${(spamServer.address() as net.AddressInfo).port}`;
+      try {
+        // Post one legitimate order first from lender
+        const legitOrder = await postJson<{ order_hash: string }>(`${spamUrl}/orders`, {
+          order_type: 'lend',
+          order: lendOfferRelay,
+          signature: lendRelaySig,
+        });
+        assert.equal(legitOrder.status, 201);
+        const legitHashLower = legitOrder.body.order_hash.toLowerCase();
+
+        // Same maker posting 25 valid orders across different IPs evicts ONLY its own oldest orders (capped at 20)
+        for (let i = 0; i < 25; i++) {
+          const { ord, sig } = await signBorrowForTest(spamSigner1, {
+            minUsdc: (600_000_000n + BigInt(i)).toString(),
+            nonce: '0',
+          });
+          const resMaker = await postJson<{ order_hash: string }>(`${spamUrl}/orders`, {
+            order_type: 'borrow',
+            order: ord,
+            signature: sig,
+          }, { 'X-Forwarded-For': `198.51.100.${i + 1}` });
+          assert.equal(resMaker.status, 201);
+        }
+        const signer1Count = Array.from(spamSignedMap.values()).filter(
+          (r) => r.maker.toLowerCase() === spamSigner1.address.toLowerCase()
+        ).length;
+        assert.equal(signer1Count, 20, 'Per-maker active relay cap must bound maker to 20 orders');
+        assert.ok(spamSignedMap.has(legitHashLower), 'Maker eviction must NEVER evict another maker valid order');
+
+        // Same IP posting > 50 orders across fresh keys hits 429 on #51
+        for (let ipIdx = 0; ipIdx < 50; ipIdx++) {
+          const kAcct = privateKeyToAccount(generatePrivateKey());
+          const { ord, sig } = await signBorrowForTest(kAcct, {
+            minUsdc: (650_000_000n + BigInt(ipIdx)).toString(),
+            nonce: '0',
+          });
+          const ipRes = await postJson(`${spamUrl}/orders`, {
+            order_type: 'borrow',
+            order: ord,
+            signature: sig,
+          }, { 'X-Forwarded-For': '198.51.110.1' });
+          assert.equal(ipRes.status, 201);
+        }
+        const overflowIpAcct = privateKeyToAccount(generatePrivateKey());
+        const overflowIpOrder = await signBorrowForTest(overflowIpAcct, { minUsdc: '777000000', nonce: '0' });
+        const overflowIpRes = await postJson<{ error: { code: string } }>(`${spamUrl}/orders`, {
+          order_type: 'borrow',
+          order: overflowIpOrder.ord,
+          signature: overflowIpOrder.sig,
+        }, { 'X-Forwarded-For': '198.51.110.1' });
+        assert.equal(overflowIpRes.status, 429);
+        assert.equal(overflowIpRes.body.error.code, 'RATE_LIMIT_EXCEEDED');
+
+        // Fill relay to 2000 active entries, verify #2001 gets 429 ORDERBOOK_CAPACITY_EXCEEDED without evicting legit order
+        const futureExpStr = (latestBlkRelay.timestamp + 3600n).toString();
+        let fillIdx = 0;
+        while (spamSignedMap.size < 2000) {
+          fillIdx += 1;
+          const synthHash = ('0x' + fillIdx.toString(16).padStart(64, 'a')) as Hex;
+          const synthMaker = getAddress('0x' + (1000 + fillIdx).toString(16).padStart(40, '0'));
+          spamSignedMap.set(synthHash, {
+            orderHash: synthHash,
+            orderType: 'borrow',
+            maker: synthMaker,
+            collateralToken: nvdac,
+            collateralSymbol: 'NVDAc',
+            collateralDecimals: 18,
+            collateralAmount: borrowOrderRelay.collateralAmount,
+            totalUsdc: '700000000',
+            rateBps: 900,
+            termDays: 30,
+            maxLtvBps: 6000,
+            minFill: '500000000',
+            expiry: futureExpStr,
+            nonce: '0',
+            yieldMode: 0,
+            signature: ('0x' + '22'.repeat(65)) as Hex,
+            signedOrder: { ...borrowOrderRelay, borrower: synthMaker, nonce: '0', expiry: futureExpStr },
+            submittedAt: new Date().toISOString(),
+            submittedAtMs: Date.now(),
+            submittedIp: `10.0.${Math.floor(fillIdx / 250)}.${fillIdx % 250}`,
+            cachedFilled: 0n,
+            cachedCancelled: false,
+            cachedMakerNonce: 0n,
+            cachedStatus: 'open',
+            cachedBlockNumber: 0n,
+            lastRefreshedAtMs: 0,
+          });
+        }
+        const capRes = await postJson<{ error: { code: string } }>(`${spamUrl}/orders`, {
+          order_type: 'borrow',
+          order: overflowIpOrder.ord,
+          signature: overflowIpOrder.sig,
+        }, { 'X-Forwarded-For': '198.51.120.5' });
+        assert.equal(capRes.status, 429);
+        assert.equal(capRes.body.error.code, 'ORDERBOOK_CAPACITY_EXCEEDED');
+        assert.ok(spamSignedMap.has(legitHashLower), 'Global capacity limit must reject overflow rather than evicting valid orders');
+
+        // 10 parallel GET /orders?limit=5&offset=75 over 2000 relayed orders: singleflight + 2s cache + multicall + SQL LIMIT/OFFSET
+        multicallCount = 0;
+        directReadCount = 0;
+        const t0 = Date.now();
+        const parallelGets = await Promise.all(
+          Array.from({ length: 10 }, (_, k) =>
+            getJson<{
+              pagination: { total: number; limit: number; offset: number; has_more: boolean };
+              data: Array<{ order_hash: string }>;
+            }>(`${spamUrl}/orders?limit=5&offset=75`, { 'X-Forwarded-For': `198.51.130.${k + 1}` })
+          )
+        );
+        const elapsedMs = Date.now() - t0;
+        for (const r of parallelGets) {
+          assert.equal(r.status, 200);
+          assert.equal(r.body.data.length, 5);
+          assert.ok(r.body.pagination.total >= 2000);
+          assert.equal(r.body.pagination.limit, 5);
+          assert.equal(r.body.pagination.has_more, true);
+        }
+        assert.ok(elapsedMs < 10_000, `10 parallel GET /orders?limit=5 took ${elapsedMs}ms (must not hang)`);
+        assert.equal(multicallCount, 1, `Singleflight must collapse 10 parallel GETs into 1 multicall, saw ${multicallCount}`);
+        assert.equal(directReadCount, 0, 'Batched relay refresh must use multicall instead of per-order readContract calls');
+
+        // Second wave hits 2s live-state cache (0 additional RPC calls) and distinct page offset paginates cleanly
+        const secondWave = await getJson<{
+          pagination: { total: number; limit: number; offset: number; has_more: boolean };
+          data: Array<{ order_hash: string }>;
+        }>(`${spamUrl}/orders?limit=5&offset=75`, { 'X-Forwarded-For': '198.51.130.50' });
+        assert.equal(secondWave.status, 200);
+        assert.equal(multicallCount, 1, '2s TTL cache must avoid re-querying RPC on immediate follow-up GET');
+        const page2 = await getJson<{
+          pagination: { total: number; limit: number; offset: number; has_more: boolean };
+          data: Array<{ order_hash: string }>;
+        }>(`${spamUrl}/orders?limit=5&offset=80`, { 'X-Forwarded-For': '198.51.130.51' });
+        assert.equal(page2.status, 200);
+        assert.equal(page2.body.data.length, 5);
+        assert.equal(page2.body.pagination.offset, 80);
+        assert.notEqual(page2.body.data[0].order_hash, parallelGets[0].body.data[0].order_hash);
+      } finally {
+        await new Promise<void>((r) => spamServer.close(() => r()));
+      }
+
+      console.log('PASS TEST 7: POST /orders verification, anti-spam caps, symbol sanitization, 2000-order multicall GET benchmark, bumpNonce sync, and security headers verified.');
       console.log('\nALL API WS2.3 BASE MAINNET FORK INTEGRATION TESTS PASSED.');
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));

@@ -41,7 +41,9 @@ import {
 import { loadNotificationsConfig } from '../src/config.js';
 import {
   PiiCipher,
+  signBlockSenderToken,
   signConfirmSubscriptionToken,
+  verifyBlockSenderToken,
   verifyWebhookPayloadSignature,
 } from '../src/crypto.js';
 import {
@@ -55,7 +57,7 @@ import {
   processDeliveryQueue,
   runNotificationsCycle,
 } from '../src/engine.js';
-import { createNotificationsServer } from '../src/server.js';
+import { MIN_SYBIL_COST_ETH_WEI, createNotificationsServer } from '../src/server.js';
 import { formatSiweMessage } from '../src/siwe.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -3014,18 +3016,33 @@ async function runTests(): Promise<void> {
         const blockHtmlText = await blockHtmlPage.text();
         assert.match(blockHtmlText, /Block this wallet only/i);
         assert.match(blockHtmlText, /Block this address entirely/i);
+        assert.match(blockHtmlText, /does NOT stop existing verified subscriptions/i);
         const blockPreview = await httpJson<{
           confirmation_required: boolean;
           method: string;
           subscription_id: string;
           blocked_wallet: string;
+          stops_existing_verified_subscriptions: boolean;
+          note: string;
         }>('GET', String(spamMsg.payload.block_url), undefined, { 'X-Forwarded-For': '203.0.114.120' });
         assert.equal(blockPreview.status, 200);
         assert.equal(blockPreview.body.confirmation_required, true);
         assert.equal(blockPreview.body.method, 'POST');
         assert.equal(blockPreview.body.blocked_wallet.toLowerCase(), pocTokens[0].address.toLowerCase());
+        assert.equal(blockPreview.body.stops_existing_verified_subscriptions, false);
+        assert.match(blockPreview.body.note, /does NOT stop existing verified subscriptions/i);
 
-        const blockExec = await httpJson<{ blocked: boolean; subscription_id: string; blocked_wallet: string }>(
+        // Item 5: Default block token TTL must be 24h (86_400s)
+        const defaultBlockTok = signBlockSenderToken('test-secret', 'sub-ttl', pocTokens[0].address, 'cth', undefined, 1_700_000_000_000);
+        assert.equal(verifyBlockSenderToken('test-secret', defaultBlockTok, 1_700_000_000_000).exp, 1_700_000_000 + 86_400);
+
+        const blockExec = await httpJson<{
+          blocked: boolean;
+          subscription_id: string;
+          blocked_wallet: string;
+          stops_existing_verified_subscriptions: boolean;
+          note: string;
+        }>(
           'POST',
           `${bombUrl}/subscriptions/block`,
           { token: String(spamMsg.payload.block_token) },
@@ -3033,6 +3050,26 @@ async function runTests(): Promise<void> {
         );
         assert.equal(blockExec.status, 200);
         assert.equal(blockExec.body.blocked, true);
+        assert.equal(blockExec.body.stops_existing_verified_subscriptions, false);
+        assert.match(blockExec.body.note, /does NOT stop existing verified subscriptions/i);
+
+        // Item 5: Single-use block token cannot be replayed on GET or POST
+        const replayBlockGet = await httpJson<{ error?: { code: string } }>(
+          'GET',
+          String(spamMsg.payload.block_url),
+          undefined,
+          { 'X-Forwarded-For': '203.0.114.120' }
+        );
+        assert.equal(replayBlockGet.status, 400);
+        assert.equal(replayBlockGet.body.error?.code, 'BLOCK_TOKEN_ALREADY_USED');
+        const replayBlockPost = await httpJson<{ error?: { code: string } }>(
+          'POST',
+          `${bombUrl}/subscriptions/block`,
+          { token: String(spamMsg.payload.block_token) },
+          { 'X-Forwarded-For': '203.0.114.120' }
+        );
+        assert.equal(replayBlockPost.status, 400);
+        assert.equal(replayBlockPost.body.error?.code, 'BLOCK_TOKEN_ALREADY_USED');
 
         const blockedRetry = await httpJson<{ error?: { code: string } }>(
           'POST',
@@ -3161,6 +3198,184 @@ async function runTests(): Promise<void> {
         assert.equal(pvConfirm.body.verified, true);
       } finally {
         await new Promise<void>((r) => bombProxySrv.close(() => r()));
+      }
+
+      // Item 4: 40 one-wei wallets + self-verified inbox bypass rejected past 10/h cap; 0.01 ETH threshold + cache + RPC-down strict fallback
+      let sybilGetBalanceCalls = 0;
+      let sybilForceRpcDown = false;
+      const instrumentedNotifPublicClient = new Proxy(notifCtx.publicClient, {
+        get(target, prop, receiver) {
+          if (prop === 'getBalance') {
+            return async (args: { address: Address }) => {
+              sybilGetBalanceCalls += 1;
+              if (sybilForceRpcDown) {
+                throw new Error('Simulated RPC outage');
+              }
+              return target.getBalance(args);
+            };
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+      const sybilSrv = createNotificationsServer({
+        ...notifCtx,
+        publicClient: instrumentedNotifPublicClient,
+        config: {
+          ...notifCtx.config,
+          trustProxyHops: 1,
+          rateLimitMax: 5000,
+          authNonceRateLimitMax: 5000,
+          authVerifyRateLimitMax: 5000,
+          subscriptionsRateLimitMax: 5000,
+          confirmTargetGlobalPerHourMax: 10,
+        },
+      });
+      await new Promise<void>((r) => sybilSrv.listen(0, '127.0.0.1', r));
+      const sybilUrl = `http://127.0.0.1:${(sybilSrv.address() as net.AddressInfo).port}`;
+      try {
+        const authAtSybil = async (acct: ReturnType<typeof privateKeyToAccount>, ip: string) => {
+          const nRes = await httpJson<{ nonce: string }>(
+            'POST',
+            `${sybilUrl}/auth/nonce`,
+            { wallet_address: acct.address },
+            { 'X-Forwarded-For': ip }
+          );
+          const msg = formatSiweMessage({
+            domain: 'app.nostok.xyz',
+            address: acct.address,
+            uri: 'https://app.nostok.xyz',
+            chainId: 8453,
+            nonce: nRes.body.nonce,
+            issuedAt: nowIso,
+            expirationTime: futureIso,
+          });
+          const vRes = await httpJson<{ token: string }>(
+            'POST',
+            `${sybilUrl}/auth/verify`,
+            { message: msg, signature: await acct.signMessage({ message: msg }) },
+            { 'X-Forwarded-For': ip }
+          );
+          return vRes.body.token;
+        };
+
+        // Self-verified decoy inbox on a 1-wei wallet must NOT bypass sybil cost
+        const oneWeiVerifiedAcct = privateKeyToAccount(generatePrivateKey());
+        await fetch(LOCAL_RPC_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 201,
+            method: 'anvil_setBalance',
+            params: [oneWeiVerifiedAcct.address, '0x1'],
+          }),
+        });
+        const oneWeiVerifiedTok = await authAtSybil(oneWeiVerifiedAcct, '198.51.150.1');
+        const decoySub = await httpJson<{ id: string }>(
+          'POST',
+          `${sybilUrl}/subscriptions`,
+          { channel: 'email', target: 'decoy.selfverified@nostok.xyz' },
+          { Authorization: `Bearer ${oneWeiVerifiedTok}`, 'X-Forwarded-For': '198.51.150.1' }
+        );
+        assert.equal(decoySub.status, 201);
+        const decoyMsg = deliveredEmails.find((m) => m.subscriptionId === decoySub.body.id)!;
+        const decoyConfirm = await httpJson('POST', `${sybilUrl}/subscriptions/confirm`, {
+          token: String(decoyMsg.payload.confirm_token),
+        });
+        assert.equal(decoyConfirm.status, 200);
+
+        // 40 rotating 1-wei wallets + rotating IPs (plus the self-verified 1-wei wallet): at most 10 emails sent!
+        let oneWeiAllowed = 0;
+        let oneWeiRejected = 0;
+        for (let i = 0; i < 40; i++) {
+          const ip = `198.51.151.${i + 1}`;
+          let tok = oneWeiVerifiedTok;
+          if (i > 0) {
+            const wAcct = privateKeyToAccount(generatePrivateKey());
+            await fetch(LOCAL_RPC_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                jsonrpc: '2.0',
+                id: 210 + i,
+                method: 'anvil_setBalance',
+                params: [wAcct.address, '0x1'],
+              }),
+            });
+            tok = await authAtSybil(wAcct, ip);
+          }
+          const subRes = await httpJson<{ error?: { code: string } }>(
+            'POST',
+            `${sybilUrl}/subscriptions`,
+            { channel: 'email', target: `forty.onewei+${i}@gmail.com` },
+            { Authorization: `Bearer ${tok}`, 'X-Forwarded-For': ip }
+          );
+          if (subRes.status === 201) {
+            oneWeiAllowed += 1;
+          } else {
+            assert.equal(subRes.status, 429);
+            assert.equal(subRes.body.error?.code, 'RATE_LIMIT_EXCEEDED');
+            oneWeiRejected += 1;
+          }
+        }
+        assert.equal(oneWeiAllowed, 10, '40 one-wei + self-verified wallets must be capped at 10 global sends');
+        assert.equal(oneWeiRejected, 30, 'All 30 remaining one-wei sends past 10 must return 429');
+
+        // Wallet with >= MIN_SYBIL_COST_ETH_WEI (0.01 ETH) succeeds despite empty zero-cost cap & caches getBalance
+        const fundedSybilAcct = privateKeyToAccount(generatePrivateKey());
+        await fetch(LOCAL_RPC_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 260,
+            method: 'anvil_setBalance',
+            params: [fundedSybilAcct.address, `0x${MIN_SYBIL_COST_ETH_WEI.toString(16)}`],
+          }),
+        });
+        const fundedTok = await authAtSybil(fundedSybilAcct, '198.51.152.10');
+        sybilGetBalanceCalls = 0;
+        const fundSub1 = await httpJson(
+          'POST',
+          `${sybilUrl}/subscriptions`,
+          { channel: 'email', target: 'forty.onewei@gmail.com' },
+          { Authorization: `Bearer ${fundedTok}`, 'X-Forwarded-For': '198.51.152.10' }
+        );
+        const fundSub2 = await httpJson(
+          'POST',
+          `${sybilUrl}/subscriptions`,
+          { channel: 'email', target: 'forty.onewei+vip@gmail.com' },
+          { Authorization: `Bearer ${fundedTok}`, 'X-Forwarded-For': '198.51.152.11' }
+        );
+        assert.equal(fundSub1.status, 201);
+        assert.equal(fundSub2.status, 201);
+        assert.equal(sybilGetBalanceCalls, 1, 'Sybil ETH balance check must be cached across requests within TTL');
+
+        // When RPC is down, funded uncached wallet falls back strictly to 10/h global cap -> 429
+        sybilForceRpcDown = true;
+        const rpcDownFundedAcct = privateKeyToAccount(generatePrivateKey());
+        await fetch(LOCAL_RPC_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 261,
+            method: 'anvil_setBalance',
+            params: [rpcDownFundedAcct.address, `0x${MIN_SYBIL_COST_ETH_WEI.toString(16)}`],
+          }),
+        });
+        const rpcDownTok = await authAtSybil(rpcDownFundedAcct, '198.51.153.1');
+        const rpcDownRes = await httpJson<{ error?: { code: string } }>(
+          'POST',
+          `${sybilUrl}/subscriptions`,
+          { channel: 'email', target: 'forty.onewei+rpcdown@gmail.com' },
+          { Authorization: `Bearer ${rpcDownTok}`, 'X-Forwarded-For': '198.51.153.1' }
+        );
+        assert.equal(rpcDownRes.status, 429, 'When RPC is down, strict global cap must still reject once full');
+        assert.equal(rpcDownRes.body.error?.code, 'RATE_LIMIT_EXCEEDED');
+      } finally {
+        sybilForceRpcDown = false;
+        await new Promise<void>((r) => sybilSrv.close(() => r()));
       }
 
       // 6.7 No pre-auth login lockout across IPs
