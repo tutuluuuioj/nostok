@@ -15,6 +15,7 @@ import { useStore } from '../store.jsx';
 
 const ORDER_STATUS_FILTERS = [
   ['all', 'All statuses'],
+  ['open', 'Open (signed)'],
   ['partially_filled', 'Partially filled'],
   ['filled', 'Filled'],
   ['cancelled', 'Cancelled'],

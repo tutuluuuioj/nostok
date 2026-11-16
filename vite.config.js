@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 import {
@@ -51,7 +53,7 @@ function resolveBestAvailableConfig(env, allowProdFallback = true) {
   }
 }
 
-function nostokConfigAndCspPlugin(command, mode, env) {
+function nostokConfigAndCspPlugin(command, _mode, env) {
   let validatedBuildCfg = null;
   const isDevServe = command === 'serve';
 
@@ -81,8 +83,8 @@ function nostokConfigAndCspPlugin(command, mode, env) {
   return {
     name: 'nostok-config-and-csp',
     buildStart() {
-      if (command === 'build' && mode === 'production') {
-        // Fails `vite build` immediately on invalid production configuration
+      if (command === 'build') {
+        // Fails ANY `vite build` (regardless of `--mode`) immediately on invalid production config
         validatedBuildCfg = resolveFrontendConfigFromEnv(env, true);
       }
     },
@@ -95,7 +97,7 @@ function nostokConfigAndCspPlugin(command, mode, env) {
     transformIndexHtml(html) {
       const cfg = isDevServe
         ? resolveFrontendConfigFromEnv(env, false)
-        : (validatedBuildCfg ?? resolveBestAvailableConfig(env, true));
+        : (validatedBuildCfg ?? resolveBestAvailableConfig(env, false));
       if (!cfg) return html;
       const metaCsp = buildContentSecurityPolicy(cfg, {
         includeFrameAncestors: false,
@@ -105,6 +107,26 @@ function nostokConfigAndCspPlugin(command, mode, env) {
         /<meta\s+http-equiv="Content-Security-Policy"\s+content="[^"]*"\s*\/?>/i,
         `<meta http-equiv="Content-Security-Policy" content="${metaCsp}" />`
       );
+    },
+    writeBundle(outputOptions) {
+      if (command !== 'build') return;
+      const outDir = outputOptions?.dir ? path.resolve(outputOptions.dir) : path.resolve(process.cwd(), 'dist');
+      const cfg = validatedBuildCfg ?? resolveBestAvailableConfig(env, false);
+      if (!cfg) return;
+      const headerCsp = buildContentSecurityPolicy(cfg, {
+        includeFrameAncestors: true,
+        allowDevInlineScripts: false,
+      });
+      const headersFile = [
+        '/*',
+        `  Content-Security-Policy: ${headerCsp}`,
+        '  X-Content-Type-Options: nosniff',
+        '  X-Frame-Options: DENY',
+        '  Referrer-Policy: strict-origin-when-cross-origin',
+        '',
+      ].join('\n');
+      fs.mkdirSync(outDir, { recursive: true });
+      fs.writeFileSync(path.join(outDir, '_headers'), headersFile, 'utf8');
     },
   };
 }

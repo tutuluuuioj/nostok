@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Choice, Field, Page, Rows, Sheet, TextInput } from '../components/ui.jsx';
+import { Field, Page, Rows, Sheet, TextInput } from '../components/ui.jsx';
 import { USDC_DECIMALS } from '../lib/contracts.js';
 import {
   fetchLoanQuote,
@@ -11,14 +11,21 @@ import {
   parsePercentToBps,
 } from '../lib/marketsApi.js';
 import {
+  DEFAULT_COLLATERAL_BUFFER_BPS,
   approveCollateralForBorrow,
+  bumpMakerNonceOnChain,
   cancelSignedBorrowOrder,
   fillLendOfferAsBorrower,
+  formatTokenUnitsDisplay,
   formatWeb3Error,
+  loadPersistedSignedOrders,
+  parseBorrowOrderFromJson,
   prepareAndSignBorrowOrder,
   readBorrowAllowanceAndNonce,
+  refreshSignedBorrowOrdersState,
   resolveExactBorrowAmounts,
   shortAddress,
+  verifyAndPreviewLendOfferFill,
 } from '../lib/web3.js';
 import { useStore } from '../store.jsx';
 
@@ -30,14 +37,13 @@ export function Borrow() {
   const [selectedAsset, setSelectedAsset] = useState('');
   const [principalStr, setPrincipalStr] = useState('1000');
   const [collateralStr, setCollateralStr] = useState('');
+  const [bufferPctStr, setBufferPctStr] = useState('5.00');
   const [ratePct, setRatePct] = useState('8.00');
   const [termDaysStr, setTermDaysStr] = useState('30');
   const [maxLtvPct, setMaxLtvPct] = useState('60.00');
   const [minFillStr, setMinFillStr] = useState('500');
   const [expiryDaysStr, setExpiryDaysStr] = useState('2');
-  const [inKind, setInKind] = useState(false);
   const [yieldOn, setYieldOn] = useState(false);
-  const [eligibleConfirmed, setEligibleConfirmed] = useState(false);
 
   const [tokenMeta, setTokenMeta] = useState({ loading: false, data: null, error: '' });
   const tokenMetaSeqRef = useRef(0);
@@ -48,14 +54,24 @@ export function Borrow() {
   const quoteSeqRef = useRef(0);
 
   const [txBusy, setTxBusy] = useState('');
+  const txBusyRef = useRef(false);
   const [actionError, setActionError] = useState('');
   const [actionNotice, setActionNotice] = useState('');
-  const [signedOrder, setSignedOrder] = useState(null);
-  const [copiedPayload, setCopiedPayload] = useState(false);
+  const [latestSignedOrder, setLatestSignedOrder] = useState(null);
+  const [copiedHash, setCopiedHash] = useState('');
 
-  // Secondary borrower flow: fill a signed LendOffer JSON payload
+  // Persisted & on-chain synced signed BorrowOrders (survives field edits)
+  const [persistedOrders, setPersistedOrders] = useState(() => loadPersistedSignedOrders());
+  const [ordersRefreshing, setOrdersRefreshing] = useState(false);
+  const [pasteCancelJson, setPasteCancelJson] = useState('');
+  const [cancelError, setCancelError] = useState('');
+  const [cancelNotice, setCancelNotice] = useState('');
+
+  // LendOffer fill workflow (Step 1 verify & simulate -> review terms -> Step 2 confirm & fill)
   const [lendOfferJsonStr, setLendOfferJsonStr] = useState('');
   const [lendFillUsdcStr, setLendFillUsdcStr] = useState('500');
+  const [lendPreviewBusy, setLendPreviewBusy] = useState(false);
+  const [lendPreview, setLendPreview] = useState(null);
   const [lendFillBusy, setLendFillBusy] = useState(false);
   const [lendFillResult, setLendFillResult] = useState(null);
   const [lendFillError, setLendFillError] = useState('');
@@ -89,6 +105,39 @@ export function Borrow() {
     [assets, selectedAsset]
   );
 
+  const openLendOffers = useMemo(() => {
+    const all = marketState.data?.orders ?? [];
+    return all.filter(
+      (o) =>
+        (o.order_type === 'lend' || o.order_type === 'LendOffer') &&
+        (o.status === 'open' || o.status === 'partially_filled') &&
+        o.signed_order &&
+        o.signature
+    );
+  }, [marketState.data?.orders]);
+
+  const syncPersistedOrders = useCallback(async () => {
+    const stored = loadPersistedSignedOrders();
+    if (stored.length === 0) {
+      setPersistedOrders([]);
+      return;
+    }
+    setOrdersRefreshing(true);
+    try {
+      const enriched = await refreshSignedBorrowOrdersState({
+        orders: stored,
+        cfg: web3?.config,
+      });
+      setPersistedOrders(enriched);
+    } finally {
+      setOrdersRefreshing(false);
+    }
+  }, [web3?.config]);
+
+  useEffect(() => {
+    void syncPersistedOrders();
+  }, [syncPersistedOrders]);
+
   const loadAllowanceAndNonce = useCallback(async () => {
     if (!web3?.connected || web3?.wrongNetwork || !web3?.address || !assetObj?.token) {
       setTokenMeta({ loading: false, data: null, error: '' });
@@ -99,6 +148,7 @@ export function Borrow() {
     try {
       const res = await readBorrowAllowanceAndNonce(web3.address, assetObj.token, {
         cfg: web3.config,
+        attestationHex: web3.attestationHex,
       });
       if (seq !== tokenMetaSeqRef.current) return null;
       setTokenMeta({ loading: false, data: res, error: '' });
@@ -108,23 +158,32 @@ export function Borrow() {
       setTokenMeta({ loading: false, data: null, error: formatWeb3Error(err) });
       return null;
     }
-  }, [assetObj?.token, web3?.address, web3?.config, web3?.connected, web3?.wrongNetwork]);
+  }, [assetObj?.token, web3?.address, web3?.attestationHex, web3?.config, web3?.connected, web3?.wrongNetwork]);
 
   useEffect(() => {
     void loadAllowanceAndNonce();
   }, [loadAllowanceAndNonce]);
 
+  // Notice: field edits clear the stale quote preview & action banners,
+  // but NEVER delete persisted signed orders from state/storage.
   const updateField = useCallback((setter) => (value) => {
     quoteSeqRef.current += 1;
     setQuoteLoading(false);
     setQuoteResult(null);
     setQuoteError('');
-    setSignedOrder(null);
     setActionError('');
     setActionNotice('');
-    setCopiedPayload(false);
+    setLendPreview(null);
     setter(value);
   }, []);
+
+  const parsedBufferBps = useMemo(() => {
+    const clean = bufferPctStr.trim();
+    if (!clean) return DEFAULT_COLLATERAL_BUFFER_BPS;
+    const bps = parsePercentToBps(clean);
+    if (bps === null || bps < 0 || bps > 5000) return null;
+    return bps;
+  }, [bufferPctStr]);
 
   const parseValidatedInputs = useCallback(() => {
     if (!assetObj) {
@@ -144,9 +203,12 @@ export function Borrow() {
     if (!principalRaw && !collateralRaw) {
       return { error: 'Enter either a USDC principal amount or a collateral token amount.' };
     }
+    if (parsedBufferBps === null) {
+      return { error: 'Collateral buffer must be between 0.00% and 50.00% (recommended 5.00%–10.00%).' };
+    }
     const aprBps = parsePercentToBps(ratePct);
     if (aprBps === null || aprBps > 4000) {
-      return { error: 'Maximum APR must be between 0.00% and 40.00%.' };
+      return { error: 'Fixed APR must be between 0.00% and 40.00%.' };
     }
     const termDays = Number(termDaysStr.trim());
     if (!Number.isInteger(termDays) || termDays < 7 || termDays > 90) {
@@ -175,13 +237,14 @@ export function Borrow() {
       tokenDecimals,
       principalRaw,
       collateralRaw,
+      bufferBps: parsedBufferBps,
       aprBps,
       termDays,
       maxLtvBps,
       minFillRaw,
       expiryDays,
     };
-  }, [assetObj, collateralStr, expiryDaysStr, maxLtvPct, minFillStr, principalStr, ratePct, termDaysStr]);
+  }, [assetObj, collateralStr, expiryDaysStr, maxLtvPct, minFillStr, parsedBufferBps, principalStr, ratePct, termDaysStr]);
 
   const handleQuote = useCallback(async (event) => {
     if (event) event.preventDefault();
@@ -231,11 +294,43 @@ export function Borrow() {
         collateralStr.trim() && assetObj
           ? parseDecimalToRaw(collateralStr, Number(assetObj.decimals ?? 18))
           : null;
-      return resolveExactBorrowAmounts(quoteResult, { userCollateralRaw: userCol });
+      return resolveExactBorrowAmounts(quoteResult, {
+        userCollateralRaw: userCol,
+        bufferBps: parsedBufferBps ?? DEFAULT_COLLATERAL_BUFFER_BPS,
+      });
     } catch {
       return null;
     }
-  }, [assetObj, collateralStr, quoteResult]);
+  }, [assetObj, collateralStr, parsedBufferBps, quoteResult]);
+
+  const partialRemainderWarning = useMemo(() => {
+    const prinRawStr = exactQuoteAmounts
+      ? exactQuoteAmounts.principalRaw.toString()
+      : principalStr.trim()
+        ? parseDecimalToRaw(principalStr, USDC_DECIMALS)
+        : null;
+    const minRawStr = parseDecimalToRaw(minFillStr, USDC_DECIMALS);
+    if (!prinRawStr || !minRawStr) return '';
+    const prin = BigInt(prinRawStr);
+    const minFill = BigInt(minRawStr);
+    if (prin > minFill && prin - minFill < 500_000_000n) {
+      return `Warning (PARTIAL_REMAINDER_BELOW_500): Filling $${formatTokenUnitsDisplay(minFill, USDC_DECIMALS, 2)} leaves $${formatTokenUnitsDisplay(prin - minFill, USDC_DECIMALS, 2)} (< $500), which cannot be partially filled afterward.`;
+    }
+    return '';
+  }, [exactQuoteAmounts, minFillStr, principalStr]);
+
+  const eligibilityInfo = tokenMeta.data?.eligibility ?? null;
+  const eligibilityStatusText = eligibilityInfo
+    ? eligibilityInfo.isEligible
+      ? eligibilityInfo.permissionlessMode
+        ? 'Eligible (Permissionless mode)'
+        : 'Eligible (Allowlisted)'
+      : eligibilityInfo.isRevoked
+        ? 'Ineligible (Revoked in EligibilityGate)'
+        : 'Ineligible (Not allowlisted / missing attestation)'
+    : web3?.connected
+      ? 'Checking EligibilityGate…'
+      : 'Connect wallet to check on-chain EligibilityGate';
 
   const allowanceRawBig = tokenMeta.data ? BigInt(tokenMeta.data.allowanceRaw) : 0n;
   const balanceRawBig = tokenMeta.data ? BigInt(tokenMeta.data.balanceRaw) : 0n;
@@ -247,6 +342,7 @@ export function Borrow() {
   );
 
   async function handleApproveCollateral() {
+    if (txBusyRef.current) return;
     setActionError('');
     setActionNotice('');
     if (!web3?.connected || web3?.wrongNetwork || !web3?.address) {
@@ -258,6 +354,7 @@ export function Borrow() {
       setActionError(parsed.error);
       return;
     }
+    txBusyRef.current = true;
     setTxBusy('approve');
     try {
       let activeQuote = quoteResult;
@@ -267,7 +364,10 @@ export function Borrow() {
       if (!activeQuote || !activeQuote.accepted) {
         throw new Error('Obtain an accepted live quote before approving collateral.');
       }
-      const exact = resolveExactBorrowAmounts(activeQuote, { userCollateralRaw: parsed.collateralRaw });
+      const exact = resolveExactBorrowAmounts(activeQuote, {
+        userCollateralRaw: parsed.collateralRaw,
+        bufferBps: parsed.bufferBps,
+      });
       const res = await approveCollateralForBorrow({
         address: web3.address,
         collateralToken: assetObj.token,
@@ -283,20 +383,22 @@ export function Borrow() {
     } catch (err) {
       setActionError(formatWeb3Error(err));
     } finally {
+      txBusyRef.current = false;
       setTxBusy('');
     }
   }
 
   async function handleSignBorrowOrder(event) {
     event.preventDefault();
+    if (txBusyRef.current) return;
     setActionError('');
     setActionNotice('');
     if (!web3?.connected || web3?.wrongNetwork || !web3?.address) {
       setActionError('Connect your wallet on Base before signing a BorrowOrder.');
       return;
     }
-    if (!eligibleConfirmed) {
-      setActionError('Confirm eligibility before signing an EIP-712 BorrowOrder.');
+    if (eligibilityInfo && !eligibilityInfo.isEligible) {
+      setActionError('IneligibleCounterparty: Wallet is not eligible in EligibilityGate on-chain.');
       return;
     }
     const parsed = parseValidatedInputs();
@@ -304,6 +406,7 @@ export function Borrow() {
       setActionError(parsed.error);
       return;
     }
+    txBusyRef.current = true;
     setTxBusy('sign');
     try {
       const signed = await prepareAndSignBorrowOrder({
@@ -311,80 +414,162 @@ export function Borrow() {
         collateralToken: assetObj.token,
         principalRaw: parsed.principalRaw,
         collateralAmountRaw: parsed.collateralRaw,
+        collateralBufferBps: parsed.bufferBps,
+        expectedQuote: quoteResult,
         maxRateBps: parsed.aprBps,
         termDays: parsed.termDays,
         maxLtvBps: parsed.maxLtvBps,
         minFillRaw: parsed.minFillRaw,
         expiryDays: parsed.expiryDays,
         yieldMode: yieldOn ? 1 : 0,
-        allowInKindSettlement: inKind,
+        allowInKindSettlement: false,
         attestationHex: web3.attestationHex,
         autoApprove: true,
         cfg: web3.config,
       });
       setQuoteResult(signed.quote);
-      setSignedOrder(signed);
-      await loadAllowanceAndNonce();
+      setLatestSignedOrder(signed);
+      await Promise.all([loadAllowanceAndNonce(), syncPersistedOrders(), loadMarkets()]);
       setActionNotice(
-        `Signed EIP-712 BorrowOrder ${signed.orderHash}. Collateral required: ${signed.exactAmounts.collateralAmountRaw} raw ${assetObj.symbol} units.`
+        `Signed EIP-712 BorrowOrder ${signed.orderHash} with ${signed.exactAmounts.collateralAmountRaw} raw ${assetObj.symbol} (${signed.exactAmounts.bufferBps / 100}% buffer)${signed.publishedToApi ? ' and published to api/ orderbook.' : '.'}`
       );
     } catch (err) {
       setActionError(formatWeb3Error(err));
     } finally {
+      txBusyRef.current = false;
       setTxBusy('');
     }
   }
 
-  async function handleCancelSignedOrder() {
-    if (!signedOrder || !web3?.address) return;
-    setActionError('');
-    setActionNotice('');
+  async function handleCancelOrder(orderObj) {
+    if (txBusyRef.current || !web3?.address) return;
+    setCancelError('');
+    setCancelNotice('');
+    txBusyRef.current = true;
     setTxBusy('cancel');
     try {
       const res = await cancelSignedBorrowOrder({
         address: web3.address,
-        order: signedOrder.order,
+        order: orderObj,
         cfg: web3.config,
       });
-      setSignedOrder((prev) => (prev ? { ...prev, cancelledTxHash: res.txHash } : null));
-      setActionNotice(`Cancelled order ${res.orderHash} on-chain (tx ${res.txHash}).`);
+      await Promise.all([syncPersistedOrders(), loadMarkets()]);
+      setCancelNotice(`Cancelled order ${res.orderHash} on-chain (tx ${res.txHash}).`);
     } catch (err) {
-      setActionError(formatWeb3Error(err));
+      setCancelError(formatWeb3Error(err));
     } finally {
+      txBusyRef.current = false;
       setTxBusy('');
     }
   }
 
-  async function copySignedOrder() {
-    if (!signedOrder) return;
+  async function handleCancelPastedJson(event) {
+    event.preventDefault();
+    if (txBusyRef.current) return;
+    setCancelError('');
+    setCancelNotice('');
+    if (!web3?.connected || web3?.wrongNetwork || !web3?.address) {
+      setCancelError('Connect your wallet on Base before cancelling an order.');
+      return;
+    }
+    let parsed;
+    try {
+      parsed = parseBorrowOrderFromJson(pasteCancelJson);
+    } catch (err) {
+      setCancelError(err instanceof Error ? err.message : String(err));
+      return;
+    }
+    txBusyRef.current = true;
+    setTxBusy('cancel-paste');
+    try {
+      const res = await cancelSignedBorrowOrder({
+        address: web3.address,
+        order: parsed.order,
+        cfg: web3.config,
+      });
+      await Promise.all([syncPersistedOrders(), loadMarkets()]);
+      setCancelNotice(`Cancelled pasted BorrowOrder ${res.orderHash} on-chain (tx ${res.txHash}).`);
+    } catch (err) {
+      setCancelError(formatWeb3Error(err));
+    } finally {
+      txBusyRef.current = false;
+      setTxBusy('');
+    }
+  }
+
+  async function handleBumpAllNonces() {
+    if (txBusyRef.current) return;
+    setCancelError('');
+    setCancelNotice('');
+    if (!web3?.connected || web3?.wrongNetwork || !web3?.address) {
+      setCancelError('Connect your wallet on Base before bumping your maker nonce.');
+      return;
+    }
+    txBusyRef.current = true;
+    setTxBusy('bump-nonce');
+    try {
+      const res = await bumpMakerNonceOnChain({
+        address: web3.address,
+        cfg: web3.config,
+      });
+      await Promise.all([loadAllowanceAndNonce(), syncPersistedOrders(), loadMarkets()]);
+      setCancelNotice(
+        `Called OrderSettlement.bumpNonce() (tx ${res.txHash}). Maker nonce is now ${res.newNonce}; all open orders signed at earlier nonces are invalidated on-chain.`
+      );
+    } catch (err) {
+      setCancelError(formatWeb3Error(err));
+    } finally {
+      txBusyRef.current = false;
+      setTxBusy('');
+    }
+  }
+
+  async function copyOrderPayload(item) {
     try {
       await navigator.clipboard.writeText(
         JSON.stringify(
           {
-            order: signedOrder.orderJson,
-            signature: signedOrder.signature,
-            orderHash: signedOrder.orderHash,
+            orderHash: item.orderHash,
+            order: item.orderJson,
+            signature: item.signature,
           },
           null,
           2
         )
       );
-      setCopiedPayload(true);
+      setCopiedHash(item.orderHash);
     } catch {
-      setCopiedPayload(false);
+      setCopiedHash('');
     }
   }
 
-  async function handleFillLendOffer(event) {
-    event.preventDefault();
+  function parseLendOfferPayload(rawText) {
+    let parsedJson;
+    try {
+      parsedJson = JSON.parse(rawText);
+    } catch {
+      throw new Error('Paste valid JSON containing { "offer": { ... }, "signature": "0x..." }.');
+    }
+    const offer = parsedJson?.offer ?? parsedJson?.signed_order ?? parsedJson;
+    const signature = parsedJson?.signature;
+    if (!offer || !signature || typeof signature !== 'string') {
+      throw new Error('Lend offer JSON must include both "offer" (or "signed_order") and "signature".');
+    }
+    return { offer, signature };
+  }
+
+  async function handleVerifyLendOffer(event) {
+    if (event) event.preventDefault();
+    if (txBusyRef.current) return;
     setLendFillError('');
     setLendFillResult(null);
-    if (!web3?.connected || web3?.wrongNetwork || !web3?.address) {
-      setLendFillError('Connect your wallet on Base before filling a lend offer.');
-      return;
-    }
+    setLendPreview(null);
     if (!assetObj?.token) {
       setLendFillError('Select a collateral token above first.');
+      return;
+    }
+    if (parsedBufferBps === null) {
+      setLendFillError('Enter a valid collateral buffer percentage (0.00%–50.00%).');
       return;
     }
     const fillUsdcRaw = parseDecimalToRaw(lendFillUsdcStr, USDC_DECIMALS);
@@ -392,37 +577,64 @@ export function Borrow() {
       setLendFillError('Enter a valid positive USDC fill amount (up to 6 decimals).');
       return;
     }
-    let parsedJson;
+    let payload;
     try {
-      parsedJson = JSON.parse(lendOfferJsonStr);
-    } catch {
-      setLendFillError('Paste valid JSON containing { "offer": { ... }, "signature": "0x..." }.');
+      payload = parseLendOfferPayload(lendOfferJsonStr);
+    } catch (err) {
+      setLendFillError(err instanceof Error ? err.message : String(err));
       return;
     }
-    const offer = parsedJson?.offer ?? parsedJson;
-    const signature = parsedJson?.signature;
-    if (!offer || !signature || typeof signature !== 'string') {
-      setLendFillError('Lend offer JSON must include both "offer" fields and "signature".');
+
+    setLendPreviewBusy(true);
+    try {
+      const preview = await verifyAndPreviewLendOfferFill({
+        offer: payload.offer,
+        signature: payload.signature,
+        collateralToken: assetObj.token,
+        fillUsdcRaw,
+        collateralBufferBps: parsedBufferBps,
+        borrowerAddress: web3?.connected && !web3?.wrongNetwork ? web3.address : null,
+        borrowerAttestation: web3?.attestationHex ?? '0x',
+        cfg: web3?.config,
+      });
+      setLendPreview(preview);
+    } catch (err) {
+      setLendFillError(formatWeb3Error(err));
+    } finally {
+      setLendPreviewBusy(false);
+    }
+  }
+
+  async function handleConfirmFillLendOffer() {
+    if (txBusyRef.current || !lendPreview) return;
+    setLendFillError('');
+    setLendFillResult(null);
+    if (!web3?.connected || web3?.wrongNetwork || !web3?.address) {
+      setLendFillError('Connect your wallet on Base before filling a LendOffer.');
       return;
     }
+    txBusyRef.current = true;
     setLendFillBusy(true);
     try {
       const res = await fillLendOfferAsBorrower({
         address: web3.address,
-        offer,
-        signature,
-        collateralToken: assetObj.token,
-        fillUsdcRaw,
+        offer: lendPreview.offer,
+        signature: lendPreview.signature,
+        collateralToken: lendPreview.collateralToken,
+        fillUsdcRaw: lendPreview.fillAmountRaw,
+        collateralBufferBps: parsedBufferBps ?? DEFAULT_COLLATERAL_BUFFER_BPS,
+        expectedPreview: lendPreview,
         borrowerAttestation: web3.attestationHex,
         autoApprove: true,
         cfg: web3.config,
       });
       setLendFillResult(res);
-      await loadAllowanceAndNonce();
-      await web3.refresh();
+      setLendPreview(null);
+      await Promise.all([loadAllowanceAndNonce(), loadMarkets(), web3.refresh()]);
     } catch (err) {
       setLendFillError(formatWeb3Error(err));
     } finally {
+      txBusyRef.current = false;
       setLendFillBusy(false);
     }
   }
@@ -431,7 +643,7 @@ export function Borrow() {
     <Page
       kicker="Borrow · WS3.3"
       title="Quote, approve & sign a BorrowOrder."
-      lede="Quotes come directly from api/ GET /quote using live Base AssetRegistry, OracleRouter, FeeCollector, and EligibilityGate reads. Approvals and EIP-712 order signatures always use exact/rounded-up raw token integers."
+      lede="Quotes come directly from api/ GET /quote using live Base AssetRegistry, OracleRouter, FeeCollector, and EligibilityGate reads. Approvals and EIP-712 order signatures always use exact/rounded-up raw token integers (with default +5.00% collateral buffer for partial fills and price ticks)."
     >
       {marketState.data && (marketState.data.stale || marketState.data.degraded || marketState.data.error) ? (
         <p className="err block" role="alert">
@@ -441,7 +653,7 @@ export function Borrow() {
 
       {!web3?.connected ? (
         <div className="note block">
-          <p className="hint">Connect a Base wallet to read your B20 balance, CollateralEscrow allowance, and OrderSettlement maker nonce.</p>
+          <p className="hint">Connect a Base wallet to read your B20 balance, CollateralEscrow allowance, EligibilityGate status, and OrderSettlement maker nonce.</p>
           <div className="actions">
             <button className="btn" type="button" onClick={() => void web3?.connect()} disabled={web3?.connecting}>
               {web3?.connecting ? 'Connecting…' : 'Connect wallet'}
@@ -501,23 +713,39 @@ export function Borrow() {
             )}
           </Field>
 
-          <Field
-            id="borrow-collateral"
-            label={`Optional collateral override (${assetObj?.symbol ?? 'tokens'}, up to ${assetObj?.decimals ?? 18} decimals)`}
-            hint="Leave empty so GET /quote computes exact rounded-up raw units required."
-          >
-            {(props) => (
-              <TextInput
-                id="borrow-collateral"
-                value={collateralStr}
-                onChange={updateField(setCollateralStr)}
-                {...props}
-              />
-            )}
-          </Field>
+          <div className="split">
+            <Field
+              id="borrow-buffer"
+              label="Collateral buffer (%)"
+              hint="Default +5.00% above minimum required so partial fills ($800/$500) & minor price ticks do not hit LtvExceeded."
+            >
+              {(props) => (
+                <TextInput
+                  id="borrow-buffer"
+                  value={bufferPctStr}
+                  onChange={updateField(setBufferPctStr)}
+                  {...props}
+                />
+              )}
+            </Field>
+            <Field
+              id="borrow-collateral"
+              label={`Optional collateral override (${assetObj?.symbol ?? 'tokens'})`}
+              hint="Leave empty to use exact quote min + buffer above."
+            >
+              {(props) => (
+                <TextInput
+                  id="borrow-collateral"
+                  value={collateralStr}
+                  onChange={updateField(setCollateralStr)}
+                  {...props}
+                />
+              )}
+            </Field>
+          </div>
 
           <div className="split">
-            <Field id="borrow-rate" label="Maximum APR (%)" hint="0.00% to 40.00%.">
+            <Field id="borrow-rate" label="Fixed APR (%)" hint="0.00% to 40.00% fixed loan APR if filled.">
               {(props) => (
                 <TextInput
                   id="borrow-rate"
@@ -587,13 +815,21 @@ export function Borrow() {
             </label>
           </fieldset>
 
-          <Choice id="borrow-inkind" checked={inKind} onChange={updateField(setInKind)}>
-            Allow in-kind settlement on default (borrower &amp; lender must both allow).
-          </Choice>
+          {partialRemainderWarning ? (
+            <p className="hint" role="note">
+              {partialRemainderWarning}
+            </p>
+          ) : null}
 
-          <Choice id="borrow-eligible" checked={eligibleConfirmed} onChange={setEligibleConfirmed}>
-            I confirm my connected Base address satisfies EligibilityGate requirements.
-          </Choice>
+          {quoteResult?.warnings?.length > 0 ? (
+            <div className="hint" role="note">
+              {quoteResult.warnings.map((w) => (
+                <p key={w.code}>
+                  Warning ({w.code}): {w.message}
+                </p>
+              ))}
+            </div>
+          ) : null}
 
           {quoteError ? <p className="err" role="alert">{quoteError}</p> : null}
           {actionError ? <p className="err" role="alert">{actionError}</p> : null}
@@ -623,9 +859,15 @@ export function Borrow() {
             <button
               className="btn"
               type="submit"
-              disabled={!web3?.connected || web3?.wrongNetwork || Boolean(txBusy) || !assetObj}
+              disabled={
+                !web3?.connected ||
+                web3?.wrongNetwork ||
+                Boolean(txBusy) ||
+                !assetObj ||
+                Boolean(eligibilityInfo && !eligibilityInfo.isEligible)
+              }
             >
-              {txBusy === 'sign' ? '3. Signing EIP-712 order…' : '3. Sign EIP-712 BorrowOrder'}
+              {txBusy === 'sign' ? '3. Signing EIP-712 order…' : '3. Sign & publish BorrowOrder'}
             </button>
           </div>
         </div>
@@ -633,7 +875,7 @@ export function Borrow() {
         <Sheet
           sticky
           title="On-chain quote & wallet readiness"
-          note="Approval and EIP-712 BorrowOrder use exact raw integers from quote.amounts.*.raw, never rounded display strings."
+          note="Approval and EIP-712 BorrowOrder use exact raw integers from quote.amounts.*.raw + buffer, never rounded display strings."
         >
           {tokenMeta.error ? <p className="err">{tokenMeta.error}</p> : null}
           <Rows
@@ -645,6 +887,10 @@ export function Borrow() {
               {
                 label: 'CollateralEscrow',
                 value: web3?.config?.contracts?.collateralEscrow ?? 'Unset',
+              },
+              {
+                label: 'EligibilityGate (on-chain)',
+                value: eligibilityStatusText,
               },
               tokenMeta.data
                 ? {
@@ -677,8 +923,14 @@ export function Borrow() {
                 : null,
               exactQuoteAmounts
                 ? {
-                    label: `Exact collateral raw (${quoteResult.asset.decimals} dec)`,
-                    value: `${formatApiAmount(quoteResult.amounts.collateral_required, { maxFractionDigits: 6, showSymbol: true })} (${exactQuoteAmounts.collateralAmountRaw.toString()} raw)`,
+                    label: `Min required collateral (${quoteResult.asset.decimals} dec)`,
+                    value: `${formatTokenUnitsDisplay(exactQuoteAmounts.minRequiredCollateralRaw, quoteResult.asset.decimals, 6)} ${quoteResult.asset.symbol} (${exactQuoteAmounts.minRequiredCollateralRaw.toString()} raw)`,
+                  }
+                : null,
+              exactQuoteAmounts
+                ? {
+                    label: `Buffered collateral (+${(exactQuoteAmounts.bufferBps / 100).toFixed(2)}%)`,
+                    value: `${formatTokenUnitsDisplay(exactQuoteAmounts.collateralAmountRaw, quoteResult.asset.decimals, 6)} ${quoteResult.asset.symbol} (${exactQuoteAmounts.collateralAmountRaw.toString()} raw)`,
                   }
                 : null,
               exactQuoteAmounts
@@ -697,7 +949,7 @@ export function Borrow() {
           />
           {insufficientBalance ? (
             <p className="err" style={{ marginTop: 12 }}>
-              Wallet {assetObj?.symbol} balance ({tokenMeta.data.balanceRaw} raw) is below required {exactQuoteAmounts.collateralAmountRaw.toString()} raw.
+              Wallet {assetObj?.symbol} balance ({tokenMeta.data.balanceRaw} raw) is below buffered collateral {exactQuoteAmounts.collateralAmountRaw.toString()} raw.
             </p>
           ) : null}
           {quoteResult && !quoteResult.accepted ? (
@@ -708,61 +960,193 @@ export function Borrow() {
         </Sheet>
       </form>
 
-      {signedOrder ? (
+      {latestSignedOrder ? (
         <section className="block">
-          <h2>Signed EIP-712 BorrowOrder</h2>
+          <h2>Latest signed EIP-712 BorrowOrder</h2>
           <p className="hint">
-            Order hash: <code>{signedOrder.orderHash}</code>
-            {signedOrder.approvalTxHash ? ` · Approval tx: ${signedOrder.approvalTxHash}` : ''}
-            {signedOrder.cancelledTxHash ? ` · Cancelled tx: ${signedOrder.cancelledTxHash}` : ''}
+            Order hash: <code>{latestSignedOrder.orderHash}</code>
+            {latestSignedOrder.approvalTxHash ? ` · Approval tx: ${latestSignedOrder.approvalTxHash}` : ''}
+            {latestSignedOrder.publishedToApi ? ' · Published to live api/ orderbook' : latestSignedOrder.publishError ? ` · Relay note: ${latestSignedOrder.publishError}` : ''}
           </p>
           <pre className="json">
             {JSON.stringify(
               {
-                orderHash: signedOrder.orderHash,
-                order: signedOrder.orderJson,
-                signature: signedOrder.signature,
+                orderHash: latestSignedOrder.orderHash,
+                order: latestSignedOrder.orderJson,
+                signature: latestSignedOrder.signature,
               },
               null,
               2
             )}
           </pre>
-          <div className="actions">
-            <button className="btn secondary" type="button" onClick={copySignedOrder}>
-              {copiedPayload ? 'Copied payload JSON' : 'Copy signed order JSON'}
-            </button>
-            <button
-              className="btn secondary"
-              type="button"
-              onClick={() => void handleCancelSignedOrder()}
-              disabled={Boolean(txBusy) || Boolean(signedOrder.cancelledTxHash)}
-            >
-              {txBusy === 'cancel'
-                ? 'Cancelling on-chain…'
-                : signedOrder.cancelledTxHash
-                  ? 'Order cancelled on-chain'
-                  : 'Cancel order on-chain'}
-            </button>
-            <Link className="btn secondary" to="/markets">
-              View indexed book
-            </Link>
-          </div>
         </section>
       ) : null}
 
       <section className="block">
+        <h2>Manage &amp; cancel your BorrowOrders</h2>
+        <p className="hint">
+          Signed orders stay persisted locally across field edits and are published to api/ POST /orders. You can cancel individual orders on-chain, cancel from pasted JSON, or bump your maker nonce to invalidate every open order at your current nonce.
+        </p>
+
+        <div className="actions">
+          <button
+            className="btn secondary"
+            type="button"
+            onClick={() => void syncPersistedOrders()}
+            disabled={ordersRefreshing || Boolean(txBusy)}
+          >
+            {ordersRefreshing ? 'Checking on-chain status…' : 'Refresh order statuses'}
+          </button>
+          <button
+            className="btn secondary"
+            type="button"
+            onClick={() => void handleBumpAllNonces()}
+            disabled={!web3?.connected || web3?.wrongNetwork || Boolean(txBusy)}
+          >
+            {txBusy === 'bump-nonce'
+              ? 'Bumping maker nonce…'
+              : `Cancel all open orders (bumpNonce${tokenMeta.data ? ` · current nonce ${tokenMeta.data.makerNonce}` : ''})`}
+          </button>
+          <Link className="btn secondary" to="/markets">
+            View live order book
+          </Link>
+        </div>
+
+        {cancelError ? <p className="err block" role="alert">{cancelError}</p> : null}
+        {cancelNotice ? <p className="note block" role="status">{cancelNotice}</p> : null}
+
+        {persistedOrders.length === 0 ? (
+          <p className="hint block">No persisted BorrowOrders saved in this browser yet.</p>
+        ) : (
+          <div className="block">
+            {persistedOrders.map((item) => {
+              const ord = item.orderJson ?? {};
+              const statusLabel = item.onchainStatus ?? (item.cancelledTxHash ? 'cancelled' : 'saved');
+              const isCancelable =
+                statusLabel === 'open' || statusLabel === 'partially_filled' || statusLabel === 'saved';
+              return (
+                <article className="order-row" key={item.orderHash}>
+                  <div>
+                    <strong>
+                      Order {String(item.orderHash).slice(0, 14)}… · Status: {statusLabel}
+                    </strong>
+                    <span className="quiet">
+                      Principal ${formatTokenUnitsDisplay(ord.minUsdc ?? '0', USDC_DECIMALS, 2)} · Collateral raw{' '}
+                      {ord.collateralAmount ?? '0'} · Fixed APR {formatBpsPercent(ord.maxRateBps)} · Term {ord.termDays}d · Nonce {ord.nonce}
+                    </span>
+                    <span className="quiet">
+                      Maker {shortAddress(ord.borrower)} · Remaining $
+                      {formatTokenUnitsDisplay(item.remainingRaw ?? ord.minUsdc ?? '0', USDC_DECIMALS, 2)} ·{' '}
+                      {item.publishedToApi ? 'Published to api/' : 'Local only'}
+                    </span>
+                  </div>
+                  <div className="actions">
+                    <button
+                      className="btn secondary"
+                      type="button"
+                      onClick={() => void copyOrderPayload(item)}
+                    >
+                      {copiedHash === item.orderHash ? 'Copied JSON' : 'Copy JSON'}
+                    </button>
+                    {isCancelable && web3?.address && ord.borrower?.toLowerCase() === web3.address.toLowerCase() ? (
+                      <button
+                        className="btn secondary"
+                        type="button"
+                        onClick={() => void handleCancelOrder(ord)}
+                        disabled={Boolean(txBusy)}
+                      >
+                        {txBusy === 'cancel' ? 'Cancelling…' : 'Cancel on-chain'}
+                      </button>
+                    ) : null}
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
+
+        <form className="fields block" onSubmit={handleCancelPastedJson}>
+          <div className="field">
+            <label htmlFor="cancel-paste-json">Cancel a BorrowOrder from pasted JSON</label>
+            <textarea
+              id="cancel-paste-json"
+              rows={3}
+              value={pasteCancelJson}
+              onChange={(e) => setPasteCancelJson(e.target.value)}
+              placeholder='Paste { "order": { ... }, "signature": "0x..." } or raw BorrowOrder JSON'
+              style={{
+                width: '100%',
+                padding: 12,
+                border: '1px solid var(--line)',
+                borderRadius: 'var(--radius-control)',
+                background: 'var(--sheet)',
+              }}
+            />
+          </div>
+          <div className="actions">
+            <button
+              className="btn secondary"
+              type="submit"
+              disabled={!web3?.connected || web3?.wrongNetwork || Boolean(txBusy) || !pasteCancelJson.trim()}
+            >
+              {txBusy === 'cancel-paste' ? 'Cancelling pasted order…' : 'Cancel pasted BorrowOrder on-chain'}
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <section className="block">
         <h2>Fill a signed LendOffer (as borrower)</h2>
         <p className="hint">
-          Paste a lender&apos;s signed EIP-712 LendOffer JSON (`{`{ "offer": ..., "signature": "0x..." }`}`). Collateral units are quoted live via GET /quote and approved/submitted in exact raw integers.
+          Select an open signed LendOffer from api/ or paste JSON (`{`{ "offer": ..., "signature": "0x..." }`}`). We verify the signature, expiry, nonce, remaining capacity, lender USDC allowance, and simulate the fill via eth_call BEFORE asking for an ERC-20 approve transaction.
         </p>
-        <form className="fields" onSubmit={handleFillLendOffer}>
+
+        {openLendOffers.length > 0 ? (
+          <div className="chips block" role="group" aria-label="Open relayed lend offers">
+            {openLendOffers.map((row) => (
+              <button
+                key={row.order_hash}
+                type="button"
+                onClick={() => {
+                  setLendOfferJsonStr(
+                    JSON.stringify(
+                      {
+                        orderHash: row.order_hash,
+                        offer: row.signed_order,
+                        signature: row.signature,
+                      },
+                      null,
+                      2
+                    )
+                  );
+                  setLendFillUsdcStr(
+                    formatTokenUnitsDisplay(row.remaining_usdc?.raw ?? row.min_usdc?.raw ?? '500000000', USDC_DECIMALS, 2)
+                  );
+                  setLendPreview(null);
+                  setLendFillError('');
+                  setLendFillResult(null);
+                }}
+              >
+                LendOffer {row.order_hash.slice(0, 10)}… · $
+                {formatTokenUnitsDisplay(row.remaining_usdc?.raw ?? row.min_usdc?.raw ?? '0', USDC_DECIMALS, 2)} @{' '}
+                {formatBpsPercent(row.min_rate_bps ?? row.rate_bps)}
+              </button>
+            ))}
+          </div>
+        ) : null}
+
+        <form className="fields" onSubmit={handleVerifyLendOffer}>
           <div className="field">
             <label htmlFor="lend-offer-json">Signed LendOffer JSON</label>
             <textarea
               id="lend-offer-json"
               rows={4}
               value={lendOfferJsonStr}
-              onChange={(e) => setLendOfferJsonStr(e.target.value)}
+              onChange={(e) => {
+                setLendOfferJsonStr(e.target.value);
+                setLendPreview(null);
+                setLendFillError('');
+              }}
               style={{
                 width: '100%',
                 padding: 12,
@@ -777,11 +1161,16 @@ export function Borrow() {
               <TextInput
                 id="lend-fill-usdc"
                 value={lendFillUsdcStr}
-                onChange={setLendFillUsdcStr}
+                onChange={(v) => {
+                  setLendFillUsdcStr(v);
+                  setLendPreview(null);
+                  setLendFillError('');
+                }}
                 {...props}
               />
             )}
           </Field>
+
           {lendFillError ? <p className="err" role="alert">{lendFillError}</p> : null}
           {lendFillResult ? (
             <p className="note" role="status">
@@ -789,16 +1178,91 @@ export function Borrow() {
               {lendFillResult.collateralAmountRaw} raw units for {lendFillResult.fillUsdcRaw} raw USDC.
             </p>
           ) : null}
+
           <div className="actions">
             <button
               className="btn secondary"
               type="submit"
-              disabled={lendFillBusy || !web3?.connected || web3?.wrongNetwork}
+              disabled={lendPreviewBusy || lendFillBusy || !assetObj || !lendOfferJsonStr.trim()}
             >
-              {lendFillBusy ? 'Approving & filling LendOffer…' : 'Approve & fill LendOffer on-chain'}
+              {lendPreviewBusy ? 'Verifying & simulating fill…' : '1. Verify & preview LendOffer fill'}
             </button>
           </div>
         </form>
+
+        {lendPreview ? (
+          <Sheet
+            title="LendOffer fill review (pre-approval simulation verified)"
+            note="Signature, expiry, nonce, cancellation status, lender USDC allowance, EligibilityGate, and OrderSettlement.fillLendOffer() eth_call all passed. Confirm below to approve exact collateral (if needed) and fill."
+          >
+            {lendPreview.warnings?.length > 0 ? (
+              <div className="err block" role="note">
+                {lendPreview.warnings.map((w) => (
+                  <p key={w.code}>
+                    Warning ({w.code}): {w.message}
+                  </p>
+                ))}
+              </div>
+            ) : null}
+            <Rows
+              items={[
+                { label: 'Lender', value: lendPreview.lender },
+                { label: 'Order hash', value: lendPreview.orderHash },
+                { label: 'Fixed APR', value: formatBpsPercent(lendPreview.rateBps) },
+                { label: 'Term / Max LTV', value: `${lendPreview.termDays} days · ${formatBpsPercent(lendPreview.maxLtvBps)}` },
+                { label: 'Offer expiry (UTC)', value: new Date(lendPreview.expiry * 1000).toISOString() },
+                {
+                  label: 'Remaining / Min fill (USDC)',
+                  value: `$${formatTokenUnitsDisplay(lendPreview.remainingRaw, USDC_DECIMALS, 2)} / $${formatTokenUnitsDisplay(lendPreview.minFillRaw, USDC_DECIMALS, 2)}`,
+                },
+                {
+                  label: 'Requested fill USDC (6 dec)',
+                  value: `$${formatTokenUnitsDisplay(lendPreview.fillAmountRaw, USDC_DECIMALS, 2)} (${lendPreview.fillAmountRaw} raw)`,
+                },
+                {
+                  label: `Min required / Buffered collateral (+${(lendPreview.exact.bufferBps / 100).toFixed(2)}%)`,
+                  value: `${formatTokenUnitsDisplay(lendPreview.exact.collateralAmountRaw, lendPreview.collateralDecimals, 6)} ${lendPreview.collateralSymbol} (${lendPreview.exact.collateralAmountRaw.toString()} raw · min ${lendPreview.exact.minRequiredCollateralRaw.toString()} raw)`,
+                },
+                {
+                  label: 'Origination fee / Net USDC proceeds',
+                  value: `$${formatTokenUnitsDisplay(lendPreview.exact.originationFeeRaw, USDC_DECIMALS, 2)} / $${formatTokenUnitsDisplay(lendPreview.exact.netProceedsRaw, USDC_DECIMALS, 2)}`,
+                },
+                {
+                  label: 'Total repayment at maturity',
+                  value: `$${formatTokenUnitsDisplay(lendPreview.exact.totalRepaymentAtMaturityRaw, USDC_DECIMALS, 2)} (${lendPreview.exact.totalRepaymentAtMaturityRaw.toString()} raw)`,
+                },
+                {
+                  label: 'Pre-approval eth_call simulation',
+                  value: lendPreview.simulationVerified
+                    ? lendPreview.needsApproval
+                      ? 'Verified (ERC-20 approval required before fill)'
+                      : 'Verified (allowance sufficient)'
+                    : 'Pending wallet connection',
+                },
+              ]}
+            />
+            <div className="actions" style={{ marginTop: 14 }}>
+              <button
+                className="btn"
+                type="button"
+                onClick={() => void handleConfirmFillLendOffer()}
+                disabled={lendFillBusy || !web3?.connected || web3?.wrongNetwork}
+              >
+                {lendFillBusy
+                  ? '2. Approving & filling LendOffer…'
+                  : '2. Confirm: Approve & fill LendOffer on-chain'}
+              </button>
+              <button
+                className="btn secondary"
+                type="button"
+                onClick={() => setLendPreview(null)}
+                disabled={lendFillBusy}
+              >
+                Clear preview
+              </button>
+            </div>
+          </Sheet>
+        ) : null}
       </section>
     </Page>
   );

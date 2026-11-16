@@ -96,6 +96,13 @@ function resolveClientIp(req: IncomingMessage, trustProxyHops: number): string {
   return ips[idx];
 }
 
+function setSecurityHeaders(res: ServerResponse): void {
+  res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none';");
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+}
+
 function setCorsHeaders(req: IncomingMessage, res: ServerResponse, allowedOrigins: string[]): void {
   const reqOrigin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
   if (allowedOrigins.includes('*')) {
@@ -107,12 +114,13 @@ function setCorsHeaders(req: IncomingMessage, res: ServerResponse, allowedOrigin
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Access-Control-Max-Age', '86400');
+  setSecurityHeaders(res);
 }
 
 function sendJson(res: ServerResponse, statusCode: number, body: unknown): void {
   res.statusCode = statusCode;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
+  setSecurityHeaders(res);
   res.setHeader('Cache-Control', 'no-store');
   res.end(JSON.stringify(body));
 }

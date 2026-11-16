@@ -4,7 +4,6 @@ import { type Address, type Hex, getAddress } from 'viem';
 import { ZodError } from 'zod/v3';
 import { resolveAndValidateWebhookTarget, validateChannelTarget } from './channels.js';
 import {
-  hasPlusSubaddress,
   hashVerificationCode,
   maskTarget,
   signBlockSenderToken,
@@ -19,6 +18,7 @@ import {
 import { type NotificationsContext, defaultPreferencesMap } from './engine.js';
 import { issueSiweNonce, verifySiweAuth } from './siwe.js';
 import {
+  blockSenderSchema,
   buildPaginationSchema,
   confirmSubscriptionSchema,
   createSubscriptionSchema,
@@ -121,6 +121,18 @@ function resolveClientIp(req: IncomingMessage, trustProxyHops: number): string {
   return ips[idx];
 }
 
+function setSecurityHeaders(res: ServerResponse, isHtml = false): void {
+  res.setHeader(
+    'Content-Security-Policy',
+    isHtml
+      ? "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none';"
+      : "default-src 'none'; frame-ancestors 'none';"
+  );
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+}
+
 function setCorsHeaders(req: IncomingMessage, res: ServerResponse, allowedOrigins: string[]): void {
   const reqOrigin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
   if (reqOrigin && allowedOrigins.includes(reqOrigin)) {
@@ -130,14 +142,39 @@ function setCorsHeaders(req: IncomingMessage, res: ServerResponse, allowedOrigin
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Max-Age', '86400');
+  setSecurityHeaders(res, false);
 }
 
 function sendJson(res: ServerResponse, statusCode: number, body: unknown): void {
   res.statusCode = statusCode;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
+  setSecurityHeaders(res, false);
   res.setHeader('Cache-Control', 'no-store');
   res.end(JSON.stringify(body));
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function prefersHtmlResponse(req: IncomingMessage): boolean {
+  const accept = typeof req.headers.accept === 'string' ? req.headers.accept : '';
+  return accept.includes('text/html') && !accept.includes('application/json');
+}
+
+function sendHtmlPage(res: ServerResponse, statusCode: number, title: string, bodyHtml: string): void {
+  res.statusCode = statusCode;
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  setSecurityHeaders(res, true);
+  res.setHeader('Cache-Control', 'no-store');
+  res.end(
+    `<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>${escapeHtml(title)}</title><style>body{font-family:system-ui,-apple-system,sans-serif;max-width:560px;margin:48px auto;padding:0 16px;background:#f7f5f0;color:#1b1a17}main{background:#fff;border:1px solid #dedad2;border-radius:10px;padding:24px}h1{font-size:20px;margin:0 0 12px}p{line-height:1.5;margin:0 0 16px}code{background:#f1eee8;padding:2px 6px;border-radius:4px;font-size:13px}.actions{display:flex;flex-wrap:wrap;gap:10px}button{cursor:pointer;padding:10px 16px;border-radius:8px;border:1px solid #1b1a17;background:#1b1a17;color:#fff;font-size:14px;font-weight:600}button.secondary{background:#fff;color:#1b1a17}button.danger{background:#9f1239;border-color:#9f1239}</style></head><body><main>${bodyHtml}</main></body></html>`
+  );
 }
 
 async function readJsonBody(req: IncomingMessage, maxBytes: number): Promise<unknown> {
@@ -154,6 +191,14 @@ async function readJsonBody(req: IncomingMessage, maxBytes: number): Promise<unk
   if (chunks.length === 0) return {};
   const raw = Buffer.concat(chunks).toString('utf8').trim();
   if (!raw) return {};
+  const contentType = typeof req.headers['content-type'] === 'string' ? req.headers['content-type'].toLowerCase() : '';
+  if (contentType.includes('application/x-www-form-urlencoded')) {
+    const out: Record<string, string> = {};
+    for (const [k, v] of new URLSearchParams(raw).entries()) {
+      out[k] = v;
+    }
+    return out;
+  }
   try {
     return JSON.parse(raw) as unknown;
   } catch {
@@ -250,6 +295,73 @@ async function authenticateRequest(
   throw new HttpError(401, 'UNAUTHORIZED', 'Missing Authorization Bearer token or SIWE signature');
 }
 
+async function hasOnchainSybilCost(ctx: NotificationsContext, wallet: Address): Promise<boolean> {
+  const walletLower = wallet.toLowerCase();
+
+  try {
+    const verifiedSub = await ctx.notifDb.query<{ one: number }>(
+      'SELECT 1 AS one FROM notif_subscriptions WHERE wallet = $1 AND verified = TRUE LIMIT 1',
+      [walletLower]
+    );
+    if (verifiedSub.rows.length > 0) return true;
+  } catch {
+    // continue checks
+  }
+
+  try {
+    const [loanRes, orderRes, posRes, claimRes] = await Promise.all([
+      ctx.indexerDb.query<{ one: number }>(
+        'SELECT 1 AS one FROM loans WHERE LOWER(borrower) = $1 OR LOWER(lender) = $1 LIMIT 1',
+        [walletLower]
+      ),
+      ctx.indexerDb.query<{ one: number }>(
+        'SELECT 1 AS one FROM orders WHERE LOWER(maker) = $1 LIMIT 1',
+        [walletLower]
+      ),
+      ctx.indexerDb.query<{ one: number }>(
+        'SELECT 1 AS one FROM positions WHERE LOWER(owner) = $1 LIMIT 1',
+        [walletLower]
+      ),
+      ctx.indexerDb.query<{ one: number }>(
+        'SELECT 1 AS one FROM claims WHERE LOWER(recipient) = $1 LIMIT 1',
+        [walletLower]
+      ),
+    ]);
+    if (
+      loanRes.rows.length > 0 ||
+      orderRes.rows.length > 0 ||
+      posRes.rows.length > 0 ||
+      claimRes.rows.length > 0
+    ) {
+      return true;
+    }
+  } catch {
+    // continue to RPC check
+  }
+
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const rpcCheck = Promise.all([
+      ctx.publicClient.getBalance({ address: wallet }),
+      ctx.publicClient.getTransactionCount({ address: wallet }),
+      ctx.publicClient.getCode({ address: wallet }),
+    ]);
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error('sybil cost RPC check timeout')), 2500);
+    });
+    const [bal, txCount, code] = await Promise.race([rpcCheck, timeout]);
+    if (bal > 0n || txCount > 0 || (code !== undefined && code !== '0x')) {
+      return true;
+    }
+  } catch {
+    return false;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+
+  return false;
+}
+
 export function createNotificationsServer(ctx: NotificationsContext): http.Server {
   const rateLimiter = new IpRateLimiter(
     ctx.config.rateLimitMax,
@@ -298,11 +410,6 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
   );
   const confirmTargetResendLimiter = new IpRateLimiter(
     Math.max(1, Math.min(3, Math.floor(ctx.config.confirmTargetGlobalPerHourMax / 2))),
-    3_600_000,
-    ctx.config.rateLimitMaxBuckets
-  );
-  const confirmTargetOwnerReserveLimiter = new IpRateLimiter(
-    ctx.config.confirmTargetPerHourMax,
     3_600_000,
     ctx.config.rateLimitMaxBuckets
   );
@@ -565,9 +672,17 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
 
         if (!isWebhook) {
           const blockedRes = await ctx.notifDb.query<{ wallet: string }>(
-            'SELECT wallet FROM notif_blocked_senders WHERE wallet = $1 AND canonical_target_hash = $2',
-            [wallet.toLowerCase(), canonicalTargetHash]
+            `SELECT wallet FROM notif_blocked_senders
+             WHERE canonical_target_hash = $1 AND (wallet = $2 OR wallet = '*')`,
+            [canonicalTargetHash, wallet.toLowerCase()]
           );
+          if (blockedRes.rows.some((r) => r.wallet === '*')) {
+            throw new HttpError(
+              403,
+              'TARGET_OPTED_OUT',
+              'This recipient address has opted out of all NOSTOK notifications.'
+            );
+          }
           if (blockedRes.rows.length > 0) {
             throw new HttpError(
               403,
@@ -603,9 +718,11 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             return;
           }
 
-          // Enforce per-wallet (3/h), per-IP (3/h), bounded resend cap, and global cap (10/h)
-          // with a reserved verified-session slot so unauthenticated/spam flooding cannot lock out
-          // a legitimate wallet from confirming its own target.
+          // Enforce per-wallet (3/h) and per-IP (3/h) on all wallets.
+          // Wallets with real on-chain / protocol sybil cost (ETH balance, tx nonce, SCW code,
+          // indexed Nostok activity, or prior verified sub) cannot be locked out by zero-cost
+          // botnet exhaustions on the shared target cap (for either plain or +tag addresses).
+          // Fresh zero-cost wallets remain strictly capped at 10/h globally per target.
           enforceScopedRateLimit(
             res,
             confirmTargetWalletLimiter,
@@ -619,59 +736,48 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             `IP confirmation sends to ${input.channel} target`
           );
 
-          const nowMs = Date.now();
-          let seenEntry = pendingWalletsByTarget.get(canonicalTargetHash);
-          if (seenEntry && seenEntry.resetAtMs <= nowMs) {
-            pendingWalletsByTarget.delete(canonicalTargetHash);
-            seenEntry = undefined;
-          }
-          if (!seenEntry) {
-            if (pendingWalletsByTarget.size >= ctx.config.rateLimitMaxBuckets) {
-              for (const [k, v] of pendingWalletsByTarget.entries()) {
-                if (v.resetAtMs <= nowMs) pendingWalletsByTarget.delete(k);
+          const walletHasSybilCost = await hasOnchainSybilCost(ctx, wallet);
+          if (!walletHasSybilCost) {
+            const nowMs = Date.now();
+            let seenEntry = pendingWalletsByTarget.get(canonicalTargetHash);
+            if (seenEntry && seenEntry.resetAtMs <= nowMs) {
+              pendingWalletsByTarget.delete(canonicalTargetHash);
+              seenEntry = undefined;
+            }
+            if (!seenEntry) {
+              if (pendingWalletsByTarget.size >= ctx.config.rateLimitMaxBuckets) {
+                for (const [k, v] of pendingWalletsByTarget.entries()) {
+                  if (v.resetAtMs <= nowMs) pendingWalletsByTarget.delete(k);
+                }
+              }
+              seenEntry = { wallets: new Set(), resetAtMs: nowMs + 3_600_000 };
+              if (pendingWalletsByTarget.size < ctx.config.rateLimitMaxBuckets) {
+                pendingWalletsByTarget.set(canonicalTargetHash, seenEntry);
               }
             }
-            seenEntry = { wallets: new Set(), resetAtMs: nowMs + 3_600_000 };
-            if (pendingWalletsByTarget.size < ctx.config.rateLimitMaxBuckets) {
-              pendingWalletsByTarget.set(canonicalTargetHash, seenEntry);
-            }
-          }
 
-          const walletLower = wallet.toLowerCase();
-          const alreadyRequested = seenEntry.wallets.has(walletLower);
-          if (alreadyRequested) {
-            enforceScopedRateLimit(
-              res,
-              confirmTargetResendLimiter,
-              canonicalTargetHash,
-              `confirmation resends to ${input.channel} target`
-            );
-          }
-
-          const globalRl = confirmTargetGlobalLimiter.check(canonicalTargetHash);
-          if (!globalRl.allowed) {
-            const allowOwnerReserve =
-              Boolean(caller.jti) &&
-              !alreadyRequested &&
-              !hasPlusSubaddress(input.channel, normalizedTarget);
-            if (allowOwnerReserve) {
+            const walletLower = wallet.toLowerCase();
+            if (seenEntry.wallets.has(walletLower)) {
               enforceScopedRateLimit(
                 res,
-                confirmTargetOwnerReserveLimiter,
+                confirmTargetResendLimiter,
                 canonicalTargetHash,
-                `verified-session confirmation sends to ${input.channel} target`
+                `confirmation resends to ${input.channel} target`
               );
-            } else {
+            }
+
+            const globalRl = confirmTargetGlobalLimiter.check(canonicalTargetHash);
+            if (!globalRl.allowed) {
               res.setHeader('Retry-After', String(globalRl.retryAfterSec));
               throw new HttpError(
                 429,
                 'RATE_LIMIT_EXCEEDED',
-                `Rate limit exceeded for global confirmation sends to ${input.channel} target; retry later.`
+                `Rate limit exceeded for unverified-wallet confirmation sends to ${input.channel} target; retry later.`
               );
             }
-          }
 
-          seenEntry.wallets.add(walletLower);
+            seenEntry.wallets.add(walletLower);
+          }
         }
 
         const newId = existingSub.rows[0]?.id ?? `sub_${crypto.randomUUID().replace(/-/g, '')}`;
@@ -732,6 +838,9 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             30 * 86_400
           );
           const blockUrl = `${ctx.config.publicBaseUrl}/subscriptions/block?token=${encodeURIComponent(blockToken)}`;
+          const siweAppOrigin = ctx.config.siweUri ? ctx.config.siweUri.replace(/\/+$/, '') : ctx.config.publicBaseUrl;
+          const frontendConfirmUrl = `${siweAppOrigin}/subscriptions/confirm?token=${encodeURIComponent(confirmToken)}`;
+          const frontendBlockUrl = `${siweAppOrigin}/subscriptions/block?token=${encodeURIComponent(blockToken)}`;
           const unsubToken = signUnsubscribeToken(
             ctx.config.unsubscribeSecret,
             created.id,
@@ -752,8 +861,10 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
               verification_code: verificationCode,
               confirm_token: confirmToken,
               confirm_url: confirmUrl,
+              frontend_confirm_url: frontendConfirmUrl,
               block_token: blockToken,
               block_url: blockUrl,
+              frontend_block_url: frontendBlockUrl,
             },
             unsubscribeUrl,
           };
@@ -786,11 +897,38 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
         } catch (err) {
           throw new HttpError(400, 'VALIDATION_ERROR', err instanceof Error ? err.message : 'Invalid token');
         }
+        const checksumWallet = getAddress(verified.wallet);
+        if (prefersHtmlResponse(req)) {
+          const escToken = escapeHtml(rawToken);
+          const escWallet = escapeHtml(checksumWallet);
+          sendHtmlPage(
+            res,
+            200,
+            'Block NOSTOK Alert Sender',
+            `<h1>Didn't request this alert subscription?</h1>
+<p>A verification email was requested for wallet <code>${escWallet}</code>.</p>
+<div class="actions">
+  <form method="POST" action="/subscriptions/block">
+    <input type="hidden" name="token" value="${escToken}" />
+    <input type="hidden" name="scope" value="wallet" />
+    <button type="submit" class="secondary">Block this wallet only</button>
+  </form>
+  <form method="POST" action="/subscriptions/block">
+    <input type="hidden" name="token" value="${escToken}" />
+    <input type="hidden" name="scope" value="target_all" />
+    <input type="hidden" name="block_all" value="true" />
+    <button type="submit" class="danger">Block this address entirely (all wallets)</button>
+  </form>
+</div>`
+          );
+          return;
+        }
         sendJson(res, 200, {
           confirmation_required: true,
           method: 'POST',
           subscription_id: verified.subId,
-          blocked_wallet: getAddress(verified.wallet),
+          blocked_wallet: checksumWallet,
+          supported_scopes: ['wallet', 'target_all'],
         });
         return;
       }
@@ -802,10 +940,11 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
           rawBody && typeof rawBody === 'object' && 'token' in rawBody
             ? rawBody
             : { token: queryObj.token };
-        const rawToken = parseOrThrow(unsubscribeBodySchema, bodyObj).token;
+        const parsedBlock = parseOrThrow(blockSenderSchema, bodyObj);
+        const blockAll = parsedBlock.scope === 'target_all' || parsedBlock.block_all === true;
         let verified: { subId: string; wallet: string; canonicalTargetHash: string };
         try {
-          verified = verifyBlockSenderToken(ctx.config.confirmSecret, rawToken);
+          verified = verifyBlockSenderToken(ctx.config.confirmSecret, parsedBlock.token);
         } catch (err) {
           throw new HttpError(400, 'VALIDATION_ERROR', err instanceof Error ? err.message : 'Invalid token');
         }
@@ -816,21 +955,81 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
            ON CONFLICT (wallet, canonical_target_hash) DO NOTHING`,
           [walletLower, verified.canonicalTargetHash]
         );
+        const deletedIds: string[] = [];
         const delRes = await ctx.notifDb.query<{ id: string }>(
           `DELETE FROM notif_subscriptions
            WHERE id = $1 AND LOWER(wallet) = $2 AND verified = FALSE
            RETURNING id`,
           [verified.subId, walletLower]
         );
-        if (delRes.rows.length > 0) {
+        for (const r of delRes.rows) deletedIds.push(r.id);
+
+        if (blockAll) {
+          await ctx.notifDb.query(
+            `INSERT INTO notif_blocked_senders (wallet, canonical_target_hash)
+             VALUES ('*', $1)
+             ON CONFLICT (wallet, canonical_target_hash) DO NOTHING`,
+            [verified.canonicalTargetHash]
+          );
+          const pendingSubs = await ctx.notifDb.query<{
+            id: string;
+            channel: 'email' | 'telegram' | 'webhook';
+            target_ciphertext: string;
+            key_id: string;
+          }>(
+            `SELECT id, channel, target_ciphertext, key_id
+             FROM notif_subscriptions
+             WHERE verified = FALSE AND channel IN ('email', 'telegram')`
+          );
+          const matchingIds: string[] = [];
+          for (const sub of pendingSubs.rows) {
+            try {
+              const targetPlain = ctx.cipher.decrypt(sub.target_ciphertext, sub.key_id);
+              const gHash = ctx.cipher.computeGlobalTargetHash(sub.channel, targetPlain);
+              if (gHash === verified.canonicalTargetHash) {
+                matchingIds.push(sub.id);
+              }
+            } catch {
+              // ignore corrupted or unknown-key rows
+            }
+          }
+          if (matchingIds.length > 0) {
+            const ph = matchingIds.map((_, idx) => `$${idx + 1}`).join(', ');
+            const bulkDel = await ctx.notifDb.query<{ id: string }>(
+              `DELETE FROM notif_subscriptions WHERE id IN (${ph}) RETURNING id`,
+              matchingIds
+            );
+            for (const r of bulkDel.rows) deletedIds.push(r.id);
+          }
+          confirmTargetGlobalLimiter.refund(verified.canonicalTargetHash);
+          confirmTargetResendLimiter.refund(verified.canonicalTargetHash);
+          pendingWalletsByTarget.delete(verified.canonicalTargetHash);
+        } else if (delRes.rows.length > 0) {
           confirmTargetGlobalLimiter.refund(verified.canonicalTargetHash);
           confirmTargetResendLimiter.refund(verified.canonicalTargetHash);
           pendingWalletsByTarget.get(verified.canonicalTargetHash)?.wallets.delete(walletLower);
         }
+
+        const checksumWallet = getAddress(verified.wallet);
+        const scope = blockAll ? 'target_all' : 'wallet';
+        if (prefersHtmlResponse(req)) {
+          sendHtmlPage(
+            res,
+            200,
+            blockAll ? 'Address Blocked Entirely' : 'Sender Wallet Blocked',
+            blockAll
+              ? `<h1>Address opted out of all NOSTOK notifications</h1><p>No wallet can send confirmation or alert emails to this address again.</p>`
+              : `<h1>Sender wallet blocked</h1><p>Wallet <code>${escapeHtml(checksumWallet)}</code> can no longer send confirmation requests to this address.</p>`
+          );
+          return;
+        }
         sendJson(res, 200, {
           blocked: true,
+          scope,
+          block_all: blockAll,
           subscription_id: verified.subId,
-          blocked_wallet: getAddress(verified.wallet),
+          blocked_wallet: checksumWallet,
+          deleted_pending_count: deletedIds.length,
         });
         return;
       }
@@ -844,11 +1043,28 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
         } catch (err) {
           throw new HttpError(400, 'VALIDATION_ERROR', err instanceof Error ? err.message : 'Invalid token');
         }
+        const checksumWallet = getAddress(verified.wallet);
+        if (prefersHtmlResponse(req)) {
+          const escToken = escapeHtml(rawToken);
+          const escWallet = escapeHtml(checksumWallet);
+          sendHtmlPage(
+            res,
+            200,
+            'Confirm NOSTOK Alert Subscription',
+            `<h1>Confirm your NOSTOK alert subscription</h1>
+<p>Wallet: <code>${escWallet}</code></p>
+<form method="POST" action="/subscriptions/confirm">
+  <input type="hidden" name="token" value="${escToken}" />
+  <button type="submit">Confirm subscription</button>
+</form>`
+          );
+          return;
+        }
         sendJson(res, 200, {
           confirmation_required: true,
           method: 'POST',
           subscription_id: verified.subId,
-          wallet_address: getAddress(verified.wallet),
+          wallet_address: checksumWallet,
         });
         return;
       }
@@ -909,6 +1125,15 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
              WHERE id = $1`,
             [row.id]
           );
+          if (prefersHtmlResponse(req)) {
+            sendHtmlPage(
+              res,
+              200,
+              'Subscription Confirmed',
+              `<h1>Alert subscription confirmed</h1><p>Subscription <code>${escapeHtml(row.id)}</code> for wallet <code>${escapeHtml(getAddress(verified.wallet))}</code> is now active.</p>`
+            );
+            return;
+          }
           sendJson(res, 200, {
             confirmed: true,
             id: row.id,
@@ -1315,7 +1540,6 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
     confirmTargetIpLimiter.close();
     confirmTargetGlobalLimiter.close();
     confirmTargetResendLimiter.close();
-    confirmTargetOwnerReserveLimiter.close();
     clearInterval(pendingWalletsTimer);
     confirmIpLimiter.close();
     confirmWalletLimiter.close();

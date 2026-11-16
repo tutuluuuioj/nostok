@@ -21,8 +21,14 @@ import {
 } from './marketsApi.js';
 import { termSheet } from './money.js';
 import {
+  DEFAULT_COLLATERAL_BUFFER_BPS,
+  decodeContractRevert,
   formatTokenUnitsDisplay,
+  formatWeb3Error,
+  loadPersistedSignedOrders,
+  parseBorrowOrderFromJson,
   resolveExactBorrowAmounts,
+  saveSignedBorrowOrder,
   verifySiweChallengeParams,
 } from './web3.js';
 
@@ -289,7 +295,7 @@ assert.equal(feeCards.length, 4);
 assert.match(feeCards[0].detail, /0\.30% of principal\. Hard cap 2\.00%/);
 assert.match(feeCards[3].detail, /25\.00% of collected protocol fees/);
 
-// WS3.3: resolveExactBorrowAmounts always uses exact/rounded-up raw API values, never floored display strings
+// WS3.3 + M3: resolveExactBorrowAmounts defaults to +5.00% buffered raw collateral above minRequiredCollateralRaw
 const quoteSample = {
   amounts: {
     principal: { raw: '700000000', formatted: '700', decimals: 6, symbol: 'USDC' },
@@ -303,7 +309,13 @@ const quoteSample = {
 const resolvedDefault = resolveExactBorrowAmounts(quoteSample);
 assert.equal(resolvedDefault.principalRaw, 700000000n);
 assert.equal(resolvedDefault.minRequiredCollateralRaw, 8333333333333333334n);
-assert.equal(resolvedDefault.collateralAmountRaw, 8333333333333333334n);
+assert.equal(resolvedDefault.bufferBps, DEFAULT_COLLATERAL_BUFFER_BPS);
+assert.equal(resolvedDefault.bufferedCollateralRaw, 8750000000000000001n);
+assert.equal(resolvedDefault.collateralAmountRaw, 8750000000000000001n);
+assert.equal(
+  resolveExactBorrowAmounts(quoteSample, { bufferBps: 0 }).collateralAmountRaw,
+  8333333333333333334n
+);
 assert.throws(
   () => resolveExactBorrowAmounts(quoteSample, { userCollateralRaw: '8333333000000000000' }),
   /below API rounded-up minimum/i
@@ -312,6 +324,34 @@ assert.equal(
   resolveExactBorrowAmounts(quoteSample, { userCollateralRaw: '9000000000000000000' }).collateralAmountRaw,
   9000000000000000000n
 );
+
+// M4 + Low: custom error decoding & M5 persisted storage + paste-JSON parse
+assert.equal(decodeContractRevert({ data: '0x8c0fe5c3' })?.errorName, 'LtvExceeded');
+assert.match(formatWeb3Error({ cause: { data: '0x8c0fe5c3' } }), /LtvExceeded/);
+
+const memStoreMap = new Map();
+const memStorage = {
+  getItem: (k) => memStoreMap.get(k) ?? null,
+  setItem: (k, v) => memStoreMap.set(k, v),
+};
+const sampleOrder = {
+  borrower: '0x1111111111111111111111111111111111111111',
+  collateralToken: '0x2222222222222222222222222222222222222222',
+  collateralAmount: '8750000000000000001',
+  minUsdc: '700000000',
+  maxRateBps: 800,
+  termDays: 30,
+  maxLtvBps: 6000,
+  minFill: '500000000',
+  expiry: '1900000000',
+  nonce: '0',
+  yieldMode: 0,
+  allowInKindSettlement: false,
+};
+saveSignedBorrowOrder({ orderHash: '0x' + 'ab'.repeat(32), orderJson: sampleOrder, signature: '0x' + 'cd'.repeat(65) }, memStorage);
+assert.equal(loadPersistedSignedOrders(memStorage).length, 1);
+const parsedOrder = parseBorrowOrderFromJson(JSON.stringify({ order: sampleOrder, signature: '0x' + 'cd'.repeat(65) }));
+assert.equal(parsedOrder.order.collateralAmount, 8750000000000000001n);
 
 setFrontendConfigOverrides({});
 

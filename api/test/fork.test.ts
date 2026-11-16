@@ -1680,6 +1680,176 @@ async function runTests(): Promise<void> {
       assert.ok(qUnsupported.body.rejection_reasons.some((r) => r.code === 'ASSET_NOT_SUPPORTED'));
 
       console.log('PASS TEST 6: Eligibility parity, caps, uint128 bounds, extend terms, unsupported status, and warning separation verified.');
+
+      // TEST 7: POST /orders off-chain signed orderbook relay + GET /orders live merge + security headers
+      console.log('\n=== TEST 7: POST /orders relay + GET /orders live state merge + security headers ===');
+      const secHeadersRes = await fetch(`${baseUrl}/health`);
+      assert.ok(secHeadersRes.headers.get('content-security-policy'));
+      assert.equal(secHeadersRes.headers.get('x-content-type-options'), 'nosniff');
+      assert.equal(secHeadersRes.headers.get('x-frame-options'), 'DENY');
+      assert.equal(secHeadersRes.headers.get('referrer-policy'), 'strict-origin-when-cross-origin');
+
+      const signerBorrower = privateKeyToAccount(KEYS.borrower);
+      const signerLender = privateKeyToAccount(KEYS.lender);
+      const latestBlkRelay = await publicClient.getBlock();
+      const borrowNonceNow = await publicClient.readContract({
+        address: deployed.orderSettlement,
+        abi: parseAbi(['function getMakerNonce(address) view returns (uint256)']),
+        functionName: 'getMakerNonce',
+        args: [ADDRESSES.borrower],
+      });
+      const lenderNonceNow = await publicClient.readContract({
+        address: deployed.orderSettlement,
+        abi: parseAbi(['function getMakerNonce(address) view returns (uint256)']),
+        functionName: 'getMakerNonce',
+        args: [ADDRESSES.lender],
+      });
+
+      const borrowOrderRelay = {
+        borrower: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        collateralAmount: (12n * 10n ** 18n).toString(),
+        minUsdc: '800000000',
+        maxRateBps: 900,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFill: '500000000',
+        expiry: (latestBlkRelay.timestamp + 3600n).toString(),
+        nonce: borrowNonceNow.toString(),
+        yieldMode: 0,
+        allowInKindSettlement: false,
+      };
+      const borrowRelaySig = await signerBorrower.signTypedData({
+        domain: {
+          name: 'NOSTOK Order Settlement',
+          version: '1',
+          chainId: 8453,
+          verifyingContract: deployed.orderSettlement,
+        },
+        types: {
+          BorrowOrder: [
+            { name: 'borrower', type: 'address' },
+            { name: 'collateralToken', type: 'address' },
+            { name: 'collateralAmount', type: 'uint128' },
+            { name: 'minUsdc', type: 'uint128' },
+            { name: 'maxRateBps', type: 'uint32' },
+            { name: 'termDays', type: 'uint16' },
+            { name: 'maxLtvBps', type: 'uint16' },
+            { name: 'minFill', type: 'uint128' },
+            { name: 'expiry', type: 'uint64' },
+            { name: 'nonce', type: 'uint256' },
+            { name: 'yieldMode', type: 'uint8' },
+            { name: 'allowInKindSettlement', type: 'bool' },
+          ],
+        },
+        primaryType: 'BorrowOrder',
+        message: {
+          ...borrowOrderRelay,
+          collateralAmount: BigInt(borrowOrderRelay.collateralAmount),
+          minUsdc: BigInt(borrowOrderRelay.minUsdc),
+          minFill: BigInt(borrowOrderRelay.minFill),
+          expiry: BigInt(borrowOrderRelay.expiry),
+          nonce: BigInt(borrowOrderRelay.nonce),
+        },
+      });
+
+      // Invalid signature rejected with 400 INVALID_ORDER_SIGNATURE
+      const badSigPost = await postJson<{ error: { code: string } }>(`${baseUrl}/orders`, {
+        order_type: 'borrow',
+        order: borrowOrderRelay,
+        signature: '0x' + '11'.repeat(65),
+      });
+      assert.equal(badSigPost.status, 400);
+      assert.equal(badSigPost.body.error.code, 'INVALID_ORDER_SIGNATURE');
+
+      // Valid signed BorrowOrder accepted (201) & visible in GET /orders
+      const postBorrowRes = await postJson<{
+        order_hash: string;
+        status: string;
+        order_type: string;
+        signature: string;
+      }>(`${baseUrl}/orders`, {
+        order_type: 'borrow',
+        order: borrowOrderRelay,
+        signature: borrowRelaySig,
+      });
+      assert.equal(postBorrowRes.status, 201);
+      assert.equal(postBorrowRes.body.status, 'open');
+      assert.equal(postBorrowRes.body.order_type, 'borrow');
+
+      // Valid signed LendOffer accepted (201) & visible in GET /orders?order_type=lend
+      const lendOfferRelay = {
+        lender: ADDRESSES.lender,
+        usdcAmount: '1000000000',
+        minRateBps: 850,
+        termDays: 30,
+        allowedCollateral: nvdac,
+        maxLtvBps: 6000,
+        minFill: '500000000',
+        expiry: (latestBlkRelay.timestamp + 3600n).toString(),
+        nonce: lenderNonceNow.toString(),
+        yieldMode: 0,
+      };
+      const lendRelaySig = await signerLender.signTypedData({
+        domain: {
+          name: 'NOSTOK Order Settlement',
+          version: '1',
+          chainId: 8453,
+          verifyingContract: deployed.orderSettlement,
+        },
+        types: {
+          LendOffer: [
+            { name: 'lender', type: 'address' },
+            { name: 'usdcAmount', type: 'uint128' },
+            { name: 'minRateBps', type: 'uint32' },
+            { name: 'termDays', type: 'uint16' },
+            { name: 'allowedCollateral', type: 'address' },
+            { name: 'maxLtvBps', type: 'uint16' },
+            { name: 'minFill', type: 'uint128' },
+            { name: 'expiry', type: 'uint64' },
+            { name: 'nonce', type: 'uint256' },
+            { name: 'yieldMode', type: 'uint8' },
+          ],
+        },
+        primaryType: 'LendOffer',
+        message: {
+          ...lendOfferRelay,
+          usdcAmount: BigInt(lendOfferRelay.usdcAmount),
+          minFill: BigInt(lendOfferRelay.minFill),
+          expiry: BigInt(lendOfferRelay.expiry),
+          nonce: BigInt(lendOfferRelay.nonce),
+        },
+      });
+      const postLendRes = await postJson<{ order_hash: string; status: string }>(`${baseUrl}/orders`, {
+        order_type: 'lend',
+        order: lendOfferRelay,
+        signature: lendRelaySig,
+      });
+      assert.equal(postLendRes.status, 201);
+
+      const getLendsRes = await getJson<{
+        pagination: { total: number };
+        data: Array<{ order_hash: string; status: string; signature?: string }>;
+      }>(`${baseUrl}/orders?order_type=lend`);
+      assert.equal(getLendsRes.status, 200);
+      assert.ok(getLendsRes.body.data.some((o) => o.order_hash === postLendRes.body.order_hash && o.signature === lendRelaySig));
+
+      // After borrower bumpNonce() on-chain, open relay order moves out of public open book and shows nonce_bumped when include_inactive=true
+      await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: deployed.orderSettlement,
+          abi: parseAbi(['function bumpNonce() returns (uint256)']),
+          functionName: 'bumpNonce',
+        }),
+      });
+      const inactiveOrders = await getJson<{
+        data: Array<{ order_hash: string; status: string }>;
+      }>(`${baseUrl}/orders?maker=${ADDRESSES.borrower}&include_inactive=true`);
+      const bumpedEntry = inactiveOrders.body.data.find((o) => o.order_hash === postBorrowRes.body.order_hash);
+      assert.ok(bumpedEntry);
+      assert.equal(bumpedEntry.status, 'nonce_bumped');
+
+      console.log('PASS TEST 7: POST /orders verification, GET /orders merge, bumpNonce sync, and security headers verified.');
       console.log('\nALL API WS2.3 BASE MAINNET FORK INTEGRATION TESTS PASSED.');
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));

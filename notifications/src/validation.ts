@@ -71,6 +71,16 @@ export const unsubscribeBodySchema = z.object({
   token: z.string().trim().min(10).max(2048),
 });
 
+export const blockSenderSchema = z.object({
+  token: z.string().trim().min(10).max(2048),
+  scope: z.enum(['wallet', 'target_all']).optional(),
+  block_all: z.union([z.boolean(), z.enum(['true', '1', 'on', 'false', '0'])]).optional().transform((v) => {
+    if (v === undefined) return undefined;
+    if (typeof v === 'boolean') return v;
+    return v === 'true' || v === '1' || v === 'on';
+  }),
+});
+
 export const confirmSubscriptionSchema = z.union([
   z.object({
     token: z.string().trim().min(10).max(2048),

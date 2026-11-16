@@ -66,6 +66,28 @@ export const erc20Abi = [
     outputs: [{ name: '', type: 'bool' }],
   },
   { type: 'function', name: 'uiMultiplier', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint256' }] },
+  {
+    type: 'error',
+    name: 'ERC20InsufficientBalance',
+    inputs: [
+      { name: 'sender', type: 'address' },
+      { name: 'balance', type: 'uint256' },
+      { name: 'needed', type: 'uint256' },
+    ],
+  },
+  {
+    type: 'error',
+    name: 'ERC20InsufficientAllowance',
+    inputs: [
+      { name: 'spender', type: 'address' },
+      { name: 'allowance', type: 'uint256' },
+      { name: 'needed', type: 'uint256' },
+    ],
+  },
+  { type: 'error', name: 'ERC20InvalidSender', inputs: [{ name: 'sender', type: 'address' }] },
+  { type: 'error', name: 'ERC20InvalidReceiver', inputs: [{ name: 'receiver', type: 'address' }] },
+  { type: 'error', name: 'ERC20InvalidApprover', inputs: [{ name: 'approver', type: 'address' }] },
+  { type: 'error', name: 'ERC20InvalidSpender', inputs: [{ name: 'spender', type: 'address' }] },
 ];
 
 export const eligibilityGateAbi = [
@@ -83,6 +105,9 @@ export const eligibilityGateAbi = [
     ],
     outputs: [{ name: '', type: 'bool' }],
   },
+  { type: 'error', name: 'ZeroAddress', inputs: [] },
+  { type: 'error', name: 'Unauthorized', inputs: [] },
+  { type: 'error', name: 'InvalidSignature', inputs: [] },
 ];
 
 export const loanCoreAbi = [
@@ -147,6 +172,22 @@ export const loanCoreAbi = [
     outputs: [],
   },
   { type: 'function', name: 'claim', stateMutability: 'nonpayable', inputs: [{ name: 'to', type: 'address' }], outputs: [{ name: 'claimedAmount', type: 'uint128' }] },
+  { type: 'error', name: 'UnauthorizedCaller', inputs: [] },
+  { type: 'error', name: 'ZeroAddress', inputs: [] },
+  { type: 'error', name: 'ProtocolPaused', inputs: [] },
+  { type: 'error', name: 'GlobalCapExceeded', inputs: [] },
+  { type: 'error', name: 'PerLoanCapExceeded', inputs: [] },
+  { type: 'error', name: 'AssetCapExceeded', inputs: [] },
+  { type: 'error', name: 'AssetNotActive', inputs: [] },
+  { type: 'error', name: 'OracleInvalidForAction', inputs: [] },
+  { type: 'error', name: 'LtvExceeded', inputs: [] },
+  { type: 'error', name: 'InvalidLoanTerms', inputs: [] },
+  { type: 'error', name: 'LoanNotActive', inputs: [] },
+  { type: 'error', name: 'LoanNotInGrace', inputs: [] },
+  { type: 'error', name: 'LoanNotLiquidatable', inputs: [] },
+  { type: 'error', name: 'InsufficientPayment', inputs: [] },
+  { type: 'error', name: 'OrderExpired', inputs: [] },
+  { type: 'error', name: 'InvalidSignature', inputs: [] },
 ];
 
 export const ORDER_SETTLEMENT_DOMAIN_NAME = 'NOSTOK Order Settlement';
@@ -329,6 +370,24 @@ export const orderSettlementAbi = [
       { name: 'maker', type: 'address', indexed: true },
     ],
   },
+  {
+    type: 'event',
+    name: 'NonceBumped',
+    inputs: [
+      { name: 'maker', type: 'address', indexed: true },
+      { name: 'newNonce', type: 'uint256', indexed: false },
+    ],
+  },
+  { type: 'error', name: 'Unauthorized', inputs: [] },
+  { type: 'error', name: 'ZeroAddress', inputs: [] },
+  { type: 'error', name: 'OrderExpired', inputs: [] },
+  { type: 'error', name: 'OrderCancelledAlready', inputs: [] },
+  { type: 'error', name: 'InvalidNonce', inputs: [] },
+  { type: 'error', name: 'InvalidSignature', inputs: [] },
+  { type: 'error', name: 'FillAmountTooLow', inputs: [] },
+  { type: 'error', name: 'OrderExceeded', inputs: [] },
+  { type: 'error', name: 'IneligibleCounterparty', inputs: [] },
+  { type: 'error', name: 'CollateralMismatch', inputs: [] },
 ];
 
 export const assetRegistryAbi = [
@@ -361,6 +420,13 @@ export const assetRegistryAbi = [
       },
     ],
   },
+  { type: 'error', name: 'UnauthorizedCaller', inputs: [] },
+  { type: 'error', name: 'ZeroAddress', inputs: [] },
+  { type: 'error', name: 'AssetNotSupported', inputs: [] },
+  { type: 'error', name: 'InvalidLtvParameters', inputs: [] },
+  { type: 'error', name: 'InvalidDiscountParameters', inputs: [] },
+  { type: 'error', name: 'GuardianCanOnlyTighten', inputs: [] },
+  { type: 'error', name: 'InvalidStaleParameters', inputs: [] },
 ];
 
 export const oracleRouterAbi = [
@@ -390,16 +456,27 @@ export const oracleRouterAbi = [
     ],
   },
   { type: 'function', name: 'recordedMultiplier', stateMutability: 'view', inputs: [{ name: 'token', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
+  { type: 'error', name: 'ZeroAddress', inputs: [] },
+  { type: 'error', name: 'InvalidAnswer', inputs: [] },
+  { type: 'error', name: 'AssetNotConfigured', inputs: [] },
+  { type: 'error', name: 'CorporateActionSplitPending', inputs: [] },
 ];
 
 export const positionNftAbi = [
   { type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ name: 'owner', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
   { type: 'function', name: 'ownerOf', stateMutability: 'view', inputs: [{ name: 'tokenId', type: 'uint256' }], outputs: [{ name: '', type: 'address' }] },
   { type: 'function', name: 'isAuctionLocked', stateMutability: 'view', inputs: [{ name: 'loanId', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] },
+  { type: 'error', name: 'UnauthorizedCaller', inputs: [] },
+  { type: 'error', name: 'ZeroAddress', inputs: [] },
+  { type: 'error', name: 'AuctionTransferLocked', inputs: [] },
+  { type: 'error', name: 'IneligibleRecipient', inputs: [] },
 ];
 
 export const collateralEscrowAbi = [
   { type: 'function', name: 'getBalance', stateMutability: 'view', inputs: [{ name: 'token', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
+  { type: 'error', name: 'UnauthorizedCaller', inputs: [] },
+  { type: 'error', name: 'ZeroAddress', inputs: [] },
+  { type: 'error', name: 'InsufficientBalance', inputs: [] },
 ];
 
 export const liquidationAuctionAbi = [
@@ -433,7 +510,43 @@ export const liquidationAuctionAbi = [
       },
     ],
   },
+  { type: 'error', name: 'UnauthorizedCaller', inputs: [] },
+  { type: 'error', name: 'ZeroAddress', inputs: [] },
+  { type: 'error', name: 'AuctionNotActive', inputs: [] },
+  { type: 'error', name: 'InvalidAuctionAmount', inputs: [] },
+  { type: 'error', name: 'SlippageExceeded', inputs: [] },
+  { type: 'error', name: 'BuyAmountTooSmall', inputs: [] },
+  { type: 'error', name: 'AuctionExpired', inputs: [] },
+  { type: 'error', name: 'OracleNotStaleOrFrozen', inputs: [] },
+  { type: 'error', name: 'EmergencyCancelCooldownActive', inputs: [] },
 ];
+
+const EXTRA_SYSTEM_ERROR_ABI = [
+  { type: 'error', name: 'ECDSAInvalidSignature', inputs: [] },
+  { type: 'error', name: 'ECDSAInvalidSignatureLength', inputs: [{ name: 'length', type: 'uint256' }] },
+  { type: 'error', name: 'ECDSAInvalidSignatureS', inputs: [{ name: 's', type: 'bytes32' }] },
+  { type: 'error', name: 'SafeERC20FailedOperation', inputs: [{ name: 'token', type: 'address' }] },
+  { type: 'error', name: 'FeeCapExceeded', inputs: [] },
+];
+
+export const PROTOCOL_ERROR_ABI = Array.from(
+  new Map(
+    [
+      ...orderSettlementAbi,
+      ...loanCoreAbi,
+      ...eligibilityGateAbi,
+      ...assetRegistryAbi,
+      ...oracleRouterAbi,
+      ...positionNftAbi,
+      ...collateralEscrowAbi,
+      ...liquidationAuctionAbi,
+      ...erc20Abi,
+      ...EXTRA_SYSTEM_ERROR_ABI,
+    ]
+      .filter((item) => item.type === 'error')
+      .map((item) => [`${item.name}(${(item.inputs ?? []).map((i) => i.type).join(',')})`, item])
+  ).values()
+);
 
 export const REQUIRED_CONTRACT_KEYS = [
   'loanCore',

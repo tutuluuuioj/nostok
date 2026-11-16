@@ -298,4 +298,87 @@ export const erc20MetaAbi = [
     inputs: [],
     outputs: [{ name: '', type: 'uint256' }],
   },
+  {
+    type: 'function',
+    name: 'balanceOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'allowance',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'owner', type: 'address' },
+      { name: 'spender', type: 'address' },
+    ],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+] as const;
+
+export const BORROW_ORDER_COMPONENTS = [
+  { name: 'borrower', type: 'address' },
+  { name: 'collateralToken', type: 'address' },
+  { name: 'collateralAmount', type: 'uint128' },
+  { name: 'minUsdc', type: 'uint128' },
+  { name: 'maxRateBps', type: 'uint32' },
+  { name: 'termDays', type: 'uint16' },
+  { name: 'maxLtvBps', type: 'uint16' },
+  { name: 'minFill', type: 'uint128' },
+  { name: 'expiry', type: 'uint64' },
+  { name: 'nonce', type: 'uint256' },
+  { name: 'yieldMode', type: 'uint8' },
+  { name: 'allowInKindSettlement', type: 'bool' },
+] as const;
+
+export const LEND_OFFER_COMPONENTS = [
+  { name: 'lender', type: 'address' },
+  { name: 'usdcAmount', type: 'uint128' },
+  { name: 'minRateBps', type: 'uint32' },
+  { name: 'termDays', type: 'uint16' },
+  { name: 'allowedCollateral', type: 'address' },
+  { name: 'maxLtvBps', type: 'uint16' },
+  { name: 'minFill', type: 'uint128' },
+  { name: 'expiry', type: 'uint64' },
+  { name: 'nonce', type: 'uint256' },
+  { name: 'yieldMode', type: 'uint8' },
+] as const;
+
+export const orderSettlementAbi = [
+  {
+    type: 'function',
+    name: 'getMakerNonce',
+    stateMutability: 'view',
+    inputs: [{ name: 'maker', type: 'address' }],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'getOrderFilledAmount',
+    stateMutability: 'view',
+    inputs: [{ name: 'orderHash', type: 'bytes32' }],
+    outputs: [{ name: '', type: 'uint128' }],
+  },
+  {
+    type: 'function',
+    name: 'isOrderCancelled',
+    stateMutability: 'view',
+    inputs: [{ name: 'orderHash', type: 'bytes32' }],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+  {
+    type: 'function',
+    name: 'hashBorrowOrder',
+    stateMutability: 'view',
+    inputs: [{ name: 'o', type: 'tuple', components: BORROW_ORDER_COMPONENTS }],
+    outputs: [{ name: '', type: 'bytes32' }],
+  },
+  {
+    type: 'function',
+    name: 'hashLendOffer',
+    stateMutability: 'view',
+    inputs: [{ name: 'o', type: 'tuple', components: LEND_OFFER_COMPONENTS }],
+    outputs: [{ name: '', type: 'bytes32' }],
+  },
 ] as const;

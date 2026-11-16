@@ -1,4 +1,4 @@
-import { BrowserRouter, Route, Routes } from 'react-router-dom';
+import { BrowserRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { Gate, Restricted } from './components/Gate.jsx';
 import { Shell } from './components/Shell.jsx';
 import { ErrorBoundary } from './components/ui.jsx';
@@ -14,14 +14,19 @@ import { Loans } from './pages/Loans.jsx';
 import { Markets } from './pages/Markets.jsx';
 import { Positions } from './pages/Positions.jsx';
 import { Risk } from './pages/Risk.jsx';
+import { SubscriptionAction } from './pages/SubscriptionAction.jsx';
 import { Terms } from './pages/Terms.jsx';
 import { Wallet } from './pages/Wallet.jsx';
 import { StoreProvider, useStore } from './store.jsx';
 
 function Frame() {
   const { state } = useStore();
+  const location = useLocation();
+  const isSubscriptionAction =
+    location.pathname === '/subscriptions/confirm' ||
+    location.pathname === '/subscriptions/block';
   if (state.gate === 'restricted') return <Restricted />;
-  if (state.gate !== 'accepted') return <Gate />;
+  if (state.gate !== 'accepted' && !isSubscriptionAction) return <Gate />;
   return (
     <Shell>
       <Routes>
@@ -39,6 +44,8 @@ function Frame() {
         <Route path="/builders" element={<Builders />} />
         <Route path="/alerts" element={<Alerts />} />
         <Route path="/wallet" element={<Wallet />} />
+        <Route path="/subscriptions/confirm" element={<SubscriptionAction mode="confirm" />} />
+        <Route path="/subscriptions/block" element={<SubscriptionAction mode="block" />} />
         <Route path="*" element={<Home />} />
       </Routes>
     </Shell>

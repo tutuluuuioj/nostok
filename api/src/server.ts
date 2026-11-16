@@ -1,5 +1,17 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
-import { type Address, type Chain, type PublicClient, type Transport, createPublicClient, defineChain, getAddress, http as viemHttp } from 'viem';
+import {
+  type Address,
+  type Chain,
+  type Hex,
+  type PublicClient,
+  type Transport,
+  createPublicClient,
+  defineChain,
+  getAddress,
+  http as viemHttp,
+  recoverAddress,
+  zeroAddress,
+} from 'viem';
 import { base } from 'viem/chains';
 import { ZodError } from 'zod/v3';
 import {
@@ -13,6 +25,7 @@ import {
   feeCollectorAbi,
   loanCoreAbi,
   oracleRouterAbi,
+  orderSettlementAbi,
 } from './abi.js';
 import type { ApiConfig } from './config.js';
 import { type ReadOnlyDatabase, openReadOnlyDatabase, toBigInt } from './db.js';
@@ -25,6 +38,7 @@ import {
   loansQuerySchema,
   ordersQuerySchema,
   positionsQuerySchema,
+  postOrderSchema,
   quoteRequestSchema,
 } from './validation.js';
 
@@ -62,11 +76,33 @@ interface AssetsBlockCacheEntry {
   perAsset: Map<string, AssetLiveSnapshot>;
 }
 
+export interface RelaySignedOrderRecord {
+  orderHash: Hex;
+  orderType: 'borrow' | 'lend';
+  maker: Address;
+  collateralToken: Address | null;
+  collateralSymbol: string | null;
+  collateralDecimals: number;
+  collateralAmount: string | null;
+  totalUsdc: string;
+  rateBps: number;
+  termDays: number;
+  maxLtvBps: number;
+  minFill: string;
+  expiry: string;
+  nonce: string;
+  yieldMode: number;
+  signedOrder: Record<string, unknown>;
+  signature: Hex;
+  submittedAt: string;
+}
+
 export interface ApiContext {
   config: ApiConfig;
   publicClient: PublicClient<Transport, Chain>;
   db: ReadOnlyDatabase;
   assetBlockCache?: AssetsBlockCacheEntry;
+  signedOrders?: Map<string, RelaySignedOrderRecord>;
 }
 
 class HttpError extends Error {
@@ -206,7 +242,14 @@ export async function createApiContext(
   });
 
   const db = dbOverride ?? (await openReadOnlyDatabase(config.databaseUrl));
-  return { config, publicClient, db };
+  return { config, publicClient, db, signedOrders: new Map() };
+}
+
+function setSecurityHeaders(res: ServerResponse): void {
+  res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none';");
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
 }
 
 function setCorsHeaders(req: IncomingMessage, res: ServerResponse, allowedOrigins: string[]): void {
@@ -220,13 +263,14 @@ function setCorsHeaders(req: IncomingMessage, res: ServerResponse, allowedOrigin
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Access-Control-Max-Age', '86400');
+  setSecurityHeaders(res);
 }
 
 function sendJson(res: ServerResponse, statusCode: number, body: unknown): void {
   const payload = JSON.stringify(body);
   res.statusCode = statusCode;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
+  setSecurityHeaders(res);
   res.setHeader('Cache-Control', 'no-store');
   res.end(payload);
 }
@@ -483,10 +527,414 @@ async function handleHealth(ctx: ApiContext) {
   };
 }
 
+const MAX_SIGNED_ORDERS = 2000;
+const FALLBACK_SIGNED_ORDERS = new WeakMap<ApiContext, Map<string, RelaySignedOrderRecord>>();
+
+function getSignedOrdersMap(ctx: ApiContext): Map<string, RelaySignedOrderRecord> {
+  if (ctx.signedOrders) return ctx.signedOrders;
+  let existing = FALLBACK_SIGNED_ORDERS.get(ctx);
+  if (!existing) {
+    existing = new Map<string, RelaySignedOrderRecord>();
+    FALLBACK_SIGNED_ORDERS.set(ctx, existing);
+  }
+  return existing;
+}
+
+interface LiveRelayOrderState {
+  record: RelaySignedOrderRecord;
+  filled: bigint;
+  remaining: bigint;
+  cancelled: boolean;
+  expired: boolean;
+  nonceBumped: boolean;
+  currentMakerNonce: bigint;
+  status: 'open' | 'partially_filled' | 'filled' | 'cancelled' | 'expired' | 'nonce_bumped';
+  blockNumber: bigint;
+}
+
+async function readLiveRelayOrderState(
+  ctx: ApiContext,
+  rec: RelaySignedOrderRecord,
+  chainNowSec: bigint,
+  chainBlockNum: bigint
+): Promise<LiveRelayOrderState> {
+  let filled = 0n;
+  let cancelled = false;
+  let currentMakerNonce = BigInt(rec.nonce);
+  try {
+    const [fRes, cRes, nRes] = await Promise.all([
+      ctx.publicClient.readContract({
+        address: ctx.config.orderSettlement,
+        abi: orderSettlementAbi,
+        functionName: 'getOrderFilledAmount',
+        args: [rec.orderHash],
+      }),
+      ctx.publicClient.readContract({
+        address: ctx.config.orderSettlement,
+        abi: orderSettlementAbi,
+        functionName: 'isOrderCancelled',
+        args: [rec.orderHash],
+      }),
+      ctx.publicClient.readContract({
+        address: ctx.config.orderSettlement,
+        abi: orderSettlementAbi,
+        functionName: 'getMakerNonce',
+        args: [rec.maker],
+      }),
+    ]);
+    filled = BigInt(fRes);
+    cancelled = Boolean(cRes);
+    currentMakerNonce = BigInt(nRes);
+  } catch {
+    // Fallback conservatively if RPC call fails transiently
+  }
+
+  const total = BigInt(rec.totalUsdc);
+  const remaining = total > filled ? total - filled : 0n;
+  const expired = BigInt(rec.expiry) <= chainNowSec;
+  const nonceBumped = currentMakerNonce !== BigInt(rec.nonce);
+  const status: LiveRelayOrderState['status'] = cancelled
+    ? 'cancelled'
+    : nonceBumped
+      ? 'nonce_bumped'
+      : remaining === 0n
+        ? 'filled'
+        : expired
+          ? 'expired'
+          : filled > 0n
+            ? 'partially_filled'
+            : 'open';
+
+  return {
+    record: rec,
+    filled,
+    remaining,
+    cancelled,
+    expired,
+    nonceBumped,
+    currentMakerNonce,
+    status,
+    blockNumber: chainBlockNum,
+  };
+}
+
+function formatRelayOrderEnvelope(live: LiveRelayOrderState, fills: unknown[] = []) {
+  const rec = live.record;
+  const total = BigInt(rec.totalUsdc);
+  return {
+    order_hash: rec.orderHash,
+    maker: rec.maker,
+    order_type: rec.orderType,
+    collateral_token: rec.collateralToken,
+    collateral_symbol: rec.collateralSymbol,
+    status: live.status,
+    min_usdc: formatAmount(total, USDC_DECIMALS, 'USDC'),
+    ...(rec.orderType === 'lend' ? { usdc_amount: formatAmount(total, USDC_DECIMALS, 'USDC') } : {}),
+    filled_usdc: formatAmount(live.filled, USDC_DECIMALS, 'USDC'),
+    remaining_usdc: formatAmount(live.remaining, USDC_DECIMALS, 'USDC'),
+    cancelled: live.cancelled,
+    maker_nonce: rec.nonce,
+    current_maker_nonce: live.currentMakerNonce.toString(),
+    fills_count: fills.length,
+    fills,
+    first_seen_block: live.blockNumber.toString(),
+    last_updated_block: live.blockNumber.toString(),
+    collateral_amount: rec.collateralAmount
+      ? formatAmount(BigInt(rec.collateralAmount), rec.collateralDecimals, rec.collateralSymbol ?? undefined)
+      : null,
+    rate_bps: rec.rateBps,
+    ...(rec.orderType === 'borrow'
+      ? { max_rate_bps: rec.rateBps }
+      : { min_rate_bps: rec.rateBps, allowed_collateral: rec.collateralToken ?? zeroAddress }),
+    term_days: rec.termDays,
+    max_ltv_bps: rec.maxLtvBps,
+    min_fill: formatAmount(BigInt(rec.minFill), USDC_DECIMALS, 'USDC'),
+    expiry: rec.expiry,
+    nonce: rec.nonce,
+    yield_mode: rec.yieldMode,
+    signed_order: rec.signedOrder,
+    signature: rec.signature,
+    submitted_at: rec.submittedAt,
+  };
+}
+
+async function handlePostOrder(ctx: ApiContext, rawBody: unknown) {
+  const input = parseOrThrow(postOrderSchema, rawBody);
+  const signedMap = getSignedOrdersMap(ctx);
+
+  let blk: { number: bigint; timestamp: bigint };
+  try {
+    blk = await ctx.publicClient.getBlock({ blockTag: 'latest' });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new RpcUnavailableError(`Failed to read latest block on POST /orders: ${reason}`);
+  }
+
+  let orderHash: Hex;
+  let maker: Address;
+  let collateralToken: Address | null = null;
+  let collateralAmount: string | null = null;
+  let totalUsdc: bigint;
+  let rateBps: number;
+  let termDays: number;
+  let maxLtvBps: number;
+  let minFill: bigint;
+  let expiry: bigint;
+  let nonce: bigint;
+  let yieldMode: number;
+  let signedOrderPlain: Record<string, unknown>;
+
+  if (input.order_type === 'borrow') {
+    const o = input.order;
+    maker = getAddress(o.borrower);
+    collateralToken = getAddress(o.collateralToken);
+    collateralAmount = o.collateralAmount;
+    totalUsdc = BigInt(o.minUsdc);
+    rateBps = o.maxRateBps;
+    termDays = o.termDays;
+    maxLtvBps = o.maxLtvBps;
+    minFill = BigInt(o.minFill);
+    expiry = BigInt(o.expiry);
+    nonce = BigInt(o.nonce);
+    yieldMode = o.yieldMode;
+
+    const structArgs = {
+      borrower: maker,
+      collateralToken,
+      collateralAmount: BigInt(collateralAmount),
+      minUsdc: totalUsdc,
+      maxRateBps: rateBps,
+      termDays,
+      maxLtvBps,
+      minFill,
+      expiry,
+      nonce,
+      yieldMode,
+      allowInKindSettlement: Boolean(o.allowInKindSettlement),
+    };
+    signedOrderPlain = {
+      borrower: maker,
+      collateralToken,
+      collateralAmount: collateralAmount.toString(),
+      minUsdc: totalUsdc.toString(),
+      maxRateBps: rateBps,
+      termDays,
+      maxLtvBps,
+      minFill: minFill.toString(),
+      expiry: expiry.toString(),
+      nonce: nonce.toString(),
+      yieldMode,
+      allowInKindSettlement: Boolean(o.allowInKindSettlement),
+    };
+    try {
+      orderHash = await ctx.publicClient.readContract({
+        address: ctx.config.orderSettlement,
+        abi: orderSettlementAbi,
+        functionName: 'hashBorrowOrder',
+        args: [structArgs],
+      });
+    } catch (err) {
+      throw new RpcUnavailableError(err instanceof Error ? err.message : String(err));
+    }
+  } else {
+    const o = input.order;
+    maker = getAddress(o.lender);
+    const allowedCol = getAddress(o.allowedCollateral);
+    collateralToken = allowedCol === zeroAddress ? null : allowedCol;
+    totalUsdc = BigInt(o.usdcAmount);
+    rateBps = o.minRateBps;
+    termDays = o.termDays;
+    maxLtvBps = o.maxLtvBps;
+    minFill = BigInt(o.minFill);
+    expiry = BigInt(o.expiry);
+    nonce = BigInt(o.nonce);
+    yieldMode = o.yieldMode;
+
+    const structArgs = {
+      lender: maker,
+      usdcAmount: totalUsdc,
+      minRateBps: rateBps,
+      termDays,
+      allowedCollateral: allowedCol,
+      maxLtvBps,
+      minFill,
+      expiry,
+      nonce,
+      yieldMode,
+    };
+    signedOrderPlain = {
+      lender: maker,
+      usdcAmount: totalUsdc.toString(),
+      minRateBps: rateBps,
+      termDays,
+      allowedCollateral: allowedCol,
+      maxLtvBps,
+      minFill: minFill.toString(),
+      expiry: expiry.toString(),
+      nonce: nonce.toString(),
+      yieldMode,
+    };
+    try {
+      orderHash = await ctx.publicClient.readContract({
+        address: ctx.config.orderSettlement,
+        abi: orderSettlementAbi,
+        functionName: 'hashLendOffer',
+        args: [structArgs],
+      });
+    } catch (err) {
+      throw new RpcUnavailableError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  if (minFill > totalUsdc) {
+    throw new HttpError(400, 'VALIDATION_ERROR', 'Order minFill cannot exceed principal amount');
+  }
+
+  let recovered: Address;
+  try {
+    recovered = await recoverAddress({ hash: orderHash, signature: input.signature as Hex });
+  } catch {
+    throw new HttpError(400, 'INVALID_ORDER_SIGNATURE', 'Malformed EIP-712 order signature');
+  }
+  if (recovered.toLowerCase() !== maker.toLowerCase()) {
+    throw new HttpError(
+      400,
+      'INVALID_ORDER_SIGNATURE',
+      `Signature signer ${recovered} does not match order maker ${maker}`
+    );
+  }
+
+  if (expiry <= blk.timestamp) {
+    throw new HttpError(400, 'ORDER_EXPIRED', 'Order expiry timestamp is in the past');
+  }
+
+  let cancelled = false;
+  let currentMakerNonce = 0n;
+  let filled = 0n;
+  try {
+    const [cRes, nRes, fRes] = await Promise.all([
+      ctx.publicClient.readContract({
+        address: ctx.config.orderSettlement,
+        abi: orderSettlementAbi,
+        functionName: 'isOrderCancelled',
+        args: [orderHash],
+      }),
+      ctx.publicClient.readContract({
+        address: ctx.config.orderSettlement,
+        abi: orderSettlementAbi,
+        functionName: 'getMakerNonce',
+        args: [maker],
+      }),
+      ctx.publicClient.readContract({
+        address: ctx.config.orderSettlement,
+        abi: orderSettlementAbi,
+        functionName: 'getOrderFilledAmount',
+        args: [orderHash],
+      }),
+    ]);
+    cancelled = Boolean(cRes);
+    currentMakerNonce = BigInt(nRes);
+    filled = BigInt(fRes);
+  } catch (err) {
+    throw new RpcUnavailableError(err instanceof Error ? err.message : String(err));
+  }
+
+  if (cancelled) {
+    throw new HttpError(400, 'ORDER_CANCELLED', 'Order has already been cancelled on-chain');
+  }
+  if (currentMakerNonce !== nonce) {
+    throw new HttpError(
+      400,
+      'INVALID_ORDER_NONCE',
+      `Order nonce ${nonce.toString()} does not match on-chain maker nonce ${currentMakerNonce.toString()}`
+    );
+  }
+  if (filled >= totalUsdc) {
+    throw new HttpError(400, 'ORDER_ALREADY_FILLED', 'Order has already been completely filled on-chain');
+  }
+
+  let collateralSymbol: string | null = null;
+  let collateralDecimals = 18;
+  if (collateralToken) {
+    const assetRes = await ctx.db.query<{ symbol: string | null; decimals: number | null }>(
+      'SELECT symbol, decimals FROM assets WHERE LOWER(token) = LOWER($1) LIMIT 1',
+      [collateralToken]
+    );
+    if (assetRes.rows[0]) {
+      collateralSymbol = assetRes.rows[0].symbol ?? null;
+      collateralDecimals = Number(assetRes.rows[0].decimals ?? 18);
+    } else {
+      try {
+        const [sym, dec] = await Promise.all([
+          ctx.publicClient.readContract({ address: collateralToken, abi: erc20MetaAbi, functionName: 'symbol' }),
+          ctx.publicClient.readContract({ address: collateralToken, abi: erc20MetaAbi, functionName: 'decimals' }),
+        ]);
+        collateralSymbol = String(sym);
+        collateralDecimals = Number(dec);
+      } catch {
+        // leave null/18 fallback
+      }
+    }
+  }
+
+  // Evict stale entries if near capacity
+  if (signedMap.size >= MAX_SIGNED_ORDERS && !signedMap.has(orderHash.toLowerCase())) {
+    for (const [k, existing] of signedMap.entries()) {
+      if (BigInt(existing.expiry) <= blk.timestamp) {
+        signedMap.delete(k);
+      }
+    }
+    if (signedMap.size >= MAX_SIGNED_ORDERS) {
+      const oldestKey = signedMap.keys().next().value;
+      if (oldestKey) signedMap.delete(oldestKey);
+    }
+  }
+
+  const record: RelaySignedOrderRecord = {
+    orderHash,
+    orderType: input.order_type,
+    maker,
+    collateralToken,
+    collateralSymbol,
+    collateralDecimals,
+    collateralAmount,
+    totalUsdc: totalUsdc.toString(),
+    rateBps,
+    termDays,
+    maxLtvBps,
+    minFill: minFill.toString(),
+    expiry: expiry.toString(),
+    nonce: nonce.toString(),
+    yieldMode,
+    signedOrder: signedOrderPlain,
+    signature: input.signature as Hex,
+    submittedAt: new Date().toISOString(),
+  };
+  signedMap.set(orderHash.toLowerCase(), record);
+
+  const liveState: LiveRelayOrderState = {
+    record,
+    filled,
+    remaining: totalUsdc - filled,
+    cancelled: false,
+    expired: false,
+    nonceBumped: false,
+    currentMakerNonce,
+    status: filled > 0n ? 'partially_filled' : 'open',
+    blockNumber: blk.number,
+  };
+
+  return {
+    statusCode: 201,
+    body: formatRelayOrderEnvelope(liveState, []),
+  };
+}
+
 async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
   const pag = parseOrThrow(buildPaginationSchema(ctx.config.maxPageLimit), queryObj);
   const filters = parseOrThrow(ordersQuerySchema, queryObj);
   const meta = await getSnapshotMeta(ctx);
+  const signedMap = getSignedOrdersMap(ctx);
 
   const conditions: string[] = [];
   const params: unknown[] = [];
@@ -508,6 +956,11 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
     conditions.push(`LOWER(o.maker) = LOWER($${params.length})`);
   }
 
+  if (filters.order_type) {
+    params.push(filters.order_type);
+    conditions.push(`LOWER(o.order_type) = LOWER($${params.length})`);
+  }
+
   if (filters.asset) {
     params.push(filters.asset);
     conditions.push(
@@ -525,14 +978,10 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
   }
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-  const countRes = await ctx.db.query<{ cnt: number }>(
-    `SELECT COUNT(*)::INT AS cnt FROM orders o ${whereClause}`,
-    params
-  );
-  const total = Number(countRes.rows[0]?.cnt ?? 0);
+  const hasSignedOrders = signedMap.size > 0;
 
-  const dataParams = [...params, pag.limit, pag.offset];
-  const rowsRes = await ctx.db.query<{
+  let total = 0;
+  let dbRows: Array<{
     order_hash: string;
     maker: string;
     collateral_token: string | null;
@@ -545,29 +994,63 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
     first_seen_block: string;
     last_updated_block: string;
     fills_count: number;
-  }>(
-    `SELECT
-       o.order_hash,
-       o.maker,
-       o.collateral_token,
-       a.symbol AS collateral_symbol,
-       o.min_usdc::TEXT AS min_usdc,
-       o.filled_usdc::TEXT AS filled_usdc,
-       o.order_type,
-       o.cancelled,
-       o.maker_nonce::TEXT AS maker_nonce,
-       o.first_seen_block::TEXT AS first_seen_block,
-       o.last_updated_block::TEXT AS last_updated_block,
-       (SELECT COUNT(*)::INT FROM order_fills ofi WHERE ofi.order_hash = o.order_hash) AS fills_count
-     FROM orders o
-     LEFT JOIN assets a ON LOWER(a.token) = LOWER(o.collateral_token)
-     ${whereClause}
-     ORDER BY o.last_updated_block DESC, o.order_hash ASC
-     LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`,
-    dataParams
-  );
+  }> = [];
 
-  const hashes = rowsRes.rows.map((r) => r.order_hash);
+  if (!hasSignedOrders) {
+    const countRes = await ctx.db.query<{ cnt: number }>(
+      `SELECT COUNT(*)::INT AS cnt FROM orders o ${whereClause}`,
+      params
+    );
+    total = Number(countRes.rows[0]?.cnt ?? 0);
+
+    const dataParams = [...params, pag.limit, pag.offset];
+    const rowsRes = await ctx.db.query<typeof dbRows[number]>(
+      `SELECT
+         o.order_hash,
+         o.maker,
+         o.collateral_token,
+         a.symbol AS collateral_symbol,
+         o.min_usdc::TEXT AS min_usdc,
+         o.filled_usdc::TEXT AS filled_usdc,
+         o.order_type,
+         o.cancelled,
+         o.maker_nonce::TEXT AS maker_nonce,
+         o.first_seen_block::TEXT AS first_seen_block,
+         o.last_updated_block::TEXT AS last_updated_block,
+         (SELECT COUNT(*)::INT FROM order_fills ofi WHERE ofi.order_hash = o.order_hash) AS fills_count
+       FROM orders o
+       LEFT JOIN assets a ON LOWER(a.token) = LOWER(o.collateral_token)
+       ${whereClause}
+       ORDER BY o.last_updated_block DESC, o.order_hash ASC
+       LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`,
+      dataParams
+    );
+    dbRows = rowsRes.rows;
+  } else {
+    const rowsRes = await ctx.db.query<typeof dbRows[number]>(
+      `SELECT
+         o.order_hash,
+         o.maker,
+         o.collateral_token,
+         a.symbol AS collateral_symbol,
+         o.min_usdc::TEXT AS min_usdc,
+         o.filled_usdc::TEXT AS filled_usdc,
+         o.order_type,
+         o.cancelled,
+         o.maker_nonce::TEXT AS maker_nonce,
+         o.first_seen_block::TEXT AS first_seen_block,
+         o.last_updated_block::TEXT AS last_updated_block,
+         (SELECT COUNT(*)::INT FROM order_fills ofi WHERE ofi.order_hash = o.order_hash) AS fills_count
+       FROM orders o
+       LEFT JOIN assets a ON LOWER(a.token) = LOWER(o.collateral_token)
+       ${whereClause}
+       ORDER BY o.last_updated_block DESC, o.order_hash ASC`,
+      params
+    );
+    dbRows = rowsRes.rows;
+  }
+
+  const hashes = dbRows.map((r) => r.order_hash);
   const fillsByOrder = new Map<
     string,
     Array<{
@@ -631,18 +1114,89 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
     }
   }
 
-  const data = rowsRes.rows.map((r) => {
-    const filled = BigInt(r.filled_usdc);
-    const minUsdc = BigInt(r.min_usdc);
-    const remaining = minUsdc > filled ? minUsdc - filled : 0n;
-    const derivedStatus = r.cancelled
-      ? 'cancelled'
-      : minUsdc === 0n
-        ? 'unknown'
-        : filled < minUsdc
-          ? 'partially_filled'
-          : 'filled';
+  if (!hasSignedOrders) {
+    const data = dbRows.map((r) => {
+      const filled = BigInt(r.filled_usdc);
+      const minUsdc = BigInt(r.min_usdc);
+      const remaining = minUsdc > filled ? minUsdc - filled : 0n;
+      const derivedStatus = r.cancelled
+        ? 'cancelled'
+        : minUsdc === 0n
+          ? 'unknown'
+          : filled < minUsdc
+            ? 'partially_filled'
+            : 'filled';
+      return {
+        order_hash: r.order_hash,
+        maker: getAddress(r.maker),
+        order_type: r.order_type,
+        collateral_token: r.collateral_token ? getAddress(r.collateral_token) : null,
+        collateral_symbol: r.collateral_symbol,
+        status: derivedStatus,
+        min_usdc: formatAmount(minUsdc, USDC_DECIMALS, 'USDC'),
+        filled_usdc: formatAmount(filled, USDC_DECIMALS, 'USDC'),
+        remaining_usdc: minUsdc > 0n ? formatAmount(remaining, USDC_DECIMALS, 'USDC') : null,
+        cancelled: r.cancelled,
+        maker_nonce: r.maker_nonce,
+        fills_count: Number(r.fills_count),
+        fills: fillsByOrder.get(r.order_hash) ?? [],
+        first_seen_block: r.first_seen_block,
+        last_updated_block: r.last_updated_block,
+      };
+    });
+
     return {
+      statusCode: 200,
+      body: {
+        ...meta,
+        pagination: buildPaginationEnvelope(pag.limit, pag.offset, data.length, total),
+        data,
+      },
+    };
+  }
+
+  // Merge live verified relay orders with indexed DB order rows
+  let blk = { number: BigInt(meta.block_number || '0'), timestamp: BigInt(Math.floor(Date.now() / 1000)) };
+  try {
+    const liveBlk = await ctx.publicClient.getBlock({ blockTag: 'latest' });
+    blk = { number: liveBlk.number, timestamp: liveBlk.timestamp };
+  } catch {
+    // use metadata fallback if head query fails
+  }
+
+  const relayStates = new Map<string, LiveRelayOrderState>();
+  await Promise.all(
+    Array.from(signedMap.entries()).map(async ([k, rec]) => {
+      const st = await readLiveRelayOrderState(ctx, rec, blk.timestamp, blk.number);
+      relayStates.set(k, st);
+    })
+  );
+
+  const seenHashes = new Set<string>();
+  const dbFormatted: Array<Record<string, unknown>> = [];
+  for (const r of dbRows) {
+    const key = r.order_hash.toLowerCase();
+    seenHashes.add(key);
+    const liveRelay = relayStates.get(key);
+    const filled = liveRelay ? liveRelay.filled : BigInt(r.filled_usdc);
+    const minUsdc = BigInt(r.min_usdc);
+    const cancelled = liveRelay ? liveRelay.cancelled : r.cancelled;
+    const remaining = minUsdc > filled ? minUsdc - filled : 0n;
+    const derivedStatus = cancelled
+      ? 'cancelled'
+      : liveRelay?.nonceBumped
+        ? 'nonce_bumped'
+        : minUsdc === 0n
+          ? 'unknown'
+          : filled < minUsdc
+            ? liveRelay && filled === 0n && !liveRelay.expired
+              ? 'open'
+              : 'partially_filled'
+            : 'filled';
+
+    if (filters.status && derivedStatus !== filters.status) continue;
+
+    const baseRow: Record<string, unknown> = {
       order_hash: r.order_hash,
       maker: getAddress(r.maker),
       order_type: r.order_type,
@@ -652,21 +1206,74 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
       min_usdc: formatAmount(minUsdc, USDC_DECIMALS, 'USDC'),
       filled_usdc: formatAmount(filled, USDC_DECIMALS, 'USDC'),
       remaining_usdc: minUsdc > 0n ? formatAmount(remaining, USDC_DECIMALS, 'USDC') : null,
-      cancelled: r.cancelled,
+      cancelled,
       maker_nonce: r.maker_nonce,
       fills_count: Number(r.fills_count),
       fills: fillsByOrder.get(r.order_hash) ?? [],
       first_seen_block: r.first_seen_block,
       last_updated_block: r.last_updated_block,
     };
-  });
+
+    if (liveRelay) {
+      const rec = liveRelay.record;
+      baseRow.collateral_amount = rec.collateralAmount
+        ? formatAmount(BigInt(rec.collateralAmount), rec.collateralDecimals, rec.collateralSymbol ?? undefined)
+        : null;
+      baseRow.rate_bps = rec.rateBps;
+      if (rec.orderType === 'borrow') {
+        baseRow.max_rate_bps = rec.rateBps;
+      } else {
+        baseRow.min_rate_bps = rec.rateBps;
+        baseRow.allowed_collateral = rec.collateralToken ?? zeroAddress;
+      }
+      baseRow.term_days = rec.termDays;
+      baseRow.max_ltv_bps = rec.maxLtvBps;
+      baseRow.min_fill = formatAmount(BigInt(rec.minFill), USDC_DECIMALS, 'USDC');
+      baseRow.expiry = rec.expiry;
+      baseRow.nonce = rec.nonce;
+      baseRow.current_maker_nonce = liveRelay.currentMakerNonce.toString();
+      baseRow.yield_mode = rec.yieldMode;
+      baseRow.signed_order = rec.signedOrder;
+      baseRow.signature = rec.signature;
+      baseRow.submitted_at = rec.submittedAt;
+    }
+
+    dbFormatted.push(baseRow);
+  }
+
+  const relayOnlyRows: Array<Record<string, unknown>> = [];
+  for (const [k, live] of relayStates.entries()) {
+    if (seenHashes.has(k)) continue;
+    const rec = live.record;
+    if (filters.maker && rec.maker.toLowerCase() !== filters.maker.toLowerCase()) continue;
+    if (filters.order_type && rec.orderType !== filters.order_type) continue;
+    if (filters.asset) {
+      if (rec.orderType === 'borrow') {
+        if (!rec.collateralToken || rec.collateralToken.toLowerCase() !== filters.asset.toLowerCase()) continue;
+      } else if (rec.collateralToken && rec.collateralToken.toLowerCase() !== filters.asset.toLowerCase()) {
+        continue;
+      }
+    }
+    if (filters.status) {
+      if (live.status !== filters.status) continue;
+    } else if (!filters.include_inactive && live.status !== 'open' && live.status !== 'partially_filled') {
+      // Hide expired / nonce_bumped / cancelled / filled unindexed relay stubs from public open book unless requested
+      continue;
+    }
+
+    relayOnlyRows.push(formatRelayOrderEnvelope(live, []));
+  }
+
+  const merged = [...relayOnlyRows, ...dbFormatted];
+  total = merged.length;
+  const pageData = merged.slice(pag.offset, pag.offset + pag.limit);
 
   return {
     statusCode: 200,
     body: {
       ...meta,
-      pagination: buildPaginationEnvelope(pag.limit, pag.offset, data.length, total),
-      data,
+      pagination: buildPaginationEnvelope(pag.limit, pag.offset, pageData.length, total),
+      data: pageData,
     },
   };
 }
@@ -1461,6 +2068,13 @@ export function createApiServer(ctx: ApiContext): http.Server {
 
       if (pathname === '/orders' && req.method === 'GET') {
         const result = await handleOrders(ctx, queryObj);
+        sendJson(res, result.statusCode, result.body);
+        return;
+      }
+
+      if (pathname === '/orders' && req.method === 'POST') {
+        const rawBody = await readJsonBody(req, Math.min(ctx.config.maxBodyBytes, 16_384));
+        const result = await handlePostOrder(ctx, rawBody);
         sendJson(res, result.statusCode, result.body);
         return;
       }

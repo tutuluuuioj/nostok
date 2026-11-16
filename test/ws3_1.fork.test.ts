@@ -58,30 +58,40 @@ import {
   formatBpsPercent,
 } from '../src/lib/marketsApi.js';
 import {
+  DEFAULT_COLLATERAL_BUFFER_BPS,
+  bumpMakerNonceOnChain,
   cancelSignedBorrowOrder,
   connectWallet,
+  decodeContractRevert,
   fetchNotificationsSessionState,
   fetchPaginatedApiRows,
   fetchWalletState,
   fillLendOfferAsBorrower,
   formatTokenUnitsDisplay,
+  formatWeb3Error,
+  loadPersistedSignedOrders,
+  parseBorrowOrderFromJson,
   prepareAndSignBorrowOrder,
   readBorrowAllowanceAndNonce,
+  refreshSignedBorrowOrdersState,
   resolveExactBorrowAmounts,
   setInjectedProvider,
   signInWithSiwe,
   signOutSiwe,
+  verifyAndPreviewLendOfferFill,
 } from '../src/lib/web3.js';
 import { App } from '../src/App.jsx';
 import { Shell } from '../src/components/Shell.jsx';
 import { ErrorBoundary } from '../src/components/ui.jsx';
 import { Alerts } from '../src/pages/Alerts.jsx';
+import { Borrow } from '../src/pages/Borrow.jsx';
 import { Builders } from '../src/pages/Builders.jsx';
 import { Lend } from '../src/pages/Lend.jsx';
 import { Loan } from '../src/pages/Loan.jsx';
 import { Loans } from '../src/pages/Loans.jsx';
 import { Markets } from '../src/pages/Markets.jsx';
 import { Positions } from '../src/pages/Positions.jsx';
+import { SubscriptionAction } from '../src/pages/SubscriptionAction.jsx';
 import { StoreProvider, createWalletEventsHandler } from '../src/store.jsx';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1343,8 +1353,8 @@ async function runTests(): Promise<void> {
         }),
       });
 
-      // Non-round $700 principal at $140 / 60% LTV requires ceilDiv(700e6 * 1e20 / 6000 / 140e8) = 8.333333333333333334e18 NVDAc;
-      // flooring to 6 decimals (8.333333e18) would fail on-chain LTV.
+      // Non-round $700 principal at $140 / 60% LTV: minRequired is ceilDiv(700e6 * 1e20 / 6000 / 140e8),
+      // and M3 default +5.00% (500 bps) buffer sizes collateralAmountRaw cleanly above exact min.
       const nonRoundQuote = await fetchLoanQuote({
         cfg,
         asset: nvdac,
@@ -1357,26 +1367,73 @@ async function runTests(): Promise<void> {
       assert.equal(nonRoundQuote.accepted, true);
       const exact700 = resolveExactBorrowAmounts(nonRoundQuote);
       assert.equal(exact700.principalRaw, 700_000_000n);
+      assert.equal(exact700.bufferBps, DEFAULT_COLLATERAL_BUFFER_BPS);
+      assert.equal(exact700.collateralAmountRaw, exact700.bufferedCollateralRaw);
       assert.ok(
-        exact700.collateralAmountRaw > 8_333_333_000_000_000_000n,
-        `Expected rounded-up raw collateral > 6-dec floor, got ${exact700.collateralAmountRaw}`
+        exact700.minRequiredCollateralRaw > 8_333_333_000_000_000_000n,
+        `Expected rounded-up minRequiredCollateralRaw > 6-dec floor, got ${exact700.minRequiredCollateralRaw}`
       );
+      assert.ok(
+        exact700.collateralAmountRaw > exact700.minRequiredCollateralRaw,
+        'Default +5.00% buffer must exceed unbuffered minimum collateral'
+      );
+
+      // Zero buffer option returns exact unbuffered minimum
+      const exact700ZeroBuf = resolveExactBorrowAmounts(nonRoundQuote, { bufferBps: 0 });
+      assert.equal(exact700ZeroBuf.collateralAmountRaw, exact700.minRequiredCollateralRaw);
+
+      // Re-quote mismatch check must abort before signing if expectedQuote differs
+      await assert.rejects(
+        () =>
+          prepareAndSignBorrowOrder({
+            address: ADDRESSES.borrower,
+            collateralToken: nvdac,
+            principalRaw: '700000000',
+            expectedQuote: {
+              ...nonRoundQuote,
+              amounts: {
+                ...nonRoundQuote.amounts,
+                collateral_required: { ...nonRoundQuote.amounts.collateral_required, raw: '1' },
+              },
+            },
+            maxRateBps: 1000,
+            termDays: 30,
+            maxLtvBps: 6000,
+            expiryDays: 7,
+            autoApprove: true,
+            provider: walletProvider,
+            cfg,
+          }),
+        /Quote changed before signing/
+      );
+
+      const memMap = new Map<string, string>();
+      const mockStorage = {
+        getItem: (k: string) => memMap.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          memMap.set(k, v);
+        },
+      };
 
       const preparedBorrow = await prepareAndSignBorrowOrder({
         address: ADDRESSES.borrower,
         collateralToken: nvdac,
         principalRaw: '700000000',
+        expectedQuote: nonRoundQuote,
         maxRateBps: 1000,
         termDays: 30,
         maxLtvBps: 6000,
         expiryDays: 7,
         autoApprove: true,
+        storage: mockStorage,
         provider: walletProvider,
         cfg,
       });
       assert.ok(preparedBorrow.approvalTxHash, 'WS3.3 must submit exact ERC-20 approve tx when allowance < required');
       assert.equal(preparedBorrow.order.collateralAmount, exact700.collateralAmountRaw);
       assert.equal(preparedBorrow.order.minUsdc, 700_000_000n);
+      assert.equal(preparedBorrow.publishedToApi, true, 'BorrowOrder must auto-publish to POST /orders');
+      assert.equal(loadPersistedSignedOrders(mockStorage).length, 1);
 
       const postApproveMeta = await readBorrowAllowanceAndNonce(ADDRESSES.borrower, nvdac, { cfg });
       assert.equal(
@@ -1514,7 +1571,497 @@ async function runTests(): Promise<void> {
       assert.equal(finalLoans.total, 4, 'fillLendOfferAsBorrower must open Loan #4 in indexer/api');
       console.log('PASS WS3.3: Borrow flow (quote -> exact approve -> EIP-712 sign -> fill -> cancel -> fillLendOffer) verified.');
 
-      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 FRONTEND BASE MAINNET FORK TESTS PASSED.');
+      // 3.4 Pre-WS3.4 Hardening Suite (M3 partial fills & price tick, M4 pre-approve sim & revert decoding, M5 persistence & bumpNonce, M2 routes, Low guards)
+      console.log('\n=== Pre-WS3.4 Hardening (M3, M4, M5, M2 Frontend, Low) ===');
+
+      // Mint extra collateral & USDC so M3 partial fills & M5 tests have ample balances
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdac,
+          abi: mockB20Artifact.abi,
+          functionName: 'mint',
+          args: [ADDRESSES.borrower, 100n * 10n ** 18n],
+        }),
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await rawWalletClient.sendTransaction({
+          account: BASE_USDC_WHALE,
+          to: BASE_USDC,
+          data: encodeFunctionData({
+            abi: parseAbi(['function transfer(address to, uint256 value) returns (bool)']),
+            functionName: 'transfer',
+            args: [ADDRESSES.lender, 5_000_000_000n],
+          }),
+        }),
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await lenderClient.writeContract({
+          address: BASE_USDC,
+          abi: approveAbi,
+          functionName: 'approve',
+          args: [deployed.loanCore, 20_000_000_000n],
+        }),
+      });
+
+      // M3: $1000 order signed at exact-min collateral (bufferBps=0) MUST fail $800 partial fill with LtvExceeded (0x8c0fe5c3)
+      // while $1000 order signed with default +5% buffer MUST succeed for BOTH $800 + $200 partial fills and a $0.01 price drop!
+      const quote1000 = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '1000000000',
+        termDays: 30,
+        aprBps: 900,
+        maxLtvBps: 6000,
+        borrower: ADDRESSES.borrower,
+      });
+      assert.equal(quote1000.accepted, true);
+      const exact1000ZeroBuf = resolveExactBorrowAmounts(quote1000, { bufferBps: 0 });
+      const exact1000Buffered = resolveExactBorrowAmounts(quote1000, { bufferBps: DEFAULT_COLLATERAL_BUFFER_BPS });
+      assert.ok(exact1000Buffered.collateralAmountRaw > exact1000ZeroBuf.collateralAmountRaw);
+
+      await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: nvdac,
+          abi: approveAbi,
+          functionName: 'approve',
+          args: [deployed.collateralEscrow, 100n * 10n ** 18n],
+        }),
+      });
+
+      const unbufferedOrderRes = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '1000000000',
+        collateralBufferBps: 0,
+        minFillRaw: '500000000',
+        maxRateBps: 900,
+        termDays: 30,
+        maxLtvBps: 6000,
+        expiryDays: 7,
+        autoApprove: false,
+        publishToApi: false,
+        storage: mockStorage,
+        provider: walletProvider,
+        cfg,
+      });
+      let unbufferedFillErr: unknown = null;
+      try {
+        await publicClient.call({
+          account: ADDRESSES.lender,
+          to: deployed.orderSettlement,
+          data: encodeFunctionData({
+            abi: fillOrderAbi,
+            functionName: 'fillBorrowOrder',
+            args: [unbufferedOrderRes.order, unbufferedOrderRes.signature, 800_000_000n],
+          }),
+        });
+      } catch (e) {
+        unbufferedFillErr = e;
+      }
+      assert.ok(unbufferedFillErr, 'Exact-min ($0 buffer) $1000 order must revert on $800 partial fill');
+      const decodedUnbuf = decodeContractRevert({ data: '0x8c0fe5c3' });
+      assert.equal(decodedUnbuf?.errorName, 'LtvExceeded');
+      assert.match(formatWeb3Error(unbufferedFillErr), /LtvExceeded/);
+
+      // Now sign the SAME $1000 order with default +5.00% collateral buffer (resetting allowance to 0 first to test exact buffered approval)
+      await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: nvdac,
+          abi: approveAbi,
+          functionName: 'approve',
+          args: [deployed.collateralEscrow, 0n],
+        }),
+      });
+      const bufferedOrderRes = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '1000000000',
+        minFillRaw: '500000000',
+        maxRateBps: 900,
+        termDays: 30,
+        maxLtvBps: 6000,
+        expiryDays: 7,
+        autoApprove: true,
+        storage: mockStorage,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(
+        bufferedOrderRes.order.collateralAmount,
+        exact1000Buffered.collateralAmountRaw,
+        'Buffered order must sign exact +5.00% buffered collateral raw amount'
+      );
+      const bufAllowMeta = await readBorrowAllowanceAndNonce(ADDRESSES.borrower, nvdac, { cfg });
+      assert.equal(
+        BigInt(bufAllowMeta.allowanceRaw),
+        exact1000Buffered.collateralAmountRaw,
+        'Approve MUST grant exact buffered collateral amount'
+      );
+      // Approve enough to cover $800 fill on Order A + $500+$500 fills on Order B
+      await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: nvdac,
+          abi: approveAbi,
+          functionName: 'approve',
+          args: [deployed.collateralEscrow, exact1000Buffered.collateralAmountRaw * 2n + 1_000n],
+        }),
+      });
+      // Fill $800 partial fill on Order A (succeeds cleanly with +5% buffer!)
+      await publicClient.waitForTransactionReceipt({
+        hash: await lenderClient.writeContract({
+          address: deployed.orderSettlement,
+          abi: fillOrderAbi,
+          functionName: 'fillBorrowOrder',
+          args: [bufferedOrderRes.order, bufferedOrderRes.signature, 800_000_000n],
+        }),
+      });
+
+      // Sign another $1000 buffered order and complete TWO consecutive $500 partial fills ($500 + $500 = $1000)
+      const bufferedTwoPart = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '1000000000',
+        minFillRaw: '500000000',
+        maxRateBps: 900,
+        termDays: 30,
+        maxLtvBps: 6000,
+        expiryDays: 7,
+        autoApprove: false,
+        storage: mockStorage,
+        provider: walletProvider,
+        cfg,
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await lenderClient.writeContract({
+          address: deployed.orderSettlement,
+          abi: fillOrderAbi,
+          functionName: 'fillBorrowOrder',
+          args: [bufferedTwoPart.order, bufferedTwoPart.signature, 500_000_000n],
+        }),
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await lenderClient.writeContract({
+          address: deployed.orderSettlement,
+          abi: fillOrderAbi,
+          functionName: 'fillBorrowOrder',
+          args: [bufferedTwoPart.order, bufferedTwoPart.signature, 500_000_000n],
+        }),
+      });
+
+      // Sign another $1000 buffered order, drop oracle by $0.01 ($140.00 -> $139.99), and prove $500 partial fill STILL passes!
+      await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: nvdac,
+          abi: approveAbi,
+          functionName: 'approve',
+          args: [deployed.collateralEscrow, exact1000Buffered.collateralAmountRaw],
+        }),
+      });
+      const bufferedOrderPriceTick = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '1000000000',
+        minFillRaw: '500000000',
+        maxRateBps: 900,
+        termDays: 30,
+        maxLtvBps: 6000,
+        expiryDays: 7,
+        autoApprove: false,
+        storage: mockStorage,
+        provider: walletProvider,
+        cfg,
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdaFeed,
+          abi: mockAggArtifact.abi,
+          functionName: 'setPrice',
+          args: [139_99000000n], // -$0.01 tick
+        }),
+      });
+      try {
+        await publicClient.waitForTransactionReceipt({
+          hash: await lenderClient.writeContract({
+            address: deployed.orderSettlement,
+            abi: fillOrderAbi,
+            functionName: 'fillBorrowOrder',
+            args: [bufferedOrderPriceTick.order, bufferedOrderPriceTick.signature, 500_000_000n],
+          }),
+        });
+      } finally {
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdaFeed,
+            abi: mockAggArtifact.abi,
+            functionName: 'setPrice',
+            args: [140_00000000n],
+          }),
+        });
+      }
+      console.log('PASS M3: +5% collateral buffer prevents LtvExceeded on $800/$200/$500 partial fills and $0.01 price drops.');
+
+      // M4: verifyAndPreviewLendOfferFill + pre-approve simulation catches errors BEFORE any ERC-20 approve tx
+      await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: nvdac,
+          abi: approveAbi,
+          functionName: 'approve',
+          args: [deployed.collateralEscrow, 0n],
+        }),
+      });
+      const expiredBlk = await publicClient.getBlock();
+      const expiredOffer = {
+        lender: ADDRESSES.lender,
+        usdcAmount: 1_000_000_000n,
+        minRateBps: 900,
+        termDays: 30,
+        allowedCollateral: nvdac,
+        maxLtvBps: 6000,
+        minFill: 500_000_000n,
+        expiry: expiredBlk.timestamp - 60n,
+        nonce: lenderNonce,
+        yieldMode: 0,
+      };
+      const expiredOfferSig = await lenderAccount.signTypedData({
+        domain: {
+          name: ORDER_SETTLEMENT_DOMAIN_NAME,
+          version: ORDER_SETTLEMENT_DOMAIN_VERSION,
+          chainId: BASE_CHAIN_ID,
+          verifyingContract: deployed.orderSettlement,
+        },
+        types: LEND_OFFER_EIP712_TYPES,
+        primaryType: 'LendOffer',
+        message: expiredOffer,
+      });
+      await assert.rejects(
+        () =>
+          fillLendOfferAsBorrower({
+            address: ADDRESSES.borrower,
+            offer: expiredOffer,
+            signature: expiredOfferSig,
+            collateralToken: nvdac,
+            fillUsdcRaw: '500000000',
+            autoApprove: true,
+            provider: walletProvider,
+            cfg,
+          }),
+        /OrderExpired/
+      );
+      const allowanceAfterRejectedFill = await readBorrowAllowanceAndNonce(ADDRESSES.borrower, nvdac, { cfg });
+      assert.equal(
+        allowanceAfterRejectedFill.allowanceRaw,
+        '0',
+        'Failed LendOffer pre-check/simulation MUST NOT trigger an ERC-20 approve tx'
+      );
+
+      // Remaining $450 on lendOffer rejects PRINCIPAL_BELOW_MINIMUM cleanly before approve
+      await assert.rejects(
+        () =>
+          verifyAndPreviewLendOfferFill({
+            offer: lendOffer,
+            signature: lendOfferSig,
+            collateralToken: nvdac,
+            fillUsdcRaw: '450000000',
+            borrowerAddress: ADDRESSES.borrower,
+            cfg,
+          }),
+        /PRINCIPAL_BELOW_MINIMUM/
+      );
+
+      // Fresh open $1000 LendOffer + pre-approval preview verification ($500 fill)
+      const freshBlk = await publicClient.getBlock();
+      const freshOffer = {
+        lender: ADDRESSES.lender,
+        usdcAmount: 1_000_000_000n,
+        minRateBps: 900,
+        termDays: 30,
+        allowedCollateral: nvdac,
+        maxLtvBps: 6000,
+        minFill: 500_000_000n,
+        expiry: freshBlk.timestamp + 3600n,
+        nonce: lenderNonce,
+        yieldMode: 0,
+      };
+      const freshOfferSig = await lenderAccount.signTypedData({
+        domain: {
+          name: ORDER_SETTLEMENT_DOMAIN_NAME,
+          version: ORDER_SETTLEMENT_DOMAIN_VERSION,
+          chainId: BASE_CHAIN_ID,
+          verifyingContract: deployed.orderSettlement,
+        },
+        types: LEND_OFFER_EIP712_TYPES,
+        primaryType: 'LendOffer',
+        message: freshOffer,
+      });
+      const previewValid = await verifyAndPreviewLendOfferFill({
+        offer: freshOffer,
+        signature: freshOfferSig,
+        collateralToken: nvdac,
+        fillUsdcRaw: '500000000',
+        borrowerAddress: ADDRESSES.borrower,
+        cfg,
+      });
+      assert.equal(previewValid.simulationVerified, true);
+      assert.equal(previewValid.needsApproval, true);
+      assert.equal(previewValid.fillAmountRaw, '500000000');
+
+      // Warning PARTIAL_REMAINDER_BELOW_500 fires when partial fill on a $1000 offer leaves $400 (< $500)
+      const warnPreview = await verifyAndPreviewLendOfferFill({
+        offer: freshOffer,
+        signature: freshOfferSig,
+        collateralToken: nvdac,
+        fillUsdcRaw: '600000000',
+        borrowerAddress: ADDRESSES.borrower,
+        cfg,
+      });
+      assert.ok(
+        warnPreview.warnings.some((w: { code: string }) => w.code === 'PARTIAL_REMAINDER_BELOW_500'),
+        'Preview must warn when remaining USDC after partial fill drops below $500'
+      );
+      console.log('PASS M4: verifyAndPreviewLendOfferFill + pre-approval eth_call simulation + revert decoding verified.');
+
+      // M5: Persisted BorrowOrders survive, cancel from pasted JSON, and bumpMakerNonceOnChain invalidates open orders
+      const persistedList = loadPersistedSignedOrders(mockStorage);
+      assert.ok(persistedList.length >= 2);
+      const parsedFromJson = parseBorrowOrderFromJson(
+        JSON.stringify({
+          order: bufferedOrderPriceTick.orderJson,
+          signature: bufferedOrderPriceTick.signature,
+        })
+      );
+      const cancelJsonRes = await cancelSignedBorrowOrder({
+        address: ADDRESSES.borrower,
+        order: parsedFromJson.order,
+        storage: mockStorage,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(/^0x[0-9a-fA-F]{64}$/.test(cancelJsonRes.txHash));
+
+      const toBumpOrder = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '500000000',
+        maxRateBps: 850,
+        termDays: 30,
+        maxLtvBps: 6000,
+        expiryDays: 7,
+        autoApprove: true,
+        storage: mockStorage,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(toBumpOrder.publishedToApi, true);
+      const bumpRes = await bumpMakerNonceOnChain({
+        address: ADDRESSES.borrower,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(BigInt(bumpRes.newNonce) > toBumpOrder.order.nonce, true);
+
+      const refreshedOrders = await refreshSignedBorrowOrdersState({
+        orders: loadPersistedSignedOrders(mockStorage),
+        cfg,
+      });
+      const bumpedLocal = refreshedOrders.find(
+        (o: { orderHash: string }) => o.orderHash.toLowerCase() === toBumpOrder.orderHash.toLowerCase()
+      );
+      assert.equal(bumpedLocal?.onchainStatus, 'nonce_bumped', 'bumpNonce must mark earlier open orders as nonce_bumped');
+
+      const apiAfterBump = await fetchPaginatedApiRows(`${cfg.apiUrl}/orders?maker=${ADDRESSES.borrower}&include_inactive=true`, { cfg });
+      const bumpedApiRow = (apiAfterBump.rows as Array<{ order_hash: string; status: string }>).find(
+        (r) => r.order_hash.toLowerCase() === toBumpOrder.orderHash.toLowerCase()
+      );
+      assert.equal(bumpedApiRow?.status, 'nonce_bumped');
+      console.log('PASS M5: Orderbook POST /orders relay, persisted storage, paste-JSON cancel, & bumpNonce verified.');
+
+      // M2 Frontend Pages + Low Borrow UI + Low vite build --mode guard
+      const confirmPageHtml = renderToStaticMarkup(
+        createElement(
+          StoreProvider,
+          null,
+          createElement(MemoryRouter, { initialEntries: ['/subscriptions/confirm?token=testtoken12345'] }, createElement(Shell, null, createElement(SubscriptionAction, { mode: 'confirm' })))
+        )
+      );
+      assert.match(confirmPageHtml, /Confirm email subscription/);
+      const blockPageHtml = renderToStaticMarkup(
+        createElement(
+          StoreProvider,
+          null,
+          createElement(MemoryRouter, { initialEntries: ['/subscriptions/block?token=testtoken12345'] }, createElement(Shell, null, createElement(SubscriptionAction, { mode: 'block' })))
+        )
+      );
+      assert.match(blockPageHtml, /Block this sender wallet only/);
+      assert.match(blockPageHtml, /Block this address entirely \(all wallets\)/);
+
+      const borrowPageHtml = renderToStaticMarkup(
+        createElement(
+          StoreProvider,
+          null,
+          createElement(MemoryRouter, { initialEntries: ['/borrow'] }, createElement(Shell, null, createElement(Borrow)))
+        )
+      );
+      assert.match(borrowPageHtml, /Collateral buffer \(%\)/);
+      assert.match(borrowPageHtml, /Fixed APR \(%\)/);
+      assert.match(borrowPageHtml, /EligibilityGate \(on-chain\)/);
+      assert.match(borrowPageHtml, /Cancel all open orders \(bumpNonce/);
+      assert.ok(!borrowPageHtml.includes('borrow-inkind'), 'Unused in-kind checkbox must be removed');
+      assert.ok(!borrowPageHtml.includes('borrow-eligible'), 'Manual EligibilityGate checkbox must be removed');
+
+      // Low: `vite build --mode development` MUST still enforce prod config validation & write _headers
+      const tmpModeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nostok-vite-mode-'));
+      try {
+        const modeBuildEnv: NodeJS.ProcessEnv = {
+          PATH: process.env.PATH,
+          HOME: process.env.HOME,
+          NODE_ENV: 'production',
+          VITE_CHAIN_ID: '8453',
+          VITE_RPC_URL: 'https://base-mainnet.private-rpc.example/v1/key',
+          VITE_API_URL: 'https://api.nostok.xyz',
+          VITE_NOTIFICATIONS_URL: 'https://notifications.nostok.xyz',
+          VITE_RISK_URL: 'https://risk.nostok.xyz',
+          VITE_LOAN_CORE_ADDRESS: deployed.loanCore,
+          VITE_ORDER_SETTLEMENT_ADDRESS: deployed.orderSettlement,
+          VITE_LIQUIDATION_AUCTION_ADDRESS: deployed.liquidationAuction,
+          VITE_POSITION_NFT_ADDRESS: deployed.positionNFT,
+          VITE_COLLATERAL_ESCROW_ADDRESS: deployed.collateralEscrow,
+          VITE_ASSET_REGISTRY_ADDRESS: deployed.assetRegistry,
+          VITE_ORACLE_ROUTER_ADDRESS: deployed.oracleRouter,
+          VITE_ELIGIBILITY_GATE_ADDRESS: deployed.eligibilityGate,
+        };
+        const devModeBypassAttempt = spawnSync(
+          viteBin,
+          ['build', '--mode', 'development', '--outDir', path.join(tmpModeDir, 'bad-mode'), '--emptyOutDir'],
+          {
+            cwd: REPO_ROOT,
+            env: { ...modeBuildEnv, NODE_ENV: 'development', VITE_CHAIN_ID: '1' },
+            encoding: 'utf8',
+          }
+        );
+        assert.notEqual(
+          devModeBypassAttempt.status,
+          0,
+          'vite build --mode development MUST NOT bypass production config validation'
+        );
+
+        const goodHeadersOut = path.join(tmpModeDir, 'good-headers');
+        const goodHeadersBuild = spawnSync(
+          viteBin,
+          ['build', '--outDir', goodHeadersOut, '--emptyOutDir'],
+          { cwd: REPO_ROOT, env: modeBuildEnv, encoding: 'utf8' }
+        );
+        assert.equal(goodHeadersBuild.status, 0);
+        const emittedHeaders = fs.readFileSync(path.join(goodHeadersOut, '_headers'), 'utf8');
+        assert.match(emittedHeaders, /Content-Security-Policy:/);
+        assert.match(emittedHeaders, /X-Content-Type-Options: nosniff/);
+        assert.match(emittedHeaders, /X-Frame-Options: DENY/);
+        assert.match(emittedHeaders, /Referrer-Policy: strict-origin-when-cross-origin/);
+      } finally {
+        fs.rmSync(tmpModeDir, { recursive: true, force: true });
+      }
+      console.log('PASS M2 Frontend + Low (SubscriptionAction, Borrow UI hardening, vite build --mode guard, _headers).');
+
+      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 HARDENING FORK TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
       await new Promise<void>((r) => apiServer.close(() => r()));

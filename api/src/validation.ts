@@ -92,7 +92,79 @@ export const ordersQuerySchema = z.object({
   status: z.enum(['cancelled', 'partially_filled', 'filled', 'unknown']).optional(),
   maker: checksumAddressSchema.optional(),
   asset: checksumAddressSchema.optional(),
+  order_type: z.enum(['borrow', 'lend']).optional(),
+  include_inactive: z.enum(['true', 'false']).transform((v) => v === 'true').optional(),
 });
+
+const addressLikeSchema = z
+  .string()
+  .trim()
+  .refine((val) => isAddress(val), {
+    message: 'Invalid EVM address',
+  })
+  .transform((val) => getAddress(val));
+
+const uintStringOrSafeIntSchema = z.union([
+  unsignedBigIntStringSchema,
+  z
+    .number()
+    .int()
+    .nonnegative()
+    .refine((n) => Number.isSafeInteger(n), 'Integer exceeds MAX_SAFE_INTEGER')
+    .transform((n) => String(n)),
+]);
+
+const positiveUintStringOrSafeIntSchema = uintStringOrSafeIntSchema.refine((val) => {
+  const parsed = safeParseBigInt(val);
+  return parsed !== null && parsed > 0n;
+}, 'Amount must be greater than zero');
+
+export const borrowOrderPayloadSchema = z.object({
+  borrower: addressLikeSchema,
+  collateralToken: addressLikeSchema,
+  collateralAmount: positiveUintStringOrSafeIntSchema,
+  minUsdc: positiveUintStringOrSafeIntSchema,
+  maxRateBps: z.coerce.number().int().min(0).max(100_000),
+  termDays: z.coerce.number().int().min(1).max(3650),
+  maxLtvBps: z.coerce.number().int().min(1).max(10_000),
+  minFill: positiveUintStringOrSafeIntSchema,
+  expiry: positiveUintStringOrSafeIntSchema,
+  nonce: uintStringOrSafeIntSchema,
+  yieldMode: z.coerce.number().int().min(0).max(255).default(0),
+  allowInKindSettlement: z.boolean().default(false),
+});
+
+export const lendOfferPayloadSchema = z.object({
+  lender: addressLikeSchema,
+  usdcAmount: positiveUintStringOrSafeIntSchema,
+  minRateBps: z.coerce.number().int().min(0).max(100_000),
+  termDays: z.coerce.number().int().min(1).max(3650),
+  allowedCollateral: addressLikeSchema,
+  maxLtvBps: z.coerce.number().int().min(1).max(10_000),
+  minFill: positiveUintStringOrSafeIntSchema,
+  expiry: positiveUintStringOrSafeIntSchema,
+  nonce: uintStringOrSafeIntSchema,
+  yieldMode: z.coerce.number().int().min(0).max(255).default(0),
+});
+
+export const postOrderSchema = z.discriminatedUnion('order_type', [
+  z.object({
+    order_type: z.literal('borrow'),
+    order: borrowOrderPayloadSchema,
+    signature: z
+      .string()
+      .trim()
+      .regex(/^0x[0-9a-fA-F]{130,}$/, 'Signature must be a valid 0x-prefixed hex string'),
+  }),
+  z.object({
+    order_type: z.literal('lend'),
+    order: lendOfferPayloadSchema,
+    signature: z
+      .string()
+      .trim()
+      .regex(/^0x[0-9a-fA-F]{130,}$/, 'Signature must be a valid 0x-prefixed hex string'),
+  }),
+]);
 
 const LOAN_STATUS_MAP: Record<string, number> = {
   '0': 0,

@@ -2863,10 +2863,54 @@ async function runTests(): Promise<void> {
           }
         }
 
-        // Fix #3a: Even after 10/h global cap on bombedtarget@gmail.com is exhausted by 10 distinct wallets+IPs,
-        // a legitimate victim WITH a valid SIWE session confirming their own address (no +subaddress) STILL succeeds (201 -> 200)!
+        // M1: Fresh zero-cost SIWE wallets (0 ETH, 0 nonce, 0 indexed history) CANNOT consume an "owner reserve"
+        // to push past the 10/h global cap (closing the 13-request fresh-wallet lockout vector).
+        for (let sybil = 12; sybil <= 15; sybil++) {
+          const sKey = generatePrivateKey();
+          const sAcct = privateKeyToAccount(sKey);
+          const sNonce = await getNonce(sAcct.address);
+          const sSiwe = formatSiweMessage({
+            domain: 'app.nostok.xyz',
+            address: sAcct.address,
+            uri: 'https://app.nostok.xyz',
+            chainId: 8453,
+            nonce: sNonce,
+            issuedAt: nowIso,
+            expirationTime: futureIso,
+          });
+          const sTok = (
+            await httpJson<{ token: string }>('POST', `${bombUrl}/auth/verify`, {
+              message: sSiwe,
+              signature: await sAcct.signMessage({ message: sSiwe }),
+            })
+          ).body.token;
+          const sybilRes = await httpJson<{ error?: { code: string } }>(
+            'POST',
+            `${bombUrl}/subscriptions`,
+            {
+              channel: 'email',
+              target: sybil % 2 === 0 ? 'bombed.target@gmail.com' : `bombed.target+extra${sybil}@gmail.com`,
+            },
+            { Authorization: `Bearer ${sTok}`, 'X-Forwarded-For': `198.51.101.${sybil}` }
+          );
+          assert.equal(sybilRes.status, 429, `Zero-cost sybil wallet #${sybil} must still hit 429`);
+          assert.equal(sybilRes.body.error?.code, 'RATE_LIMIT_EXCEEDED');
+        }
+
+        // Meanwhile a legitimate wallet WITH on-chain sybil cost (ETH balance / tx / indexed history)
+        // STILL succeeds for BOTH plain and +tag addresses even after 15 fresh-wallet+IP requests!
         const gmailVictimKey = generatePrivateKey();
         const gmailVictimAcct = privateKeyToAccount(gmailVictimKey);
+        await fetch(LOCAL_RPC_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 99,
+            method: 'anvil_setBalance',
+            params: [gmailVictimAcct.address, '0xb1a2bc2ec50000'], // 0.05 ETH on Base fork
+          }),
+        });
         const gvNonce = await getNonce(gmailVictimAcct.address);
         const gvSiwe = formatSiweMessage({
           domain: 'app.nostok.xyz',
@@ -2883,27 +2927,40 @@ async function runTests(): Promise<void> {
             signature: await gmailVictimAcct.signMessage({ message: gvSiwe }),
           })
         ).body.token;
-        const gvSubRes = await httpJson<{ id: string; verified: boolean }>(
-          'POST',
-          `${bombUrl}/subscriptions`,
-          { channel: 'email', target: 'bombed.target@gmail.com' },
-          { Authorization: `Bearer ${gvTok}`, 'X-Forwarded-For': '203.0.114.99' }
-        );
-        assert.equal(
-          gvSubRes.status,
-          201,
-          'Legitimate victim with valid SIWE session must NOT be locked out even when global cap is exhausted'
-        );
-        const gvMsg = deliveredEmails.find((m) => m.subscriptionId === gvSubRes.body.id)!;
-        assert.ok(gvMsg, 'Verification email for victim must be delivered');
-        const gvConfirmRes = await httpJson<{ confirmed: boolean; verified: boolean }>(
-          'POST',
-          `${bombUrl}/subscriptions/confirm`,
-          { token: String(gvMsg.payload.confirm_token) },
-          { 'X-Forwarded-For': '203.0.114.99' }
-        );
-        assert.equal(gvConfirmRes.status, 200);
-        assert.equal(gvConfirmRes.body.verified, true);
+        for (const victimTarget of ['bombed.target@gmail.com', 'bombed.target+alerts@gmail.com']) {
+          const gvSubRes = await httpJson<{ id: string; verified: boolean }>(
+            'POST',
+            `${bombUrl}/subscriptions`,
+            { channel: 'email', target: victimTarget },
+            { Authorization: `Bearer ${gvTok}`, 'X-Forwarded-For': '203.0.114.99' }
+          );
+          assert.equal(
+            gvSubRes.status,
+            201,
+            `Wallet with sybil cost confirming ${victimTarget} must NOT be locked out by 15 zero-cost spam requests`
+          );
+          const gvMsg = deliveredEmails.find((m) => m.subscriptionId === gvSubRes.body.id)!;
+          assert.ok(gvMsg, 'Verification email for victim must be delivered');
+          // M2: GET with Accept: text/html returns interactive HTML <form method="POST"> confirm page
+          const htmlConfirmPage = await fetch(String(gvMsg.payload.confirm_url), {
+            headers: { Accept: 'text/html', 'X-Forwarded-For': '203.0.114.99' },
+          });
+          assert.equal(htmlConfirmPage.status, 200);
+          assert.match(htmlConfirmPage.headers.get('content-type') ?? '', /text\/html/i);
+          assert.ok(htmlConfirmPage.headers.get('content-security-policy'));
+          const htmlConfirmBody = await htmlConfirmPage.text();
+          assert.match(htmlConfirmBody, /<form[^>]*method="POST"/i);
+          assert.match(htmlConfirmBody, /Confirm subscription/i);
+
+          const gvConfirmRes = await httpJson<{ confirmed: boolean; verified: boolean }>(
+            'POST',
+            `${bombUrl}/subscriptions/confirm`,
+            { token: String(gvMsg.payload.confirm_token) },
+            { 'X-Forwarded-For': '203.0.114.99' }
+          );
+          assert.equal(gvConfirmRes.status, 200);
+          assert.equal(gvConfirmRes.body.verified, true);
+        }
 
         // Fix #3b: 4-wallet / 10-IP PoC against lockout.victim@nostok.xyz + "Not me, block this address" link
         const pocTokens: Array<{ address: string; token: string }> = [];
@@ -2947,9 +3004,16 @@ async function runTests(): Promise<void> {
         }
         assert.ok(pocBlockedResends >= 1, '4-wallet/10-IP resend PoC must hit confirmTargetResendLimiter before filling 10/h cap');
 
-        // "Not me, block this address" link: GET previews block, POST blocks sender wallet, deletes unverified sub, and persists across DELETE /user/data
+        // "Not me, block this address" link: GET previews block (JSON & HTML), POST blocks sender wallet, deletes unverified sub, and persists across DELETE /user/data
         const spamMsg = deliveredEmails.find((m) => m.subscriptionId === firstSpamSubId)!;
         assert.ok(spamMsg.message.includes('Not me, block this address:'), 'Email message must contain block link');
+        const blockHtmlPage = await fetch(String(spamMsg.payload.block_url), {
+          headers: { Accept: 'text/html', 'X-Forwarded-For': '203.0.114.120' },
+        });
+        assert.equal(blockHtmlPage.status, 200);
+        const blockHtmlText = await blockHtmlPage.text();
+        assert.match(blockHtmlText, /Block this wallet only/i);
+        assert.match(blockHtmlText, /Block this address entirely/i);
         const blockPreview = await httpJson<{
           confirmation_required: boolean;
           method: string;
@@ -2996,9 +3060,73 @@ async function runTests(): Promise<void> {
         assert.equal(blockedAfterDel.status, 403);
         assert.equal(blockedAfterDel.body.error?.code, 'SENDER_BLOCKED_BY_RECIPIENT');
 
-        // Legitimate victim STILL subscribes & confirms cleanly
+        // M2: "Block this address entirely" (scope: 'target_all') opts out target across ALL wallets forever
+        const optOutSenderKey = generatePrivateKey();
+        const optOutSenderAcct = privateKeyToAccount(optOutSenderKey);
+        const ooNonce = await getNonce(optOutSenderAcct.address);
+        const ooSiwe = formatSiweMessage({
+          domain: 'app.nostok.xyz',
+          address: optOutSenderAcct.address,
+          uri: 'https://app.nostok.xyz',
+          chainId: 8453,
+          nonce: ooNonce,
+          issuedAt: nowIso,
+          expirationTime: futureIso,
+        });
+        const ooTok = (
+          await httpJson<{ token: string }>('POST', `${bombUrl}/auth/verify`, {
+            message: ooSiwe,
+            signature: await optOutSenderAcct.signMessage({ message: ooSiwe }),
+          })
+        ).body.token;
+        const ooSub = await httpJson<{ id: string }>(
+          'POST',
+          `${bombUrl}/subscriptions`,
+          { channel: 'email', target: 'optout.victim@nostok.xyz' },
+          { Authorization: `Bearer ${ooTok}`, 'X-Forwarded-For': '203.0.114.140' }
+        );
+        assert.equal(ooSub.status, 201);
+        const ooMsg = deliveredEmails.find((m) => m.subscriptionId === ooSub.body.id)!;
+        const blockAllExec = await httpJson<{
+          blocked: boolean;
+          scope: string;
+          block_all: boolean;
+          deleted_pending_count: number;
+        }>(
+          'POST',
+          `${bombUrl}/subscriptions/block`,
+          { token: String(ooMsg.payload.block_token), scope: 'target_all', block_all: true },
+          { 'X-Forwarded-For': '203.0.114.141' }
+        );
+        assert.equal(blockAllExec.status, 200);
+        assert.equal(blockAllExec.body.blocked, true);
+        assert.equal(blockAllExec.body.scope, 'target_all');
+        assert.equal(blockAllExec.body.block_all, true);
+        assert.ok(blockAllExec.body.deleted_pending_count >= 1);
+
+        // Even the funded sybil-cost wallet cannot subscribe to optout.victim@nostok.xyz or +plus variants now!
+        const optedOutRetry = await httpJson<{ error?: { code: string } }>(
+          'POST',
+          `${bombUrl}/subscriptions`,
+          { channel: 'email', target: 'optout.victim+any@nostok.xyz' },
+          { Authorization: `Bearer ${gvTok}`, 'X-Forwarded-For': '203.0.114.142' }
+        );
+        assert.equal(optedOutRetry.status, 403);
+        assert.equal(optedOutRetry.body.error?.code, 'TARGET_OPTED_OUT');
+
+        // Legitimate funded victim STILL subscribes & confirms lockout.victim cleanly
         const pocVictimKey = generatePrivateKey();
         const pocVictimAcct = privateKeyToAccount(pocVictimKey);
+        await fetch(LOCAL_RPC_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 100,
+            method: 'anvil_setBalance',
+            params: [pocVictimAcct.address, '0xb1a2bc2ec50000'],
+          }),
+        });
         const pvNonce = await getNonce(pocVictimAcct.address);
         const pvSiwe = formatSiweMessage({
           domain: 'app.nostok.xyz',
