@@ -2,6 +2,13 @@ node_modules
 dist
 .DS_Store
 .env
+.env.*
+!.env.example
+keeper/.env
+keeper/.env.*
+!keeper/.env.example
+keeper/node_modules
+keeper/dist
 contracts/out
 contracts/cache
 contracts/broadcast
