@@ -22,6 +22,7 @@ contract OracleRouterTest is Test {
     address public guardian = address(0x2222);
 
     function setUp() public {
+        vm.warp(1700000000 + 7200);
         AssetRegistry regImpl = new AssetRegistry();
         bytes memory regData = abi.encodeCall(AssetRegistry.initialize, (owner, guardian));
         registry = AssetRegistry(address(new ERC1967Proxy(address(regImpl), regData)));
@@ -220,6 +221,9 @@ contract OracleRouterTest is Test {
         assertEq(uint8(stateNvidia), uint8(IOracleRouter.OracleState.VALID_OPEN));
         assertEq(pNvidia, 180e8); // Not double-multiplied!
 
+        // Baseline synced
+        router.syncMultiplier(address(stockToken));
+
         // Normal dividend drift (+15 bps) does NOT freeze
         stockToken.setUiMultiplier(1002000000000000000);
         (, , IOracleRouter.OracleState stateDiv) = router.getPrice(address(stockToken));
@@ -264,6 +268,68 @@ contract OracleRouterTest is Test {
         assertEq(uint8(state3), uint8(IOracleRouter.OracleState.STALE_FEED));
     }
 
+    function test_PMc_LikeMultiplier_NotFrozenAtLaunch() public {
+        feed.setUpdatedAt(block.timestamp);
+        // PMc real multiplier ~ 1.5588e18
+        stockToken.setUiMultiplier(1558800000000000000);
+
+        // First read initializes baseline from token; NOT frozen at launch!
+        (uint256 p, , IOracleRouter.OracleState state) = router.getPrice(address(stockToken));
+        assertEq(uint8(state), uint8(IOracleRouter.OracleState.VALID_OPEN));
+        assertEq(p, 180e8);
+    }
+
+    function test_DividendDrift_RepeatedRatchet_NotFrozen() public {
+        feed.setUpdatedAt(block.timestamp);
+        uint256 mult = 1e18;
+        stockToken.setUiMultiplier(mult);
+
+        // Sync initial baseline
+        router.syncMultiplier(address(stockToken));
+
+        // +4% repeated 5 times with syncMultiplier ratcheting baseline
+        for (uint256 i = 0; i < 5; i++) {
+            mult = (mult * 104) / 100;
+            stockToken.setUiMultiplier(mult);
+
+            // Permissionless caller ratchets baseline since diff is 4% (< 5%)
+            address keeper = address(0x9999);
+            vm.prank(keeper);
+            router.syncMultiplier(address(stockToken));
+
+            (, , IOracleRouter.OracleState state) = router.getPrice(address(stockToken));
+            assertEq(uint8(state), uint8(IOracleRouter.OracleState.VALID_OPEN));
+        }
+    }
+
+    function test_TenToOneSplit_Freezes_ThenSynced() public {
+        feed.setUpdatedAt(block.timestamp);
+        uint256 baseMult = 1e18;
+        stockToken.setUiMultiplier(baseMult);
+        router.syncMultiplier(address(stockToken));
+
+        // 10:1 split occurs! Multiplier becomes 10e18 (1000% jump)
+        stockToken.setUiMultiplier(10e18);
+
+        // OracleRouter auto-freezes!
+        (, , IOracleRouter.OracleState frozenState) = router.getPrice(address(stockToken));
+        assertEq(uint8(frozenState), uint8(IOracleRouter.OracleState.FROZEN_CORPORATE_ACTION));
+
+        // Permissionless caller cannot unfreeze a corporate action split
+        address keeper = address(0x9999);
+        vm.prank(keeper);
+        vm.expectRevert(OracleRouter.CorporateActionSplitPending.selector);
+        router.syncMultiplier(address(stockToken));
+
+        // Governance / owner reviews corporate action and syncs multiplier
+        vm.prank(owner);
+        router.syncMultiplier(address(stockToken));
+
+        // Asset is unfrozen and operational
+        (, , IOracleRouter.OracleState unfreezeState) = router.getPrice(address(stockToken));
+        assertEq(uint8(unfreezeState), uint8(IOracleRouter.OracleState.VALID_OPEN));
+    }
+
     function test_Holidays_2027_2028_LoadedByDefault() public view {
         // 2027 New Year's Day (day 20819)
         assertTrue(router.isHoliday(20819));
@@ -278,6 +344,22 @@ contract OracleRouterTest is Test {
         assertTrue(router.isHoliday(21543));
         // 2028 July 3 half-day (day 21368)
         assertTrue(router.isHalfDay(21368));
+    }
+
+    function test_Holidays_2029_2030_LoadedByDefault() public view {
+        // 2029 New Year's Day (day 21550)
+        assertTrue(router.isHoliday(21550));
+        // 2029 Thanksgiving (day 21875)
+        assertTrue(router.isHoliday(21875));
+        // 2029 Black Friday half-day (day 21876)
+        assertTrue(router.isHalfDay(21876));
+
+        // 2030 Juneteenth (day 22084)
+        assertTrue(router.isHoliday(22084));
+        // 2030 Christmas (day 22273)
+        assertTrue(router.isHoliday(22273));
+        // 2030 Christmas Eve half-day (day 22272)
+        assertTrue(router.isHalfDay(22272));
     }
 
     function test_Thanksgiving_IsLoadedByDefault() public {

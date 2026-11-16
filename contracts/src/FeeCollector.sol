@@ -125,4 +125,6 @@ contract FeeCollector is Initializable, UUPSUpgradeable, OwnableUpgradeable, IFe
 
         emit FeeCollected(token, treasuryPortion, reservePortion);
     }
+
+    uint256[50] private __gap;
 }

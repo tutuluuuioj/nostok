@@ -344,4 +344,56 @@ contract OrderSettlementTest is Test {
         assertEq(loanId, 1);
         assertEq(core.totalOutstandingPrincipal(), 5000e6);
     }
+
+    function test_FillLendOffer_WithAttestations() public {
+        uint256 kycPrivateKey = 0x8888;
+        address kycSigner = vm.addr(kycPrivateKey);
+
+        vm.startPrank(owner);
+        gate.setPermissionlessMode(false);
+        gate.setAttestationSigner(kycSigner);
+        vm.stopPrank();
+
+        IOrderSettlement.LendOffer memory offer = IOrderSettlement.LendOffer({
+            lender: lender,
+            usdcAmount: 5000e6,
+            minRateBps: 800,
+            termDays: 30,
+            allowedCollateral: address(stockToken),
+            maxLtvBps: 6000,
+            minFill: 500e6,
+            expiry: uint64(block.timestamp + 7 days),
+            nonce: 0,
+            yieldMode: 0
+        });
+
+        bytes32 digest = settlement.hashLendOffer(offer);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(lenderPrivateKey, digest);
+        bytes memory sig = abi.encodePacked(r, s, v);
+
+        // Sign KYC attestations
+        uint256 expiry = block.timestamp + 1 days;
+        bytes32 bDigest = gate.getAttestationDigest(borrower, 0, expiry);
+        (uint8 bv, bytes32 br, bytes32 bs) = vm.sign(kycPrivateKey, bDigest);
+        bytes memory bAttestation = abi.encode(expiry, abi.encodePacked(br, bs, bv));
+
+        bytes32 lDigest = gate.getAttestationDigest(lender, 0, expiry);
+        (uint8 lv, bytes32 lr, bytes32 ls) = vm.sign(kycPrivateKey, lDigest);
+        bytes memory lAttestation = abi.encode(expiry, abi.encodePacked(lr, ls, lv));
+
+        // Taker (borrower) fills lend offer passing borrowerAttestation then lenderAttestation
+        vm.prank(borrower);
+        uint256 loanId = settlement.fillLendOfferWithAttestations(
+            offer,
+            sig,
+            address(stockToken),
+            50e6,
+            5000e6,
+            bAttestation,
+            lAttestation
+        );
+
+        assertEq(loanId, 1);
+        assertEq(core.totalOutstandingPrincipal(), 5000e6);
+    }
 }

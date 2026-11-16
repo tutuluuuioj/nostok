@@ -30,4 +30,8 @@ interface IOracleRouter {
         returns (uint256 grossValueUsdc, uint256 effectiveValueUsdc, OracleState state);
 
     function getOracleState(address token) external view returns (OracleState state);
+
+    function isMarketOpen() external view returns (bool);
+
+    function syncMultiplier(address token) external returns (uint256);
 }

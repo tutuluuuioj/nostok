@@ -31,6 +31,7 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
     CollateralEscrow public escrow;
     PositionNFT public nft;
     LiquidationAuction public auction;
+    OracleRouter public router;
     MockAggregator public feed;
     MockERC20 public stockToken;
     MockERC20 public usdc;
@@ -51,6 +52,7 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
         CollateralEscrow _escrow,
         PositionNFT _nft,
         LiquidationAuction _auction,
+        OracleRouter _router,
         MockAggregator _feed,
         MockERC20 _stockToken,
         MockERC20 _usdc,
@@ -65,6 +67,7 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
         escrow = _escrow;
         nft = _nft;
         auction = _auction;
+        router = _router;
         feed = _feed;
         stockToken = _stockToken;
         usdc = _usdc;
@@ -81,11 +84,17 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
         if (activeLoanIds.length >= 10) return;
 
         address activeBorrower = useBorrower2 ? borrower2 : borrower1;
-        // Bounded collateral between 10 NVDAc and 50 NVDAc ($2,000 to $10,000 at $200/share)
+        // Bounded collateral between 10 NVDAc and 50 NVDAc
         uint128 collateralAmount = uint128(bound(collateralSeed, 10e6, 50e6));
-        // Safe max borrow at 50% LTV: collateral * 100
-        uint128 maxPrincipal = uint128((uint256(collateralAmount) * 100));
-        uint128 principal = uint128(bound(principalSeed, 500e6, maxPrincipal));
+        
+        feed.setUpdatedAt(block.timestamp);
+        (uint256 grossVal, , ) = router.getValue(address(stockToken), collateralAmount);
+        if (grossVal == 0) return;
+        uint128 maxPrincipalAllowed = uint128((grossVal * 6000) / 10000);
+        if (maxPrincipalAllowed < 500e6) return;
+
+        uint128 principal = uint128(bound(principalSeed, 500e6, maxPrincipalAllowed));
+        if (ghost_totalOutstandingPrincipal + principal > 250_000e6) return;
 
         stockToken.mint(activeBorrower, collateralAmount);
         vm.prank(activeBorrower);
@@ -193,6 +202,33 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
         activeLoanIds.pop();
     }
 
+    function repayDuringAuction(uint256 loanIndexSeed) external {
+        if (activeLoanIds.length == 0) return;
+
+        uint256 idx = loanIndexSeed % activeLoanIds.length;
+        uint256 loanId = activeLoanIds[idx];
+
+        ILoanCore.Loan memory l = core.getLoan(loanId);
+        if (l.status != uint8(ILoanCore.LoanStatus.Auction)) return;
+
+        uint128 remaining = l.principal - l.principalRepaid;
+        uint128 interest = core.getDueInterest(loanId);
+        uint128 totalDue = remaining + interest;
+
+        usdc.mint(l.borrower, totalDue);
+        vm.prank(l.borrower);
+        usdc.approve(address(core), totalDue);
+
+        vm.prank(l.borrower);
+        core.repay(loanId);
+
+        ghost_totalEscrowedCollateral -= l.collateralRaw;
+        ghost_totalOutstandingPrincipal -= remaining;
+
+        activeLoanIds[idx] = activeLoanIds[activeLoanIds.length - 1];
+        activeLoanIds.pop();
+    }
+
     function startLiquidationAuction(uint256 loanIndexSeed) external {
         if (activeLoanIds.length == 0) return;
 
@@ -202,12 +238,57 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
         ILoanCore.Loan memory l = core.getLoan(loanId);
         if (l.status != uint8(ILoanCore.LoanStatus.Active) && l.status != uint8(ILoanCore.LoanStatus.Grace)) return;
 
-        // Drop price so position breaches liquidation LTV
-        feed.setPrice(120e8);
         feed.setUpdatedAt(block.timestamp);
+        (uint256 grossVal, , ) = router.getValue(l.collateralToken, l.collateralRaw);
+        if (grossVal == 0) return;
+        uint128 debtPrincipal = l.principal - l.principalRepaid;
+        uint128 debtInterest = core.getDueInterest(loanId);
+        uint256 currentDebt = debtPrincipal + debtInterest;
+        uint256 currentLtvBps = (currentDebt * 10000) / grossVal;
+
+        if (currentLtvBps < l.liqLtvBps) {
+            feed.setPrice(100e8);
+            (grossVal, , ) = router.getValue(l.collateralToken, l.collateralRaw);
+            if (grossVal == 0) return;
+            currentLtvBps = (currentDebt * 10000) / grossVal;
+            if (currentLtvBps < l.liqLtvBps) return;
+        }
 
         vm.prank(keeper);
         core.startLiquidation(loanId);
+    }
+
+    function triggerDefaultAuction(uint256 loanIndexSeed) external {
+        if (activeLoanIds.length == 0) return;
+
+        uint256 idx = loanIndexSeed % activeLoanIds.length;
+        uint256 loanId = activeLoanIds[idx];
+
+        ILoanCore.Loan memory l = core.getLoan(loanId);
+        if (block.timestamp <= l.maturity + 24 hours) return;
+        if (l.status != uint8(ILoanCore.LoanStatus.Active) && l.status != uint8(ILoanCore.LoanStatus.Grace)) return;
+
+        feed.setUpdatedAt(block.timestamp);
+        vm.prank(keeper);
+        core.startDefaultAuction(loanId);
+    }
+
+    function restartOrCancelAuction(uint256 loanIndexSeed) external {
+        if (activeLoanIds.length == 0) return;
+
+        uint256 idx = loanIndexSeed % activeLoanIds.length;
+        uint256 loanId = activeLoanIds[idx];
+
+        uint256 auctionId = core.loanActiveAuction(loanId);
+        if (auctionId == 0) return;
+
+        ILiquidationAuction.Auction memory a = auction.getAuction(auctionId);
+        if (a.status != ILiquidationAuction.AuctionStatus.Active) return;
+        if (block.timestamp < a.startTime + a.duration) return;
+        if (a.collateralRemaining == 0) return;
+
+        feed.setUpdatedAt(block.timestamp);
+        auction.restartOrCancelAuction(auctionId);
     }
 
     function buyAuction(uint256 loanIndexSeed, uint256 buyAmountSeed, bool buyFull) external {
@@ -222,8 +303,7 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
         ILiquidationAuction.Auction memory a = auction.getAuction(auctionId);
         if (a.status != ILiquidationAuction.AuctionStatus.Active || a.collateralRemaining == 0) return;
 
-        // If auction expired (> 30 mins), restart it
-        if (block.timestamp > a.startTime + a.duration) {
+        if (block.timestamp > a.startTime + a.duration && router.isMarketOpen()) {
             feed.setUpdatedAt(block.timestamp);
             auction.restartOrCancelAuction(auctionId);
             a = auction.getAuction(auctionId);
@@ -268,6 +348,27 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
             ghost_totalEscrowedCollateral -= collateralSold;
             ghost_totalOutstandingPrincipal -= principalPaid;
         }
+    }
+
+    function advanceTime(uint256 timeSeed) external {
+        uint256 elapsed = bound(timeSeed, 1 hours, 10 days);
+        vm.warp(block.timestamp + elapsed);
+        feed.setUpdatedAt(block.timestamp);
+    }
+
+    function changePrice(uint256 priceSeed) external {
+        uint256 newPrice = bound(priceSeed, 100e8, 300e8);
+        feed.setPrice(int256(newPrice));
+        feed.setUpdatedAt(block.timestamp);
+    }
+
+    function claimPayout(bool claimLender) external {
+        address recipient = claimLender ? lender : borrower1;
+        uint128 claimableAmount = core.getClaimable(recipient);
+        if (claimableAmount == 0) return;
+
+        vm.prank(recipient);
+        core.claim(recipient);
     }
 
     function activeLoansCount() external view returns (uint256) {
@@ -395,6 +496,7 @@ contract InvariantsTest is Test {
             escrow,
             nft,
             auction,
+            router,
             feed,
             stockToken,
             usdc,
@@ -448,6 +550,23 @@ contract InvariantsTest is Test {
             core.assetOutstandingPrincipal(address(stockToken)),
             handler.ghost_totalOutstandingPrincipal(),
             "Asset outstanding principal mismatch"
+        );
+    }
+
+    /**
+     * @notice Invariant 4: LoanCore Solvency
+     * USDC balance of LoanCore must ALWAYS be >= total uncollected claimable payouts.
+     */
+    function invariant_LoanCoreSolvency() public view {
+        uint256 totalClaimable = core.getClaimable(borrower) +
+            core.getClaimable(borrower2) +
+            core.getClaimable(lender) +
+            core.getClaimable(liquidator) +
+            core.getClaimable(keeper);
+        assertGe(
+            usdc.balanceOf(address(core)),
+            totalClaimable,
+            "LoanCore USDC balance must be >= total claimable"
         );
     }
 }

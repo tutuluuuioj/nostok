@@ -40,6 +40,7 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
     error ZeroAddress();
     error InvalidAnswer();
     error AssetNotConfigured();
+    error CorporateActionSplitPending();
 
     event MarketSessionUpdated(bool isOpen, bool isManual);
     event AssetRegistryUpdated(address indexed registry);
@@ -74,9 +75,8 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
     }
 
     function _loadDefaultHolidays() internal {
-        // Pre-load NYSE holidays & half-days for 2024 through 2028
-        // 2024: New Year's Day, MLK, Washington's Bday, Good Friday, Memorial Day, Juneteenth, July 4th, Labor Day, Thanksgiving, Christmas
-        uint256[50] memory holidays = [
+        // Pre-load NYSE holidays & half-days for 2024 through 2030
+        uint256[70] memory holidays = [
             // 2024
             uint256(19723), 19737, 19772, 19811, 19870, 19893, 19908, 19968, 20055, 20082,
             // 2025
@@ -86,9 +86,13 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
             // 2027
             uint256(20819), 20836, 20864, 20903, 20969, 20987, 21004, 21067, 21147, 21176,
             // 2028
-            uint256(21184), 21200, 21235, 21288, 21333, 21354, 21369, 21431, 21511, 21543
+            uint256(21184), 21200, 21235, 21288, 21333, 21354, 21369, 21431, 21511, 21543,
+            // 2029
+            uint256(21550), 21564, 21599, 21638, 21697, 21719, 21734, 21795, 21875, 21908,
+            // 2030
+            uint256(21915), 21935, 21963, 22023, 22061, 22084, 22099, 22159, 22246, 22273
         ];
-        for (uint256 i = 0; i < 50; i++) {
+        for (uint256 i = 0; i < 70; i++) {
             isHoliday[holidays[i]] = true;
         }
 
@@ -98,14 +102,18 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
         // 2026: Black Friday (Nov 27), Christmas Eve (Dec 24)
         // 2027: Black Friday (Nov 26)
         // 2028: July 3, Black Friday (Nov 24)
-        uint256[11] memory halfDays = [
+        // 2029: July 3, Black Friday (Nov 23), Christmas Eve (Dec 24)
+        // 2030: July 3, Black Friday (Nov 29), Christmas Eve (Dec 24)
+        uint256[17] memory halfDays = [
             uint256(19907), 20056, 20081,
             uint256(20272), 20420, 20446,
             uint256(20784), 20811,
             uint256(21148),
-            uint256(21368), 21512
+            uint256(21368), 21512,
+            uint256(21733), 21876, 21907,
+            uint256(22098), 22247, 22272
         ];
-        for (uint256 j = 0; j < 11; j++) {
+        for (uint256 j = 0; j < 17; j++) {
             isHalfDay[halfDays[j]] = true;
         }
     }
@@ -152,8 +160,15 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
         }
     }
 
-    function syncMultiplier(address token) public onlyOwner {
-        uint256 current = 1e18;
+    /**
+     * @notice Synchronizes recorded multiplier with current token uiMultiplier.
+     * - If recordedMultiplier[token] == 0 (initial baseline) or diff < 5% (dividend drift):
+     *   Permissionless (callable by anyone to ratchet baseline).
+     * - If diff >= 5% (corporate action split):
+     *   Restricted to Owner (post-split unfreeze).
+     */
+    function syncMultiplier(address token) public returns (uint256 current) {
+        current = 1e18;
         (bool success, bytes memory ret) = token.staticcall(
             abi.encodeWithSelector(IB20Token.uiMultiplier.selector)
         );
@@ -161,6 +176,16 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
             uint256 m = abi.decode(ret, (uint256));
             if (m > 0) current = m;
         }
+
+        uint256 prev = recordedMultiplier[token];
+        if (prev != 0 && msg.sender != owner()) {
+            uint256 diff = current > prev ? current - prev : prev - current;
+            uint256 diffBps = (diff * 10000) / prev;
+            if (diffBps >= 500) {
+                revert CorporateActionSplitPending();
+            }
+        }
+
         recordedMultiplier[token] = current;
         emit MultiplierSynced(token, current);
     }
@@ -281,7 +306,7 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
             if (currentMult > 0) {
                 uint256 recMult = recordedMultiplier[token];
                 if (recMult == 0) {
-                    recMult = 1e18;
+                    recMult = currentMult;
                 }
                 uint256 diff = currentMult > recMult ? currentMult - recMult : recMult - currentMult;
                 uint256 diffBps = (diff * 10000) / recMult;
@@ -367,4 +392,6 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
     function getOracleState(address token) external view override returns (OracleState state) {
         (, , state) = getPrice(token);
     }
+
+    uint256[50] private __gap;
 }

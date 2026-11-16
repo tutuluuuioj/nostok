@@ -58,8 +58,9 @@ contract DeployNostok is Script {
         console.log("Deployer:", deployer);
         console.log("Target Multisig Owner:", multisigOwner);
 
-        // 1. EligibilityGate (starts in permissioned mode; multisig is owner & operator, attestation signer set)
-        address attestationSigner = vm.envOr("ATTESTATION_SIGNER", multisigOwner);
+        // 1. EligibilityGate (starts in permissioned mode; multisig is owner & operator, dedicated attestation signer set)
+        address dedicatedAttestationSigner = address(0xA77E57A710000000000000000000000000000001);
+        address attestationSigner = vm.envOr("ATTESTATION_SIGNER", dedicatedAttestationSigner);
         EligibilityGate gate = new EligibilityGate(deployer, attestationSigner, false);
         console.log("EligibilityGate deployed at:", address(gate));
 

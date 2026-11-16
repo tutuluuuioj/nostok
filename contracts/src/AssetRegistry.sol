@@ -112,4 +112,6 @@ contract AssetRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable, IA
     function isAssetSupported(address token) external view override returns (bool) {
         return _supported[token];
     }
+
+    uint256[50] private __gap;
 }

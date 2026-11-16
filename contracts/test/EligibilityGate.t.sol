@@ -3,6 +3,7 @@ pragma solidity ^0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 import {EligibilityGate} from "../src/EligibilityGate.sol";
+import {MockSmartWallet} from "./mocks/MockSmartWallet.sol";
 
 contract EligibilityGateTest is Test {
     EligibilityGate public gate;
@@ -87,5 +88,43 @@ contract EligibilityGateTest is Test {
         // 3. Expired attestation fails
         vm.warp(expiry + 1);
         assertFalse(gate.isEligible(user1, newContext));
+    }
+
+    function test_MalformedContext_ReturnsFalse() public view {
+        // Short malformed context (< 96 bytes)
+        assertFalse(gate.isEligible(user1, hex"deadbeef"));
+        // Random 96-byte non-ABI payload
+        bytes memory garbage = new bytes(96);
+        for (uint256 i = 0; i < 96; i++) {
+            garbage[i] = bytes1(uint8(i + 1));
+        }
+        // Must return false without reverting
+        assertFalse(gate.isEligible(user1, garbage));
+    }
+
+    function test_Legacy65Byte_Rejected() public view {
+        bytes memory raw65 = new bytes(65);
+        assertFalse(gate.isEligible(user1, raw65));
+    }
+
+    function test_ERC1271_SmartWalletAttestationSigner() public {
+        // Deploy smart contract wallet that implements ERC-1271
+        uint256 walletSignerPk = 0x8888;
+        address walletSigner = vm.addr(walletSignerPk);
+        MockSmartWallet smartSigner = new MockSmartWallet(walletSigner);
+
+        // Set EligibilityGate's attestationSigner to the smart wallet contract
+        vm.prank(owner);
+        gate.setAttestationSigner(address(smartSigner));
+        assertEq(gate.attestationSigner(), address(smartSigner));
+
+        // Generate attestation signed by the key behind the smart contract wallet
+        uint256 expiry = block.timestamp + 1 days;
+        bytes32 digest = gate.getAttestationDigest(user1, 0, expiry);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(walletSignerPk, digest);
+        bytes memory context = abi.encode(expiry, abi.encodePacked(r, s, v));
+
+        // EligibilityGate checks ERC-1271 on the contract wallet and approves eligibility
+        assertTrue(gate.isEligible(user1, context));
     }
 }

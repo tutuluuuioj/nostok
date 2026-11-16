@@ -114,6 +114,10 @@ contract EligibilityGate is IEligibilityGate, Ownable {
         return structHash.toEthSignedMessageHash();
     }
 
+    function decodeAttestation(bytes calldata context) external pure returns (uint256 expiry, bytes memory signature) {
+        return abi.decode(context, (uint256, bytes));
+    }
+
     function isEligible(
         address account,
         bytes calldata context
@@ -122,20 +126,13 @@ contract EligibilityGate is IEligibilityGate, Ownable {
         if (permissionlessMode) return true;
         if (allowlist[account]) return true;
 
-        if (context.length > 0 && attestationSigner != address(0)) {
-            // Standard ABI-encoded attestation: (uint256 expiry, bytes signature)
-            if (context.length >= 96) {
-                (uint256 expiry, bytes memory signature) = abi.decode(context, (uint256, bytes));
+        if (context.length >= 96 && attestationSigner != address(0)) {
+            try this.decodeAttestation(context) returns (uint256 expiry, bytes memory signature) {
                 if (block.timestamp > expiry) return false;
-
                 bytes32 digest = getAttestationDigest(account, userNonce[account], expiry);
                 return SignatureChecker.isValidSignatureNow(attestationSigner, digest, signature);
-            }
-
-            // Compact raw 65-byte ECDSA signature with no expiry (legacy fallback)
-            if (context.length == 65) {
-                bytes32 digest = getAttestationDigest(account, userNonce[account], type(uint256).max);
-                return SignatureChecker.isValidSignatureNow(attestationSigner, digest, context);
+            } catch {
+                return false;
             }
         }
 

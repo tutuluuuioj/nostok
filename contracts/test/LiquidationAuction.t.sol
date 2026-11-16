@@ -522,4 +522,83 @@ contract LiquidationAuctionTest is Test {
         uint128 paid = auction.buy(auctionId, 10e6, 20_000e6);
         assertGt(paid, 0);
     }
+
+    function test_Auction_WeekendClosedMarket_BuyAtFloor() public {
+        vm.prank(mockOrderSettlement);
+        uint256 loanId = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            50e6,
+            5800e6,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        feed.setPrice(145e8);
+        vm.prank(keeper);
+        uint256 auctionId = core.startLiquidation(loanId);
+
+        // Friday night: Market closes for the weekend, and auction expires (> 30 min)
+        vm.prank(owner);
+        router.setMarketSession(false, true);
+        assertFalse(router.isMarketOpen());
+
+        vm.warp(block.timestamp + 3600); // 1 hour later (past 30 min duration)
+
+        // Over the weekend (market closed), buying at floor price succeeds without getting stuck!
+        vm.prank(liquidator);
+        uint128 paid = auction.buy(auctionId, 10e6, 20_000e6);
+        assertGt(paid, 0);
+
+        // When the partial buy reduces LTV below liquidation threshold, restartOrCancel cancels auction!
+        vm.warp(block.timestamp + 3600);
+        auction.restartOrCancelAuction(auctionId);
+        ILiquidationAuction.Auction memory a = auction.getAuction(auctionId);
+        assertEq(uint8(a.status), uint8(ILiquidationAuction.AuctionStatus.Cancelled));
+    }
+
+    function test_Auction_DustRemainder_AutoCloses() public {
+        vm.prank(mockOrderSettlement);
+        uint256 loanId = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            50e6,
+            5800e6,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        feed.setPrice(145e8);
+        vm.prank(keeper);
+        uint256 auctionId = core.startLiquidation(loanId);
+
+        ILiquidationAuction.Auction memory aBefore = auction.getAuction(auctionId);
+        uint128 totalAuctionCollateral = aBefore.collateralRemaining; // 25e6 (25 shares)
+
+        // Liquidator buys 24.999 shares, leaving 0.001 shares (~$0.14 worth, well under $10 MIN_BUY_USDC)
+        uint128 buyAmount = totalAuctionCollateral - 1000; // 1000 raw units = 0.001 shares
+        vm.prank(liquidator);
+        auction.buy(auctionId, buyAmount, 20_000e6);
+
+        // Auction must be auto-closed!
+        ILiquidationAuction.Auction memory aAfter = auction.getAuction(auctionId);
+        assertEq(uint8(aAfter.status), uint8(ILiquidationAuction.AuctionStatus.Settled));
+        assertEq(aAfter.collateralRemaining, 0);
+
+        // Borrower receives the 0.001 dust shares
+        assertGe(stockToken.balanceOf(borrower), 1000);
+
+        // Escrow tracked balance and physical token balance remain 100% in sync with LoanCore
+        ILoanCore.Loan memory l = core.getLoan(loanId);
+        assertEq(stockToken.balanceOf(address(escrow)), l.collateralRaw);
+        assertEq(escrow.getBalance(address(stockToken)), l.collateralRaw);
+    }
 }

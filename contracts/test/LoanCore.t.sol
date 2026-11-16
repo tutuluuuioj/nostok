@@ -45,6 +45,7 @@ contract LoanCoreTest is Test {
     address public borrower;
     uint256 public lenderPrivateKey = 0xB0B;
     address public lender;
+    address public keeper = address(0xDDDD);
 
     bytes32 public constant EXTEND_ORDER_TYPEHASH = keccak256(
         "ExtendOrder(uint256 loanId,uint64 newMaturity,uint32 newRateBps,uint256 nonce,uint64 deadline)"
@@ -363,7 +364,6 @@ contract LoanCoreTest is Test {
 
         // Trigger liquidation auction (50 shares * $125 = $6,250; debt $5,000 = 80% LTV > 78% threshold)
         feed.setPrice(125e8);
-        address keeper = address(0xDDDD);
         vm.prank(keeper);
         uint256 auctionId = core.startLiquidation(1);
         assertEq(auctionId, 1);
@@ -478,7 +478,6 @@ contract LoanCoreTest is Test {
 
         // Price drops to trigger liquidation
         feed.setPrice(125e8);
-        address keeper = address(0xDDDD);
         vm.prank(keeper);
         uint256 auctionId = core.startLiquidation(1);
 
@@ -621,5 +620,41 @@ contract LoanCoreTest is Test {
         ILoanCore.Loan memory updated = core.getLoan(1);
         assertEq(updated.maturity, newMaturity);
         assertEq(updated.rateBps, 1200);
+    }
+
+    function test_MinInterest_FloorNotDoubleCountedPostLiquidation() public {
+        test_OpenLoan_Success();
+
+        // 3 days min interest floor on $5,000 at 8% APR:
+        // (5000e6 * 800 * 3 days + (365 days * 10000 - 1)) / (365 days * 10000) = 3287672 ($3.287672)
+        uint128 expected3DaysFloor = uint128(
+            (uint256(5000e6) * 800 * 3 days + (365 days * 10000 - 1)) / (365 days * 10000)
+        );
+
+        // Day 1: Liquidation triggers
+        vm.warp(block.timestamp + 1 days);
+        feed.setPrice(120e8);
+        vm.prank(keeper);
+        core.startLiquidation(1);
+
+        // At Day 1 liquidation checkpoint, due interest is floored at 3 days min interest
+        assertEq(core.getDueInterest(1), expected3DaysFloor);
+
+        // Day 2: 1 day later (total 2 days elapsed < 3 minInterestDays), borrower repays during auction
+        vm.warp(block.timestamp + 1 days);
+
+        // Total due interest must STILL be the 3-day minimum floor, NOT 3 days + 1 day = 4 days!
+        uint128 dueAtDay2 = core.getDueInterest(1);
+        assertEq(dueAtDay2, expected3DaysFloor);
+
+        usdc.mint(borrower, 6000e6);
+        vm.prank(borrower);
+        usdc.approve(address(core), type(uint256).max);
+
+        vm.prank(borrower);
+        uint128 totalPaid = core.repay(1);
+
+        // Paid exactly principal + 3-day min interest floor (no double counting!)
+        assertEq(totalPaid, 5000e6 + expected3DaysFloor);
     }
 }

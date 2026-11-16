@@ -178,7 +178,11 @@ contract LiquidationAuction is
     ) external override nonReentrant returns (uint128 usdcPaid) {
         Auction storage a = auctions[auctionId];
         if (a.status != AuctionStatus.Active) revert AuctionNotActive();
-        if (block.timestamp > a.startTime + a.duration) revert AuctionExpired();
+        address router = ILoanCore(loanCore).oracleRouter();
+        bool marketOpen = IOracleRouter(router).isMarketOpen();
+        if (block.timestamp > a.startTime + a.duration && marketOpen) {
+            revert AuctionExpired();
+        }
         if (collateralAmount == 0 || collateralAmount > a.collateralRemaining) {
             revert InvalidAuctionAmount();
         }
@@ -198,6 +202,21 @@ contract LiquidationAuction is
         if (usdcPaid > maxUsdcPayment) revert SlippageExceeded();
 
         a.collateralRemaining -= collateralAmount;
+
+        // Auto-close dust remainder: if remaining collateral value is under MIN_BUY_USDC ($10),
+        // nobody will spend gas to buy it. Send dust to borrower and close auction.
+        uint128 dustCollateral = 0;
+        if (a.collateralRemaining > 0) {
+            uint256 remVal = (uint256(a.collateralRemaining) * currentPrice * 1e6) /
+                ((10 ** tokenDecimals) * 1e8);
+            if (remVal < MIN_BUY_USDC) {
+                dustCollateral = a.collateralRemaining;
+                a.collateralRemaining = 0;
+                if (a.borrower != address(0)) {
+                    ICollateralEscrow(escrow).releaseCollateral(a.collateralToken, a.borrower, dustCollateral);
+                }
+            }
+        }
 
         // Pull USDC from buyer
         IERC20(usdc).safeTransferFrom(msg.sender, address(this), usdcPaid);
@@ -259,7 +278,7 @@ contract LiquidationAuction is
             a.loanId,
             principalPayment,
             interestPayment,
-            collateralAmount,
+            collateralAmount + dustCollateral,
             isAuctionCollateralDepleted,
             a.isDefaultAuction
         );
@@ -287,8 +306,8 @@ contract LiquidationAuction is
 
         address router = ILoanCore(loanCore).oracleRouter();
         (uint256 currentPrice, , IOracleRouter.OracleState oState) = IOracleRouter(router).getPrice(a.collateralToken);
-        if (oState != IOracleRouter.OracleState.VALID_OPEN) {
-            return; // Maintain status if oracle is closed or invalid
+        if (oState != IOracleRouter.OracleState.VALID_OPEN && oState != IOracleRouter.OracleState.VALID_CLOSED) {
+            return; // Maintain status if oracle is invalid or feed stale
         }
 
         ILoanCore.Loan memory l = ILoanCore(loanCore).getLoan(a.loanId);
@@ -316,4 +335,6 @@ contract LiquidationAuction is
     function getAuction(uint256 auctionId) external view override returns (Auction memory) {
         return auctions[auctionId];
     }
+
+    uint256[50] private __gap;
 }

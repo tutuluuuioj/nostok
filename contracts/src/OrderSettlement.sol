@@ -248,8 +248,8 @@ contract OrderSettlement is
         address collateralToken,
         uint128 collateralAmount,
         uint128 fillUsdc,
-        bytes calldata lenderAttestation,
-        bytes calldata borrowerAttestation
+        bytes calldata borrowerAttestation,
+        bytes calldata lenderAttestation
     ) external override returns (uint256 loanId) {
         return _fillLendOffer(
             offer,
@@ -257,8 +257,8 @@ contract OrderSettlement is
             collateralToken,
             collateralAmount,
             fillUsdc,
-            lenderAttestation,
-            borrowerAttestation
+            borrowerAttestation,
+            lenderAttestation
         );
     }
 
@@ -268,8 +268,8 @@ contract OrderSettlement is
         address collateralToken,
         uint128 collateralAmount,
         uint128 fillUsdc,
-        bytes memory lenderAttestation,
-        bytes memory borrowerAttestation
+        bytes memory borrowerAttestation,
+        bytes memory lenderAttestation
     ) internal returns (uint256 loanId) {
         if (block.timestamp > offer.expiry) revert OrderExpired();
         if (offer.nonce != getMakerNonce[offer.lender]) revert InvalidNonce();

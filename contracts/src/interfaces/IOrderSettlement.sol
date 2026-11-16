@@ -74,8 +74,8 @@ interface IOrderSettlement {
         address collateralToken,
         uint128 collateralAmount,
         uint128 fillUsdc,
-        bytes calldata lenderAttestation,
-        bytes calldata borrowerAttestation
+        bytes calldata borrowerAttestation,
+        bytes calldata lenderAttestation
     ) external returns (uint256 loanId);
 
     function cancelBorrowOrder(BorrowOrder calldata order) external;

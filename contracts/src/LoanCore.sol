@@ -293,8 +293,65 @@ contract LoanCore is
     }
 
     /**
+     * @notice Helper to compute minimum interest floor across the full loan.
+     */
+    function _getMinInterestFloor(uint256 loanId) internal view returns (uint128) {
+        Loan storage l = loans[loanId];
+        uint256 minSecs = uint256(l.minInterestDays) * 1 days;
+        return uint128(
+            (uint256(l.principal) * l.rateBps * minSecs + (10000 * SECONDS_PER_YEAR - 1)) /
+                (10000 * SECONDS_PER_YEAR)
+        );
+    }
+
+    /**
+     * @notice Helper to calculate interest accrual between lastAccrued and toTimestamp.
+     */
+    function _calculateInterestAccrual(
+        uint256 loanId,
+        uint256 toTimestamp
+    ) internal view returns (uint128) {
+        Loan storage l = loans[loanId];
+        uint256 activePrincipal = uint256(l.principal - l.principalRepaid);
+        if (activePrincipal == 0) return 0;
+
+        uint64 lastAccrued = loanLastInterestAccruedTime[loanId];
+        if (lastAccrued == 0) {
+            lastAccrued = l.startTime;
+        }
+        if (toTimestamp <= lastAccrued) return 0;
+
+        uint256 newAccrual = 0;
+        if (toTimestamp <= l.maturity) {
+            uint256 elapsed = toTimestamp - lastAccrued;
+            uint256 fullTermRemaining = l.maturity > lastAccrued ? l.maturity - lastAccrued : 0;
+            uint256 maxRemaining = (activePrincipal * l.rateBps * fullTermRemaining + (10000 * SECONDS_PER_YEAR - 1)) /
+                (10000 * SECONDS_PER_YEAR);
+
+            uint256 calc = (activePrincipal * l.rateBps * elapsed + (10000 * SECONDS_PER_YEAR - 1)) /
+                (10000 * SECONDS_PER_YEAR);
+
+            newAccrual = calc > maxRemaining ? maxRemaining : calc;
+        } else {
+            uint256 regSecs = l.maturity > lastAccrued ? l.maturity - lastAccrued : 0;
+            uint256 regInterest = (activePrincipal * l.rateBps * regSecs + (10000 * SECONDS_PER_YEAR - 1)) /
+                (10000 * SECONDS_PER_YEAR);
+
+            uint256 graceStart = lastAccrued > l.maturity ? lastAccrued : l.maturity;
+            uint256 graceElapsed = toTimestamp > graceStart ? toTimestamp - graceStart : 0;
+            uint256 penaltyRate = l.rateBps + l.penaltySpreadBps;
+
+            uint256 penaltyInterest = (activePrincipal * penaltyRate * graceElapsed + (10000 * SECONDS_PER_YEAR - 1)) /
+                (10000 * SECONDS_PER_YEAR);
+
+            newAccrual = regInterest + penaltyInterest;
+        }
+        return uint128(newAccrual);
+    }
+
+    /**
      * @notice Computes due interest following Simple Interest Actual/365, minInterest, and grace penalties.
-     * Prevents double-charging across partial repayments and auction buys by tracking accrual timestamps.
+     * Enforces minInterest as a floor on cumulative interest across the loan lifetime.
      */
     function getDueInterest(uint256 loanId) public view override returns (uint128) {
         Loan storage l = loans[loanId];
@@ -302,47 +359,13 @@ contract LoanCore is
             return 0;
         }
 
-        uint256 activePrincipal = uint256(l.principal - l.principalRepaid);
-        if (activePrincipal == 0) return loanUnpaidInterest[loanId];
+        uint128 newAccrual = _calculateInterestAccrual(loanId, block.timestamp);
+        uint256 totalAccruedSoFar = uint256(l.interestPaid) + uint256(loanUnpaidInterest[loanId]) + uint256(newAccrual);
 
-        uint64 lastAccrued = loanLastInterestAccruedTime[loanId];
-        if (lastAccrued == 0) {
-            lastAccrued = l.startTime;
-        }
+        uint128 minFloor = _getMinInterestFloor(loanId);
+        uint256 totalOwed = totalAccruedSoFar < minFloor ? uint256(minFloor) : totalAccruedSoFar;
 
-        uint256 newAccrual = 0;
-        if (block.timestamp <= l.maturity) {
-            uint256 elapsed = block.timestamp > lastAccrued ? block.timestamp - lastAccrued : 0;
-            uint256 totalElapsed = block.timestamp - l.startTime;
-            uint256 minSecs = uint256(l.minInterestDays) * 1 days;
-            if (totalElapsed < minSecs && lastAccrued == l.startTime) {
-                elapsed = minSecs;
-            }
-
-            uint256 fullTermRemaining = l.maturity > lastAccrued ? l.maturity - lastAccrued : 0;
-            uint256 maxRemainingInterest = (activePrincipal * l.rateBps * fullTermRemaining + (10000 * SECONDS_PER_YEAR - 1)) /
-                (10000 * SECONDS_PER_YEAR);
-
-            uint256 calculated = (activePrincipal * l.rateBps * elapsed + (10000 * SECONDS_PER_YEAR - 1)) /
-                (10000 * SECONDS_PER_YEAR);
-
-            newAccrual = calculated > maxRemainingInterest ? maxRemainingInterest : calculated;
-        } else {
-            uint256 regularSecs = l.maturity > lastAccrued ? l.maturity - lastAccrued : 0;
-            uint256 regularInterest = (activePrincipal * l.rateBps * regularSecs + (10000 * SECONDS_PER_YEAR - 1)) /
-                (10000 * SECONDS_PER_YEAR);
-
-            uint256 graceStart = lastAccrued > l.maturity ? lastAccrued : l.maturity;
-            uint256 graceElapsed = block.timestamp > graceStart ? block.timestamp - graceStart : 0;
-            uint256 penaltyRate = l.rateBps + l.penaltySpreadBps;
-
-            uint256 penaltyInterest = (activePrincipal * penaltyRate * graceElapsed + (10000 * SECONDS_PER_YEAR - 1)) /
-                (10000 * SECONDS_PER_YEAR);
-
-            newAccrual = regularInterest + penaltyInterest;
-        }
-
-        return uint128(loanUnpaidInterest[loanId] + newAccrual);
+        return totalOwed > l.interestPaid ? uint128(totalOwed - l.interestPaid) : 0;
     }
 
     /**
@@ -388,7 +411,9 @@ contract LoanCore is
         totalOutstandingPrincipal -= remainingPrincipal;
         assetOutstandingPrincipal[l.collateralToken] -= remainingPrincipal;
 
-        ICollateralEscrow(escrow).releaseCollateral(l.collateralToken, l.borrower, l.collateralRaw);
+        uint128 collateralToRelease = l.collateralRaw;
+        l.collateralRaw = 0;
+        ICollateralEscrow(escrow).releaseCollateral(l.collateralToken, l.borrower, collateralToRelease);
         IPositionNFT(positionNft).burn(loanId);
 
         emit Repaid(loanId, msg.sender, remainingPrincipal, interestDue);
@@ -410,25 +435,20 @@ contract LoanCore is
             revert InvalidLoanTerms();
         }
 
-        // Accrue and charge interest on the portion of principal being repaid
-        uint64 lastAccrued = loanLastInterestAccruedTime[loanId];
-        if (lastAccrued == 0) lastAccrued = l.startTime;
-        uint256 elapsed = block.timestamp > lastAccrued ? block.timestamp - lastAccrued : 0;
-        uint256 totalElapsed = block.timestamp - l.startTime;
-        uint256 minSecs = uint256(l.minInterestDays) * 1 days;
-        uint256 interestElapsed = (totalElapsed < minSecs && lastAccrued == l.startTime) ? minSecs : elapsed;
-        uint128 interestOnRepaid = uint128(
-            (uint256(principalRepayAmount) * l.rateBps * interestElapsed + (10000 * SECONDS_PER_YEAR - 1)) /
-                (10000 * SECONDS_PER_YEAR)
-        );
+        // 1. Accrue interest on full active principal up to now
+        uint128 newAccrual = _calculateInterestAccrual(loanId, block.timestamp);
+        loanUnpaidInterest[loanId] += newAccrual;
+        loanLastInterestAccruedTime[loanId] = uint64(block.timestamp);
 
-        if (loanUnpaidInterest[loanId] > 0) {
-            uint128 unpaidShare = uint128(
-                (uint256(loanUnpaidInterest[loanId]) * principalRepayAmount) / remainingPrincipal
-            );
-            interestOnRepaid += unpaidShare;
-            loanUnpaidInterest[loanId] -= unpaidShare;
-        }
+        // 2. Determine pro-rata interest for the repaid portion respecting min interest floor
+        uint128 minFloor = _getMinInterestFloor(loanId);
+        uint256 totalAccrued = uint256(l.interestPaid) + uint256(loanUnpaidInterest[loanId]);
+        uint256 totalDueOwed = totalAccrued < minFloor ? uint256(minFloor) - l.interestPaid : loanUnpaidInterest[loanId];
+        uint128 interestOnRepaid = uint128((totalDueOwed * principalRepayAmount) / remainingPrincipal);
+
+        loanUnpaidInterest[loanId] = loanUnpaidInterest[loanId] > interestOnRepaid
+            ? loanUnpaidInterest[loanId] - interestOnRepaid
+            : 0;
 
         uint128 interestCut = IFeeCollector(feeCollector).calculateInterestCut(interestOnRepaid);
         uint128 netInterest = interestOnRepaid - interestCut;
@@ -541,9 +561,8 @@ contract LoanCore is
         (uint256 grossVal, , ) = IOracleRouter(oracleRouter).getValue(l.collateralToken, l.collateralRaw);
         uint128 debtPrincipal = l.principal - l.principalRepaid;
         uint128 debtInterest = getDueInterest(loanId);
-        loanUnpaidInterest[loanId] = debtInterest;
-        loanLastInterestAccruedTime[loanId] = uint64(block.timestamp);
-        loanUnpaidInterest[loanId] = debtInterest;
+        uint128 newAccrual = _calculateInterestAccrual(loanId, block.timestamp);
+        loanUnpaidInterest[loanId] += newAccrual;
         loanLastInterestAccruedTime[loanId] = uint64(block.timestamp);
         uint256 currentDebt = debtPrincipal + debtInterest;
 
@@ -591,7 +610,8 @@ contract LoanCore is
 
         uint128 debtPrincipal = l.principal - l.principalRepaid;
         uint128 debtInterest = getDueInterest(loanId);
-        loanUnpaidInterest[loanId] = debtInterest;
+        uint128 newAccrual = _calculateInterestAccrual(loanId, block.timestamp);
+        loanUnpaidInterest[loanId] += newAccrual;
         loanLastInterestAccruedTime[loanId] = uint64(block.timestamp);
 
         IAssetRegistry.AssetConfig memory cfg = IAssetRegistry(assetRegistry).getAssetConfig(l.collateralToken);
@@ -639,6 +659,10 @@ contract LoanCore is
 
             claimable[holder] += (principalPaid + (interestPaid - interestCut));
         }
+
+        // Accrue interest elapsed between auction checkpoint and this settlement buy
+        uint128 newAccrual = _calculateInterestAccrual(loanId, block.timestamp);
+        loanUnpaidInterest[loanId] += newAccrual;
 
         l.collateralRaw -= collateralSold;
         l.principalRepaid += principalPaid;
@@ -718,4 +742,6 @@ contract LoanCore is
     function getClaimable(address account) external view override returns (uint128) {
         return claimable[account];
     }
+
+    uint256[50] private __gap;
 }
