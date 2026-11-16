@@ -1,14 +1,17 @@
 import crypto from 'node:crypto';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { type Address, type Hex, getAddress } from 'viem';
-import { ZodError } from 'zod';
+import { ZodError } from 'zod/v3';
 import { resolveAndValidateWebhookTarget, validateChannelTarget } from './channels.js';
 import {
+  hasPlusSubaddress,
   hashVerificationCode,
   maskTarget,
+  signBlockSenderToken,
   signConfirmSubscriptionToken,
   signSessionToken,
   signUnsubscribeToken,
+  verifyBlockSenderToken,
   verifyConfirmSubscriptionToken,
   verifySessionTokenClaims,
   verifyUnsubscribeToken,
@@ -92,6 +95,13 @@ class IpRateLimiter {
       resetEpochSec: Math.ceil(bucket.resetAtMs / 1000),
       retryAfterSec: Math.max(1, Math.ceil((bucket.resetAtMs - now) / 1000)),
     };
+  }
+
+  refund(key: string): void {
+    const bucket = this.buckets.get(key);
+    if (bucket && bucket.count > 0) {
+      bucket.count -= 1;
+    }
   }
 
   close(): void {
@@ -286,6 +296,24 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
     3_600_000,
     ctx.config.rateLimitMaxBuckets
   );
+  const confirmTargetResendLimiter = new IpRateLimiter(
+    Math.max(1, Math.min(3, Math.floor(ctx.config.confirmTargetGlobalPerHourMax / 2))),
+    3_600_000,
+    ctx.config.rateLimitMaxBuckets
+  );
+  const confirmTargetOwnerReserveLimiter = new IpRateLimiter(
+    ctx.config.confirmTargetPerHourMax,
+    3_600_000,
+    ctx.config.rateLimitMaxBuckets
+  );
+  const pendingWalletsByTarget = new Map<string, { wallets: Set<string>; resetAtMs: number }>();
+  const pendingWalletsTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of pendingWalletsByTarget.entries()) {
+      if (v.resetAtMs <= now) pendingWalletsByTarget.delete(k);
+    }
+  }, 60_000);
+  pendingWalletsTimer.unref();
   const confirmIpLimiter = new IpRateLimiter(
     ctx.config.confirmRateLimitMax,
     ctx.config.rateLimitWindowMs,
@@ -512,8 +540,8 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
         const encrypted = ctx.cipher.encrypt(normalizedTarget);
         const targetHash = ctx.cipher.computeTargetHash(wallet, input.channel, normalizedTarget);
 
-        const existingSub = await ctx.notifDb.query<{ id: string }>(
-          'SELECT id FROM notif_subscriptions WHERE wallet = $1 AND channel = $2 AND target_hash = $3',
+        const existingSub = await ctx.notifDb.query<{ id: string; verified: boolean }>(
+          'SELECT id, verified FROM notif_subscriptions WHERE wallet = $1 AND channel = $2 AND target_hash = $3',
           [wallet.toLowerCase(), input.channel, targetHash]
         );
         if (existingSub.rows.length === 0) {
@@ -531,10 +559,53 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
         }
 
         const isWebhook = input.channel === 'webhook';
+        const canonicalTargetHash = !isWebhook
+          ? ctx.cipher.computeGlobalTargetHash(input.channel, normalizedTarget)
+          : '';
+
         if (!isWebhook) {
-          // Enforce per-wallet (3/h), per-IP (3/h), and generous global cap (10/h) on canonicalized target
-          // (strips +subaddress, trailing domain dots, Gmail dots, and googlemail->gmail alias)
-          const canonicalTargetHash = ctx.cipher.computeGlobalTargetHash(input.channel, normalizedTarget);
+          const blockedRes = await ctx.notifDb.query<{ wallet: string }>(
+            'SELECT wallet FROM notif_blocked_senders WHERE wallet = $1 AND canonical_target_hash = $2',
+            [wallet.toLowerCase(), canonicalTargetHash]
+          );
+          if (blockedRes.rows.length > 0) {
+            throw new HttpError(
+              403,
+              'SENDER_BLOCKED_BY_RECIPIENT',
+              'This wallet has been blocked by the target recipient.'
+            );
+          }
+
+          if (existingSub.rows[0]?.verified === true) {
+            const reEnabled = await ctx.notifDb.query<{
+              id: string;
+              channel: 'email' | 'telegram' | 'webhook';
+              enabled: boolean;
+              verified: boolean;
+            }>(
+              `UPDATE notif_subscriptions
+               SET enabled = TRUE, updated_at = NOW()
+               WHERE id = $1
+               RETURNING id, channel, enabled, verified`,
+              [existingSub.rows[0].id]
+            );
+            const row = reEnabled.rows[0];
+            sendJson(res, 201, {
+              id: row.id,
+              wallet_address: wallet,
+              channel: row.channel,
+              masked_target: maskTarget(input.channel, normalizedTarget),
+              key_id: encrypted.keyId,
+              enabled: row.enabled,
+              verified: row.verified,
+              verification_required: false,
+            });
+            return;
+          }
+
+          // Enforce per-wallet (3/h), per-IP (3/h), bounded resend cap, and global cap (10/h)
+          // with a reserved verified-session slot so unauthenticated/spam flooding cannot lock out
+          // a legitimate wallet from confirming its own target.
           enforceScopedRateLimit(
             res,
             confirmTargetWalletLimiter,
@@ -547,12 +618,60 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             `${clientIp}:${canonicalTargetHash}`,
             `IP confirmation sends to ${input.channel} target`
           );
-          enforceScopedRateLimit(
-            res,
-            confirmTargetGlobalLimiter,
-            canonicalTargetHash,
-            `global confirmation sends to ${input.channel} target`
-          );
+
+          const nowMs = Date.now();
+          let seenEntry = pendingWalletsByTarget.get(canonicalTargetHash);
+          if (seenEntry && seenEntry.resetAtMs <= nowMs) {
+            pendingWalletsByTarget.delete(canonicalTargetHash);
+            seenEntry = undefined;
+          }
+          if (!seenEntry) {
+            if (pendingWalletsByTarget.size >= ctx.config.rateLimitMaxBuckets) {
+              for (const [k, v] of pendingWalletsByTarget.entries()) {
+                if (v.resetAtMs <= nowMs) pendingWalletsByTarget.delete(k);
+              }
+            }
+            seenEntry = { wallets: new Set(), resetAtMs: nowMs + 3_600_000 };
+            if (pendingWalletsByTarget.size < ctx.config.rateLimitMaxBuckets) {
+              pendingWalletsByTarget.set(canonicalTargetHash, seenEntry);
+            }
+          }
+
+          const walletLower = wallet.toLowerCase();
+          const alreadyRequested = seenEntry.wallets.has(walletLower);
+          if (alreadyRequested) {
+            enforceScopedRateLimit(
+              res,
+              confirmTargetResendLimiter,
+              canonicalTargetHash,
+              `confirmation resends to ${input.channel} target`
+            );
+          }
+
+          const globalRl = confirmTargetGlobalLimiter.check(canonicalTargetHash);
+          if (!globalRl.allowed) {
+            const allowOwnerReserve =
+              Boolean(caller.jti) &&
+              !alreadyRequested &&
+              !hasPlusSubaddress(input.channel, normalizedTarget);
+            if (allowOwnerReserve) {
+              enforceScopedRateLimit(
+                res,
+                confirmTargetOwnerReserveLimiter,
+                canonicalTargetHash,
+                `verified-session confirmation sends to ${input.channel} target`
+              );
+            } else {
+              res.setHeader('Retry-After', String(globalRl.retryAfterSec));
+              throw new HttpError(
+                429,
+                'RATE_LIMIT_EXCEEDED',
+                `Rate limit exceeded for global confirmation sends to ${input.channel} target; retry later.`
+              );
+            }
+          }
+
+          seenEntry.wallets.add(walletLower);
         }
 
         const newId = existingSub.rows[0]?.id ?? `sub_${crypto.randomUUID().replace(/-/g, '')}`;
@@ -605,6 +724,14 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             3600
           );
           const confirmUrl = `${ctx.config.publicBaseUrl}/subscriptions/confirm?token=${encodeURIComponent(confirmToken)}`;
+          const blockToken = signBlockSenderToken(
+            ctx.config.confirmSecret,
+            created.id,
+            wallet,
+            canonicalTargetHash,
+            30 * 86_400
+          );
+          const blockUrl = `${ctx.config.publicBaseUrl}/subscriptions/block?token=${encodeURIComponent(blockToken)}`;
           const unsubToken = signUnsubscribeToken(
             ctx.config.unsubscribeSecret,
             created.id,
@@ -619,12 +746,14 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             alertType: 'subscription_verification',
             severity: 'info' as const,
             title: 'Confirm your NOSTOK alert subscription',
-            message: `Verification code: ${verificationCode}. Confirm link: ${confirmUrl}`,
+            message: `Verification code: ${verificationCode}. Confirm link: ${confirmUrl}. Not me, block this address: ${blockUrl}`,
             payload: {
               subscription_id: created.id,
               verification_code: verificationCode,
               confirm_token: confirmToken,
               confirm_url: confirmUrl,
+              block_token: blockToken,
+              block_url: blockUrl,
             },
             unsubscribeUrl,
           };
@@ -644,6 +773,64 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
           enabled: created.enabled,
           verified: created.verified,
           verification_required: !created.verified,
+        });
+        return;
+      }
+
+      if (pathname === '/subscriptions/block' && req.method === 'GET') {
+        enforceScopedRateLimit(res, confirmIpLimiter, clientIp, '/subscriptions/block IP');
+        const rawToken = parseOrThrow(unsubscribeBodySchema, { token: queryObj.token }).token;
+        let verified: { subId: string; wallet: string; canonicalTargetHash: string };
+        try {
+          verified = verifyBlockSenderToken(ctx.config.confirmSecret, rawToken);
+        } catch (err) {
+          throw new HttpError(400, 'VALIDATION_ERROR', err instanceof Error ? err.message : 'Invalid token');
+        }
+        sendJson(res, 200, {
+          confirmation_required: true,
+          method: 'POST',
+          subscription_id: verified.subId,
+          blocked_wallet: getAddress(verified.wallet),
+        });
+        return;
+      }
+
+      if (pathname === '/subscriptions/block' && req.method === 'POST') {
+        enforceScopedRateLimit(res, confirmIpLimiter, clientIp, '/subscriptions/block IP');
+        const rawBody = await readJsonBody(req, ctx.config.maxBodyBytes);
+        const bodyObj =
+          rawBody && typeof rawBody === 'object' && 'token' in rawBody
+            ? rawBody
+            : { token: queryObj.token };
+        const rawToken = parseOrThrow(unsubscribeBodySchema, bodyObj).token;
+        let verified: { subId: string; wallet: string; canonicalTargetHash: string };
+        try {
+          verified = verifyBlockSenderToken(ctx.config.confirmSecret, rawToken);
+        } catch (err) {
+          throw new HttpError(400, 'VALIDATION_ERROR', err instanceof Error ? err.message : 'Invalid token');
+        }
+        const walletLower = verified.wallet.toLowerCase();
+        await ctx.notifDb.query(
+          `INSERT INTO notif_blocked_senders (wallet, canonical_target_hash)
+           VALUES ($1, $2)
+           ON CONFLICT (wallet, canonical_target_hash) DO NOTHING`,
+          [walletLower, verified.canonicalTargetHash]
+        );
+        const delRes = await ctx.notifDb.query<{ id: string }>(
+          `DELETE FROM notif_subscriptions
+           WHERE id = $1 AND LOWER(wallet) = $2 AND verified = FALSE
+           RETURNING id`,
+          [verified.subId, walletLower]
+        );
+        if (delRes.rows.length > 0) {
+          confirmTargetGlobalLimiter.refund(verified.canonicalTargetHash);
+          confirmTargetResendLimiter.refund(verified.canonicalTargetHash);
+          pendingWalletsByTarget.get(verified.canonicalTargetHash)?.wallets.delete(walletLower);
+        }
+        sendJson(res, 200, {
+          blocked: true,
+          subscription_id: verified.subId,
+          blocked_wallet: getAddress(verified.wallet),
         });
         return;
       }
@@ -1127,6 +1314,9 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
     confirmTargetWalletLimiter.close();
     confirmTargetIpLimiter.close();
     confirmTargetGlobalLimiter.close();
+    confirmTargetResendLimiter.close();
+    confirmTargetOwnerReserveLimiter.close();
+    clearInterval(pendingWalletsTimer);
     confirmIpLimiter.close();
     confirmWalletLimiter.close();
     confirmSubLimiter.close();

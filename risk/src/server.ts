@@ -1,5 +1,5 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
-import { ZodError } from 'zod';
+import { ZodError } from 'zod/v3';
 import type { AlertSeverity } from './alerts.js';
 import type { RiskContext } from './monitor.js';
 import {

@@ -183,6 +183,27 @@ export const oracleRouterAbi = [
 export const feeCollectorAbi = [
   {
     type: 'function',
+    name: 'MAX_ORIGINATION_BPS',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'uint16' }],
+  },
+  {
+    type: 'function',
+    name: 'MAX_INTEREST_CUT_BPS',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'uint16' }],
+  },
+  {
+    type: 'function',
+    name: 'MAX_LIQUIDATION_BPS',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'uint16' }],
+  },
+  {
+    type: 'function',
     name: 'originationFeeBps',
     stateMutability: 'view',
     inputs: [],

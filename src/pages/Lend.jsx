@@ -1,15 +1,13 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Choice, Field, Page, Sheet, TextInput } from '../components/ui.jsx';
+import { Choice, Field, Page, PreviewBanner, Sheet, TextInput } from '../components/ui.jsx';
 import { ASSETS } from '../lib/data.js';
 import { formatApr, formatHundredths, formatUsd, parseDays, parseDollars, parsePercent } from '../lib/format.js';
 import { termSheet } from '../lib/money.js';
-import { useStore } from '../store.jsx';
 
 const CHOICES = ['NVDAc', 'AAPLc', 'MSFTc', 'GOOGLc', 'AMZNc', 'METAc'];
 
 export function Lend() {
-  const { act } = useStore();
   const [usdc, setUsdc] = useState('5000');
   const [rate, setRate] = useState('8.00');
   const [term, setTerm] = useState('30');
@@ -19,9 +17,6 @@ export function Lend() {
   const [picked, setPicked] = useState(['NVDAc', 'MSFTc']);
   const [inKind, setInKind] = useState(false);
   const [yieldOn, setYieldOn] = useState(false);
-  const [eligible, setEligible] = useState(false);
-  const [message, setMessage] = useState('');
-  const [formError, setFormError] = useState('');
 
   const principal = parseDollars(usdc);
   const rateBps = parsePercent(rate);
@@ -47,58 +42,38 @@ export function Lend() {
     ));
   }
 
-  function submit(event) {
-    event.preventDefault();
-    setMessage('');
-    if (inputError) {
-      setFormError(inputError);
-      return;
-    }
-    const next = act({
-      type: 'place-lend',
-      assets: picked,
-      usdcCents: principal,
-      rateBps,
-      termDays,
-      maxLtvBps,
-      minFillCents,
-      expiryDays,
-      inKind,
-      yieldOn,
-      eligible,
-    });
-    setFormError(next.error || '');
-    setMessage(next.error ? '' : next.notice);
-  }
-
   return (
     <Page
-      kicker="Lend"
-      title="Offer USDC."
-      lede="You name the stocks, the minimum rate, and the longest term you will take. Your USDC stays with you until a borrower fills the offer."
+      kicker="Lend · Preview"
+      title="Offer USDC (coming soon)."
+      lede="You name the stocks, the minimum rate, and the longest term you will take. Live lend offer signing and order filling arrive in WS3.4."
     >
-      <form className="form-layout" onSubmit={submit}>
+      <PreviewBanner>
+        Preview data, not your positions — live EIP-712 lend offer signing and OrderSettlement fills arrive in WS3.4. For live on-chain quotes today, use{' '}
+        <Link to="/markets">Markets</Link> or sign a live borrow order on <Link to="/borrow">Borrow</Link>.
+      </PreviewBanner>
+      <form className="form-layout" onSubmit={(event) => event.preventDefault()}>
         <div className="fields">
-          <Field id="usdc" label="USDC to offer" hint="Each fill is capped at $10,000. The offer itself can be larger, up to $100,000 in this preview.">
+          <Field id="usdc" label="USDC to offer (illustrative)" hint="Each fill is capped at $10,000. The offer itself can be larger, up to $100,000 in this preview.">
             {(props) => <TextInput id="usdc" value={usdc} onChange={setUsdc} {...props} />}
           </Field>
-          <Field id="rate" label="Minimum APR" hint="The borrower pays this fixed rate. You receive it minus a 10% cut of the interest.">
+          <Field id="rate" label="Minimum APR (illustrative)" hint="The borrower pays this fixed rate. You receive it minus the protocol cut of interest.">
             {(props) => <TextInput id="rate" value={rate} onChange={setRate} {...props} />}
           </Field>
-          <Field id="term" label="Term, days" hint="7 to 90 days.">
+          <Field id="term" label="Term, days (illustrative)" hint="7 to 90 days.">
             {(props) => <TextInput id="term" value={term} onChange={setTerm} inputMode="numeric" {...props} />}
           </Field>
-          <Field id="ltv" label="Maximum LTV" hint="Applied to the stock named at fill. Tier A caps initial LTV at 60%.">
+          <Field id="ltv" label="Maximum LTV (illustrative)" hint="Applied to the stock named at fill. Tier A caps initial LTV at 60%.">
             {(props) => <TextInput id="ltv" value={maxLtv} onChange={setMaxLtv} {...props} />}
           </Field>
-          <Field id="fill" label="Minimum fill, USDC">
+          <Field id="fill" label="Minimum fill, USDC (illustrative)">
             {(props) => <TextInput id="fill" value={minFill} onChange={setMinFill} {...props} />}
           </Field>
-          <Field id="expiry" label="Expiry, days">
+          <Field id="expiry" label="Expiry, days (illustrative)">
             {(props) => <TextInput id="expiry" value={expiry} onChange={setExpiry} inputMode="numeric" {...props} />}
           </Field>
           <fieldset>
-            <legend>Stocks you will lend against</legend>
+            <legend>Stocks (preview roster)</legend>
             {CHOICES.map((symbol) => {
               const asset = ASSETS[symbol];
               const blocked = asset.status !== 'Active';
@@ -114,7 +89,7 @@ export function Lend() {
                 </label>
               );
             })}
-            <p className="hint">Tier B names are not at launch. METAc is frozen, so a new loan against it will not open.</p>
+            <p className="hint">Live asset statuses and caps are shown on Markets and Risk.</p>
           </fieldset>
           <fieldset>
             <legend>Yield on the locked stock</legend>
@@ -124,31 +99,25 @@ export function Lend() {
             </label>
             <label className="choice">
               <input type="radio" name="yield" checked={yieldOn} onChange={() => setYieldOn(true)} />
-              <span>On. You earn what the venue pays on the locked stock, and you bear any venue loss. The borrower has to turn it on too.</span>
+              <span>On. Deferred until yield integration is enabled.</span>
             </label>
           </fieldset>
           <Choice id="inkind" checked={inKind} onChange={setInKind}>
             Allow in-kind settlement if the borrower allows it too.
           </Choice>
-          <Choice id="eligible" checked={eligible} onChange={setEligible}>
-            I am eligible to lend and to hold a Position NFT.
-          </Choice>
-          <p className="hint">Venue yield can be about nothing. The switch does not promise a rate.</p>
-          {formError ? <p className="err" role="alert">{formError}</p> : null}
-          {message ? <p className="note" role="status">{message} <Link to="/markets">See the book.</Link></p> : null}
-          <button className="btn" type="submit">Post lend offer</button>
+          <p className="hint">Lend offer posting is disabled until WS3.4 live OrderSettlement integration.</p>
         </div>
         <Sheet
           sticky
-          title="If this is filled in full"
-          note="The borrower pays the origination. You pay none of it. You pay 10% of the interest when the loan repays."
+          title="Illustrative preview economics"
+          note="Static formula illustration only. Query /quote on Markets for live on-chain numbers."
           items={quote ? [
             { label: 'Rate', value: `${formatApr(rateBps)} APR` },
             { label: 'Term', value: `${termDays} days` },
             { label: 'Interest at maturity', value: formatUsd(quote.interest) },
             { label: 'Protocol cut of interest', value: formatUsd(quote.cut) },
-            { label: 'You receive', value: formatUsd(quote.holder) },
-            { label: 'Your yield', value: `${formatHundredths(quote.lenderApr)} APR` },
+            { label: 'Lender receives', value: formatUsd(quote.holder) },
+            { label: 'Lender yield', value: `${formatHundredths(quote.lenderApr)} APR` },
             { label: 'Borrower origination', value: formatUsd(quote.fee) },
           ] : []}
         >

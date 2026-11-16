@@ -149,6 +149,7 @@ export interface MonitorInternalState {
   previousPrices: Map<string, bigint>;
   liquidatableSinceBlockTs: Map<string, number>;
   surplusSeenAtMsByAsset: Map<string, { balance: bigint; firstSeenMs: number }>;
+  unknownLoanConsecutiveScans: Map<string, number>;
   latestSummary: RiskSummarySnapshot | null;
   latestLoans: LoanRiskSnapshot[];
 }
@@ -269,6 +270,7 @@ export async function createRiskContext(
       previousPrices: new Map(),
       liquidatableSinceBlockTs: new Map(),
       surplusSeenAtMsByAsset: new Map(),
+      unknownLoanConsecutiveScans: new Map(),
       latestSummary: null,
       latestLoans: [],
     },
@@ -1274,6 +1276,31 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
     for (const id of Array.from(ctx.state.liquidatableSinceBlockTs.keys())) {
       if (!activeLiquidatableIds.has(id)) {
         ctx.state.liquidatableSinceBlockTs.delete(id);
+      }
+    }
+
+    // Track consecutive scans where a loan stays 'unknown' and alert operators after threshold
+    const currentUnknownLoanIds = new Set<string>(
+      loanSnapshots.filter((l) => l.risk_status === 'unknown').map((l) => l.loan_id)
+    );
+    const unknownThreshold = ctx.config.unknownLoanAlertScans ?? 3;
+    for (const unknownId of currentUnknownLoanIds) {
+      const scans = (ctx.state.unknownLoanConsecutiveScans.get(unknownId) ?? 0) + 1;
+      ctx.state.unknownLoanConsecutiveScans.set(unknownId, scans);
+      if (scans >= unknownThreshold) {
+        observations.push({
+          dedupKey: `loan_risk:${unknownId}:unknown_persistent`,
+          category: 'loan_risk',
+          severity: scans >= unknownThreshold * 2 ? 'critical' : 'warning',
+          title: `Loan #${unknownId} risk state unknown for ${scans} consecutive scans`,
+          message: `Loan #${unknownId} on-chain risk evaluation stayed unknown for ${scans} consecutive scans`,
+          details: { loanId: unknownId, consecutiveScans: scans },
+        });
+      }
+    }
+    for (const prevUnknownId of Array.from(ctx.state.unknownLoanConsecutiveScans.keys())) {
+      if (!currentUnknownLoanIds.has(prevUnknownId)) {
+        ctx.state.unknownLoanConsecutiveScans.delete(prevUnknownId);
       }
     }
 

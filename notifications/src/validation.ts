@@ -1,5 +1,5 @@
 import { type Address, getAddress, isAddress } from 'viem';
-import { z } from 'zod';
+import { z } from 'zod/v3';
 
 export const ALL_ALERT_TYPES = [
   'loan_margin_call',

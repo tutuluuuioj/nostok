@@ -1,7 +1,5 @@
-import { useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { Choice, Field, Page, Rows, TextInput } from '../components/ui.jsx';
-import { openOrders } from '../lib/book.js';
+import { Page, PreviewBanner, Rows } from '../components/ui.jsx';
 import { ASSETS, CLOCK, partyName, stateLabel } from '../lib/data.js';
 import {
   formatApr,
@@ -9,13 +7,9 @@ import {
   formatTokens,
   formatUsd,
   formatWhen,
-  parseDollars,
-  parsePercent,
-  parseTokens,
-  parseDays,
 } from '../lib/format.js';
-import { health, releaseTokens } from '../lib/health.js';
-import { auctionPriceCents, dueInterestCents } from '../lib/money.js';
+import { health } from '../lib/health.js';
+import { auctionPriceCents } from '../lib/money.js';
 import { useStore } from '../store.jsx';
 
 function line(loan, view) {
@@ -37,21 +31,13 @@ function line(loan, view) {
 
 export function Loan() {
   const { id } = useParams();
-  const { state, act } = useStore();
+  const { state } = useStore();
   const loan = state.loans.find((item) => item.id === id);
-  const [part, setPart] = useState('1000');
-  const [top, setTop] = useState('1');
-  const [term, setTerm] = useState('30');
-  const [rate, setRate] = useState('8.00');
-  const [capitalize, setCapitalize] = useState(false);
-  const [agreed, setAgreed] = useState(false);
-  const [offerId, setOfferId] = useState('');
-  const [message, setMessage] = useState('');
-  const [formError, setFormError] = useState('');
 
   if (!loan) {
     return (
-      <Page kicker="Loan" title="Not in this book." lede="That loan is not in the preview.">
+      <Page kicker="Loan · Preview" title="Not in preview book." lede="That sample loan is not in the preview.">
+        <PreviewBanner />
         <Link to="/loans">Back to loans</Link>
       </Page>
     );
@@ -61,11 +47,6 @@ export function Loan() {
   const asset = ASSETS[loan.asset];
   const oracleLtv = view.oracleValue > 0 ? formatApr(Math.round((view.debt * 10000) / view.oracleValue)) : '—';
   const marketLtv = view.marketValue > 0 ? formatApr(Math.round((view.debt * 10000) / view.marketValue)) : '—';
-  const portion = parseDollars(part);
-  const interest = portion ? dueInterestCents(loan, CLOCK, Math.min(portion, view.remaining)) : 0;
-  const release = portion ? releaseTokens(loan, Math.min(portion, view.remaining)) : null;
-  const fullInterest = view.remaining ? dueInterestCents(loan, CLOCK, view.remaining) : 0;
-  const offers = openOrders(state).filter((order) => order.side === 'lend' && order.assets.includes(loan.asset) && order.maker !== 'you');
   const auction = loan.status === 'Auction' && loan.auctionStarted
     ? auctionPriceCents(asset.oracleCents, asset.discountBps, Math.floor((CLOCK - loan.auctionStarted) / 1000))
     : null;
@@ -76,22 +57,12 @@ export function Loan() {
     : view.phase === 'Active' && view.margin
       ? 'Margin call.'
       : `${view.phase}.`;
-  const canChange = loan.borrower === 'you' && !closed && view.phase !== 'Auction' && view.phase !== 'PastGrace' && asset.status === 'Active' && asset.state !== 'FROZEN_CORPORATE_ACTION';
-
-  function run(action) {
-    const next = act(action);
-    setFormError(next.error || '');
-    setMessage(next.error ? '' : next.notice);
-  }
 
   return (
-    <Page kicker={`Loan ${loan.id}`} title={`${loan.asset}. ${titleState}`} lede={line(loan, view)}>
-      {!closed ? (
-        <div className="actions">
-          <button className="btn" type="button" onClick={() => run({ type: 'repay', id: loan.id, all: true })}>Repay all</button>
-          <button className="btn secondary" type="button" onClick={() => document.getElementById('top')?.focus()}>Add collateral</button>
-        </div>
-      ) : null}
+    <Page kicker={`Sample Loan ${loan.id} · Preview`} title={`${loan.asset}. ${titleState}`} lede={line(loan, view)}>
+      <PreviewBanner>
+        This is a read-only preview of a sample loan. Live repay, top-up, and extend actions arrive in WS3.5.
+      </PreviewBanner>
       {!closed ? (
         <div className="ltv-pair">
           <div>
@@ -105,25 +76,6 @@ export function Loan() {
             <p>Information only. A closed-market price does not liquidate you.</p>
           </div>
         </div>
-      ) : null}
-
-      {!closed ? (
-        <section className="block split" aria-label="Repay or add collateral">
-          <form className="fields" onSubmit={(event) => { event.preventDefault(); run({ type: 'repay', id: loan.id, principalCents: portion }); }}>
-            <h2>Repay part</h2>
-            <Field id="part" label="Principal to repay" hint={release ? `Interest on this portion ${formatUsd(interest)}. Collateral released ${formatTokens(release.tokens)} ${loan.asset}.${release.capped ? ' Capped so LTV stays at or below the initial LTV.' : ''}` : 'Anyone can repay. Collateral goes back to the borrower.'}>
-              {(props) => <TextInput id="part" value={part} onChange={setPart} {...props} />}
-            </Field>
-            <button className="btn secondary" type="submit">Repay this portion</button>
-          </form>
-          <form className="fields" onSubmit={(event) => { event.preventDefault(); run({ type: 'topup', id: loan.id, tokenMicro: parseTokens(top) }); }}>
-            <h2>Add collateral</h2>
-            <Field id="top" label={`Raw ${loan.asset} to add`} hint="You can add stock when the market is closed, the oracle is stale, or the asset is frozen.">
-              {(props) => <TextInput id="top" value={top} onChange={setTop} {...props} />}
-            </Field>
-            <button className="btn secondary" type="submit">Add this stock</button>
-          </form>
-        </section>
       ) : null}
 
       <div className="block">
@@ -156,57 +108,16 @@ export function Loan() {
 
       {auction ? (
         <section className="block">
-          <h2>Auction</h2>
+          <h2>Sample auction (preview)</h2>
           <p className="lede">
             The price is {formatUsd(auction.priceCents)} per token, {formatApr(auction.offBps)} under the oracle. It falls for 30 minutes, from 1% under the oracle to {formatApr(asset.discountBps)} under. About {formatLeft((30 * 60 - Math.floor((CLOCK - loan.auctionStarted) / 1000)) * 1000)} left in this preview.
           </p>
         </section>
       ) : null}
 
-      {canChange ? (
-        <section className="block split">
-          <form onSubmit={(event) => {
-            event.preventDefault();
-            run({ type: 'extend', id: loan.id, termDays: parseDays(term), rateBps: parsePercent(rate), capitalize, agreed });
-          }}>
-            <h2>Extend</h2>
-            <p className="hint">The NFT holder signs a new maturity and rate. You accept. LTV is checked at the current oracle.</p>
-            <div className="fields">
-              <Field id="new-term" label="New term, days from now">
-                {(props) => <TextInput id="new-term" value={term} onChange={setTerm} inputMode="numeric" {...props} />}
-              </Field>
-              <Field id="new-rate" label="New APR">
-                {(props) => <TextInput id="new-rate" value={rate} onChange={setRate} {...props} />}
-              </Field>
-              <Choice id="cap" checked={capitalize} onChange={setCapitalize}>Add accrued interest to principal instead of paying it now.</Choice>
-              <Choice id="agree" checked={agreed} onChange={setAgreed}>The Position NFT holder has signed this extension.</Choice>
-              <button className="btn" type="submit">Accept extension</button>
-            </div>
-          </form>
-          <form onSubmit={(event) => { event.preventDefault(); run({ type: 'rollover', id: loan.id, offerId }); }}>
-            <h2>Roll</h2>
-            <p className="hint">Repay and open the next loan in one step. The stock does not leave escrow. Nobody is rolled without consent.</p>
-            <div className="field">
-              <label htmlFor="offer">Lend offer</label>
-              <select id="offer" value={offerId} onChange={(event) => setOfferId(event.target.value)}>
-                <option value="">Choose an offer</option>
-                {offers.map((offer) => (
-                  <option key={offer.id} value={offer.id}>{offer.id} · {formatApr(offer.rateBps)} · {offer.termDays} days · {formatUsd(offer.remainingCents)} left</option>
-                ))}
-              </select>
-            </div>
-            <div className="actions">
-              <button className="btn secondary" type="submit">Roll this loan</button>
-            </div>
-          </form>
-        </section>
-      ) : null}
-
-      {loan.lender === 'you' && !closed ? (
-        <p className="block hint">This claim is yours. <Link to="/positions">Sell it on the position market</Link> unless an auction has locked transfer.</p>
-      ) : null}
-      {formError ? <p className="err" role="alert">{formError}</p> : null}
-      {message ? <p className="note" role="status">{message}</p> : null}
+      <div className="actions">
+        <Link className="btn secondary" to="/loans">Back to loans</Link>
+      </div>
     </Page>
   );
 }

@@ -46,6 +46,7 @@ const ALLOWED_NOTIF_TABLES = new Set([
   'notif_cursor',
   'notif_alert_episodes',
   'notif_revoked_sessions',
+  'notif_blocked_senders',
 ]);
 
 const INDEXER_TABLES = new Set([
@@ -873,5 +874,12 @@ export async function initNotifSchema(db: NotifDatabase): Promise<void> {
       revoked_at BIGINT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_notif_revoked_wallet ON notif_revoked_sessions (wallet);
+
+    CREATE TABLE IF NOT EXISTS notif_blocked_senders (
+      wallet TEXT NOT NULL,
+      canonical_target_hash TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (wallet, canonical_target_hash)
+    );
   `);
 }

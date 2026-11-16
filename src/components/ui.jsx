@@ -1,3 +1,45 @@
+import { Component } from 'react';
+
+export class ErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: props.initialError ?? null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error: error instanceof Error ? error : new Error(String(error)) };
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <main className="wrap page" id="main">
+          <article className="block">
+            <p className="kicker">Configuration Error</p>
+            <h1>Application cannot start.</h1>
+            <p className="err" role="alert">
+              {this.state.error.message || 'Invalid frontend configuration.'}
+            </p>
+            <p className="hint">
+              Check VITE_CHAIN_ID, VITE_RPC_URL, VITE_API_URL, VITE_NOTIFICATIONS_URL, VITE_USDC_ADDRESS, and deployed Base contract addresses.
+            </p>
+          </article>
+        </main>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+export function PreviewBanner({ children }) {
+  return (
+    <div className="err block" role="note" data-testid="preview-banner">
+      <strong>Preview data, not your positions.</strong>{' '}
+      {children || 'Sample book figures below are static illustrations and cannot be executed.'}
+    </div>
+  );
+}
+
 export function Page({ kicker, title, lede, children }) {
   return (
     <article className="page">

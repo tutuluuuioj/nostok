@@ -19,6 +19,7 @@ export interface RiskConfig {
   nearLiqBufferBps: number;
   priceDeviationWarnBps: number;
   keeperInactivityAlertSecs: number;
+  unknownLoanAlertScans: number;
   maxHealthyLagBlocks: number;
   maxHealthyLagSecs: number;
   corsOrigins: string[];
@@ -138,6 +139,9 @@ export function loadRiskConfig(overrides: RiskConfigOverrides = {}): RiskConfig 
     keeperInactivityAlertSecs:
       overrides.keeperInactivityAlertSecs ??
       parsePositiveInt(process.env.KEEPER_INACTIVITY_ALERT_SECS, 120, 'KEEPER_INACTIVITY_ALERT_SECS'),
+    unknownLoanAlertScans:
+      overrides.unknownLoanAlertScans ??
+      parsePositiveInt(process.env.UNKNOWN_LOAN_ALERT_SCANS, 3, 'UNKNOWN_LOAN_ALERT_SCANS'),
     maxHealthyLagBlocks:
       overrides.maxHealthyLagBlocks ??
       parsePositiveInt(process.env.MAX_HEALTHY_LAG_BLOCKS, 20, 'MAX_HEALTHY_LAG_BLOCKS'),

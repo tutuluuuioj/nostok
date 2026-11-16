@@ -1,8 +1,20 @@
-import { formatUnits, getAddress, isAddress, toHex } from 'viem';
+import {
+  decodeEventLog,
+  encodeFunctionData,
+  formatUnits,
+  getAddress,
+  isAddress,
+  recoverAddress,
+  toHex,
+  zeroAddress,
+} from 'viem';
 import {
   BASE_CHAIN_ID,
+  BORROW_ORDER_EIP712_TYPES,
   DEFAULT_B20_DECIMALS,
   ETH_DECIMALS,
+  ORDER_SETTLEMENT_DOMAIN_NAME,
+  ORDER_SETTLEMENT_DOMAIN_VERSION,
   USDC_DECIMALS,
   createProtocolPublicClient,
   eligibilityGateAbi,
@@ -10,6 +22,7 @@ import {
   getFrontendConfig,
   getMissingContractAddresses,
   loanCoreAbi,
+  orderSettlementAbi,
 } from './contracts.js';
 
 let injectedProviderOverride = null;
@@ -369,14 +382,32 @@ export async function fetchNotificationsSessionState({ token, cfg = getFrontendC
   };
 }
 
-export async function fetchPaginatedApiRows(baseUrl, { limit = 100, maxPages = 10, timeoutMs = 8000 } = {}) {
+/**
+ * @param {string} baseUrl
+ * @param {{
+ *   limit?: number,
+ *   maxPages?: number,
+ *   timeoutMs?: number,
+ *   cfg?: any
+ * }} [opts]
+ */
+export async function fetchPaginatedApiRows(
+  baseUrl,
+  { limit = 100, maxPages = 10, timeoutMs = 8000, cfg = null } = {}
+) {
+  const resolvedBase =
+    baseUrl.startsWith('/') && cfg?.apiUrl ? `${cfg.apiUrl}${baseUrl}` : baseUrl;
   const rows = [];
   let offset = 0;
   let total = null;
   let truncated = false;
+  let firstJson = null;
   for (let page = 0; page < maxPages; page++) {
-    const sep = baseUrl.includes('?') ? '&' : '?';
-    const json = await fetchJsonStrict(`${baseUrl}${sep}limit=${limit}&offset=${offset}`, {}, timeoutMs);
+    const sep = resolvedBase.includes('?') ? '&' : '?';
+    const json = await fetchJsonStrict(`${resolvedBase}${sep}limit=${limit}&offset=${offset}`, {}, timeoutMs);
+    if (!firstJson && json && typeof json === 'object') {
+      firstJson = json;
+    }
     const pageData = Array.isArray(json?.data) ? json.data : [];
     rows.push(...pageData);
     if (typeof json?.pagination?.total === 'number') {
@@ -396,7 +427,7 @@ export async function fetchPaginatedApiRows(baseUrl, { limit = 100, maxPages = 1
         ? Number(json.pagination.next_cursor)
         : offset + pageData.length;
   }
-  return { rows, total: total ?? rows.length, truncated };
+  return { rows, total: total ?? rows.length, truncated, fees: firstJson?.fees ?? null };
 }
 
 /**
@@ -593,5 +624,700 @@ export async function fetchWalletState(
     openLenderCount,
     openBorrowDisplay,
     openLenderDisplay,
+  };
+}
+
+/**
+ * @param {{
+ *   cfg?: any,
+ *   asset: string,
+ *   principalRaw?: string | null,
+ *   collateralAmountRaw?: string | null,
+ *   termDays: number,
+ *   aprBps: number,
+ *   maxLtvBps?: number | string | null,
+ *   borrower?: string | null,
+ *   lender?: string | null,
+ *   borrowerAttestation?: string | null,
+ *   lenderAttestation?: string | null
+ * }} opts
+ */
+export async function fetchLoanQuote({
+  cfg = getFrontendConfig(),
+  asset,
+  principalRaw,
+  collateralAmountRaw,
+  termDays,
+  aprBps,
+  maxLtvBps,
+  borrower,
+  lender,
+  borrowerAttestation,
+  lenderAttestation,
+}) {
+  if (!cfg?.apiUrl) {
+    throw new Error('VITE_API_URL is not configured.');
+  }
+  if (!asset || !isAddress(asset)) {
+    throw new Error('Select a valid registered collateral asset.');
+  }
+  if (!principalRaw && !collateralAmountRaw) {
+    throw new Error('Enter either a USDC principal amount or a collateral token amount.');
+  }
+
+  const params = new URLSearchParams();
+  params.set('asset', getAddress(asset));
+  if (principalRaw) params.set('principal', String(principalRaw));
+  if (collateralAmountRaw) params.set('collateral_amount', String(collateralAmountRaw));
+  params.set('term_days', String(termDays));
+  params.set('apr_bps', String(aprBps));
+  if (maxLtvBps !== undefined && maxLtvBps !== null && maxLtvBps !== '') {
+    params.set('max_ltv_bps', String(maxLtvBps));
+  }
+  if (borrower && isAddress(borrower)) {
+    params.set('borrower', getAddress(borrower));
+  }
+  if (lender && isAddress(lender)) {
+    params.set('lender', getAddress(lender));
+  }
+  if (borrowerAttestation && /^0x([0-9a-fA-F]{2})+$/.test(borrowerAttestation.trim())) {
+    params.set('borrower_attestation', borrowerAttestation.trim());
+  }
+  if (lenderAttestation && /^0x([0-9a-fA-F]{2})+$/.test(lenderAttestation.trim())) {
+    params.set('lender_attestation', lenderAttestation.trim());
+  }
+
+  return fetchJsonStrict(`${cfg.apiUrl}/quote?${params.toString()}`);
+}
+
+/**
+ * Extracts exact/rounded-up raw base-unit integer amounts from an api/ quote response.
+ * Never parses floored UI display strings for transaction or EIP-712 payload values.
+ */
+export function resolveExactBorrowAmounts(quote, { userCollateralRaw = null } = {}) {
+  if (!quote?.amounts?.principal?.raw || !quote?.amounts?.collateral_required?.raw) {
+    throw new Error('Quote response is missing exact raw principal or collateral_required amounts.');
+  }
+  const principalRaw = BigInt(quote.amounts.principal.raw);
+  const minRequiredCollateralRaw = BigInt(quote.amounts.collateral_required.raw);
+  let collateralAmountRaw = minRequiredCollateralRaw;
+
+  if (userCollateralRaw !== null && userCollateralRaw !== undefined && String(userCollateralRaw).trim() !== '') {
+    const provided = BigInt(userCollateralRaw);
+    if (provided < minRequiredCollateralRaw) {
+      throw new Error(
+        `Collateral raw amount (${provided}) is below API rounded-up minimum (${minRequiredCollateralRaw}).`
+      );
+    }
+    collateralAmountRaw = provided;
+  }
+
+  return {
+    principalRaw,
+    minRequiredCollateralRaw,
+    collateralAmountRaw,
+    originationFeeRaw: BigInt(quote.amounts.origination_fee?.raw ?? 0n),
+    netProceedsRaw: BigInt(quote.amounts.net_proceeds?.raw ?? 0n),
+    interestMaturityRaw: BigInt(quote.amounts.interest_maturity?.raw ?? 0n),
+    totalRepaymentAtMaturityRaw: BigInt(quote.amounts.total_repayment_at_maturity?.raw ?? 0n),
+  };
+}
+
+async function assertActiveWalletAndChain(provider, expectedAddress, expectedChainId) {
+  if (!provider || typeof provider.request !== 'function') {
+    throw new Error('No EIP-1193 wallet provider available.');
+  }
+  if (!expectedAddress || !isAddress(expectedAddress)) {
+    throw new Error('Connect a valid wallet address first.');
+  }
+  const wallet = getAddress(expectedAddress);
+  const rawChain = await provider.request({ method: 'eth_chainId' });
+  const walletChainId = parseChainIdHex(rawChain);
+  if (walletChainId !== expectedChainId) {
+    throw new Error(`Switch wallet to Base (${expectedChainId}) before signing or sending transactions.`);
+  }
+  const accounts = await provider.request({ method: 'eth_accounts' });
+  const active =
+    Array.isArray(accounts) && accounts[0] && isAddress(accounts[0])
+      ? getAddress(accounts[0])
+      : null;
+  if (!active || active.toLowerCase() !== wallet.toLowerCase()) {
+    throw new Error('Active wallet account does not match connected address.');
+  }
+  return wallet;
+}
+
+async function sendWalletTransaction(provider, publicClient, { from, to, data, value = 0n }) {
+  const txParams = {
+    from,
+    to,
+    data,
+    ...(value > 0n ? { value: toHex(value) } : {}),
+  };
+  const txHash = await provider.request({
+    method: 'eth_sendTransaction',
+    params: [txParams],
+  });
+  if (typeof txHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+    throw new Error('Wallet returned an invalid transaction hash.');
+  }
+  const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
+  if (receipt.status !== 'success') {
+    throw new Error(`Transaction ${txHash} reverted on-chain.`);
+  }
+  return { txHash, receipt };
+}
+
+export async function readBorrowAllowanceAndNonce(
+  address,
+  collateralToken,
+  { cfg = getFrontendConfig(), publicClient = createProtocolPublicClient(cfg) } = {}
+) {
+  if (!address || !isAddress(address)) {
+    throw new Error('Valid wallet address required.');
+  }
+  if (!collateralToken || !isAddress(collateralToken)) {
+    throw new Error('Valid collateral token address required.');
+  }
+  if (!cfg.contracts.collateralEscrow || !cfg.contracts.orderSettlement) {
+    throw new Error('Missing CollateralEscrow or OrderSettlement contract address in configuration.');
+  }
+  const wallet = getAddress(address);
+  const token = getAddress(collateralToken);
+
+  const [bal, allowance, dec, sym, nonce] = await Promise.all([
+    publicClient.readContract({ address: token, abi: erc20Abi, functionName: 'balanceOf', args: [wallet] }),
+    publicClient.readContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: 'allowance',
+      args: [wallet, cfg.contracts.collateralEscrow],
+    }),
+    publicClient.readContract({ address: token, abi: erc20Abi, functionName: 'decimals' }),
+    publicClient.readContract({ address: token, abi: erc20Abi, functionName: 'symbol' }),
+    publicClient.readContract({
+      address: cfg.contracts.orderSettlement,
+      abi: orderSettlementAbi,
+      functionName: 'getMakerNonce',
+      args: [wallet],
+    }),
+  ]);
+
+  const decimals = Number(dec);
+  return {
+    token,
+    symbol: sym,
+    decimals,
+    balanceRaw: bal.toString(),
+    balanceFormatted: formatTokenUnitsDisplay(bal, decimals, 6),
+    allowanceRaw: allowance.toString(),
+    allowanceFormatted: formatTokenUnitsDisplay(allowance, decimals, 6),
+    makerNonce: nonce.toString(),
+  };
+}
+
+export async function approveCollateralForBorrow({
+  address,
+  collateralToken,
+  requiredCollateralRaw,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!collateralToken || !isAddress(collateralToken)) {
+    throw new Error('Valid collateral token address required.');
+  }
+  if (!cfg.contracts.collateralEscrow) {
+    throw new Error('CollateralEscrow contract address is not configured.');
+  }
+  const required = BigInt(requiredCollateralRaw);
+  if (required <= 0n) {
+    throw new Error('Required collateral raw amount must be positive.');
+  }
+
+  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
+  const token = getAddress(collateralToken);
+  const escrow = getAddress(cfg.contracts.collateralEscrow);
+
+  const currentAllowance = BigInt(
+    await publicClient.readContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: 'allowance',
+      args: [wallet, escrow],
+    })
+  );
+  if (currentAllowance >= required) {
+    return {
+      approved: true,
+      alreadyApproved: true,
+      txHash: null,
+      allowanceRaw: currentAllowance.toString(),
+    };
+  }
+
+  const data = encodeFunctionData({
+    abi: erc20Abi,
+    functionName: 'approve',
+    args: [escrow, required],
+  });
+  const { txHash } = await sendWalletTransaction(provider, publicClient, {
+    from: wallet,
+    to: token,
+    data,
+  });
+
+  const postAllowance = BigInt(
+    await publicClient.readContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: 'allowance',
+      args: [wallet, escrow],
+    })
+  );
+  if (postAllowance < required) {
+    throw new Error('Post-approval allowance check failed; allowance still below required collateral.');
+  }
+
+  return {
+    approved: true,
+    alreadyApproved: false,
+    txHash,
+    allowanceRaw: postAllowance.toString(),
+  };
+}
+
+export function normalizeBorrowOrderStruct(order) {
+  return {
+    borrower: getAddress(order.borrower),
+    collateralToken: getAddress(order.collateralToken),
+    collateralAmount: BigInt(order.collateralAmount),
+    minUsdc: BigInt(order.minUsdc),
+    maxRateBps: Number(order.maxRateBps),
+    termDays: Number(order.termDays),
+    maxLtvBps: Number(order.maxLtvBps),
+    minFill: BigInt(order.minFill),
+    expiry: BigInt(order.expiry),
+    nonce: BigInt(order.nonce),
+    yieldMode: Number(order.yieldMode ?? 0),
+    allowInKindSettlement: Boolean(order.allowInKindSettlement),
+  };
+}
+
+export function borrowOrderToJson(order) {
+  const n = normalizeBorrowOrderStruct(order);
+  return {
+    borrower: n.borrower,
+    collateralToken: n.collateralToken,
+    collateralAmount: n.collateralAmount.toString(),
+    minUsdc: n.minUsdc.toString(),
+    maxRateBps: n.maxRateBps,
+    termDays: n.termDays,
+    maxLtvBps: n.maxLtvBps,
+    minFill: n.minFill.toString(),
+    expiry: n.expiry.toString(),
+    nonce: n.nonce.toString(),
+    yieldMode: n.yieldMode,
+    allowInKindSettlement: n.allowInKindSettlement,
+  };
+}
+
+export function buildBorrowOrderTypedData({ order, cfg = getFrontendConfig() }) {
+  if (!cfg?.contracts?.orderSettlement) {
+    throw new Error('OrderSettlement contract address is not configured.');
+  }
+  const message = normalizeBorrowOrderStruct(order);
+  return {
+    domain: {
+      name: ORDER_SETTLEMENT_DOMAIN_NAME,
+      version: ORDER_SETTLEMENT_DOMAIN_VERSION,
+      chainId: Number(cfg.chainId || BASE_CHAIN_ID),
+      verifyingContract: getAddress(cfg.contracts.orderSettlement),
+    },
+    types: BORROW_ORDER_EIP712_TYPES,
+    primaryType: 'BorrowOrder',
+    message,
+  };
+}
+
+function serializeTypedDataForRpc(typedData) {
+  return JSON.stringify(
+    {
+      types: {
+        EIP712Domain: [
+          { name: 'name', type: 'string' },
+          { name: 'version', type: 'string' },
+          { name: 'chainId', type: 'uint256' },
+          { name: 'verifyingContract', type: 'address' },
+        ],
+        ...typedData.types,
+      },
+      primaryType: typedData.primaryType,
+      domain: {
+        ...typedData.domain,
+        chainId: Number(typedData.domain.chainId),
+      },
+      message: typedData.message,
+    },
+    (_key, value) => (typeof value === 'bigint' ? value.toString() : value)
+  );
+}
+
+/**
+ * @param {{
+ *   address: string,
+ *   collateralToken: string,
+ *   principalRaw?: string | bigint | null,
+ *   collateralAmountRaw?: string | bigint | null,
+ *   maxRateBps: number,
+ *   termDays: number,
+ *   maxLtvBps?: number | null,
+ *   minFillRaw?: string | bigint | null,
+ *   expiryDays?: number,
+ *   expiryTimestamp?: string | bigint | number | null,
+ *   yieldMode?: number,
+ *   allowInKindSettlement?: boolean,
+ *   attestationHex?: string,
+ *   autoApprove?: boolean,
+ *   provider?: any,
+ *   cfg?: any,
+ *   publicClient?: any
+ * }} opts
+ */
+export async function prepareAndSignBorrowOrder({
+  address,
+  collateralToken,
+  principalRaw = null,
+  collateralAmountRaw = null,
+  maxRateBps,
+  termDays,
+  maxLtvBps = null,
+  minFillRaw = null,
+  expiryDays = 2,
+  expiryTimestamp = null,
+  yieldMode = 0,
+  allowInKindSettlement = false,
+  attestationHex = '0x',
+  autoApprove = true,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!cfg.contracts.orderSettlement || !cfg.contracts.collateralEscrow) {
+    throw new Error('OrderSettlement or CollateralEscrow address is not configured.');
+  }
+  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
+  const token = getAddress(collateralToken);
+
+  const quote = await fetchLoanQuote({
+    cfg,
+    asset: token,
+    principalRaw: principalRaw ? String(principalRaw) : undefined,
+    collateralAmountRaw: collateralAmountRaw ? String(collateralAmountRaw) : undefined,
+    termDays: Number(termDays),
+    aprBps: Number(maxRateBps),
+    maxLtvBps: maxLtvBps !== null && maxLtvBps !== undefined ? Number(maxLtvBps) : undefined,
+    borrower: wallet,
+    borrowerAttestation: attestationHex,
+  });
+
+  if (!quote.accepted) {
+    const reasons = (quote.rejection_reasons ?? []).map((r) => `${r.code}: ${r.message}`).join('; ');
+    throw new Error(`Quote rejected by on-chain protocol rules: ${reasons || 'Unknown rejection'}`);
+  }
+
+  const exact = resolveExactBorrowAmounts(quote, { userCollateralRaw: collateralAmountRaw });
+  const minFillBig = BigInt(minFillRaw ?? exact.principalRaw);
+  if (minFillBig < 500_000_000n) {
+    throw new Error('Minimum fill cannot be below $500.00 (500000000 raw USDC).');
+  }
+  if (minFillBig > exact.principalRaw) {
+    throw new Error('Minimum fill cannot exceed principal amount.');
+  }
+
+  const walletMeta = await readBorrowAllowanceAndNonce(wallet, token, { cfg, publicClient });
+  if (BigInt(walletMeta.balanceRaw) < exact.collateralAmountRaw) {
+    throw new Error(
+      `Insufficient ${walletMeta.symbol} balance: have ${walletMeta.balanceRaw} raw units, need ${exact.collateralAmountRaw.toString()} raw units.`
+    );
+  }
+
+  let approvalTxHash = null;
+  if (BigInt(walletMeta.allowanceRaw) < exact.collateralAmountRaw) {
+    if (!autoApprove) {
+      throw new Error('CollateralEscrow allowance is below required collateral; approve exact collateral first.');
+    }
+    const appRes = await approveCollateralForBorrow({
+      address: wallet,
+      collateralToken: token,
+      requiredCollateralRaw: exact.collateralAmountRaw,
+      provider,
+      cfg,
+      publicClient,
+    });
+    approvalTxHash = appRes.txHash;
+  }
+
+  let expiryBig;
+  if (expiryTimestamp !== null && expiryTimestamp !== undefined) {
+    expiryBig = BigInt(expiryTimestamp);
+  } else {
+    const expDaysInt = Number(expiryDays);
+    if (!Number.isInteger(expDaysInt) || expDaysInt < 1 || expDaysInt > 30) {
+      throw new Error('Order expiry must be between 1 and 30 days.');
+    }
+    const blk = await publicClient.getBlock();
+    expiryBig = blk.timestamp + BigInt(expDaysInt) * 86_400n;
+  }
+
+  const effectiveLtv = Number(quote.asset?.allowed_ltv_bps ?? maxLtvBps ?? 6000);
+  const order = normalizeBorrowOrderStruct({
+    borrower: wallet,
+    collateralToken: token,
+    collateralAmount: exact.collateralAmountRaw,
+    minUsdc: exact.principalRaw,
+    maxRateBps: Number(maxRateBps),
+    termDays: Number(termDays),
+    maxLtvBps: effectiveLtv,
+    minFill: minFillBig,
+    expiry: expiryBig,
+    nonce: BigInt(walletMeta.makerNonce),
+    yieldMode: Number(yieldMode ?? 0),
+    allowInKindSettlement: Boolean(allowInKindSettlement),
+  });
+
+  const typedData = buildBorrowOrderTypedData({ order, cfg });
+  const signature = await provider.request({
+    method: 'eth_signTypedData_v4',
+    params: [wallet, serializeTypedDataForRpc(typedData)],
+  });
+  if (typeof signature !== 'string' || !/^0x[0-9a-fA-F]+$/.test(signature)) {
+    throw new Error('Wallet returned an invalid EIP-712 signature.');
+  }
+
+  await assertActiveWalletAndChain(provider, wallet, cfg.chainId);
+
+  const orderHash = await publicClient.readContract({
+    address: getAddress(cfg.contracts.orderSettlement),
+    abi: orderSettlementAbi,
+    functionName: 'hashBorrowOrder',
+    args: [order],
+  });
+  const recovered = await recoverAddress({ hash: orderHash, signature });
+  if (recovered.toLowerCase() !== wallet.toLowerCase()) {
+    throw new Error(`Signature signer mismatch: recovered ${recovered}, expected ${wallet}.`);
+  }
+
+  return {
+    quote,
+    order,
+    orderJson: borrowOrderToJson(order),
+    orderHash,
+    signature: /** @type {`0x${string}`} */ (signature),
+    approvalTxHash,
+    exactAmounts: {
+      principalRaw: exact.principalRaw.toString(),
+      collateralAmountRaw: exact.collateralAmountRaw.toString(),
+      originationFeeRaw: exact.originationFeeRaw.toString(),
+      netProceedsRaw: exact.netProceedsRaw.toString(),
+      totalRepaymentAtMaturityRaw: exact.totalRepaymentAtMaturityRaw.toString(),
+    },
+  };
+}
+
+export async function cancelSignedBorrowOrder({
+  address,
+  order,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!cfg.contracts.orderSettlement) {
+    throw new Error('OrderSettlement contract address is not configured.');
+  }
+  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
+  const normalized = normalizeBorrowOrderStruct(order);
+  if (normalized.borrower.toLowerCase() !== wallet.toLowerCase()) {
+    throw new Error('Only the borrow order maker can cancel this order.');
+  }
+  const settlementAddr = getAddress(cfg.contracts.orderSettlement);
+  const orderHash = await publicClient.readContract({
+    address: settlementAddr,
+    abi: orderSettlementAbi,
+    functionName: 'hashBorrowOrder',
+    args: [normalized],
+  });
+  const data = encodeFunctionData({
+    abi: orderSettlementAbi,
+    functionName: 'cancelBorrowOrder',
+    args: [normalized],
+  });
+  const { txHash, receipt } = await sendWalletTransaction(provider, publicClient, {
+    from: wallet,
+    to: settlementAddr,
+    data,
+  });
+  return { txHash, receipt, orderHash };
+}
+
+/**
+ * @param {{
+ *   address: string,
+ *   offer: any,
+ *   signature: `0x${string}`,
+ *   collateralToken: string,
+ *   fillUsdcRaw: string | bigint,
+ *   collateralAmountRaw?: string | bigint | null,
+ *   borrowerAttestation?: string,
+ *   lenderAttestation?: string,
+ *   autoApprove?: boolean,
+ *   provider?: any,
+ *   cfg?: any,
+ *   publicClient?: any
+ * }} opts
+ */
+export async function fillLendOfferAsBorrower({
+  address,
+  offer,
+  signature,
+  collateralToken,
+  fillUsdcRaw,
+  collateralAmountRaw = null,
+  borrowerAttestation = '0x',
+  lenderAttestation = '0x',
+  autoApprove = true,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!cfg.contracts.orderSettlement || !cfg.contracts.collateralEscrow) {
+    throw new Error('OrderSettlement or CollateralEscrow address is not configured.');
+  }
+  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
+  const token = getAddress(collateralToken);
+  const settlementAddr = getAddress(cfg.contracts.orderSettlement);
+
+  const normalizedOffer = {
+    lender: getAddress(offer.lender),
+    usdcAmount: BigInt(offer.usdcAmount),
+    minRateBps: Number(offer.minRateBps),
+    termDays: Number(offer.termDays),
+    allowedCollateral: getAddress(offer.allowedCollateral),
+    maxLtvBps: Number(offer.maxLtvBps),
+    minFill: BigInt(offer.minFill),
+    expiry: BigInt(offer.expiry),
+    nonce: BigInt(offer.nonce),
+    yieldMode: Number(offer.yieldMode ?? 0),
+  };
+
+  if (
+    normalizedOffer.allowedCollateral !== zeroAddress &&
+    normalizedOffer.allowedCollateral.toLowerCase() !== token.toLowerCase()
+  ) {
+    throw new Error('Selected collateral token is not permitted by this lend offer.');
+  }
+
+  const fillUsdcBig = BigInt(fillUsdcRaw);
+  const quote = await fetchLoanQuote({
+    cfg,
+    asset: token,
+    principalRaw: fillUsdcBig.toString(),
+    collateralAmountRaw: collateralAmountRaw ? String(collateralAmountRaw) : undefined,
+    termDays: normalizedOffer.termDays,
+    aprBps: normalizedOffer.minRateBps,
+    maxLtvBps: normalizedOffer.maxLtvBps,
+    borrower: wallet,
+    lender: normalizedOffer.lender,
+    borrowerAttestation,
+    lenderAttestation,
+  });
+  if (!quote.accepted) {
+    const reasons = (quote.rejection_reasons ?? []).map((r) => `${r.code}: ${r.message}`).join('; ');
+    throw new Error(`Lend offer fill quote rejected: ${reasons || 'Unknown rejection'}`);
+  }
+
+  const exact = resolveExactBorrowAmounts(quote, { userCollateralRaw: collateralAmountRaw });
+  const walletMeta = await readBorrowAllowanceAndNonce(wallet, token, { cfg, publicClient });
+  if (BigInt(walletMeta.balanceRaw) < exact.collateralAmountRaw) {
+    throw new Error(
+      `Insufficient ${walletMeta.symbol} balance: have ${walletMeta.balanceRaw}, need ${exact.collateralAmountRaw.toString()}.`
+    );
+  }
+  if (BigInt(walletMeta.allowanceRaw) < exact.collateralAmountRaw) {
+    if (!autoApprove) {
+      throw new Error('CollateralEscrow allowance is below required collateral.');
+    }
+    await approveCollateralForBorrow({
+      address: wallet,
+      collateralToken: token,
+      requiredCollateralRaw: exact.collateralAmountRaw,
+      provider,
+      cfg,
+      publicClient,
+    });
+  }
+
+  const cleanBorrowerAtt =
+    typeof borrowerAttestation === 'string' && /^0x([0-9a-fA-F]{2})+$/.test(borrowerAttestation.trim())
+      ? borrowerAttestation.trim()
+      : '0x';
+  const cleanLenderAtt =
+    typeof lenderAttestation === 'string' && /^0x([0-9a-fA-F]{2})+$/.test(lenderAttestation.trim())
+      ? lenderAttestation.trim()
+      : '0x';
+  const useAttestations = cleanBorrowerAtt !== '0x' || cleanLenderAtt !== '0x';
+
+  const data = useAttestations
+    ? encodeFunctionData({
+        abi: orderSettlementAbi,
+        functionName: 'fillLendOfferWithAttestations',
+        args: [
+          normalizedOffer,
+          signature,
+          token,
+          exact.collateralAmountRaw,
+          fillUsdcBig,
+          cleanBorrowerAtt,
+          cleanLenderAtt,
+        ],
+      })
+    : encodeFunctionData({
+        abi: orderSettlementAbi,
+        functionName: 'fillLendOffer',
+        args: [normalizedOffer, signature, token, exact.collateralAmountRaw, fillUsdcBig],
+      });
+
+  const { txHash, receipt } = await sendWalletTransaction(provider, publicClient, {
+    from: wallet,
+    to: settlementAddr,
+    data,
+  });
+
+  let loanId = null;
+  for (const log of receipt.logs ?? []) {
+    if (log.address?.toLowerCase() !== settlementAddr.toLowerCase()) continue;
+    try {
+      const decoded = decodeEventLog({
+        abi: orderSettlementAbi,
+        data: log.data,
+        topics: log.topics,
+      });
+      if (decoded.eventName === 'OrderFilled' && decoded.args?.loanId !== undefined) {
+        loanId = decoded.args.loanId.toString();
+        break;
+      }
+    } catch {
+      // ignore non-matching logs
+    }
+  }
+
+  return {
+    txHash,
+    receipt,
+    loanId,
+    quote,
+    exact,
+    collateralAmountRaw: exact.collateralAmountRaw.toString(),
+    fillUsdcRaw: fillUsdcBig.toString(),
   };
 }

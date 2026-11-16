@@ -1,5 +1,5 @@
 import { type Address, type Hex, getAddress, isAddress } from 'viem';
-import { z } from 'zod';
+import { z } from 'zod/v3';
 
 /**
  * Zod validator requiring strictly EIP-55 checksummed EVM addresses.

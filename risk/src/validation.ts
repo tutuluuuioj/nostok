@@ -1,5 +1,5 @@
 import { type Address, getAddress, isAddress } from 'viem';
-import { z } from 'zod';
+import { z } from 'zod/v3';
 
 export const checksumAddressSchema = z
   .string()

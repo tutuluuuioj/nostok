@@ -1,4 +1,4 @@
-import { Page } from '../components/ui.jsx';
+import { Page, PreviewBanner } from '../components/ui.jsx';
 import { useStore } from '../store.jsx';
 
 export function Builders() {
@@ -8,8 +8,11 @@ export function Builders() {
     <Page
       kicker="Builders"
       title="One order format."
-      lede="Wallets and agents use the same signing path and the same eligibility gate as a person. Orders are public. Any interface can fill them. The contracts are the source of truth."
+      lede="Wallets and agents use the same EIP-712 signing path and the same EligibilityGate as a person. Orders are public. Any interface can fill them. The contracts are the source of truth."
     >
+      <PreviewBanner>
+        The JSON example below uses preview book figures for schema illustration, not live orders or your positions.
+      </PreviewBanner>
       <section className="block">
         <h2>Borrow order</h2>
         <p>Borrower, stock token, raw collateral amount, minimum USDC, maximum rate, term in days, maximum LTV, minimum fill, expiry, nonce, yield mode, in-kind flag, and an eligibility proof when the gate requires one.</p>
@@ -19,8 +22,8 @@ export function Builders() {
         <p>Lender, USDC amount, minimum rate, term, allowed stocks, maximum LTV, expiry, nonce, and yield mode. Yield is off unless both the order and the fill turn it on.</p>
       </section>
       <section className="block">
-        <h2>A public order</h2>
-        <p className="hint">This is the preview book, not a signed EIP-712 payload. A live order carries the signature beside these fields.</p>
+        <h2>Illustrative order fields (preview sample)</h2>
+        <p className="hint">This is a static preview book sample, not a signed EIP-712 payload. A live signed order uses raw base units (6 decimals for USDC, token decimals for collateral) plus the EIP-712 signature.</p>
         <pre className="json">{JSON.stringify({
           id: sample.id,
           side: sample.side,

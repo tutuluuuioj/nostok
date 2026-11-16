@@ -5,18 +5,26 @@ import { formatApr, formatHundredths, formatUsd } from './format.js';
 import {
   BASE_CHAIN_ID,
   BASE_USDC_ADDRESS,
+  buildContentSecurityPolicy,
   getFrontendConfig,
   setFrontendConfigOverrides,
 } from './contracts.js';
 import {
   buildBookSummary,
+  buildDataMetricRows,
+  buildProtocolFeeCards,
+  buildRiskSummaryRows,
   formatApiAmount,
   formatBpsPercent,
   parseDecimalToRaw,
   parsePercentToBps,
 } from './marketsApi.js';
 import { termSheet } from './money.js';
-import { formatTokenUnitsDisplay, verifySiweChallengeParams } from './web3.js';
+import {
+  formatTokenUnitsDisplay,
+  resolveExactBorrowAmounts,
+  verifySiweChallengeParams,
+} from './web3.js';
 
 const state = freshState();
 const nvda = state.loans.find((loan) => loan.id === '1842');
@@ -173,6 +181,133 @@ assert.throws(() => {
   setFrontendConfigOverrides({ ...baseProdCfg, isFork: false, usdcAddress: '0x9999999999999999999999999999999999999999' });
   getFrontendConfig();
 }, /prohibited outside fork/i);
+
+// Fix #2: Production MUST ignore VITE_IS_FORK / FORK and keep BASE_USDC_ADDRESS pinned
+const prevViteFork = process.env.VITE_IS_FORK;
+const prevFork = process.env.FORK;
+try {
+  process.env.VITE_IS_FORK = 'true';
+  process.env.FORK = 'true';
+  setFrontendConfigOverrides({ ...baseProdCfg, isFork: true });
+  const prodWithForkFlags = getFrontendConfig();
+  assert.equal(prodWithForkFlags.isProd, true);
+  assert.equal(prodWithForkFlags.isFork, false);
+  assert.equal(prodWithForkFlags.usdcAddress, BASE_USDC_ADDRESS);
+
+  assert.throws(() => {
+    setFrontendConfigOverrides({
+      ...baseProdCfg,
+      isFork: true,
+      usdcAddress: '0x9999999999999999999999999999999999999999',
+    });
+    getFrontendConfig();
+  }, /prohibited outside fork/i);
+} finally {
+  if (prevViteFork === undefined) delete process.env.VITE_IS_FORK;
+  else process.env.VITE_IS_FORK = prevViteFork;
+  if (prevFork === undefined) delete process.env.FORK;
+  else process.env.FORK = prevFork;
+}
+
+assert.throws(() => {
+  setFrontendConfigOverrides({ ...baseProdCfg, riskUrl: 'http://risk.nostok.xyz' });
+  getFrontendConfig();
+}, /https:\/\//);
+
+// Low CSP: exact origins instead of https: wildcard
+const prodCspHeader = buildContentSecurityPolicy(baseProdCfg);
+assert.ok(!/connect-src[^;]*\shttps:(?:\s|;|$)/.test(prodCspHeader), 'Prod CSP must not use https: wildcard');
+assert.ok(!prodCspHeader.includes('127.0.0.1'), 'Prod CSP must not allow loopback');
+assert.ok(prodCspHeader.includes('https://base-mainnet.private-rpc.example'));
+assert.ok(prodCspHeader.includes('https://api.nostok.xyz'));
+assert.ok(prodCspHeader.includes('https://notifications.nostok.xyz'));
+assert.ok(prodCspHeader.includes('https://risk.nostok.xyz'));
+assert.ok(prodCspHeader.includes("frame-ancestors 'none'"));
+const prodCspMeta = buildContentSecurityPolicy(baseProdCfg, { includeFrameAncestors: false });
+assert.ok(!prodCspMeta.includes('frame-ancestors'));
+
+// Low Data.jsx: '+' suffix on every loan/order/auction count & sum when loansTruncated=true
+const truncSummary = buildBookSummary(
+  [{ caps: { global_usdc_cap: { raw: '1000000000', decimals: 6, symbol: 'USDC' }, global_remaining: { raw: '500000000', decimals: 6, symbol: 'USDC' } } }],
+  [{ order_type: 'borrow', cancelled: false, status: 'open' }],
+  [
+    { status: 0, principal: { raw: '500000000' }, principal_repaid: { raw: '0' }, rate_bps: 800, bad_debt_shortfall: { raw: '0' } },
+    { status: 3, principal: { raw: '600000000' }, principal_repaid: { raw: '600000000' }, rate_bps: 700, bad_debt_shortfall: { raw: '1000000' } },
+  ],
+  [{ status: 0 }],
+  { loansTruncated: true }
+);
+const dataRows = buildDataMetricRows(
+  truncSummary,
+  { orders: [{ order_type: 'borrow', cancelled: false, status: 'open' }], fetchedAt: '2026-11-16T00:00:00Z' },
+  { last_indexed_block: 10, chain_head_block: 10, lag_blocks: 0, freshness_timestamp: '2026-11-16T00:00:00Z' }
+);
+const rowMap = Object.fromEntries(dataRows.map((r) => [r.label, r.value]));
+assert.match(rowMap['Outstanding principal'], /\+$/);
+assert.match(rowMap['Total originated (indexed)'], /\+$/);
+assert.match(rowMap['Active loans (status 0)'], /^\d+\+$/);
+assert.match(rowMap['Loans in grace (status 1)'], /^\d+\+$/);
+assert.match(rowMap['Loans in auction (status 2)'], /^\d+\+$/);
+assert.equal(rowMap['Repaid / defaulted / liquidated'], '1+ / 0+ / 0+');
+assert.match(rowMap['Active liquidation auctions'], /^\d+\+$/);
+assert.match(rowMap['Indexed orders (active / total)'], /^\d+\+ \/ \d+\+$/);
+assert.match(rowMap['Realized bad debt shortfall'], /\+$/);
+
+// Fix #5 & Low Fees: risk summary exposes monitor_degraded, last_scan_error, last_scan_timestamp + fee cards from API
+const riskRows = buildRiskSummaryRows({
+  status: 'degraded',
+  monitor_degraded: true,
+  last_scan_error: 'Oracle RPC timeout',
+  last_scan_timestamp: '2026-11-16T12:00:00.000Z',
+  chain_head_block: 42000000,
+  market_open: false,
+  protocol_paused: false,
+  global_usdc_cap: { raw: '1000000000', decimals: 6, symbol: 'USDC' },
+  total_outstanding_principal: { raw: '500000000', decimals: 6, symbol: 'USDC' },
+  loan_counts: { healthy: 1, margin_call: 0, near_liquidation: 0, liquidatable: 0, unknown: 2 },
+});
+const riskMap = Object.fromEntries(riskRows.map((r) => [r.label, r.value]));
+assert.equal(riskMap['Monitor degraded (monitor_degraded)'], 'true (degraded)');
+assert.equal(riskMap['Last scan error (last_scan_error)'], 'Oracle RPC timeout');
+assert.equal(riskMap['Last scan timestamp (last_scan_timestamp)'], '2026-11-16T12:00:00.000Z');
+assert.match(riskMap['Loans by risk (H / MC / NL / Liq / Unk)'], /\/ 2$/);
+
+const feeCards = buildProtocolFeeCards({
+  origination_fee_bps: 30,
+  max_origination_bps: 200,
+  interest_cut_bps: 1000,
+  max_interest_cut_bps: 2000,
+  liquidation_fee_bps: 500,
+  max_liquidation_bps: 1000,
+  safety_reserve_share_bps: 2500,
+});
+assert.equal(feeCards.length, 4);
+assert.match(feeCards[0].detail, /0\.30% of principal\. Hard cap 2\.00%/);
+assert.match(feeCards[3].detail, /25\.00% of collected protocol fees/);
+
+// WS3.3: resolveExactBorrowAmounts always uses exact/rounded-up raw API values, never floored display strings
+const quoteSample = {
+  amounts: {
+    principal: { raw: '700000000', formatted: '700', decimals: 6, symbol: 'USDC' },
+    collateral_required: { raw: '8333333333333333334', formatted: '8.333333', decimals: 18, symbol: 'bNVDA' },
+    origination_fee: { raw: '2100000', formatted: '2.1', decimals: 6, symbol: 'USDC' },
+    net_proceeds: { raw: '697900000', formatted: '697.9', decimals: 6, symbol: 'USDC' },
+    interest_maturity: { raw: '4602740', formatted: '4.60274', decimals: 6, symbol: 'USDC' },
+    total_repayment_at_maturity: { raw: '704602740', formatted: '704.60274', decimals: 6, symbol: 'USDC' },
+  },
+};
+const resolvedDefault = resolveExactBorrowAmounts(quoteSample);
+assert.equal(resolvedDefault.principalRaw, 700000000n);
+assert.equal(resolvedDefault.minRequiredCollateralRaw, 8333333333333333334n);
+assert.equal(resolvedDefault.collateralAmountRaw, 8333333333333333334n);
+assert.throws(
+  () => resolveExactBorrowAmounts(quoteSample, { userCollateralRaw: '8333333000000000000' }),
+  /below API rounded-up minimum/i
+);
+assert.equal(
+  resolveExactBorrowAmounts(quoteSample, { userCollateralRaw: '9000000000000000000' }).collateralAmountRaw,
+  9000000000000000000n
+);
 
 setFrontendConfigOverrides({});
 

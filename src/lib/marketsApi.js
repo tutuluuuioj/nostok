@@ -2,10 +2,13 @@ import { formatUnits, getAddress, isAddress } from 'viem';
 import { USDC_DECIMALS, getFrontendConfig } from './contracts.js';
 import {
   fetchJsonStrict,
+  fetchLoanQuote,
   fetchPaginatedApiRows,
   formatTokenUnitsDisplay,
   formatWeb3Error,
 } from './web3.js';
+
+export { fetchLoanQuote };
 
 function addThousandsCommas(intStr) {
   return String(intStr).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
@@ -86,7 +89,13 @@ export function formatRawUsdc(raw, opts = {}) {
   );
 }
 
-export function buildBookSummary(assets, orders, loans, auctions, { loansTruncated = false } = {}) {
+export function buildBookSummary(
+  assets,
+  orders,
+  loans,
+  auctions,
+  { loansTruncated = false, ordersTruncated = false, auctionsTruncated = false } = {}
+) {
   const safeAssets = Array.isArray(assets) ? assets : [];
   const safeOrders = Array.isArray(orders) ? orders : [];
   const safeLoans = Array.isArray(loans) ? loans : [];
@@ -179,7 +188,136 @@ export function buildBookSummary(assets, orders, loans, auctions, { loansTruncat
     activeOrdersCount,
     activeAuctionsCount,
     loansTruncated,
+    ordersTruncated,
+    auctionsTruncated,
   };
+}
+
+export function buildDataMetricRows(summary, data, health) {
+  const unavailable = !summary || Boolean(data?.error && !health);
+  const loanPlus = summary?.loansTruncated ? '+' : '';
+  const ordersPlus = summary?.ordersTruncated || summary?.loansTruncated ? '+' : '';
+  const auctionsPlus = summary?.auctionsTruncated || summary?.loansTruncated ? '+' : '';
+
+  return [
+    {
+      label: 'Outstanding principal',
+      value: unavailable
+        ? 'Unavailable'
+        : `${formatApiAmount(summary.totalOutstandingUsdc, { prefixUsd: true, showSymbol: true })}${loanPlus}`,
+    },
+    {
+      label: 'Global USDC cap / remaining',
+      value: unavailable || !summary.globalCapUsdc
+        ? 'Unavailable'
+        : `${formatApiAmount(summary.globalCapUsdc, { prefixUsd: true })} / ${formatApiAmount(summary.globalRemainingUsdc, { prefixUsd: true })}`,
+    },
+    {
+      label: 'Total originated (indexed)',
+      value: unavailable
+        ? 'Unavailable'
+        : `${formatApiAmount(summary.totalOriginatedUsdc, { prefixUsd: true, showSymbol: true })}${loanPlus}`,
+    },
+    {
+      label: 'Active loans (status 0)',
+      value: unavailable ? 'Unavailable' : `${summary.activeLoansCount}${loanPlus}`,
+    },
+    {
+      label: 'Loans in grace (status 1)',
+      value: unavailable ? 'Unavailable' : `${summary.graceLoansCount}${loanPlus}`,
+    },
+    {
+      label: 'Loans in auction (status 2)',
+      value: unavailable ? 'Unavailable' : `${summary.auctionLoansCount}${loanPlus}`,
+    },
+    {
+      label: 'Repaid / defaulted / liquidated',
+      value: unavailable
+        ? 'Unavailable'
+        : `${summary.repaidLoansCount}${loanPlus} / ${summary.settledDefaultCount}${loanPlus} / ${summary.settledLiquidatedCount}${loanPlus}`,
+    },
+    {
+      label: 'Active liquidation auctions',
+      value: unavailable ? 'Unavailable' : `${summary.activeAuctionsCount}${auctionsPlus}`,
+    },
+    {
+      label: 'Indexed orders (active / total)',
+      value: unavailable
+        ? 'Unavailable'
+        : `${summary.activeOrdersCount}${ordersPlus} / ${(data?.orders ?? []).length}${ordersPlus}`,
+    },
+    {
+      label: 'Weighted average APR (open book)',
+      value: unavailable ? 'Unavailable' : formatBpsPercent(summary.weightedAverageAprBps),
+    },
+    {
+      label: 'Realized bad debt shortfall',
+      value: unavailable
+        ? 'Unavailable'
+        : `${formatApiAmount(summary.badDebtUsdc, { prefixUsd: true, showSymbol: true })}${loanPlus}`,
+    },
+    {
+      label: 'Indexed block / chain head',
+      value: health
+        ? `#${health.last_indexed_block ?? '—'} / #${health.chain_head_block ?? '—'} (lag ${health.lag_blocks ?? '—'})`
+        : 'Unavailable',
+    },
+    {
+      label: 'Snapshot timestamp',
+      value: health?.freshness_timestamp ?? data?.fetchedAt ?? 'Unavailable',
+    },
+  ];
+}
+
+export function buildRiskSummaryRows(risk) {
+  if (!risk) return [];
+  return [
+    { label: 'Monitor status', value: risk.status ?? '—' },
+    { label: 'Monitor degraded (monitor_degraded)', value: risk.monitor_degraded ? 'true (degraded)' : 'false' },
+    { label: 'Last scan error (last_scan_error)', value: risk.last_scan_error || 'None' },
+    { label: 'Last scan timestamp (last_scan_timestamp)', value: risk.last_scan_timestamp || '—' },
+    { label: 'Chain head block', value: `#${risk.chain_head_block ?? '—'}` },
+    {
+      label: 'Equity market open',
+      value: risk.market_open === null || risk.market_open === undefined ? '—' : risk.market_open ? 'Open' : 'Closed',
+    },
+    {
+      label: 'Protocol paused',
+      value: risk.protocol_paused === null || risk.protocol_paused === undefined ? '—' : risk.protocol_paused ? 'Paused' : 'Active',
+    },
+    {
+      label: 'Global cap / outstanding',
+      value: `${formatApiAmount(risk.global_usdc_cap, { prefixUsd: true })} / ${formatApiAmount(risk.total_outstanding_principal, { prefixUsd: true })}`,
+    },
+    {
+      label: 'Loans by risk (H / MC / NL / Liq / Unk)',
+      value: risk.loan_counts
+        ? `${risk.loan_counts.healthy} / ${risk.loan_counts.margin_call} / ${risk.loan_counts.near_liquidation} / ${risk.loan_counts.liquidatable} / ${risk.loan_counts.unknown ?? 0}`
+        : '—',
+    },
+  ];
+}
+
+export function buildProtocolFeeCards(fees) {
+  if (!fees) return [];
+  return [
+    {
+      name: 'Origination',
+      detail: `Borrower. ${formatBpsPercent(fees.origination_fee_bps)} of principal. Hard cap ${formatBpsPercent(fees.max_origination_bps)}. Taken from proceeds at fill.`,
+    },
+    {
+      name: 'Interest cut',
+      detail: `Lender. ${formatBpsPercent(fees.interest_cut_bps)} of interest. Hard cap ${formatBpsPercent(fees.max_interest_cut_bps)}. Taken at repayment.`,
+    },
+    {
+      name: 'Liquidation',
+      detail: `Borrower, from proceeds. ${formatBpsPercent(fees.liquidation_fee_bps)} of collateral sold. Hard cap ${formatBpsPercent(fees.max_liquidation_bps)}. Includes the keeper reward.`,
+    },
+    {
+      name: 'Safety reserve share',
+      detail: `Protocol split. ${formatBpsPercent(fees.safety_reserve_share_bps)} of collected protocol fees routed to safety reserve.`,
+    },
+  ];
 }
 
 /**
@@ -209,6 +347,7 @@ export async function fetchMarketSnapshot({
       error: 'VITE_API_URL is not configured.',
       fetchedAt,
       health: null,
+      fees: null,
       assets: [],
       orders: [],
       loans: [],
@@ -257,7 +396,11 @@ export async function fetchMarketSnapshot({
       ordersRes.rows,
       loansRes.rows,
       auctionsRes.rows,
-      { loansTruncated: loansRes.truncated }
+      {
+        loansTruncated: loansRes.truncated,
+        ordersTruncated: ordersRes.truncated,
+        auctionsTruncated: auctionsRes.truncated,
+      }
     );
 
     return {
@@ -267,6 +410,7 @@ export async function fetchMarketSnapshot({
       error: statusReason,
       fetchedAt,
       health: healthRes,
+      fees: assetsRes.fees ?? null,
       assets: assetsRes.rows,
       orders: ordersRes.rows,
       loans: loansRes.rows,
@@ -281,6 +425,7 @@ export async function fetchMarketSnapshot({
       error: `Failed to fetch live market data: ${formatWeb3Error(err)}`,
       fetchedAt,
       health: null,
+      fees: null,
       assets: [],
       orders: [],
       loans: [],
@@ -331,67 +476,4 @@ export async function fetchRiskSummaryOptional(cfg = getFrontendConfig()) {
   } catch (err) {
     return { data: null, error: formatWeb3Error(err) };
   }
-}
-
-/**
- * @param {{
- *   cfg?: any,
- *   asset: string,
- *   principalRaw?: string | null,
- *   collateralAmountRaw?: string | null,
- *   termDays: number,
- *   aprBps: number,
- *   maxLtvBps?: number | string | null,
- *   borrower?: string | null,
- *   lender?: string | null,
- *   borrowerAttestation?: string | null,
- *   lenderAttestation?: string | null
- * }} opts
- */
-export async function fetchLoanQuote({
-  cfg = getFrontendConfig(),
-  asset,
-  principalRaw,
-  collateralAmountRaw,
-  termDays,
-  aprBps,
-  maxLtvBps,
-  borrower,
-  lender,
-  borrowerAttestation,
-  lenderAttestation,
-}) {
-  if (!cfg?.apiUrl) {
-    throw new Error('VITE_API_URL is not configured.');
-  }
-  if (!asset || !isAddress(asset)) {
-    throw new Error('Select a valid registered collateral asset.');
-  }
-  if (!principalRaw && !collateralAmountRaw) {
-    throw new Error('Enter either a USDC principal amount or a collateral token amount.');
-  }
-
-  const params = new URLSearchParams();
-  params.set('asset', getAddress(asset));
-  if (principalRaw) params.set('principal', String(principalRaw));
-  if (collateralAmountRaw) params.set('collateral_amount', String(collateralAmountRaw));
-  params.set('term_days', String(termDays));
-  params.set('apr_bps', String(aprBps));
-  if (maxLtvBps !== undefined && maxLtvBps !== null && maxLtvBps !== '') {
-    params.set('max_ltv_bps', String(maxLtvBps));
-  }
-  if (borrower && isAddress(borrower)) {
-    params.set('borrower', getAddress(borrower));
-  }
-  if (lender && isAddress(lender)) {
-    params.set('lender', getAddress(lender));
-  }
-  if (borrowerAttestation && /^0x([0-9a-fA-F]{2})+$/.test(borrowerAttestation.trim())) {
-    params.set('borrower_attestation', borrowerAttestation.trim());
-  }
-  if (lenderAttestation && /^0x([0-9a-fA-F]{2})+$/.test(lenderAttestation.trim())) {
-    params.set('lender_attestation', lenderAttestation.trim());
-  }
-
-  return fetchJsonStrict(`${cfg.apiUrl}/quote?${params.toString()}`);
 }

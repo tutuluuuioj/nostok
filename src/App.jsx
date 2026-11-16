@@ -1,6 +1,8 @@
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
 import { Gate, Restricted } from './components/Gate.jsx';
 import { Shell } from './components/Shell.jsx';
+import { ErrorBoundary } from './components/ui.jsx';
+import { getFrontendConfig } from './lib/contracts.js';
 import { Alerts } from './pages/Alerts.jsx';
 import { Borrow } from './pages/Borrow.jsx';
 import { Builders } from './pages/Builders.jsx';
@@ -29,6 +31,7 @@ function Frame() {
         <Route path="/lend" element={<Lend />} />
         <Route path="/loans" element={<Loans />} />
         <Route path="/loans/:id" element={<Loan />} />
+        <Route path="/loan/:id" element={<Loan />} />
         <Route path="/positions" element={<Positions />} />
         <Route path="/risk" element={<Risk />} />
         <Route path="/data" element={<Data />} />
@@ -43,11 +46,19 @@ function Frame() {
 }
 
 export function App() {
+  let configError = null;
+  try {
+    getFrontendConfig();
+  } catch (err) {
+    configError = err instanceof Error ? err : new Error(String(err));
+  }
   return (
-    <StoreProvider>
-      <BrowserRouter>
-        <Frame />
-      </BrowserRouter>
-    </StoreProvider>
+    <ErrorBoundary initialError={configError}>
+      <StoreProvider>
+        <BrowserRouter>
+          <Frame />
+        </BrowserRouter>
+      </StoreProvider>
+    </ErrorBoundary>
   );
 }

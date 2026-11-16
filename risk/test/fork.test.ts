@@ -1657,6 +1657,40 @@ async function runTests(): Promise<void> {
           false,
           'Missing getLoan() read must NOT emit false escrow_mismatch'
         );
+        const persistKey = `loan_risk:${unknownLoanSnap.loan_id}:unknown_persistent`;
+        assert.equal(
+          lfCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === persistKey),
+          false,
+          'First unknown scan must not yet fire persistent-unknown alert'
+        );
+
+        // Scans 2 and 3 while getLoan() continues failing -> operator alert must fire at scan 3
+        t += 5_000;
+        await runRiskScan(lfCtx, t);
+        assert.equal(
+          lfCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === persistKey),
+          false,
+          'Second unknown scan must not yet fire persistent-unknown alert (threshold=3)'
+        );
+        t += 5_000;
+        await runRiskScan(lfCtx, t);
+        const persistAlert = lfCtx.alerts.getActiveAlerts().find((a) => a.dedup_key === persistKey);
+        assert.ok(
+          persistAlert,
+          'Loan remaining unknown for 3 consecutive scans MUST emit loan_risk:<id>:unknown_persistent operator alert'
+        );
+        assert.equal(persistAlert.severity, 'warning');
+
+        // Recover getLoan() -> persistent-unknown alert must resolve automatically
+        failGetLoan = false;
+        t += 5_000;
+        await runRiskScan(lfCtx, t);
+        assert.equal(
+          lfCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === persistKey),
+          false,
+          'Persistent-unknown alert must resolve once getLoan() recovers'
+        );
+        assert.equal(lfCtx.state.unknownLoanConsecutiveScans.size, 0);
       } finally {
         failGetLoan = false;
         await new Promise<void>((resolve) => loanFailProxy.close(() => resolve()));

@@ -1,7 +1,7 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { type Address, type Chain, type PublicClient, type Transport, createPublicClient, defineChain, getAddress, http as viemHttp } from 'viem';
 import { base } from 'viem/chains';
-import { ZodError } from 'zod';
+import { ZodError } from 'zod/v3';
 import {
   ASSET_STATUS_NAMES,
   AUCTION_STATUS_NAMES,
@@ -10,6 +10,7 @@ import {
   OracleState,
   assetRegistryAbi,
   erc20MetaAbi,
+  feeCollectorAbi,
   loanCoreAbi,
   oracleRouterAbi,
 } from './abi.js';
@@ -43,10 +44,21 @@ interface AssetLiveSnapshot {
   liveStatus: number | null;
 }
 
+interface ProtocolFeesSnapshot {
+  origination_fee_bps: number;
+  max_origination_bps: number;
+  interest_cut_bps: number;
+  max_interest_cut_bps: number;
+  liquidation_fee_bps: number;
+  max_liquidation_bps: number;
+  safety_reserve_share_bps: number;
+}
+
 interface AssetsBlockCacheEntry {
   blockNumber: bigint;
   globalCap: bigint;
   totalOutstanding: bigint;
+  fees: ProtocolFeesSnapshot;
   perAsset: Map<string, AssetLiveSnapshot>;
 }
 
@@ -1030,6 +1042,41 @@ async function fetchLiveAssetsStateForBlock(
       abi: loanCoreAbi,
       functionName: 'totalOutstandingPrincipal',
     } as const,
+    {
+      address: ctx.config.feeCollector,
+      abi: feeCollectorAbi,
+      functionName: 'originationFeeBps',
+    } as const,
+    {
+      address: ctx.config.feeCollector,
+      abi: feeCollectorAbi,
+      functionName: 'interestCutBps',
+    } as const,
+    {
+      address: ctx.config.feeCollector,
+      abi: feeCollectorAbi,
+      functionName: 'liquidationFeeBps',
+    } as const,
+    {
+      address: ctx.config.feeCollector,
+      abi: feeCollectorAbi,
+      functionName: 'safetyReserveShareBps',
+    } as const,
+    {
+      address: ctx.config.feeCollector,
+      abi: feeCollectorAbi,
+      functionName: 'MAX_ORIGINATION_BPS',
+    } as const,
+    {
+      address: ctx.config.feeCollector,
+      abi: feeCollectorAbi,
+      functionName: 'MAX_INTEREST_CUT_BPS',
+    } as const,
+    {
+      address: ctx.config.feeCollector,
+      abi: feeCollectorAbi,
+      functionName: 'MAX_LIQUIDATION_BPS',
+    } as const,
     ...tokens.flatMap((tokenAddr) => [
       {
         address: ctx.config.assetRegistry,
@@ -1085,16 +1132,37 @@ async function fetchLiveAssetsStateForBlock(
   if (results[0].status === 'failure' || results[1].status === 'failure') {
     throw new RpcUnavailableError('LoanCore cap read failed on /assets');
   }
+  if (
+    results[2].status === 'failure' ||
+    results[3].status === 'failure' ||
+    results[4].status === 'failure' ||
+    results[5].status === 'failure' ||
+    results[6].status === 'failure' ||
+    results[7].status === 'failure' ||
+    results[8].status === 'failure'
+  ) {
+    throw new RpcUnavailableError('FeeCollector read failed on /assets');
+  }
 
   const globalCap = results[0].result as bigint;
   const totalOutstanding = results[1].result as bigint;
+  const fees: ProtocolFeesSnapshot = {
+    origination_fee_bps: Number(results[2].result),
+    interest_cut_bps: Number(results[3].result),
+    liquidation_fee_bps: Number(results[4].result),
+    safety_reserve_share_bps: Number(results[5].result),
+    max_origination_bps: Number(results[6].result),
+    max_interest_cut_bps: Number(results[7].result),
+    max_liquidation_bps: Number(results[8].result),
+  };
   const perAsset = new Map<string, AssetLiveSnapshot>(
     existing && existing.blockNumber === chainHead ? existing.perAsset : undefined
   );
 
+  const ASSETS_OFFSET = 9;
   const STRIDE = 6;
   for (let i = 0; i < tokens.length; i++) {
-    const baseIdx = 2 + i * STRIDE;
+    const baseIdx = ASSETS_OFFSET + i * STRIDE;
     const tokenAddr = tokens[i];
     const supportedRes = results[baseIdx];
     const assetOutRes = results[baseIdx + 1];
@@ -1150,6 +1218,7 @@ async function fetchLiveAssetsStateForBlock(
     blockNumber: chainHead,
     globalCap,
     totalOutstanding,
+    fees,
     perAsset,
   };
   ctx.assetBlockCache = cacheEntry;
@@ -1242,7 +1311,7 @@ async function handleAssets(ctx: ApiContext, queryObj: Record<string, string>) {
 
   const pageTokens = rowsRes.rows.map((r) => getAddress(r.token));
   const liveSnapshot = await fetchLiveAssetsStateForBlock(ctx, pageTokens, chainHead);
-  const { globalCap, totalOutstanding, perAsset } = liveSnapshot;
+  const { globalCap, totalOutstanding, fees, perAsset } = liveSnapshot;
 
   const data = rowsRes.rows.map((r) => {
     const tokenAddr = getAddress(r.token);
@@ -1317,8 +1386,29 @@ async function handleAssets(ctx: ApiContext, queryObj: Record<string, string>) {
     body: {
       ...meta,
       live_block_number: chainHead.toString(),
+      fees,
       pagination: buildPaginationEnvelope(pag.limit, pag.offset, data.length, total),
       data,
+    },
+  };
+}
+
+async function handleFees(ctx: ApiContext) {
+  const meta = await getSnapshotMeta(ctx);
+  let chainHead: bigint;
+  try {
+    chainHead = await ctx.publicClient.getBlockNumber();
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new RpcUnavailableError(`Failed to fetch chain head on /fees: ${reason}`);
+  }
+  const liveSnapshot = await fetchLiveAssetsStateForBlock(ctx, [], chainHead);
+  return {
+    statusCode: 200,
+    body: {
+      ...meta,
+      live_block_number: chainHead.toString(),
+      fees: liveSnapshot.fees,
     },
   };
 }
@@ -1399,6 +1489,12 @@ export function createApiServer(ctx: ApiContext): http.Server {
         return;
       }
 
+      if (pathname === '/fees' && req.method === 'GET') {
+        const result = await handleFees(ctx);
+        sendJson(res, result.statusCode, result.body);
+        return;
+      }
+
       if (pathname === '/quote' && (req.method === 'GET' || req.method === 'POST')) {
         const rawInput =
           req.method === 'GET' ? queryObj : await readJsonBody(req, ctx.config.maxBodyBytes);
@@ -1413,7 +1509,7 @@ export function createApiServer(ctx: ApiContext): http.Server {
         return;
       }
 
-      const knownPaths = new Set(['/health', '/orders', '/loans', '/positions', '/auctions', '/assets', '/quote']);
+      const knownPaths = new Set(['/health', '/orders', '/loans', '/positions', '/auctions', '/assets', '/fees', '/quote']);
       if (knownPaths.has(pathname)) {
         throw new HttpError(405, 'METHOD_NOT_ALLOWED', `Method ${req.method ?? 'UNKNOWN'} not allowed on ${pathname}`);
       }

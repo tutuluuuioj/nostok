@@ -40,6 +40,14 @@ export function Markets() {
   const [quoteError, setQuoteError] = useState('');
   const quoteSeqRef = useRef(0);
 
+  const updateQuoteField = useCallback((setter) => (value) => {
+    quoteSeqRef.current += 1;
+    setQuoteLoading(false);
+    setQuoteResult(null);
+    setQuoteError('');
+    setter(value);
+  }, []);
+
   const loadMarkets = useCallback(async () => {
     const requestId = ++reqSeqRef.current;
     setSnapshot((prev) => ({ loading: true, data: prev.data }));
@@ -132,8 +140,8 @@ export function Markets() {
     }
 
     const termDays = Number(quoteTermDays.trim());
-    if (!Number.isInteger(termDays) || termDays < 1 || termDays > 365) {
-      setQuoteError('Term days must be an integer between 1 and 365.');
+    if (!Number.isInteger(termDays) || termDays < 7 || termDays > 90) {
+      setQuoteError('Term days must be an integer between 7 and 90.');
       return;
     }
 
@@ -242,6 +250,8 @@ export function Markets() {
                     className="btn secondary"
                     type="button"
                     onClick={() => {
+                      quoteSeqRef.current += 1;
+                      setQuoteLoading(false);
                       setQuoteAsset(item.token);
                       setQuoteResult(null);
                       setQuoteError('');
@@ -352,10 +362,7 @@ export function Markets() {
               <select
                 id="quote-asset"
                 value={selectedAssetObj?.token ?? ''}
-                onChange={(e) => {
-                  setQuoteAsset(e.target.value);
-                  setQuoteResult(null);
-                }}
+                onChange={(e) => updateQuoteField(setQuoteAsset)(e.target.value)}
               >
                 {assets.length === 0 ? (
                   <option value="">No registered assets loaded</option>
@@ -378,7 +385,7 @@ export function Markets() {
                 <TextInput
                   id="quote-principal"
                   value={quotePrincipal}
-                  onChange={setQuotePrincipal}
+                  onChange={updateQuoteField(setQuotePrincipal)}
                   {...props}
                 />
               )}
@@ -393,7 +400,7 @@ export function Markets() {
                 <TextInput
                   id="quote-collateral"
                   value={quoteCollateral}
-                  onChange={setQuoteCollateral}
+                  onChange={updateQuoteField(setQuoteCollateral)}
                   {...props}
                 />
               )}
@@ -406,7 +413,7 @@ export function Markets() {
                     id="quote-term"
                     inputMode="numeric"
                     value={quoteTermDays}
-                    onChange={setQuoteTermDays}
+                    onChange={updateQuoteField(setQuoteTermDays)}
                     {...props}
                   />
                 )}
@@ -416,7 +423,7 @@ export function Markets() {
                   <TextInput
                     id="quote-apr"
                     value={quoteAprPct}
-                    onChange={setQuoteAprPct}
+                    onChange={updateQuoteField(setQuoteAprPct)}
                     {...props}
                   />
                 )}
@@ -432,7 +439,7 @@ export function Markets() {
                 <TextInput
                   id="quote-max-ltv"
                   value={quoteMaxLtvPct}
-                  onChange={setQuoteMaxLtvPct}
+                  onChange={updateQuoteField(setQuoteMaxLtvPct)}
                   {...props}
                 />
               )}

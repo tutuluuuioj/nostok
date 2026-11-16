@@ -28,7 +28,7 @@ const TITLES = {
 };
 
 export function Shell({ children }) {
-  const { alerts, web3 } = useStore();
+  const { web3 } = useStore();
   const { pathname } = useLocation();
   const [menu, setMenu] = useState(false);
 
@@ -38,17 +38,15 @@ export function Shell({ children }) {
 
   useEffect(() => {
     setMenu(false);
-    const name = TITLES[pathname] || (pathname.startsWith('/loans/') ? 'Loan' : 'NOSTOK');
+    const name = TITLES[pathname] || (pathname.startsWith('/loans/') || pathname.startsWith('/loan/') ? 'Loan' : 'NOSTOK');
     document.title = pathname === '/' ? 'NOSTOK' : `${name} · NOSTOK`;
   }, [pathname]);
 
   function item(path, label) {
     const current = pathname === path;
-    const alertLabel = path === '/alerts' ? `Alerts, ${alerts.length} open` : undefined;
     return (
-      <Link key={path} to={path} aria-current={current ? 'page' : undefined} aria-label={alertLabel}>
+      <Link key={path} to={path} aria-current={current ? 'page' : undefined}>
         {label}
-        {path === '/alerts' ? <span className="count" aria-hidden="true">{alerts.length}</span> : null}
       </Link>
     );
   }

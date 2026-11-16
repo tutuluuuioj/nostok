@@ -1,6 +1,5 @@
 import { Link } from 'react-router-dom';
-import { Page } from '../components/ui.jsx';
-import { records } from '../lib/book.js';
+import { Page, PreviewBanner } from '../components/ui.jsx';
 import { health } from '../lib/health.js';
 import { formatApr, formatUsd } from '../lib/format.js';
 import { useStore } from '../store.jsx';
@@ -24,7 +23,7 @@ function Row({ loan }) {
         <span className="quiet">{label(loan)} · {formatApr(loan.rateBps)} APR · Oracle {ltv}</span>
       </span>
       <span className="numline">{formatUsd(view.remaining)}</span>
-      <span className="open-loan">Open</span>
+      <span className="quiet">Preview</span>
     </Link>
   );
 }
@@ -34,33 +33,24 @@ export function Loans() {
   const borrow = state.loans.filter((loan) => loan.borrower === 'you');
   const lend = state.loans.filter((loan) => loan.lender === 'you');
 
-  function download() {
-    const blob = new Blob([JSON.stringify(records(state), null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'nostok-records.json';
-    link.click();
-    URL.revokeObjectURL(url);
-  }
-
   return (
     <Page
-      kicker="Loans"
-      title="Your desk."
-      lede="Borrowing and lending are separate. Open a loan to see details, repay, or add more stock."
+      kicker="Loans · Preview"
+      title="Your desk (preview)."
+      lede="Live loan management and repayment transactions arrive in WS3.5. Sample entries below are static illustrations."
     >
+      <PreviewBanner>
+        Sample loans shown below are static illustrations, not your live on-chain positions. Connect your wallet on{' '}
+        <Link to="/wallet">Wallet</Link> to see your live loan count, or visit <Link to="/borrow">Borrow</Link> to sign a live borrow order.
+      </PreviewBanner>
       <section className="block">
-        <h2>You borrow</h2>
-        {borrow.length === 0 ? <p>No borrow positions.</p> : borrow.map((loan) => <Row key={loan.id} loan={loan} />)}
+        <h2>Sample borrower positions (preview)</h2>
+        {borrow.length === 0 ? <p>No preview borrow positions.</p> : borrow.map((loan) => <Row key={loan.id} loan={loan} />)}
       </section>
       <section className="block">
-        <h2>You lend</h2>
-        {lend.length === 0 ? <p>No claims.</p> : lend.map((loan) => <Row key={loan.id} loan={loan} />)}
+        <h2>Sample lender claims (preview)</h2>
+        {lend.length === 0 ? <p>No preview claims.</p> : lend.map((loan) => <Row key={loan.id} loan={loan} />)}
       </section>
-      <div className="actions">
-        <button className="btn secondary" type="button" onClick={download}>Download my records</button>
-      </div>
     </Page>
   );
 }

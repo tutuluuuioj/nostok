@@ -149,11 +149,98 @@ export const loanCoreAbi = [
   { type: 'function', name: 'claim', stateMutability: 'nonpayable', inputs: [{ name: 'to', type: 'address' }], outputs: [{ name: 'claimedAmount', type: 'uint128' }] },
 ];
 
+export const ORDER_SETTLEMENT_DOMAIN_NAME = 'NOSTOK Order Settlement';
+export const ORDER_SETTLEMENT_DOMAIN_VERSION = '1';
+
+export const BORROW_ORDER_EIP712_TYPES = {
+  BorrowOrder: [
+    { name: 'borrower', type: 'address' },
+    { name: 'collateralToken', type: 'address' },
+    { name: 'collateralAmount', type: 'uint128' },
+    { name: 'minUsdc', type: 'uint128' },
+    { name: 'maxRateBps', type: 'uint32' },
+    { name: 'termDays', type: 'uint16' },
+    { name: 'maxLtvBps', type: 'uint16' },
+    { name: 'minFill', type: 'uint128' },
+    { name: 'expiry', type: 'uint64' },
+    { name: 'nonce', type: 'uint256' },
+    { name: 'yieldMode', type: 'uint8' },
+    { name: 'allowInKindSettlement', type: 'bool' },
+  ],
+};
+
+export const LEND_OFFER_EIP712_TYPES = {
+  LendOffer: [
+    { name: 'lender', type: 'address' },
+    { name: 'usdcAmount', type: 'uint128' },
+    { name: 'minRateBps', type: 'uint32' },
+    { name: 'termDays', type: 'uint16' },
+    { name: 'allowedCollateral', type: 'address' },
+    { name: 'maxLtvBps', type: 'uint16' },
+    { name: 'minFill', type: 'uint128' },
+    { name: 'expiry', type: 'uint64' },
+    { name: 'nonce', type: 'uint256' },
+    { name: 'yieldMode', type: 'uint8' },
+  ],
+};
+
 export const orderSettlementAbi = [
   { type: 'function', name: 'getMakerNonce', stateMutability: 'view', inputs: [{ name: 'maker', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
   { type: 'function', name: 'getOrderFilledAmount', stateMutability: 'view', inputs: [{ name: 'orderHash', type: 'bytes32' }], outputs: [{ name: '', type: 'uint128' }] },
   { type: 'function', name: 'isOrderCancelled', stateMutability: 'view', inputs: [{ name: 'orderHash', type: 'bytes32' }], outputs: [{ name: '', type: 'bool' }] },
   { type: 'function', name: 'bumpNonce', stateMutability: 'nonpayable', inputs: [], outputs: [{ name: 'newNonce', type: 'uint256' }] },
+  {
+    type: 'function',
+    name: 'hashBorrowOrder',
+    stateMutability: 'view',
+    inputs: [
+      {
+        name: 'o',
+        type: 'tuple',
+        components: BORROW_ORDER_EIP712_TYPES.BorrowOrder,
+      },
+    ],
+    outputs: [{ name: '', type: 'bytes32' }],
+  },
+  {
+    type: 'function',
+    name: 'hashLendOffer',
+    stateMutability: 'view',
+    inputs: [
+      {
+        name: 'o',
+        type: 'tuple',
+        components: LEND_OFFER_EIP712_TYPES.LendOffer,
+      },
+    ],
+    outputs: [{ name: '', type: 'bytes32' }],
+  },
+  {
+    type: 'function',
+    name: 'cancelBorrowOrder',
+    stateMutability: 'nonpayable',
+    inputs: [
+      {
+        name: 'order',
+        type: 'tuple',
+        components: BORROW_ORDER_EIP712_TYPES.BorrowOrder,
+      },
+    ],
+    outputs: [],
+  },
+  {
+    type: 'function',
+    name: 'cancelLendOffer',
+    stateMutability: 'nonpayable',
+    inputs: [
+      {
+        name: 'offer',
+        type: 'tuple',
+        components: LEND_OFFER_EIP712_TYPES.LendOffer,
+      },
+    ],
+    outputs: [],
+  },
   {
     type: 'function',
     name: 'fillBorrowOrder',
@@ -162,23 +249,27 @@ export const orderSettlementAbi = [
       {
         name: 'order',
         type: 'tuple',
-        components: [
-          { name: 'borrower', type: 'address' },
-          { name: 'collateralToken', type: 'address' },
-          { name: 'collateralAmount', type: 'uint128' },
-          { name: 'minUsdc', type: 'uint128' },
-          { name: 'maxRateBps', type: 'uint32' },
-          { name: 'termDays', type: 'uint16' },
-          { name: 'maxLtvBps', type: 'uint16' },
-          { name: 'minFill', type: 'uint128' },
-          { name: 'expiry', type: 'uint64' },
-          { name: 'nonce', type: 'uint256' },
-          { name: 'yieldMode', type: 'uint8' },
-          { name: 'allowInKindSettlement', type: 'bool' },
-        ],
+        components: BORROW_ORDER_EIP712_TYPES.BorrowOrder,
       },
       { name: 'signature', type: 'bytes' },
       { name: 'fillUsdc', type: 'uint128' },
+    ],
+    outputs: [{ name: 'loanId', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'fillBorrowOrderWithAttestations',
+    stateMutability: 'nonpayable',
+    inputs: [
+      {
+        name: 'order',
+        type: 'tuple',
+        components: BORROW_ORDER_EIP712_TYPES.BorrowOrder,
+      },
+      { name: 'signature', type: 'bytes' },
+      { name: 'fillUsdc', type: 'uint128' },
+      { name: 'borrowerAttestation', type: 'bytes' },
+      { name: 'lenderAttestation', type: 'bytes' },
     ],
     outputs: [{ name: 'loanId', type: 'uint256' }],
   },
@@ -190,18 +281,7 @@ export const orderSettlementAbi = [
       {
         name: 'offer',
         type: 'tuple',
-        components: [
-          { name: 'lender', type: 'address' },
-          { name: 'usdcAmount', type: 'uint128' },
-          { name: 'minRateBps', type: 'uint32' },
-          { name: 'termDays', type: 'uint16' },
-          { name: 'allowedCollateral', type: 'address' },
-          { name: 'maxLtvBps', type: 'uint16' },
-          { name: 'minFill', type: 'uint128' },
-          { name: 'expiry', type: 'uint64' },
-          { name: 'nonce', type: 'uint256' },
-          { name: 'yieldMode', type: 'uint8' },
-        ],
+        components: LEND_OFFER_EIP712_TYPES.LendOffer,
       },
       { name: 'signature', type: 'bytes' },
       { name: 'collateralToken', type: 'address' },
@@ -209,6 +289,45 @@ export const orderSettlementAbi = [
       { name: 'fillUsdc', type: 'uint128' },
     ],
     outputs: [{ name: 'loanId', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'fillLendOfferWithAttestations',
+    stateMutability: 'nonpayable',
+    inputs: [
+      {
+        name: 'offer',
+        type: 'tuple',
+        components: LEND_OFFER_EIP712_TYPES.LendOffer,
+      },
+      { name: 'signature', type: 'bytes' },
+      { name: 'collateralToken', type: 'address' },
+      { name: 'collateralAmount', type: 'uint128' },
+      { name: 'fillUsdc', type: 'uint128' },
+      { name: 'borrowerAttestation', type: 'bytes' },
+      { name: 'lenderAttestation', type: 'bytes' },
+    ],
+    outputs: [{ name: 'loanId', type: 'uint256' }],
+  },
+  {
+    type: 'event',
+    name: 'OrderFilled',
+    inputs: [
+      { name: 'orderHash', type: 'bytes32', indexed: true },
+      { name: 'maker', type: 'address', indexed: true },
+      { name: 'taker', type: 'address', indexed: true },
+      { name: 'loanId', type: 'uint256', indexed: false },
+      { name: 'fillAmountUsdc', type: 'uint128', indexed: false },
+      { name: 'collateralAmount', type: 'uint128', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'OrderCancelled',
+    inputs: [
+      { name: 'orderHash', type: 'bytes32', indexed: true },
+      { name: 'maker', type: 'address', indexed: true },
+    ],
   },
 ];
 
@@ -369,7 +488,8 @@ function isProductionEnv(overrides) {
   return viteProd || nodeProd;
 }
 
-function isForkEnv(overrides) {
+function isForkEnv(overrides, isProd) {
+  if (isProd) return false;
   if (typeof overrides.isFork === 'boolean') return overrides.isFork;
   return readEnv('VITE_IS_FORK') === 'true' || readEnv('FORK') === 'true';
 }
@@ -385,9 +505,10 @@ export function setFrontendConfigOverrides(overrides = {}) {
 
 export function getFrontendConfig() {
   const isProd = isProductionEnv(configOverrides);
-  const isFork = isForkEnv(configOverrides);
+  const isFork = isForkEnv(configOverrides, isProd);
   const rawChainId = configOverrides.chainId ?? readEnv('VITE_CHAIN_ID');
-  const parsedChainId = rawChainId !== undefined && rawChainId !== '' ? Number(rawChainId) : BASE_CHAIN_ID;
+  const hasChainId = rawChainId !== undefined && String(rawChainId).trim() !== '';
+  const parsedChainId = hasChainId ? Number(rawChainId) : (isProd ? NaN : BASE_CHAIN_ID);
   const chainId = Number.isInteger(parsedChainId) && parsedChainId > 0 ? parsedChainId : NaN;
 
   const rpcUrl = stripTrailingSlash(configOverrides.rpcUrl ?? readEnv('VITE_RPC_URL') ?? 'https://mainnet.base.org');
@@ -398,19 +519,23 @@ export function getFrontendConfig() {
     configOverrides.notificationsUrl ?? readEnv('VITE_NOTIFICATIONS_URL') ?? 'http://127.0.0.1:3003'
   );
   const riskUrl = stripTrailingSlash(
-    configOverrides.riskUrl ?? readEnv('VITE_RISK_URL') ?? 'http://127.0.0.1:3002'
+    configOverrides.riskUrl ?? readEnv('VITE_RISK_URL') ?? (isProd ? '' : 'http://127.0.0.1:3002')
   );
   const siweDomain = configOverrides.siweDomain ?? readEnv('VITE_SIWE_DOMAIN');
   const siweOrigin = configOverrides.siweOrigin ?? readEnv('VITE_SIWE_ORIGIN');
 
   const rawUsdc = configOverrides.usdcAddress ?? readEnv('VITE_USDC_ADDRESS');
-  const normalizedUsdcOverride = rawUsdc ? normalizeOptionalAddress(rawUsdc) : undefined;
-  if (!isFork && normalizedUsdcOverride && normalizedUsdcOverride !== BASE_USDC_ADDRESS) {
+  const cleanUsdc = rawUsdc !== undefined ? String(rawUsdc).trim() : '';
+  if (cleanUsdc !== '' && !isAddress(cleanUsdc)) {
+    throw new Error(`Invalid VITE_USDC_ADDRESS: "${cleanUsdc}".`);
+  }
+  const normalizedUsdcOverride = cleanUsdc ? getAddress(cleanUsdc) : undefined;
+  if ((!isFork || isProd) && normalizedUsdcOverride && normalizedUsdcOverride !== BASE_USDC_ADDRESS) {
     throw new Error(
       `VITE_USDC_ADDRESS override (${normalizedUsdcOverride}) is prohibited outside fork/test mode; Base USDC is pinned to ${BASE_USDC_ADDRESS}.`
     );
   }
-  const usdcAddress = isFork ? (normalizedUsdcOverride ?? BASE_USDC_ADDRESS) : BASE_USDC_ADDRESS;
+  const usdcAddress = isFork && !isProd ? (normalizedUsdcOverride ?? BASE_USDC_ADDRESS) : BASE_USDC_ADDRESS;
 
   const contracts = {
     loanCore: normalizeOptionalAddress(configOverrides.loanCore ?? readEnv('VITE_LOAN_CORE_ADDRESS')),
@@ -435,7 +560,9 @@ export function getFrontendConfig() {
 
   if (isProd) {
     if (chainId !== BASE_CHAIN_ID) {
-      throw new Error(`Production builds require VITE_CHAIN_ID=${BASE_CHAIN_ID} (got ${rawChainId ?? 'unset'}).`);
+      throw new Error(
+        `Production builds require VITE_CHAIN_ID=${BASE_CHAIN_ID} (got ${hasChainId ? rawChainId : 'unset'}).`
+      );
     }
     if (!rpcUrl.startsWith('https://') || rpcUrl === 'https://mainnet.base.org') {
       throw new Error(
@@ -470,6 +597,44 @@ export function getFrontendConfig() {
     usdcAddress,
     contracts,
   };
+}
+
+export function buildContentSecurityPolicy(
+  cfg = getFrontendConfig(),
+  { includeFrameAncestors = true } = {}
+) {
+  const connectSources = new Set(["'self'"]);
+  const urls = [cfg?.rpcUrl, cfg?.apiUrl, cfg?.notificationsUrl, cfg?.riskUrl, cfg?.siweOrigin];
+  for (const raw of urls) {
+    if (!raw || typeof raw !== 'string') continue;
+    try {
+      const parsed = new URL(raw);
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+        connectSources.add(parsed.origin);
+      }
+    } catch {
+      // ignore malformed URL
+    }
+  }
+  if (!cfg?.isProd) {
+    connectSources.add('http://127.0.0.1:*');
+    connectSources.add('http://localhost:*');
+  }
+  const directives = [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "font-src 'self' data:",
+    `connect-src ${Array.from(connectSources).join(' ')}`,
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+  ];
+  if (includeFrameAncestors) {
+    directives.push("frame-ancestors 'none'");
+  }
+  return `${directives.join('; ')};`;
 }
 
 export function createProtocolPublicClient(cfg = getFrontendConfig()) {

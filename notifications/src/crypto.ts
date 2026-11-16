@@ -133,6 +133,14 @@ export class PiiCipher {
   }
 }
 
+export function hasPlusSubaddress(channel: string, normalizedTarget: string): boolean {
+  if (channel !== 'email') return false;
+  const trimmed = normalizedTarget.trim();
+  const atIdx = trimmed.lastIndexOf('@');
+  if (atIdx <= 0) return false;
+  return trimmed.slice(0, atIdx).includes('+');
+}
+
 export function canonicalizeTargetForRateLimit(channel: string, normalizedTarget: string): string {
   const trimmed = normalizedTarget.trim();
   if (channel === 'email') {
@@ -356,6 +364,63 @@ export function verifyConfirmSubscriptionToken(
     throw new Error('Confirmation token expired');
   }
   return { subId: parsed.subId, wallet: parsed.wallet, codeHash: parsed.codeHash };
+}
+
+interface BlockSenderPayload {
+  p: 'block_sender';
+  subId: string;
+  wallet: string;
+  cth: string;
+  exp: number;
+}
+
+export function signBlockSenderToken(
+  secret: string,
+  subId: string,
+  wallet: string,
+  canonicalTargetHash: string,
+  ttlSecs = 30 * 86_400,
+  nowMs = Date.now()
+): string {
+  const payload: BlockSenderPayload = {
+    p: 'block_sender',
+    subId,
+    wallet: wallet.toLowerCase(),
+    cth: canonicalTargetHash,
+    exp: Math.floor(nowMs / 1000) + ttlSecs,
+  };
+  const body = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const sig = crypto.createHmac('sha256', secret).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+
+export function verifyBlockSenderToken(
+  secret: string,
+  token: string,
+  nowMs = Date.now()
+): { subId: string; wallet: string; canonicalTargetHash: string } {
+  const parts = token.split('.');
+  if (parts.length !== 2) throw new Error('Invalid block token format');
+  const [body, sig] = parts;
+  const expected = crypto.createHmac('sha256', secret).update(body).digest('base64url');
+  const sigBuf = Buffer.from(sig, 'utf8');
+  const expBuf = Buffer.from(expected, 'utf8');
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    throw new Error('Invalid block token signature');
+  }
+  const parsed = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as Partial<BlockSenderPayload>;
+  if (
+    parsed.p !== 'block_sender' ||
+    typeof parsed.subId !== 'string' ||
+    typeof parsed.wallet !== 'string' ||
+    typeof parsed.cth !== 'string'
+  ) {
+    throw new Error('Invalid block token purpose');
+  }
+  if (typeof parsed.exp !== 'number' || Math.floor(nowMs / 1000) > parsed.exp) {
+    throw new Error('Block token expired');
+  }
+  return { subId: parsed.subId, wallet: parsed.wallet, canonicalTargetHash: parsed.cth };
 }
 
 export function signWebhookPayload(

@@ -35,6 +35,82 @@ function init() {
   return freshState();
 }
 
+export function createWalletEventsHandler({
+  connRef,
+  siweRef,
+  snapshotSeqRef,
+  updateWalletConn,
+  setWalletSnapshot,
+  clearLocalSiweState,
+  refreshWalletData,
+  getConfig = getFrontendConfig,
+  signOutImpl = web3SignOutSiwe,
+  getAttestation = () => '0x',
+}) {
+  const onAccountsChanged = (accounts) => {
+    const nextRaw = Array.isArray(accounts) && accounts.length > 0 ? accounts[0] : null;
+    const nextAddr = nextRaw ? getAddress(nextRaw) : null;
+    const prevAddr = connRef.current.address;
+    const prevSess = siweRef.current;
+    ++snapshotSeqRef.current;
+    setWalletSnapshot({ loading: false, data: null });
+
+    if (!nextAddr || !prevAddr || nextAddr.toLowerCase() !== prevAddr.toLowerCase()) {
+      if (prevSess?.token) {
+        void signOutImpl({ token: prevSess.token, cfg: getConfig() }).catch(() => {});
+      }
+      clearLocalSiweState({
+        siweNotice: nextAddr ? 'Wallet changed. Sign in with SIWE for this address.' : '',
+      });
+    }
+    const nextConn = updateWalletConn((prev) => ({
+      ...prev,
+      connected: Boolean(nextAddr),
+      address: nextAddr,
+      walletError: prev.wrongNetwork && nextAddr ? prev.walletError : '',
+    }));
+    if (nextConn.address && !nextConn.wrongNetwork) {
+      void refreshWalletData(nextConn.address, getAttestation(), {
+        wrongNetwork: nextConn.wrongNetwork,
+      });
+    }
+  };
+
+  const onChainChanged = (rawChain) => {
+    const nextChainId = parseChainIdHex(rawChain);
+    const currentCfg = getConfig();
+    const wrong = nextChainId !== currentCfg.chainId;
+    ++snapshotSeqRef.current;
+    setWalletSnapshot({ loading: false, data: null });
+
+    if (wrong && siweRef.current) {
+      const prevSess = siweRef.current;
+      if (prevSess?.token) {
+        void signOutImpl({ token: prevSess.token, cfg: currentCfg }).catch(() => {});
+      }
+      clearLocalSiweState({
+        siweNotice: `Network changed away from Base (${currentCfg.chainId}); SIWE session cleared.`,
+      });
+    }
+
+    const nextConn = updateWalletConn((prev) => ({
+      ...prev,
+      chainId: Number.isNaN(nextChainId) ? prev.chainId : nextChainId,
+      wrongNetwork: wrong,
+      walletError: wrong
+        ? `Wrong network (chainId ${nextChainId}). Switch to Base (${currentCfg.chainId}).`
+        : '',
+    }));
+    if (!nextConn.wrongNetwork && nextConn.address) {
+      void refreshWalletData(nextConn.address, getAttestation(), {
+        wrongNetwork: false,
+      });
+    }
+  };
+
+  return { onAccountsChanged, onChainChanged };
+}
+
 export function StoreProvider({ children }) {
   const [state, setState] = useState(init);
   const ref = useRef(state);
@@ -79,9 +155,20 @@ export function StoreProvider({ children }) {
   siweRef.current = siweState.session;
   const connRef = useRef(walletConn);
   connRef.current = walletConn;
+  const attestationRef = useRef(attestationHex);
+  attestationRef.current = attestationHex;
   const snapshotSeqRef = useRef(0);
 
+  const updateWalletConn = useCallback((nextOrUpdater) => {
+    const next =
+      typeof nextOrUpdater === 'function' ? nextOrUpdater(connRef.current) : nextOrUpdater;
+    connRef.current = next;
+    setWalletConn(next);
+    return next;
+  }, []);
+
   const clearLocalSiweState = useCallback((opts = {}) => {
+    siweRef.current = null;
     setSiweState({
       session: null,
       subscriptions: null,
@@ -93,9 +180,15 @@ export function StoreProvider({ children }) {
   }, []);
 
   const refreshWalletData = useCallback(
-    async (targetAddr = connRef.current.address, customAttestation = attestationHex) => {
+    async (
+      targetAddr = connRef.current.address,
+      customAttestation = attestationRef.current,
+      opts = {}
+    ) => {
       const requestId = ++snapshotSeqRef.current;
-      if (!targetAddr || connRef.current.wrongNetwork) {
+      const isWrongNetwork =
+        typeof opts.wrongNetwork === 'boolean' ? opts.wrongNetwork : connRef.current.wrongNetwork;
+      if (!targetAddr || isWrongNetwork) {
         setWalletSnapshot({ loading: false, data: null });
         return null;
       }
@@ -163,7 +256,7 @@ export function StoreProvider({ children }) {
       }
       return snapshot;
     },
-    [attestationHex, clearLocalSiweState]
+    [clearLocalSiweState]
   );
 
   // Sync existing authorized account + subscribe to EIP-1193 accountsChanged / chainChanged
@@ -175,7 +268,7 @@ export function StoreProvider({ children }) {
     readConnectedAccount(provider, cfg)
       .then((acc) => {
         if (!mounted || !acc) return;
-        setWalletConn({
+        updateWalletConn({
           connected: true,
           address: acc.address,
           chainId: acc.chainId,
@@ -186,7 +279,7 @@ export function StoreProvider({ children }) {
             : '',
         });
         if (!acc.wrongNetwork) {
-          void refreshWalletData(acc.address, attestationHex);
+          void refreshWalletData(acc.address, attestationRef.current, { wrongNetwork: false });
         } else {
           ++snapshotSeqRef.current;
           setWalletSnapshot({ loading: false, data: null });
@@ -200,62 +293,18 @@ export function StoreProvider({ children }) {
       };
     }
 
-    const onAccountsChanged = (accounts) => {
-      const nextRaw = Array.isArray(accounts) && accounts.length > 0 ? accounts[0] : null;
-      const nextAddr = nextRaw ? getAddress(nextRaw) : null;
-      const prevAddr = connRef.current.address;
-      const prevSess = siweRef.current;
-      ++snapshotSeqRef.current;
-      setWalletSnapshot({ loading: false, data: null });
-
-      if (!nextAddr || !prevAddr || nextAddr.toLowerCase() !== prevAddr.toLowerCase()) {
-        if (prevSess?.token) {
-          void web3SignOutSiwe({ token: prevSess.token, cfg: getFrontendConfig() }).catch(() => {});
-        }
-        clearLocalSiweState({
-          siweNotice: nextAddr ? 'Wallet changed. Sign in with SIWE for this address.' : '',
-        });
-      }
-      setWalletConn((prev) => ({
-        ...prev,
-        connected: Boolean(nextAddr),
-        address: nextAddr,
-        walletError: prev.wrongNetwork && nextAddr ? prev.walletError : '',
-      }));
-      if (nextAddr && !connRef.current.wrongNetwork) {
-        void refreshWalletData(nextAddr, attestationHex);
-      }
-    };
-
-    const onChainChanged = (rawChain) => {
-      const nextChainId = parseChainIdHex(rawChain);
-      const currentCfg = getFrontendConfig();
-      const wrong = nextChainId !== currentCfg.chainId;
-      ++snapshotSeqRef.current;
-      setWalletSnapshot({ loading: false, data: null });
-
-      if (wrong && siweRef.current) {
-        const prevSess = siweRef.current;
-        if (prevSess?.token) {
-          void web3SignOutSiwe({ token: prevSess.token, cfg: currentCfg }).catch(() => {});
-        }
-        clearLocalSiweState({
-          siweNotice: `Network changed away from Base (${currentCfg.chainId}); SIWE session cleared.`,
-        });
-      }
-
-      setWalletConn((prev) => ({
-        ...prev,
-        chainId: Number.isNaN(nextChainId) ? prev.chainId : nextChainId,
-        wrongNetwork: wrong,
-        walletError: wrong
-          ? `Wrong network (chainId ${nextChainId}). Switch to Base (${currentCfg.chainId}).`
-          : '',
-      }));
-      if (!wrong && connRef.current.address) {
-        void refreshWalletData(connRef.current.address, attestationHex);
-      }
-    };
+    const { onAccountsChanged, onChainChanged } = createWalletEventsHandler({
+      connRef,
+      siweRef,
+      snapshotSeqRef,
+      updateWalletConn,
+      setWalletSnapshot,
+      clearLocalSiweState,
+      refreshWalletData,
+      getConfig: getFrontendConfig,
+      signOutImpl: web3SignOutSiwe,
+      getAttestation: () => attestationRef.current,
+    });
 
     provider.on('accountsChanged', onAccountsChanged);
     provider.on('chainChanged', onChainChanged);
@@ -266,16 +315,27 @@ export function StoreProvider({ children }) {
         provider.removeListener('chainChanged', onChainChanged);
       }
     };
-  }, [attestationHex, clearLocalSiweState, refreshWalletData]);
+  }, [clearLocalSiweState, refreshWalletData, updateWalletConn]);
+
+  const firstAttestationMount = useRef(true);
+  useEffect(() => {
+    if (firstAttestationMount.current) {
+      firstAttestationMount.current = false;
+      return;
+    }
+    if (connRef.current.connected && connRef.current.address && !connRef.current.wrongNetwork) {
+      void refreshWalletData(connRef.current.address, attestationHex, { wrongNetwork: false });
+    }
+  }, [attestationHex, refreshWalletData]);
 
   const connect = useCallback(async () => {
     const cfg = getFrontendConfig();
     ++snapshotSeqRef.current;
     setWalletSnapshot({ loading: false, data: null });
-    setWalletConn((prev) => ({ ...prev, connecting: true, walletError: '' }));
+    updateWalletConn((prev) => ({ ...prev, connecting: true, walletError: '' }));
     try {
       const res = await web3ConnectWallet(getInjectedProvider(), cfg);
-      setWalletConn({
+      updateWalletConn({
         connected: true,
         address: res.address,
         chainId: res.chainId,
@@ -284,35 +344,35 @@ export function StoreProvider({ children }) {
         walletError: res.error || '',
       });
       if (!res.wrongNetwork) {
-        await refreshWalletData(res.address, attestationHex);
+        await refreshWalletData(res.address, attestationRef.current, { wrongNetwork: false });
       }
       return res;
     } catch (err) {
       const msg = formatWeb3Error(err);
-      setWalletConn((prev) => ({ ...prev, connecting: false, walletError: msg }));
+      updateWalletConn((prev) => ({ ...prev, connecting: false, walletError: msg }));
       return null;
     }
-  }, [attestationHex, refreshWalletData]);
+  }, [refreshWalletData, updateWalletConn]);
 
   const switchNetwork = useCallback(async () => {
     const cfg = getFrontendConfig();
     try {
       const nextChainId = await switchToBaseChain(getInjectedProvider(), cfg);
-      setWalletConn((prev) => ({
+      const nextConn = updateWalletConn((prev) => ({
         ...prev,
         chainId: nextChainId,
         wrongNetwork: false,
         walletError: '',
       }));
-      if (connRef.current.address) {
-        await refreshWalletData(connRef.current.address, attestationHex);
+      if (nextConn.address) {
+        await refreshWalletData(nextConn.address, attestationRef.current, { wrongNetwork: false });
       }
       return true;
     } catch (err) {
-      setWalletConn((prev) => ({ ...prev, walletError: formatWeb3Error(err) }));
+      updateWalletConn((prev) => ({ ...prev, walletError: formatWeb3Error(err) }));
       return false;
     }
-  }, [attestationHex, refreshWalletData]);
+  }, [refreshWalletData, updateWalletConn]);
 
   const signIn = useCallback(async () => {
     const cfg = getFrontendConfig();
@@ -348,6 +408,7 @@ export function StoreProvider({ children }) {
         void web3SignOutSiwe({ token: session.token, cfg }).catch(() => {});
         return null;
       }
+      siweRef.current = session;
       setSiweState({
         session,
         subscriptions,
@@ -387,7 +448,7 @@ export function StoreProvider({ children }) {
   const disconnect = useCallback(async () => {
     ++snapshotSeqRef.current;
     setWalletSnapshot({ loading: false, data: null });
-    setWalletConn({
+    updateWalletConn({
       connected: false,
       address: null,
       chainId: null,
@@ -396,7 +457,7 @@ export function StoreProvider({ children }) {
       walletError: '',
     });
     await signOut();
-  }, [signOut]);
+  }, [signOut, updateWalletConn]);
 
   const web3 = useMemo(
     () => ({
@@ -417,7 +478,10 @@ export function StoreProvider({ children }) {
       switchNetwork,
       signIn,
       signOut,
-      refresh: () => refreshWalletData(connRef.current.address, attestationHex),
+      refresh: () =>
+        refreshWalletData(connRef.current.address, attestationRef.current, {
+          wrongNetwork: connRef.current.wrongNetwork,
+        }),
     }),
     [
       walletConn,

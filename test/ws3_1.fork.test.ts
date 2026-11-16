@@ -1,10 +1,20 @@
+/// <reference path="./ambient.d.ts" />
 import assert from 'node:assert/strict';
-import { execSync, spawn, type ChildProcess } from 'node:child_process';
+import { execSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import * as ReactNamespace from 'react';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
+
+if (!(globalThis as { React?: unknown }).React) {
+  (globalThis as { React?: unknown }).React = ReactNamespace;
+}
 import {
   type Address,
   type Hex,
@@ -33,8 +43,12 @@ import { createNotificationsServer } from '../notifications/src/server.js';
 import {
   BASE_CHAIN_ID,
   BASE_USDC_ADDRESS,
+  LEND_OFFER_EIP712_TYPES,
+  ORDER_SETTLEMENT_DOMAIN_NAME,
+  ORDER_SETTLEMENT_DOMAIN_VERSION,
   USDC_DECIMALS,
   getFrontendConfig,
+  orderSettlementAbi,
   setFrontendConfigOverrides,
 } from '../src/lib/contracts.js';
 import {
@@ -44,15 +58,31 @@ import {
   formatBpsPercent,
 } from '../src/lib/marketsApi.js';
 import {
+  cancelSignedBorrowOrder,
   connectWallet,
   fetchNotificationsSessionState,
   fetchPaginatedApiRows,
   fetchWalletState,
+  fillLendOfferAsBorrower,
   formatTokenUnitsDisplay,
+  prepareAndSignBorrowOrder,
+  readBorrowAllowanceAndNonce,
+  resolveExactBorrowAmounts,
   setInjectedProvider,
   signInWithSiwe,
   signOutSiwe,
 } from '../src/lib/web3.js';
+import { App } from '../src/App.jsx';
+import { Shell } from '../src/components/Shell.jsx';
+import { ErrorBoundary } from '../src/components/ui.jsx';
+import { Alerts } from '../src/pages/Alerts.jsx';
+import { Builders } from '../src/pages/Builders.jsx';
+import { Lend } from '../src/pages/Lend.jsx';
+import { Loan } from '../src/pages/Loan.jsx';
+import { Loans } from '../src/pages/Loans.jsx';
+import { Markets } from '../src/pages/Markets.jsx';
+import { Positions } from '../src/pages/Positions.jsx';
+import { StoreProvider, createWalletEventsHandler } from '../src/store.jsx';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -198,7 +228,7 @@ function deployProtocolWithForge() {
   };
 }
 
-function createMockEip1193Provider(initialAccountKey: Hex, initialChainId = 8453) {
+function createMockEip1193Provider(initialAccountKey: Hex, initialChainId = 8453, rpcUrl = LOCAL_RPC_URL) {
   let account = privateKeyToAccount(initialAccountKey);
   let chainId = initialChainId;
   let rejectSwitch = false;
@@ -254,6 +284,66 @@ function createMockEip1193Provider(initialAccountKey: Hex, initialChainId = 8453
           midSignNextKey = null;
         }
         return sig;
+      }
+      if (method === 'eth_signTypedData_v4') {
+        const expectedSigner = getAddress(String(params[0]));
+        if (expectedSigner.toLowerCase() !== account.address.toLowerCase()) {
+          throw new Error(`Signer mismatch: requested ${expectedSigner}, active ${account.address}`);
+        }
+        const payload = JSON.parse(String(params[1])) as {
+          types: Record<string, Array<{ name: string; type: string }>>;
+          domain: Record<string, unknown>;
+          primaryType: string;
+          message: Record<string, unknown>;
+        };
+        const { EIP712Domain: _omitDomain, ...signTypes } = payload.types;
+        const primaryFields = signTypes[payload.primaryType] ?? [];
+        const normalizedMsg: Record<string, unknown> = { ...payload.message };
+        for (const field of primaryFields) {
+          if (
+            (field.type.startsWith('uint') || field.type.startsWith('int')) &&
+            normalizedMsg[field.name] !== undefined &&
+            normalizedMsg[field.name] !== null
+          ) {
+            normalizedMsg[field.name] = BigInt(String(normalizedMsg[field.name]));
+          }
+        }
+        const sig = await account.signTypedData({
+          domain: {
+            ...payload.domain,
+            chainId: payload.domain.chainId !== undefined ? Number(payload.domain.chainId) : undefined,
+          } as Parameters<typeof account.signTypedData>[0]['domain'],
+          types: signTypes,
+          primaryType: payload.primaryType,
+          message: normalizedMsg,
+        });
+        if (midSignNextKey) {
+          account = privateKeyToAccount(midSignNextKey);
+          midSignNextKey = null;
+        }
+        return sig;
+      }
+      if (method === 'eth_sendTransaction') {
+        const tx = params[0] as { from?: Address; to: Address; data?: Hex; value?: Hex };
+        if (tx.from && getAddress(tx.from).toLowerCase() !== account.address.toLowerCase()) {
+          throw new Error(`Transaction from mismatch: ${tx.from} != ${account.address}`);
+        }
+        const wc = createWalletClient({
+          account,
+          chain: defineChain({
+            ...base,
+            id: chainId,
+            name: 'Base',
+            rpcUrls: { default: { http: [rpcUrl] } },
+          }),
+          transport: viemHttp(rpcUrl),
+        });
+        return wc.sendTransaction({
+          account,
+          to: getAddress(tx.to),
+          data: tx.data,
+          value: tx.value ? BigInt(tx.value) : 0n,
+        });
       }
       throw new Error(`Unsupported mock EIP-1193 method: ${method}`);
     },
@@ -1015,7 +1105,416 @@ async function runTests(): Promise<void> {
       assert.match(downMkt.error, /Failed to fetch live market data/i);
       console.log('PASS WS3.2: Live assets, orders, book metrics, GET /quote, and degraded error states verified.');
 
-      console.log('\nALL WS3.1 + WS3.2 FRONTEND BASE MAINNET FORK TESTS PASSED.');
+      // Pre-WS3.3 Hardening Verification (Fixes #1, #2, #4, #5, Low Fees & CSP)
+      console.log('\n=== Pre-WS3.3 Fixes #1-#5 & Low Verification ===');
+
+      // Fix #1: PreviewBanner present, no header demo Alerts count badge, no actionable buttons/forms on demo pages
+      const forbiddenDemoActionRe =
+        /<button[^>]*>\s*(Open|Download my records|Claim|List this claim|Cancel listing|Buy claim|Dismiss|Repay all|Repay part|Add collateral|Extend|Roll|Post lend offer)\s*<\/button>/i;
+      const demoRoutes: Array<{ route: string; el: ReturnType<typeof createElement> }> = [
+        { route: '/loans', el: createElement(Loans) },
+        { route: '/positions', el: createElement(Positions) },
+        { route: '/alerts', el: createElement(Alerts) },
+        {
+          route: '/loan/L-1',
+          el: createElement(Routes, null, createElement(Route, { path: '/loan/:id', element: createElement(Loan) })),
+        },
+        { route: '/lend', el: createElement(Lend) },
+        { route: '/builders', el: createElement(Builders) },
+      ];
+      for (const { route, el } of demoRoutes) {
+        const rendered = renderToStaticMarkup(
+          createElement(
+            StoreProvider,
+            null,
+            createElement(MemoryRouter, { initialEntries: [route] }, createElement(Shell, null, el))
+          )
+        );
+        const pageOnlyHtml = renderToStaticMarkup(
+          createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: [route] }, el))
+        );
+        assert.ok(rendered.includes('Preview data, not your positions.'), `${route} must show PreviewBanner`);
+        assert.ok(!rendered.includes('class="count"'), `${route} header Alerts nav must drop demo count badge`);
+        assert.ok(!/aria-label="Alerts,/.test(rendered), `${route} header must drop demo Alerts count aria-label`);
+        assert.ok(!forbiddenDemoActionRe.test(rendered), `${route} must not render actionable demo buttons`);
+        assert.ok(!/<button\b/i.test(pageOnlyHtml), `${route} page body must not render any actionable buttons on demo rows`);
+        assert.ok(!/type=["']?submit/i.test(pageOnlyHtml), `${route} page body must not render submit controls`);
+      }
+
+      const marketsHtml = renderToStaticMarkup(
+        createElement(
+          StoreProvider,
+          null,
+          createElement(MemoryRouter, { initialEntries: ['/markets'] }, createElement(Shell, null, createElement(Markets)))
+        )
+      );
+      assert.ok(marketsHtml.includes('7 to 90 days'), 'Markets term hint must match 7 to 90 day validation');
+
+      // Fix #2: ErrorBoundary catches invalid prod config (no blank page) & real vite build fails invalid / enforces prod CSP & USDC pin
+      assert.equal(
+        ErrorBoundary.getDerivedStateFromError(new Error('boom')).error.message,
+        'boom',
+        'ErrorBoundary.getDerivedStateFromError must capture thrown runtime errors'
+      );
+      setFrontendConfigOverrides({ isProd: true, chainId: 84532 });
+      try {
+        const errHtml = renderToStaticMarkup(createElement(App));
+        assert.ok(errHtml.includes('Configuration Error'), 'App must render ErrorBoundary fallback on invalid config');
+        assert.ok(errHtml.includes('Application cannot start.'), 'ErrorBoundary must render application cannot start heading');
+        assert.ok(errHtml.includes('VITE_CHAIN_ID=8453'), 'ErrorBoundary must surface concrete config failure');
+      } finally {
+        setFrontendConfigOverrides({
+          isProd: false,
+          isFork: true,
+          chainId: BASE_CHAIN_ID,
+          rpcUrl: LOCAL_RPC_URL,
+          apiUrl,
+          notificationsUrl: notifUrl,
+          siweDomain: 'app.nostok.xyz',
+          siweOrigin: 'https://app.nostok.xyz',
+          usdcAddress: BASE_USDC,
+          loanCore: deployed.loanCore,
+          orderSettlement: deployed.orderSettlement,
+          liquidationAuction: deployed.liquidationAuction,
+          positionNft: deployed.positionNFT,
+          collateralEscrow: deployed.collateralEscrow,
+          assetRegistry: deployed.assetRegistry,
+          oracleRouter: deployed.oracleRouter,
+          eligibilityGate: deployed.eligibilityGate,
+        });
+      }
+
+      const viteBin = path.join(REPO_ROOT, 'node_modules', '.bin', 'vite');
+      const tmpBuildDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nostok-vite-build-'));
+      try {
+        const baseBuildEnv: NodeJS.ProcessEnv = {
+          PATH: process.env.PATH,
+          HOME: process.env.HOME,
+          NODE_ENV: 'production',
+          VITE_CHAIN_ID: '8453',
+          VITE_RPC_URL: 'https://base-mainnet.private-rpc.example/v1/key',
+          VITE_API_URL: 'https://api.nostok.xyz',
+          VITE_NOTIFICATIONS_URL: 'https://notifications.nostok.xyz',
+          VITE_RISK_URL: 'https://risk.nostok.xyz',
+          VITE_LOAN_CORE_ADDRESS: deployed.loanCore,
+          VITE_ORDER_SETTLEMENT_ADDRESS: deployed.orderSettlement,
+          VITE_LIQUIDATION_AUCTION_ADDRESS: deployed.liquidationAuction,
+          VITE_POSITION_NFT_ADDRESS: deployed.positionNFT,
+          VITE_COLLATERAL_ESCROW_ADDRESS: deployed.collateralEscrow,
+          VITE_ASSET_REGISTRY_ADDRESS: deployed.assetRegistry,
+          VITE_ORACLE_ROUTER_ADDRESS: deployed.oracleRouter,
+          VITE_ELIGIBILITY_GATE_ADDRESS: deployed.eligibilityGate,
+        };
+        const badChainBuild = spawnSync(viteBin, ['build', '--outDir', path.join(tmpBuildDir, 'bad1'), '--emptyOutDir'], {
+          cwd: REPO_ROOT,
+          env: { ...baseBuildEnv, VITE_CHAIN_ID: '1' },
+          encoding: 'utf8',
+        });
+        assert.notEqual(badChainBuild.status, 0, 'vite build MUST fail on non-Base VITE_CHAIN_ID in production');
+
+        const badForkUsdcBuild = spawnSync(
+          viteBin,
+          ['build', '--outDir', path.join(tmpBuildDir, 'bad2'), '--emptyOutDir'],
+          {
+            cwd: REPO_ROOT,
+            env: {
+              ...baseBuildEnv,
+              VITE_IS_FORK: 'true',
+              FORK: 'true',
+              VITE_USDC_ADDRESS: '0x9999999999999999999999999999999999999999',
+            },
+            encoding: 'utf8',
+          }
+        );
+        assert.notEqual(
+          badForkUsdcBuild.status,
+          0,
+          'vite build MUST ignore VITE_IS_FORK/FORK and fail when VITE_USDC_ADDRESS overrides Base USDC'
+        );
+
+        const goodProdOut = path.join(tmpBuildDir, 'good');
+        const goodProdBuild = spawnSync(viteBin, ['build', '--outDir', goodProdOut, '--emptyOutDir'], {
+          cwd: REPO_ROOT,
+          env: { ...baseBuildEnv, VITE_IS_FORK: 'true', FORK: 'true' },
+          encoding: 'utf8',
+        });
+        assert.equal(goodProdBuild.status, 0, `Valid prod vite build failed: ${goodProdBuild.stderr}`);
+        const builtIndexHtml = fs.readFileSync(path.join(goodProdOut, 'index.html'), 'utf8');
+        assert.ok(
+          !/connect-src[^"]*?\shttps:(?:\s|;|")/.test(builtIndexHtml),
+          'Built prod index.html CSP must not contain https: wildcard'
+        );
+        assert.ok(builtIndexHtml.includes('https://base-mainnet.private-rpc.example'));
+        assert.ok(builtIndexHtml.includes('https://api.nostok.xyz'));
+        assert.ok(builtIndexHtml.includes('https://notifications.nostok.xyz'));
+        assert.ok(builtIndexHtml.includes('https://risk.nostok.xyz'));
+      } finally {
+        fs.rmSync(tmpBuildDir, { recursive: true, force: true });
+      }
+
+      // Fix #4: Live chainChanged away (0x1) and back to Base (0x2105) updates connRef synchronously & reloads live snapshot
+      const connRef = {
+        current: {
+          connected: true,
+          address: ADDRESSES.borrower,
+          chainId: BASE_CHAIN_ID,
+          wrongNetwork: false,
+          walletError: '',
+        },
+      };
+      const siweRef = { current: null };
+      const snapshotSeqRef = { current: 1 };
+      const snapshots: Array<{ loading: boolean; data: Awaited<ReturnType<typeof fetchWalletState>> | null }> = [];
+      let pendingRefresh: Promise<void> = Promise.resolve();
+      const eventsHandler = createWalletEventsHandler({
+        connRef,
+        siweRef,
+        snapshotSeqRef,
+        updateWalletConn(updater: any) {
+          const next = typeof updater === 'function' ? updater(connRef.current) : updater;
+          connRef.current = next;
+          return next;
+        },
+        setWalletSnapshot(snap: any) {
+          snapshots.push(snap);
+        },
+        clearLocalSiweState() {},
+        refreshWalletData(addr: string, att: string, opts: { wrongNetwork?: boolean } = {}) {
+          assert.equal(
+            connRef.current.wrongNetwork,
+            false,
+            'connRef.current.wrongNetwork must be updated BEFORE refreshWalletData reads it'
+          );
+          assert.equal(opts.wrongNetwork, false);
+          const reqId = ++snapshotSeqRef.current;
+          pendingRefresh = (async () => {
+            const ws = await fetchWalletState(addr, { cfg, attestationHex: att, requestId: reqId });
+            snapshots.push({ loading: false, data: ws });
+          })();
+          return pendingRefresh;
+        },
+        getConfig: () => cfg,
+      });
+
+      eventsHandler.onChainChanged('0x1');
+      assert.equal(connRef.current.wrongNetwork, true);
+      assert.equal(connRef.current.chainId, 1);
+      assert.equal(snapshots[snapshots.length - 1]?.data, null);
+
+      eventsHandler.onChainChanged('0x2105');
+      assert.equal(connRef.current.wrongNetwork, false);
+      assert.equal(connRef.current.chainId, BASE_CHAIN_ID);
+      await pendingRefresh;
+      const reloaded = snapshots[snapshots.length - 1]?.data;
+      assert.ok(reloaded && !reloaded.stale, 'Switching back to Base (0x2105) must reload live snapshot');
+      assert.equal(reloaded.rpcChainId, BASE_CHAIN_ID);
+      assert.equal(reloaded.openBorrowCount, 1);
+
+      // Fix #5 + Low Fees: live FeeCollector fees exposed on /assets + /fees & fetchMarketSnapshot
+      assert.ok(liveMkt.fees, 'fetchMarketSnapshot must populate live protocol fees from api/');
+      assert.equal(typeof liveMkt.fees.origination_fee_bps, 'number');
+      assert.equal(typeof liveMkt.fees.max_origination_bps, 'number');
+      const feesHttp = await fetch(`${apiUrl}/fees`);
+      assert.equal(feesHttp.status, 200);
+      const feesBody = (await feesHttp.json()) as { fees: Record<string, number> };
+      assert.equal(feesBody.fees.origination_fee_bps, liveMkt.fees.origination_fee_bps);
+      assert.equal(feesBody.fees.safety_reserve_share_bps, liveMkt.fees.safety_reserve_share_bps);
+      console.log('PASS Pre-WS3.3 Fixes #1-#5 + Low (demo banners, ErrorBoundary/vite build/CSP, chainChanged reload, live fees) verified.');
+
+      // 3.3 WS3.3 Borrow Flow: exact/rounded-up raw API amounts -> approve -> sign BorrowOrder -> fill -> cancel -> fillLendOffer
+      console.log('\n=== WS3.3: Borrow flow (quote -> approve exact -> sign BorrowOrder -> fill -> cancel -> fillLendOffer) ===');
+      walletProvider.setAccount(KEYS.borrower);
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdac,
+          abi: mockB20Artifact.abi,
+          functionName: 'mint',
+          args: [ADDRESSES.borrower, 25n * 10n ** 18n],
+        }),
+      });
+
+      // Reset NVDAc -> CollateralEscrow allowance to 0 so prepareAndSignBorrowOrder must issue exact on-chain approve
+      await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: nvdac,
+          abi: approveAbi,
+          functionName: 'approve',
+          args: [deployed.collateralEscrow, 0n],
+        }),
+      });
+
+      // Non-round $700 principal at $140 / 60% LTV requires ceilDiv(700e6 * 1e20 / 6000 / 140e8) = 8.333333333333333334e18 NVDAc;
+      // flooring to 6 decimals (8.333333e18) would fail on-chain LTV.
+      const nonRoundQuote = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '700000000',
+        termDays: 30,
+        aprBps: 1000,
+        maxLtvBps: 6000,
+        borrower: ADDRESSES.borrower,
+      });
+      assert.equal(nonRoundQuote.accepted, true);
+      const exact700 = resolveExactBorrowAmounts(nonRoundQuote);
+      assert.equal(exact700.principalRaw, 700_000_000n);
+      assert.ok(
+        exact700.collateralAmountRaw > 8_333_333_000_000_000_000n,
+        `Expected rounded-up raw collateral > 6-dec floor, got ${exact700.collateralAmountRaw}`
+      );
+
+      const preparedBorrow = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '700000000',
+        maxRateBps: 1000,
+        termDays: 30,
+        maxLtvBps: 6000,
+        expiryDays: 7,
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(preparedBorrow.approvalTxHash, 'WS3.3 must submit exact ERC-20 approve tx when allowance < required');
+      assert.equal(preparedBorrow.order.collateralAmount, exact700.collateralAmountRaw);
+      assert.equal(preparedBorrow.order.minUsdc, 700_000_000n);
+
+      const postApproveMeta = await readBorrowAllowanceAndNonce(ADDRESSES.borrower, nvdac, { cfg });
+      assert.equal(
+        BigInt(postApproveMeta.allowanceRaw),
+        exact700.collateralAmountRaw,
+        'Approval MUST grant exact rounded-up raw API collateral amount, never infinite or floored'
+      );
+
+      const onchainOrderHash = await publicClient.readContract({
+        address: deployed.orderSettlement,
+        abi: orderSettlementAbi,
+        functionName: 'hashBorrowOrder',
+        args: [preparedBorrow.order],
+      });
+      assert.equal(preparedBorrow.orderHash, onchainOrderHash);
+
+      await publicClient.waitForTransactionReceipt({
+        hash: await lenderClient.writeContract({
+          address: deployed.orderSettlement,
+          abi: fillOrderAbi,
+          functionName: 'fillBorrowOrder',
+          args: [preparedBorrow.order, preparedBorrow.signature, 700_000_000n],
+        }),
+      });
+
+      await runIndexerSync(idxCtx);
+      const afterFillLoans = await fetchPaginatedApiRows(`${cfg.apiUrl}/loans`, { cfg });
+      assert.equal(afterFillLoans.total, 3, 'Filled WS3.3 BorrowOrder must open Loan #3 in indexer/api');
+      const loan3 = (afterFillLoans.rows as Array<Record<string, unknown>>).find(
+        (l) => (l.principal as { raw: string })?.raw === '700000000'
+      );
+      assert.ok(loan3, 'Loan #3 must have exact $700 principal');
+      assert.equal((loan3.collateral_amount as { raw: string }).raw, exact700.collateralAmountRaw.toString());
+
+      // Cancel second BorrowOrder on-chain -> lender fill must revert
+      await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: nvdac,
+          abi: approveAbi,
+          functionName: 'approve',
+          args: [deployed.collateralEscrow, 10n ** 19n],
+        }),
+      });
+      const cancelPrep = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '600000000',
+        maxRateBps: 1000,
+        termDays: 30,
+        maxLtvBps: 6000,
+        expiryDays: 7,
+        autoApprove: false,
+        provider: walletProvider,
+        cfg,
+      });
+      const cancelRes = await cancelSignedBorrowOrder({
+        address: ADDRESSES.borrower,
+        order: cancelPrep.order,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(/^0x[0-9a-fA-F]{64}$/.test(cancelRes.txHash));
+      const isCancelledOnChain = await publicClient.readContract({
+        address: deployed.orderSettlement,
+        abi: orderSettlementAbi,
+        functionName: 'isOrderCancelled',
+        args: [cancelPrep.orderHash],
+      });
+      assert.equal(isCancelledOnChain, true);
+      await assert.rejects(() =>
+        lenderClient.writeContract({
+          address: deployed.orderSettlement,
+          abi: fillOrderAbi,
+          functionName: 'fillBorrowOrder',
+          args: [cancelPrep.order, cancelPrep.signature, 600_000_000n],
+        })
+      );
+
+      // Reset allowance to 0 -> Borrower fills lender's signed LendOffer via fillLendOfferAsBorrower ($550 -> non-round 6.547619... NVDAc)
+      await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: nvdac,
+          abi: approveAbi,
+          functionName: 'approve',
+          args: [deployed.collateralEscrow, 0n],
+        }),
+      });
+      const lenderNonce = (await publicClient.readContract({
+        address: deployed.orderSettlement,
+        abi: orderSettlementAbi,
+        functionName: 'getMakerNonce',
+        args: [ADDRESSES.lender],
+      })) as bigint;
+      const latestBlk = await publicClient.getBlock();
+      const lendOffer = {
+        lender: ADDRESSES.lender,
+        usdcAmount: 1_000_000_000n,
+        minRateBps: 900,
+        termDays: 30,
+        allowedCollateral: nvdac,
+        maxLtvBps: 6000,
+        minFill: 500_000_000n,
+        expiry: latestBlk.timestamp + 7200n,
+        nonce: lenderNonce,
+        yieldMode: 0,
+      };
+      const lendOfferSig = await lenderAccount.signTypedData({
+        domain: {
+          name: ORDER_SETTLEMENT_DOMAIN_NAME,
+          version: ORDER_SETTLEMENT_DOMAIN_VERSION,
+          chainId: BASE_CHAIN_ID,
+          verifyingContract: deployed.orderSettlement,
+        },
+        types: LEND_OFFER_EIP712_TYPES,
+        primaryType: 'LendOffer',
+        message: lendOffer,
+      });
+
+      const fillLendRes = await fillLendOfferAsBorrower({
+        address: ADDRESSES.borrower,
+        offer: lendOffer,
+        signature: lendOfferSig,
+        collateralToken: nvdac,
+        fillUsdcRaw: '550000000',
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(fillLendRes.loanId, 'fillLendOfferAsBorrower must emit OrderFilled loanId');
+      assert.equal(fillLendRes.exact.principalRaw, 550_000_000n);
+      assert.ok(fillLendRes.exact.collateralAmountRaw > 6_547_619_000_000_000_000n);
+
+      await runIndexerSync(idxCtx);
+      const finalLoans = await fetchPaginatedApiRows(`${cfg.apiUrl}/loans`, { cfg });
+      assert.equal(finalLoans.total, 4, 'fillLendOfferAsBorrower must open Loan #4 in indexer/api');
+      console.log('PASS WS3.3: Borrow flow (quote -> exact approve -> EIP-712 sign -> fill -> cancel -> fillLendOffer) verified.');
+
+      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 FRONTEND BASE MAINNET FORK TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
       await new Promise<void>((r) => apiServer.close(() => r()));

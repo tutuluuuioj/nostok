@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Page, Rows } from '../components/ui.jsx';
-import { FEES, ORACLE_STATES } from '../lib/data.js';
+import { ORACLE_STATES } from '../lib/data.js';
 import {
+  buildProtocolFeeCards,
+  buildRiskSummaryRows,
   fetchMarketSnapshot,
   fetchRiskSummaryOptional,
   formatApiAmount,
@@ -43,6 +45,7 @@ export function Risk() {
   const market = state.market;
   const assets = market?.assets ?? [];
   const risk = state.risk;
+  const feeCards = buildProtocolFeeCards(market?.fees);
 
   return (
     <Page
@@ -63,7 +66,14 @@ export function Risk() {
 
       {market && (market.stale || market.degraded || market.error) ? (
         <p className="err block" role="alert">
-          Live asset & oracle state unavailable or degraded — {market.error}
+          Live asset &amp; oracle state unavailable or degraded — {market.error}
+        </p>
+      ) : null}
+
+      {risk && (risk.monitor_degraded || risk.last_scan_error || state.riskError) ? (
+        <p className="err block" role="alert">
+          Risk monitor degraded (monitor_degraded={String(Boolean(risk.monitor_degraded))}) —{' '}
+          {risk.last_scan_error || state.riskError || 'Scan error'} · Last scan {risk.last_scan_timestamp ?? '—'}
         </p>
       ) : null}
 
@@ -76,30 +86,7 @@ export function Risk() {
       {risk ? (
         <section className="block">
           <h2>Protocol risk summary (risk/)</h2>
-          <Rows
-            items={[
-              { label: 'Monitor status', value: risk.status },
-              { label: 'Chain head block', value: `#${risk.chain_head_block ?? '—'}` },
-              {
-                label: 'Equity market open',
-                value: risk.market_open === null ? '—' : risk.market_open ? 'Open' : 'Closed',
-              },
-              {
-                label: 'Protocol paused',
-                value: risk.protocol_paused === null ? '—' : risk.protocol_paused ? 'Paused' : 'Active',
-              },
-              {
-                label: 'Global cap / outstanding',
-                value: `${formatApiAmount(risk.global_usdc_cap, { prefixUsd: true })} / ${formatApiAmount(risk.total_outstanding_principal, { prefixUsd: true })}`,
-              },
-              {
-                label: 'Loans by risk (H / MC / NL / Liq / Unk)',
-                value: risk.loan_counts
-                  ? `${risk.loan_counts.healthy} / ${risk.loan_counts.margin_call} / ${risk.loan_counts.near_liquidation} / ${risk.loan_counts.liquidatable} / ${risk.loan_counts.unknown ?? 0}`
-                  : '—',
-              },
-            ]}
-          />
+          <Rows items={buildRiskSummaryRows(risk)} />
         </section>
       ) : null}
 
@@ -166,15 +153,19 @@ export function Risk() {
       </section>
 
       <section className="block">
-        <h2>Protocol fees & caps</h2>
-        <div className="stack">
-          {FEES.map((fee) => (
-            <article key={fee.name}>
-              <h3>{fee.name}</h3>
-              <p>{fee.payer}. {fee.rate}. Hard cap {fee.cap}. {fee.when}.</p>
-            </article>
-          ))}
-        </div>
+        <h2>Protocol fees &amp; caps (FeeCollector via api/)</h2>
+        {feeCards.length === 0 ? (
+          <p className="hint">Live protocol fee parameters could not be loaded while api/ is unreachable.</p>
+        ) : (
+          <div className="stack">
+            {feeCards.map((fee) => (
+              <article key={fee.name}>
+                <h3>{fee.name}</h3>
+                <p>{fee.detail}</p>
+              </article>
+            ))}
+          </div>
+        )}
       </section>
     </Page>
   );

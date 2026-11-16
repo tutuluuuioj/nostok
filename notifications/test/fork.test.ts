@@ -2862,6 +2862,175 @@ async function runTests(): Promise<void> {
             assert.equal(rotRes.body.error?.code, 'RATE_LIMIT_EXCEEDED');
           }
         }
+
+        // Fix #3a: Even after 10/h global cap on bombedtarget@gmail.com is exhausted by 10 distinct wallets+IPs,
+        // a legitimate victim WITH a valid SIWE session confirming their own address (no +subaddress) STILL succeeds (201 -> 200)!
+        const gmailVictimKey = generatePrivateKey();
+        const gmailVictimAcct = privateKeyToAccount(gmailVictimKey);
+        const gvNonce = await getNonce(gmailVictimAcct.address);
+        const gvSiwe = formatSiweMessage({
+          domain: 'app.nostok.xyz',
+          address: gmailVictimAcct.address,
+          uri: 'https://app.nostok.xyz',
+          chainId: 8453,
+          nonce: gvNonce,
+          issuedAt: nowIso,
+          expirationTime: futureIso,
+        });
+        const gvTok = (
+          await httpJson<{ token: string }>('POST', `${bombUrl}/auth/verify`, {
+            message: gvSiwe,
+            signature: await gmailVictimAcct.signMessage({ message: gvSiwe }),
+          })
+        ).body.token;
+        const gvSubRes = await httpJson<{ id: string; verified: boolean }>(
+          'POST',
+          `${bombUrl}/subscriptions`,
+          { channel: 'email', target: 'bombed.target@gmail.com' },
+          { Authorization: `Bearer ${gvTok}`, 'X-Forwarded-For': '203.0.114.99' }
+        );
+        assert.equal(
+          gvSubRes.status,
+          201,
+          'Legitimate victim with valid SIWE session must NOT be locked out even when global cap is exhausted'
+        );
+        const gvMsg = deliveredEmails.find((m) => m.subscriptionId === gvSubRes.body.id)!;
+        assert.ok(gvMsg, 'Verification email for victim must be delivered');
+        const gvConfirmRes = await httpJson<{ confirmed: boolean; verified: boolean }>(
+          'POST',
+          `${bombUrl}/subscriptions/confirm`,
+          { token: String(gvMsg.payload.confirm_token) },
+          { 'X-Forwarded-For': '203.0.114.99' }
+        );
+        assert.equal(gvConfirmRes.status, 200);
+        assert.equal(gvConfirmRes.body.verified, true);
+
+        // Fix #3b: 4-wallet / 10-IP PoC against lockout.victim@nostok.xyz + "Not me, block this address" link
+        const pocTokens: Array<{ address: string; token: string }> = [];
+        for (let a = 0; a < 4; a++) {
+          const aKey = generatePrivateKey();
+          const aAcct = privateKeyToAccount(aKey);
+          const aNonce = await getNonce(aAcct.address);
+          const aSiwe = formatSiweMessage({
+            domain: 'app.nostok.xyz',
+            address: aAcct.address,
+            uri: 'https://app.nostok.xyz',
+            chainId: 8453,
+            nonce: aNonce,
+            issuedAt: nowIso,
+            expirationTime: futureIso,
+          });
+          const aTok = (
+            await httpJson<{ token: string }>('POST', `${bombUrl}/auth/verify`, {
+              message: aSiwe,
+              signature: await aAcct.signMessage({ message: aSiwe }),
+            })
+          ).body.token;
+          pocTokens.push({ address: aAcct.address, token: aTok });
+        }
+        let firstSpamSubId = '';
+        let pocBlockedResends = 0;
+        for (let reqIdx = 0; reqIdx < 10; reqIdx++) {
+          const att = pocTokens[reqIdx % 4];
+          const pocRes = await httpJson<{ id?: string; error?: { code: string } }>(
+            'POST',
+            `${bombUrl}/subscriptions`,
+            { channel: 'email', target: reqIdx % 2 === 0 ? 'lockout.victim@nostok.xyz' : `lockout.victim+p${reqIdx}@nostok.xyz` },
+            { Authorization: `Bearer ${att.token}`, 'X-Forwarded-For': `198.51.102.${reqIdx + 1}` }
+          );
+          if (reqIdx === 0) {
+            assert.equal(pocRes.status, 201);
+            firstSpamSubId = String(pocRes.body.id);
+          } else if (reqIdx >= 4 && pocRes.status === 429) {
+            pocBlockedResends += 1;
+          }
+        }
+        assert.ok(pocBlockedResends >= 1, '4-wallet/10-IP resend PoC must hit confirmTargetResendLimiter before filling 10/h cap');
+
+        // "Not me, block this address" link: GET previews block, POST blocks sender wallet, deletes unverified sub, and persists across DELETE /user/data
+        const spamMsg = deliveredEmails.find((m) => m.subscriptionId === firstSpamSubId)!;
+        assert.ok(spamMsg.message.includes('Not me, block this address:'), 'Email message must contain block link');
+        const blockPreview = await httpJson<{
+          confirmation_required: boolean;
+          method: string;
+          subscription_id: string;
+          blocked_wallet: string;
+        }>('GET', String(spamMsg.payload.block_url), undefined, { 'X-Forwarded-For': '203.0.114.120' });
+        assert.equal(blockPreview.status, 200);
+        assert.equal(blockPreview.body.confirmation_required, true);
+        assert.equal(blockPreview.body.method, 'POST');
+        assert.equal(blockPreview.body.blocked_wallet.toLowerCase(), pocTokens[0].address.toLowerCase());
+
+        const blockExec = await httpJson<{ blocked: boolean; subscription_id: string; blocked_wallet: string }>(
+          'POST',
+          `${bombUrl}/subscriptions/block`,
+          { token: String(spamMsg.payload.block_token) },
+          { 'X-Forwarded-For': '203.0.114.120' }
+        );
+        assert.equal(blockExec.status, 200);
+        assert.equal(blockExec.body.blocked, true);
+
+        const blockedRetry = await httpJson<{ error?: { code: string } }>(
+          'POST',
+          `${bombUrl}/subscriptions`,
+          { channel: 'email', target: 'lockout.victim+retry@nostok.xyz' },
+          { Authorization: `Bearer ${pocTokens[0].token}`, 'X-Forwarded-For': '203.0.114.121' }
+        );
+        assert.equal(blockedRetry.status, 403);
+        assert.equal(blockedRetry.body.error?.code, 'SENDER_BLOCKED_BY_RECIPIENT');
+
+        // Attacker calling DELETE /user/data cannot unblock themselves
+        const delDataRes = await httpJson(
+          'DELETE',
+          `${bombUrl}/user/data`,
+          undefined,
+          { Authorization: `Bearer ${pocTokens[0].token}`, 'X-Forwarded-For': '203.0.114.122' }
+        );
+        assert.equal(delDataRes.status, 200);
+        const blockedAfterDel = await httpJson<{ error?: { code: string } }>(
+          'POST',
+          `${bombUrl}/subscriptions`,
+          { channel: 'email', target: 'lockout.victim@nostok.xyz' },
+          { Authorization: `Bearer ${pocTokens[0].token}`, 'X-Forwarded-For': '203.0.114.123' }
+        );
+        assert.equal(blockedAfterDel.status, 403);
+        assert.equal(blockedAfterDel.body.error?.code, 'SENDER_BLOCKED_BY_RECIPIENT');
+
+        // Legitimate victim STILL subscribes & confirms cleanly
+        const pocVictimKey = generatePrivateKey();
+        const pocVictimAcct = privateKeyToAccount(pocVictimKey);
+        const pvNonce = await getNonce(pocVictimAcct.address);
+        const pvSiwe = formatSiweMessage({
+          domain: 'app.nostok.xyz',
+          address: pocVictimAcct.address,
+          uri: 'https://app.nostok.xyz',
+          chainId: 8453,
+          nonce: pvNonce,
+          issuedAt: nowIso,
+          expirationTime: futureIso,
+        });
+        const pvTok = (
+          await httpJson<{ token: string }>('POST', `${bombUrl}/auth/verify`, {
+            message: pvSiwe,
+            signature: await pocVictimAcct.signMessage({ message: pvSiwe }),
+          })
+        ).body.token;
+        const pvSub = await httpJson<{ id: string }>(
+          'POST',
+          `${bombUrl}/subscriptions`,
+          { channel: 'email', target: 'lockout.victim@nostok.xyz' },
+          { Authorization: `Bearer ${pvTok}`, 'X-Forwarded-For': '203.0.114.125' }
+        );
+        assert.equal(pvSub.status, 201);
+        const pvMsg = deliveredEmails.find((m) => m.subscriptionId === pvSub.body.id)!;
+        const pvConfirm = await httpJson<{ confirmed: boolean; verified: boolean }>(
+          'POST',
+          `${bombUrl}/subscriptions/confirm`,
+          { token: String(pvMsg.payload.confirm_token) },
+          { 'X-Forwarded-For': '203.0.114.125' }
+        );
+        assert.equal(pvConfirm.status, 200);
+        assert.equal(pvConfirm.body.verified, true);
       } finally {
         await new Promise<void>((r) => bombProxySrv.close(() => r()));
       }
