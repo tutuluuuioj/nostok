@@ -14,6 +14,7 @@ import {LiquidationAuction} from "../src/LiquidationAuction.sol";
 import {ILiquidationAuction} from "../src/interfaces/ILiquidationAuction.sol";
 import {ILoanCore} from "../src/interfaces/ILoanCore.sol";
 import {IAssetRegistry} from "../src/interfaces/IAssetRegistry.sol";
+import {IOracleRouter} from "../src/interfaces/IOracleRouter.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockAggregator} from "./mocks/MockAggregator.sol";
 import {MockSequencer} from "./mocks/MockSequencer.sol";
@@ -673,5 +674,123 @@ contract LiquidationAuctionTest is Test {
         ILiquidationAuction.Auction memory a2 = auction.getAuction(auction2);
         assertEq(uint8(a2.status), uint8(ILiquidationAuction.AuctionStatus.Cancelled));
         assertFalse(nft.isAuctionLocked(loan2));
+    }
+
+    function test_EmergencyCancelAuction_HealthyOracle_Reverts_And_Cooldown() public {
+        vm.prank(owner);
+        router.setMarketSession(true, true);
+        assertTrue(router.isMarketOpen());
+
+        vm.prank(mockOrderSettlement);
+        uint256 loanId = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            50e6,
+            5800e6,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        feed.setUpdatedAt(block.timestamp);
+        feed.setPrice(145e8);
+        vm.prank(keeper);
+        uint256 auctionId = core.startLiquidation(loanId);
+
+        // 1. When oracle is healthy (VALID_OPEN), emergencyCancelAuction MUST revert!
+        (, , IOracleRouter.OracleState state) = router.getPrice(address(stockToken));
+        assertEq(uint8(state), uint8(IOracleRouter.OracleState.VALID_OPEN));
+
+        vm.prank(guardian);
+        vm.expectRevert(LiquidationAuction.OracleNotStaleOrFrozen.selector);
+        auction.emergencyCancelAuction(auctionId);
+
+        // 2. Feed becomes stale (> 86400s)
+        feed.setUpdatedAt(block.timestamp - 90000);
+        (, , IOracleRouter.OracleState staleState) = router.getPrice(address(stockToken));
+        assertEq(uint8(staleState), uint8(IOracleRouter.OracleState.STALE_FEED));
+
+        // Guardian successfully emergency cancels stuck auction
+        vm.prank(guardian);
+        auction.emergencyCancelAuction(auctionId);
+        assertFalse(nft.isAuctionLocked(loanId));
+
+        // 3. Cooldown test: Re-start liquidation on the same loan after oracle refreshes
+        feed.setUpdatedAt(block.timestamp);
+        uint256 auctionId2 = core.startLiquidation(loanId);
+
+        // Feed becomes stale again within 1 hour cooldown window
+        feed.setUpdatedAt(block.timestamp - 90000);
+
+        // Immediate second emergency cancel reverts due to cooldown!
+        vm.prank(guardian);
+        vm.expectRevert(LiquidationAuction.EmergencyCancelCooldownActive.selector);
+        auction.emergencyCancelAuction(auctionId2);
+
+        // Warp past the 1-hour cooldown
+        vm.warp(block.timestamp + 3601);
+
+        // Now emergency cancel succeeds!
+        vm.prank(guardian);
+        auction.emergencyCancelAuction(auctionId2);
+        assertFalse(nft.isAuctionLocked(loanId));
+    }
+
+    function test_FrozenAsset_UnderwaterLoan_LiquidationBlocked_And_EmergencyRescue() public {
+        vm.prank(owner);
+        router.setMarketSession(true, true);
+
+        // Open loan: 50 shares of NVDAc ($200 each = $10,000 value), borrow $5,000 USDC
+        vm.prank(mockOrderSettlement);
+        uint256 loanId = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            50e6,
+            5000e6,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        // Severe market crash: price drops to $60 ($3,000 collateral value, debt is $5,000 -> underwater > 166% LTV)
+        feed.setUpdatedAt(block.timestamp);
+        feed.setPrice(60e8);
+
+        // Asset freezes due to corporate action split (e.g. 2-for-1 split without sync)
+        stockToken.setUiMultiplier(2e18);
+        (, , IOracleRouter.OracleState frozenState) = router.getPrice(address(stockToken));
+        assertEq(uint8(frozenState), uint8(IOracleRouter.OracleState.FROZEN_CORPORATE_ACTION));
+
+        // 1. Keeper attempts startLiquidation while asset is frozen -> reverts OracleInvalidForAction!
+        vm.prank(keeper);
+        vm.expectRevert(LoanCore.OracleInvalidForAction.selector);
+        core.startLiquidation(loanId);
+
+        // 2. What if auction was already started right before split/freeze?
+        // Guardian temporarily unfreezes multiplier to allow auction start
+        vm.prank(guardian);
+        router.syncMultiplier(address(stockToken));
+
+        vm.prank(keeper);
+        uint256 auctionId = core.startLiquidation(loanId);
+        assertTrue(nft.isAuctionLocked(loanId));
+
+        // Asset is frozen by guardian
+        vm.prank(guardian);
+        registry.setAssetStatus(address(stockToken), IAssetRegistry.AssetStatus.Frozen);
+
+        // Protocol guardian can execute emergencyCancelAuction because asset is frozen!
+        vm.prank(guardian);
+        auction.emergencyCancelAuction(auctionId);
+
+        ILiquidationAuction.Auction memory a = auction.getAuction(auctionId);
+        assertEq(uint8(a.status), uint8(ILiquidationAuction.AuctionStatus.Cancelled));
+        assertFalse(nft.isAuctionLocked(loanId));
     }
 }

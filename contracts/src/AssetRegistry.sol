@@ -13,10 +13,11 @@ import {IOracleRouter} from "./interfaces/IOracleRouter.sol";
  */
 contract AssetRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable, IAssetRegistry {
     address public guardian;
-    address public oracleRouter;
 
     mapping(address => AssetConfig) private _configs;
     mapping(address => bool) private _supported;
+
+    address public oracleRouter;
 
     error UnauthorizedCaller();
     error ZeroAddress();
@@ -80,8 +81,9 @@ contract AssetRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable, IA
         _supported[token] = true;
 
         if (oracleRouter != address(0)) {
-            // Automatically record token baseline multiplier upon listing
-            IOracleRouter(oracleRouter).syncMultiplier(token);
+            // Automatically attempt to record token baseline multiplier upon listing.
+            // Try/catch ensures a pending corporate action split does not revert asset configuration.
+            try IOracleRouter(oracleRouter).syncMultiplier(token) {} catch {}
         }
 
         emit AssetConfigSet(token, config);
@@ -125,5 +127,5 @@ contract AssetRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable, IA
         return _supported[token];
     }
 
-    uint256[50] private __gap;
+    uint256[49] private __gap;
 }

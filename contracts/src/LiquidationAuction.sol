@@ -30,6 +30,7 @@ contract LiquidationAuction is
     using SafeERC20 for IERC20;
 
     uint128 public constant MIN_BUY_USDC = 10 * 1e6; // $10 USDC min buy to prevent dust griefing
+    uint256 public constant EMERGENCY_CANCEL_COOLDOWN = 1 hours;
 
     address public escrow;
     address public loanCore;
@@ -38,6 +39,7 @@ contract LiquidationAuction is
 
     uint256 public nextAuctionId;
     mapping(uint256 => Auction) public auctions;
+    mapping(uint256 => uint256) public lastEmergencyCancelTime; // loanId => timestamp
 
     error UnauthorizedCaller();
     error ZeroAddress();
@@ -46,6 +48,8 @@ contract LiquidationAuction is
     error SlippageExceeded();
     error BuyAmountTooSmall();
     error AuctionExpired();
+    error OracleNotStaleOrFrozen();
+    error EmergencyCancelCooldownActive();
 
     modifier onlyLoanCore() {
         if (msg.sender != loanCore) revert UnauthorizedCaller();
@@ -309,12 +313,28 @@ contract LiquidationAuction is
 
     /**
      * @notice Protocol guardian or owner emergency action to cancel a stuck auction if oracle is frozen or stale.
+     * Enforces that the feed is STALE_FEED or FROZEN_CORPORATE_ACTION and applies a per-loan cooldown.
      */
     function emergencyCancelAuction(uint256 auctionId) external {
         address guardian = ILoanCore(loanCore).guardian();
         if (msg.sender != owner() && msg.sender != guardian) revert UnauthorizedCaller();
         Auction storage a = auctions[auctionId];
         if (a.status != AuctionStatus.Active) revert AuctionNotActive();
+
+        address router = ILoanCore(loanCore).oracleRouter();
+        (, , IOracleRouter.OracleState oState) = IOracleRouter(router).getPrice(a.collateralToken);
+        if (
+            oState != IOracleRouter.OracleState.STALE_FEED &&
+            oState != IOracleRouter.OracleState.FROZEN_CORPORATE_ACTION
+        ) {
+            revert OracleNotStaleOrFrozen();
+        }
+
+        if (block.timestamp < lastEmergencyCancelTime[a.loanId] + EMERGENCY_CANCEL_COOLDOWN) {
+            revert EmergencyCancelCooldownActive();
+        }
+        lastEmergencyCancelTime[a.loanId] = block.timestamp;
+
         a.status = AuctionStatus.Cancelled;
         ILoanCore(loanCore).onAuctionCancelled(a.loanId);
         emit AuctionCancelled(auctionId, a.loanId);
@@ -328,9 +348,14 @@ contract LiquidationAuction is
 
         address router = ILoanCore(loanCore).oracleRouter();
         (uint256 currentPrice, , IOracleRouter.OracleState oState) = IOracleRouter(router).getPrice(a.collateralToken);
-        if (oState != IOracleRouter.OracleState.VALID_OPEN && oState != IOracleRouter.OracleState.VALID_CLOSED) {
-            return; // Maintain status if oracle is invalid or feed stale
+        if (
+            oState != IOracleRouter.OracleState.VALID_OPEN &&
+            oState != IOracleRouter.OracleState.VALID_CLOSED &&
+            oState != IOracleRouter.OracleState.STALE_FEED
+        ) {
+            return; // Maintain status if oracle is invalid or corporate action frozen
         }
+        if (currentPrice == 0) return;
 
         ILoanCore.Loan memory l = ILoanCore(loanCore).getLoan(a.loanId);
         (uint256 grossVal, , ) = IOracleRouter(router).getValue(a.collateralToken, l.collateralRaw);
@@ -358,5 +383,5 @@ contract LiquidationAuction is
         return auctions[auctionId];
     }
 
-    uint256[50] private __gap;
+    uint256[49] private __gap;
 }

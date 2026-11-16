@@ -163,9 +163,9 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
     /**
      * @notice Synchronizes recorded multiplier with current token uiMultiplier.
      * - If recordedMultiplier[token] == 0 (initial baseline) or diff < 5% (dividend drift):
-     *   Permissionless (callable by anyone to ratchet baseline).
+     *   Permissionless (callable by anyone or daily keeper to ratchet baseline).
      * - If diff >= 5% (corporate action split):
-     *   Restricted to Owner (post-split unfreeze).
+     *   Restricted to Owner or Protocol Guardian (post-split unfreeze).
      */
     function syncMultiplier(address token) public returns (uint256 current) {
         current = 1e18;
@@ -178,7 +178,10 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
         }
 
         uint256 prev = recordedMultiplier[token];
-        if (prev != 0 && msg.sender != owner()) {
+        address guardian = assetRegistry != address(0) ? IAssetRegistry(assetRegistry).guardian() : address(0);
+        bool isPrivileged = (msg.sender == owner() || (guardian != address(0) && msg.sender == guardian));
+
+        if (prev != 0 && !isPrivileged) {
             uint256 diff = current > prev ? current - prev : prev - current;
             uint256 diffBps = (diff * 10000) / prev;
             if (diffBps >= 500) {
@@ -340,7 +343,7 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
         bool marketOpen = isMarketOpen();
 
         if (marketOpen) {
-            uint32 maxStale = cfg.maxStaleOpenSecs > 0 ? cfg.maxStaleOpenSecs : 86400;
+            uint32 maxStale = cfg.maxStaleOpenSecs > 0 ? cfg.maxStaleOpenSecs : 3600;
             if (block.timestamp - updatedAt > maxStale) {
                 return (price, decimals, OracleState.STALE_FEED);
             }

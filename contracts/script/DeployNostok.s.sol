@@ -24,10 +24,15 @@ contract DeployNostok is Script {
     function run() external {
         uint256 deployerPrivateKey = vm.envOr("DEPLOYER_PRIVATE_KEY", uint256(0));
         address deployer = deployerPrivateKey != 0 ? vm.addr(deployerPrivateKey) : msg.sender;
-        address multisigOwner = vm.envOr("OWNER_ADDRESS", deployer);
-        address guardian = vm.envOr("GUARDIAN_ADDRESS", deployer);
-        address treasury = vm.envOr("TREASURY_ADDRESS", deployer);
-        address reserve = vm.envOr("RESERVE_ADDRESS", deployer);
+        address multisigOwner = vm.envAddress("OWNER_ADDRESS");
+        address guardian = vm.envAddress("GUARDIAN_ADDRESS");
+        address treasury = vm.envAddress("TREASURY_ADDRESS");
+        address reserve = vm.envAddress("RESERVE_ADDRESS");
+
+        require(multisigOwner != deployer, "Deployer cannot be owner");
+        require(guardian != deployer, "Deployer cannot be guardian");
+        require(treasury != deployer, "Deployer cannot be treasury");
+        require(reserve != deployer, "Deployer cannot be reserve");
 
         uint256 chainId = block.chainid;
         address usdc;
@@ -145,12 +150,12 @@ contract DeployNostok is Script {
         escrow.setAuthorizedCore(address(auction), true);
         nft.setAuthorizedCore(address(core), true);
 
-        // 10. Deploy 48h NostokTimelock
+        // 10. Deploy 48h NostokTimelock (self-administered: admin dropped to address(0))
         address[] memory proposers = new address[](1);
         proposers[0] = multisigOwner;
         address[] memory executors = new address[](1);
         executors[0] = multisigOwner;
-        NostokTimelock timelock = new NostokTimelock(proposers, executors, multisigOwner);
+        NostokTimelock timelock = new NostokTimelock(proposers, executors, address(0));
         console.log("NostokTimelock deployed at:", address(timelock));
 
         // Transfer ownership of core contracts and escrow to 48-hour TimelockController

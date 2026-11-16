@@ -5,6 +5,9 @@ import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {AssetRegistry} from "../src/AssetRegistry.sol";
 import {IAssetRegistry} from "../src/interfaces/IAssetRegistry.sol";
+import {OracleRouter} from "../src/OracleRouter.sol";
+import {MockSequencer} from "./mocks/MockSequencer.sol";
+import {MockERC20} from "./mocks/MockERC20.sol";
 
 contract AssetRegistryTest is Test {
     AssetRegistry public registry;
@@ -120,5 +123,52 @@ contract AssetRegistryTest is Test {
         vm.prank(owner);
         vm.expectRevert(AssetRegistry.InvalidDiscountParameters.selector);
         registry.setAssetConfig(token, cfg);
+    }
+
+    function test_RegistryToRouterSync_SetOracleRouterThenSetAssetConfig() public {
+        MockSequencer sequencer = new MockSequencer(0);
+        OracleRouter routerImpl = new OracleRouter();
+        bytes memory routerData = abi.encodeCall(
+            OracleRouter.initialize,
+            (owner, address(registry), address(sequencer))
+        );
+        OracleRouter router = OracleRouter(address(new ERC1967Proxy(address(routerImpl), routerData)));
+
+        // 1. Wire setOracleRouter on AssetRegistry
+        vm.prank(owner);
+        registry.setOracleRouter(address(router));
+        assertEq(registry.oracleRouter(), address(router));
+
+        // 2. Deploy B20 token with non-zero multiplier (e.g. NVDAc = 1.0005e18)
+        MockERC20 b20 = new MockERC20("NVIDIA Corp", "NVDAc", 6);
+        b20.setUiMultiplier(1000537939576369481);
+
+        IAssetRegistry.AssetConfig memory cfg = IAssetRegistry.AssetConfig({
+            feed: feed,
+            feedDecimals: 8,
+            tier: uint8(IAssetRegistry.AssetTier.TierA),
+            maxInitLtvBps: 6000,
+            marginCallLtvBps: 7000,
+            liqLtvBps: 7800,
+            badDebtLtvBps: 9000,
+            maxDiscountBps: 600,
+            closedMarketHaircutBps: 500,
+            perLoanCap: 10_000e6,
+            assetCap: 250_000e6,
+            maxStaleOpenSecs: 3600,
+            status: uint8(IAssetRegistry.AssetStatus.Active),
+            restricted: false
+        });
+
+        // 3. setAssetConfig automatically syncs the multiplier to OracleRouter
+        vm.prank(owner);
+        registry.setAssetConfig(address(b20), cfg);
+
+        assertEq(router.recordedMultiplier(address(b20)), 1000537939576369481);
+
+        // 4. Pending split does NOT revert setAssetConfig
+        b20.setUiMultiplier(2e18); // 100% split jump
+        vm.prank(owner);
+        registry.setAssetConfig(address(b20), cfg); // Must succeed without reverting!
     }
 }

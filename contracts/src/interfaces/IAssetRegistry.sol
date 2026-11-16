@@ -43,4 +43,5 @@ interface IAssetRegistry {
     function isAssetSupported(address token) external view returns (bool);
     function setOracleRouter(address router) external;
     function oracleRouter() external view returns (address);
+    function guardian() external view returns (address);
 }
