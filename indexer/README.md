@@ -4,8 +4,8 @@ TypeScript + **plain `viem` + PostgreSQL (`pg` + `@electric-sql/pglite`)** index
 
 ## Stack Choice: Why Plain `viem` + PostgreSQL Instead of Ponder
 
-1. **Deterministic Reorg Rollback & State Reconciliation:** Storing block hashes in `indexed_blocks` allows exact block-by-block parent-hash verification against the RPC. When a reorg (`anvil_revert` or competing fork) is detected, orphaned `loan_events`, `order_fills`, `auction_buys`, and `claims` are rolled back inside a single SQL transaction, and surviving `loans`, `auctions`, `positions`, `orders`, and `assets` are reconciled directly against on-chain view state (`LoanCore.getLoan()`, `LiquidationAuction.getAuction()`, `PositionNFT.ownerOf()`, `CollateralEscrow.getBalance()`).
-2. **Production PostgreSQL & Zero-Daemon Local Testing:** Connects to any PostgreSQL server when `DATABASE_URL=postgresql://...` is set (`pg.Pool`), and uses embedded WASM PostgreSQL (`@electric-sql/pglite`) when `DATABASE_URL` is unset or `memory://` — providing identical PostgreSQL SQL/JSONB semantics locally with zero external Postgres service required.
+1. **Deterministic Reorg Rollback & Historical State Verification:** Storing canonical block hashes in `indexed_blocks` (bounded reorg check + automatic pruning of rows older than `head - 1000` while preserving `loan_events`) allows fast parent-hash verification against the RPC. Every log verifies `log.blockHash == block.hash` (aborting mismatched batches safely), `getLogs` retries with exponential backoff and halves oversized ranges, mid-batch `AssetConfigSet` events refetch B20 escrow `Transfer`s, and surviving entities are reconciled at the exact historical block via `readAtBlock` (requiring an archive-capable RPC with no silent fallback to `latest`).
+2. **Production PostgreSQL Enforcement & Local Fork Testing:** Requires `DATABASE_URL=postgres(ql)://...` (`pg.Pool`) whenever `FORK` is not enabled. Embedded WASM PostgreSQL (`@electric-sql/pglite` `memory://` or local `dataDir`) is allowed only when `FORK=true`.
 3. **Lightweight Read-Only Boundary:** Requires zero private keys (`RPC_URL` + contract addresses + `START_BLOCK`).
 
 ---
@@ -74,7 +74,7 @@ npm test
 ```
 
 Environment variables (no private key required):
-* `RPC_URL`, `FORK`, `FORK_CHAIN_ID`
-* `DATABASE_URL` (`postgresql://...` for PostgreSQL server, or empty / `memory://` for embedded PGlite)
+* `RPC_URL` (archive-capable Base RPC), `FORK`, `FORK_CHAIN_ID`
+* `DATABASE_URL` (`postgresql://...` required when `FORK=false`; `memory://` or local PGlite path allowed only when `FORK=true`)
 * `START_BLOCK`, `CONFIRMATIONS` (default `12`), `POLL_INTERVAL_MS`, `BLOCK_BATCH_SIZE`
 * `LOAN_CORE_ADDRESS`, `ORDER_SETTLEMENT_ADDRESS`, `LIQUIDATION_AUCTION_ADDRESS`, `POSITION_NFT_ADDRESS`, `COLLATERAL_ESCROW_ADDRESS`, `ASSET_REGISTRY_ADDRESS`, `ORACLE_ROUTER_ADDRESS`, `ASSET_LIST`

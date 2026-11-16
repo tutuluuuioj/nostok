@@ -5,6 +5,9 @@ import {
   type Log,
   type PublicClient,
   type Transport,
+  BaseError,
+  ContractFunctionRevertedError,
+  ExecutionRevertedError,
   createPublicClient,
   decodeEventLog,
   defineChain,
@@ -26,6 +29,8 @@ import {
 import type { IndexerConfig } from './config.js';
 import { type DatabaseAdapter, type Queryable, openDatabase, toBigInt } from './db.js';
 
+export const INDEXED_BLOCKS_RETENTION = 1000n;
+
 export interface IndexerContext {
   config: IndexerConfig;
   publicClient: PublicClient<Transport, Chain>;
@@ -36,10 +41,19 @@ export interface IndexerContext {
 export interface IndexerSyncSummary {
   reorgDetected: boolean;
   rolledBackToBlock?: bigint;
+  batchAborted?: boolean;
   fromBlock?: bigint;
   toBlock?: bigint;
   blocksProcessed: number;
   eventsIndexed: number;
+}
+
+export interface GetLogsQueryParams {
+  address: Address | Address[];
+  event?: (typeof b20Erc20Abi)[0];
+  args?: { from?: Address | null; to?: Address | null };
+  fromBlock: bigint;
+  toBlock: bigint;
 }
 
 function validateChainId(
@@ -64,18 +78,177 @@ function normalizeAddress(addr: string): Address {
   return getAddress(addr);
 }
 
-async function readAtBlockOrLatest<T>(
-  fn: (blockNumber?: bigint) => Promise<T>,
-  blockNumber?: bigint
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function collectErrorInfo(err: unknown): { text: string; codes: number[] } {
+  const parts: string[] = [];
+  const codes: number[] = [];
+  const visited = new Set<unknown>();
+  let cur: unknown = err;
+
+  while (cur && typeof cur === 'object' && !visited.has(cur)) {
+    visited.add(cur);
+    const obj = cur as {
+      name?: unknown;
+      shortMessage?: unknown;
+      message?: unknown;
+      details?: unknown;
+      code?: unknown;
+      cause?: unknown;
+    };
+    if (typeof obj.name === 'string') parts.push(obj.name);
+    if (typeof obj.shortMessage === 'string') parts.push(obj.shortMessage);
+    if (typeof obj.message === 'string') parts.push(obj.message);
+    if (typeof obj.details === 'string') parts.push(obj.details);
+    if (typeof obj.code === 'number') codes.push(obj.code);
+    cur = obj.cause;
+  }
+
+  if (typeof err === 'string') parts.push(err);
+  return { text: parts.join(' | ').toLowerCase(), codes };
+}
+
+export function isContractRevertError(err: unknown): boolean {
+  if (err instanceof BaseError) {
+    const matched = err.walk(
+      (e) =>
+        e instanceof ContractFunctionRevertedError ||
+        e instanceof ExecutionRevertedError ||
+        (e instanceof Error &&
+          (e.name === 'ContractFunctionRevertedError' || e.name === 'ExecutionRevertedError'))
+    );
+    if (matched) return true;
+  }
+
+  const { text, codes } = collectErrorInfo(err);
+  if (text.includes('contractfunctionrevertederror') || text.includes('executionrevertederror')) {
+    return true;
+  }
+  if (codes.includes(3)) return true;
+  if (
+    (text.includes('execution reverted') || text.includes('revert')) &&
+    !text.includes('missing trie') &&
+    !text.includes('header not found') &&
+    !text.includes('pruned') &&
+    !text.includes('historical state')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export function isRangeTooLargeError(err: unknown): boolean {
+  const { text, codes } = collectErrorInfo(err);
+  const rangeKeywords = [
+    'range is too large',
+    'range too large',
+    'block range',
+    'too many results',
+    'query returned more than',
+    'response size',
+    'max results',
+    'exceeds max',
+    'limit exceeded',
+    '10000 results',
+    'try with this block range',
+    'more than 10000',
+  ];
+  if (rangeKeywords.some((kw) => text.includes(kw))) {
+    return true;
+  }
+  if (
+    (codes.includes(-32005) || codes.includes(-32602)) &&
+    (text.includes('range') || text.includes('result') || text.includes('log') || text.includes('block'))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export async function readAtBlock<T>(
+  fn: (blockNumber: bigint) => Promise<T>,
+  blockNumber: bigint,
+  label = 'contractRead',
+  maxRetries = 3,
+  baseDelayMs = 100
 ): Promise<T> {
-  if (blockNumber === undefined) {
-    return fn(undefined);
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn(blockNumber);
+    } catch (err) {
+      if (isContractRevertError(err)) {
+        throw err;
+      }
+      lastErr = err;
+      if (attempt < maxRetries) {
+        await sleep(baseDelayMs * 2 ** attempt);
+      }
+    }
   }
-  try {
-    return await fn(blockNumber);
-  } catch {
-    return fn(undefined);
+
+  const reason = lastErr instanceof Error ? lastErr.message : String(lastErr);
+  console.warn(
+    `[INDEXER_WARN] Historical state read (${label}) failed at block ${blockNumber} after ${maxRetries + 1} attempts (archive-capable RPC required; refusing fallback to latest): ${reason}`
+  );
+  throw new Error(
+    `Historical state read (${label}) failed at block ${blockNumber}. Archive-capable RPC required: ${reason}`
+  );
+}
+
+export async function fetchLogsWithRetryAndSplit(
+  publicClient: PublicClient<Transport, Chain>,
+  params: GetLogsQueryParams,
+  maxRetries = 3,
+  baseDelayMs = 100
+): Promise<Log[]> {
+  if (params.toBlock < params.fromBlock) {
+    return [];
   }
+
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return params.event
+        ? await publicClient.getLogs<typeof b20Erc20Abi[0]>({
+            address: params.address,
+            event: params.event,
+            args: params.args,
+            fromBlock: params.fromBlock,
+            toBlock: params.toBlock,
+          })
+        : await publicClient.getLogs({
+            address: params.address,
+            fromBlock: params.fromBlock,
+            toBlock: params.toBlock,
+          });
+    } catch (err) {
+      if (isRangeTooLargeError(err) && params.fromBlock < params.toBlock) {
+        const mid = params.fromBlock + (params.toBlock - params.fromBlock) / 2n;
+        console.warn(
+          `[INDEXER_LOGS] getLogs range [${params.fromBlock}..${params.toBlock}] too large; splitting in half at ${mid}...`
+        );
+        const [left, right] = await Promise.all([
+          fetchLogsWithRetryAndSplit(publicClient, { ...params, toBlock: mid }, maxRetries, baseDelayMs),
+          fetchLogsWithRetryAndSplit(publicClient, { ...params, fromBlock: mid + 1n }, maxRetries, baseDelayMs),
+        ]);
+        return [...left, ...right];
+      }
+
+      lastErr = err;
+      if (attempt < maxRetries) {
+        const delayMs = baseDelayMs * 2 ** attempt;
+        console.warn(
+          `[INDEXER_LOGS] getLogs failed for [${params.fromBlock}..${params.toBlock}] (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${delayMs}ms...`
+        );
+        await sleep(delayMs);
+      }
+    }
+  }
+
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
 export async function createIndexerContext(config: IndexerConfig): Promise<IndexerContext> {
@@ -138,44 +311,50 @@ async function reconcileAsset(
   }
 
   const [supported, recordedMult, escrowBal] = await Promise.all([
-    readAtBlockOrLatest(
+    readAtBlock(
       (bn) =>
         publicClient.readContract({
           address: config.assetRegistry,
           abi: assetRegistryAbi,
           functionName: 'isAssetSupported',
           args: [token],
-          ...(bn !== undefined ? { blockNumber: bn } : {}),
+          blockNumber: bn,
         }),
-      blockNumber
-    ).catch(() => false),
-    readAtBlockOrLatest(
+      blockNumber,
+      `assetRegistry.isAssetSupported(${token})`
+    ),
+    readAtBlock(
       (bn) =>
         publicClient.readContract({
           address: config.oracleRouter,
           abi: oracleRouterAbi,
           functionName: 'recordedMultiplier',
           args: [token],
-          ...(bn !== undefined ? { blockNumber: bn } : {}),
+          blockNumber: bn,
         }),
-      blockNumber
-    ).catch(() => 0n),
-    readAtBlockOrLatest(
+      blockNumber,
+      `oracleRouter.recordedMultiplier(${token})`
+    ),
+    readAtBlock(
       (bn) =>
         publicClient.readContract({
           address: config.collateralEscrow,
           abi: collateralEscrowAbi,
           functionName: 'getBalance',
           args: [token],
-          ...(bn !== undefined ? { blockNumber: bn } : {}),
+          blockNumber: bn,
         }),
-      blockNumber
-    ).catch(() => 0n),
+      blockNumber,
+      `collateralEscrow.getBalance(${token})`
+    ).catch((err) => {
+      if (isContractRevertError(err)) return 0n;
+      throw err;
+    }),
   ]);
 
   let cfg: Awaited<ReturnType<typeof readAssetCfg>> | null = null;
   if (supported) {
-    cfg = await readAssetCfg(publicClient, config.assetRegistry, token, blockNumber).catch(() => null);
+    cfg = await readAssetCfg(publicClient, config.assetRegistry, token, blockNumber);
   }
 
   await db.query(
@@ -244,16 +423,17 @@ async function readAssetCfg(
   token: Address,
   blockNumber: bigint
 ) {
-  return readAtBlockOrLatest(
+  return readAtBlock(
     (bn) =>
       publicClient.readContract({
         address: assetRegistry,
         abi: assetRegistryAbi,
         functionName: 'getAssetConfig',
         args: [token],
-        ...(bn !== undefined ? { blockNumber: bn } : {}),
+        blockNumber: bn,
       }),
-    blockNumber
+    blockNumber,
+    `assetRegistry.getAssetConfig(${token})`
   );
 }
 
@@ -266,27 +446,29 @@ async function reconcileLoan(
   lenderHint?: Address
 ): Promise<void> {
   const [loan, activeAuctionId, badDebtRow] = await Promise.all([
-    readAtBlockOrLatest(
+    readAtBlock(
       (bn) =>
         publicClient.readContract({
           address: config.loanCore,
           abi: loanCoreAbi,
           functionName: 'getLoan',
           args: [loanId],
-          ...(bn !== undefined ? { blockNumber: bn } : {}),
+          blockNumber: bn,
         }),
-      blockNumber
+      blockNumber,
+      `loanCore.getLoan(${loanId})`
     ),
-    readAtBlockOrLatest(
+    readAtBlock(
       (bn) =>
         publicClient.readContract({
           address: config.loanCore,
           abi: loanCoreAbi,
           functionName: 'loanActiveAuction',
           args: [loanId],
-          ...(bn !== undefined ? { blockNumber: bn } : {}),
+          blockNumber: bn,
         }),
-      blockNumber
+      blockNumber,
+      `loanCore.loanActiveAuction(${loanId})`
     ),
     db.query<{ total: string | null }>(
       `SELECT COALESCE(SUM(amount_raw), 0)::TEXT AS total
@@ -362,16 +544,17 @@ async function reconcileAuction(
   auctionId: bigint,
   blockNumber: bigint
 ): Promise<void> {
-  const auction = await readAtBlockOrLatest(
+  const auction = await readAtBlock(
     (bn) =>
       publicClient.readContract({
         address: config.liquidationAuction,
         abi: liquidationAuctionAbi,
         functionName: 'getAuction',
         args: [auctionId],
-        ...(bn !== undefined ? { blockNumber: bn } : {}),
+        blockNumber: bn,
       }),
-    blockNumber
+    blockNumber,
+    `liquidationAuction.getAuction(${auctionId})`
   );
 
   if (auction.loanId === 0n) return;
@@ -461,32 +644,41 @@ async function reconcilePosition(
   let owner: Address = zeroAddress;
   let isBurned = false;
   try {
-    owner = await readAtBlockOrLatest(
+    owner = await readAtBlock(
       (bn) =>
         publicClient.readContract({
           address: config.positionNft,
           abi: positionNftAbi,
           functionName: 'ownerOf',
           args: [loanId],
-          ...(bn !== undefined ? { blockNumber: bn } : {}),
+          blockNumber: bn,
         }),
-      blockNumber
+      blockNumber,
+      `positionNft.ownerOf(${loanId})`
     );
-  } catch {
-    isBurned = true;
+  } catch (err) {
+    if (isContractRevertError(err)) {
+      isBurned = true;
+    } else {
+      throw err;
+    }
   }
 
-  const auctionLocked = await readAtBlockOrLatest(
+  const auctionLocked = await readAtBlock(
     (bn) =>
       publicClient.readContract({
         address: config.positionNft,
         abi: positionNftAbi,
         functionName: 'isAuctionLocked',
         args: [loanId],
-        ...(bn !== undefined ? { blockNumber: bn } : {}),
+        blockNumber: bn,
       }),
-    blockNumber
-  ).catch(() => false);
+    blockNumber,
+    `positionNft.isAuctionLocked(${loanId})`
+  ).catch((err) => {
+    if (isContractRevertError(err)) return false;
+    throw err;
+  });
 
   await db.query(
     `INSERT INTO positions (
@@ -516,38 +708,41 @@ async function reconcileOrder(
   blockNumber: bigint
 ): Promise<void> {
   const [cancelled, filledUsdc, makerNonce] = await Promise.all([
-    readAtBlockOrLatest(
+    readAtBlock(
       (bn) =>
         publicClient.readContract({
           address: config.orderSettlement,
           abi: orderSettlementAbi,
           functionName: 'isOrderCancelled',
           args: [orderHash],
-          ...(bn !== undefined ? { blockNumber: bn } : {}),
+          blockNumber: bn,
         }),
-      blockNumber
+      blockNumber,
+      `orderSettlement.isOrderCancelled(${orderHash})`
     ),
-    readAtBlockOrLatest(
+    readAtBlock(
       (bn) =>
         publicClient.readContract({
           address: config.orderSettlement,
           abi: orderSettlementAbi,
           functionName: 'getOrderFilledAmount',
           args: [orderHash],
-          ...(bn !== undefined ? { blockNumber: bn } : {}),
+          blockNumber: bn,
         }),
-      blockNumber
+      blockNumber,
+      `orderSettlement.getOrderFilledAmount(${orderHash})`
     ),
-    readAtBlockOrLatest(
+    readAtBlock(
       (bn) =>
         publicClient.readContract({
           address: config.orderSettlement,
           abi: orderSettlementAbi,
           functionName: 'getMakerNonce',
           args: [maker],
-          ...(bn !== undefined ? { blockNumber: bn } : {}),
+          blockNumber: bn,
         }),
-      blockNumber
+      blockNumber,
+      `orderSettlement.getMakerNonce(${maker})`
     ),
   ]);
 
@@ -636,9 +831,11 @@ export async function detectAndHandleReorg(
   ctx: IndexerContext
 ): Promise<{ reorgDetected: boolean; rolledBackToBlock?: bigint }> {
   const { publicClient, db, config } = ctx;
+  const checkLimit = Math.max(config.confirmations + 16, 32);
 
   const stored = await db.query<{ block_number: string; block_hash: string }>(
-    'SELECT block_number, block_hash FROM indexed_blocks ORDER BY block_number DESC'
+    'SELECT block_number, block_hash FROM indexed_blocks ORDER BY block_number DESC LIMIT $1',
+    [checkLimit]
   );
   if (stored.rows.length === 0) {
     return { reorgDetected: false };
@@ -651,8 +848,7 @@ export async function detectAndHandleReorg(
   let reorgNeeded = highestStored > headBlock;
 
   if (!reorgNeeded) {
-    const checkDepth = Math.min(stored.rows.length, Math.max(config.confirmations + 16, 32));
-    for (let i = 0; i < checkDepth; i++) {
+    for (let i = 0; i < stored.rows.length; i++) {
       const row = stored.rows[i];
       const bn = toBigInt(row.block_number);
       const canonical = await publicClient.getBlock({ blockNumber: bn }).catch(() => null);
@@ -671,16 +867,28 @@ export async function detectAndHandleReorg(
     return { reorgDetected: false };
   }
 
-  // Walk backwards to find highest matching canonical block
+  // Walk backwards in bounded pages to find highest matching canonical block
   if (forkPoint === null) {
-    for (const row of stored.rows) {
-      const bn = toBigInt(row.block_number);
-      if (bn > headBlock) continue;
-      const canonical = await publicClient.getBlock({ blockNumber: bn }).catch(() => null);
-      if (canonical && canonical.hash.toLowerCase() === row.block_hash.toLowerCase()) {
-        forkPoint = bn;
+    let page = stored.rows;
+    while (page.length > 0 && forkPoint === null) {
+      for (const row of page) {
+        const bn = toBigInt(row.block_number);
+        if (bn > headBlock) continue;
+        const canonical = await publicClient.getBlock({ blockNumber: bn }).catch(() => null);
+        if (canonical && canonical.hash.toLowerCase() === row.block_hash.toLowerCase()) {
+          forkPoint = bn;
+          break;
+        }
+      }
+      if (forkPoint !== null || page.length < checkLimit) {
         break;
       }
+      const lowestChecked = toBigInt(page[page.length - 1].block_number);
+      const nextRes = await db.query<{ block_number: string; block_hash: string }>(
+        'SELECT block_number, block_hash FROM indexed_blocks WHERE block_number < $1 ORDER BY block_number DESC LIMIT $2',
+        [lowestChecked.toString(), checkLimit]
+      );
+      page = nextRes.rows;
     }
   }
 
@@ -798,6 +1006,12 @@ export async function detectAndHandleReorg(
   return { reorgDetected: true, rolledBackToBlock: rollbackTo };
 }
 
+async function pruneOldIndexedBlocks(db: Queryable, chainHead: bigint): Promise<void> {
+  if (chainHead <= INDEXED_BLOCKS_RETENTION) return;
+  const cutoff = chainHead - INDEXED_BLOCKS_RETENTION;
+  await db.query('DELETE FROM indexed_blocks WHERE block_number < $1', [cutoff.toString()]);
+}
+
 export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSummary> {
   const { config, publicClient, db } = ctx;
 
@@ -816,6 +1030,7 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
     chainHead >= BigInt(config.confirmations) ? chainHead - BigInt(config.confirmations) : -1n;
 
   if (safeTarget < 0n || lastIndexed >= safeTarget) {
+    await pruneOldIndexedBlocks(db, chainHead);
     return {
       reorgDetected: reorgResult.reorgDetected,
       rolledBackToBlock: reorgResult.rolledBackToBlock,
@@ -840,13 +1055,13 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
   // Fetch core protocol logs plus Transfer logs on listed B20 tokens involving CollateralEscrow
   const tokenAddresses = Array.from(ctx.trackedAssets);
   const [coreLogs, b20InLogs, b20OutLogs] = await Promise.all([
-    publicClient.getLogs({
+    fetchLogsWithRetryAndSplit(publicClient, {
       address: coreAddresses,
       fromBlock,
       toBlock,
     }),
     tokenAddresses.length > 0
-      ? publicClient.getLogs({
+      ? fetchLogsWithRetryAndSplit(publicClient, {
           address: tokenAddresses,
           event: b20Erc20Abi[0],
           args: { to: config.collateralEscrow },
@@ -855,7 +1070,7 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
         })
       : Promise.resolve([]),
     tokenAddresses.length > 0
-      ? publicClient.getLogs({
+      ? fetchLogsWithRetryAndSplit(publicClient, {
           address: tokenAddresses,
           event: b20Erc20Abi[0],
           args: { from: config.collateralEscrow },
@@ -896,7 +1111,83 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
 
   for (let bn = fromBlock; bn <= toBlock; bn++) {
     const block = await publicClient.getBlock({ blockNumber: bn });
-    const blockLogs = logsByBlock.get(bn) ?? [];
+    let blockLogs = logsByBlock.get(bn) ?? [];
+
+    // Requirement 6: Check if AssetConfigSet introduced any untracked token mid-batch
+    const newlyDiscoveredTokens: Address[] = [];
+    for (const log of blockLogs) {
+      if (getAddress(log.address) !== config.assetRegistry) continue;
+      try {
+        const decoded = decodeEventLog({ abi: assetRegistryAbi, data: log.data, topics: log.topics });
+        if (decoded.eventName === 'AssetConfigSet') {
+          const tokenAddr = normalizeAddress(decoded.args.token);
+          if (!ctx.trackedAssets.has(tokenAddr) && !newlyDiscoveredTokens.includes(tokenAddr)) {
+            newlyDiscoveredTokens.push(tokenAddr);
+          }
+        }
+      } catch {
+        // Ignore unrelated log decoding errors
+      }
+    }
+
+    if (newlyDiscoveredTokens.length > 0) {
+      console.log(
+        `[INDEXER] Mid-batch AssetConfigSet detected for ${newlyDiscoveredTokens.join(', ')} at block ${bn}; fetching B20 escrow Transfer logs for [${bn}..${toBlock}]...`
+      );
+      const [newInLogs, newOutLogs] = await Promise.all([
+        fetchLogsWithRetryAndSplit(publicClient, {
+          address: newlyDiscoveredTokens,
+          event: b20Erc20Abi[0],
+          args: { to: config.collateralEscrow },
+          fromBlock: bn,
+          toBlock,
+        }),
+        fetchLogsWithRetryAndSplit(publicClient, {
+          address: newlyDiscoveredTokens,
+          event: b20Erc20Abi[0],
+          args: { from: config.collateralEscrow },
+          fromBlock: bn,
+          toBlock,
+        }),
+      ]);
+
+      for (const l of [...newInLogs, ...newOutLogs]) {
+        if (l.blockNumber === null || l.logIndex === null) continue;
+        const key = `${l.blockNumber}:${l.logIndex}`;
+        if (!seenKeys.has(key)) {
+          seenKeys.add(key);
+          const arr = logsByBlock.get(l.blockNumber) ?? [];
+          arr.push(l);
+          arr.sort((a, b) => (a.logIndex ?? 0) - (b.logIndex ?? 0));
+          logsByBlock.set(l.blockNumber, arr);
+        }
+      }
+      blockLogs = logsByBlock.get(bn) ?? [];
+    }
+
+    // Requirement 5: Verify every log in this block belongs to canonical block.hash
+    const expectedBlockHash = block.hash.toLowerCase();
+    for (const log of blockLogs) {
+      if (!log.blockHash || log.blockHash.toLowerCase() !== expectedBlockHash) {
+        console.warn(
+          `[INDEXER_REORG] Log blockHash mismatch at block ${bn} (log.blockHash=${String(log.blockHash)}, block.hash=${block.hash}). Aborting batch to retry next poll.`
+        );
+        return {
+          reorgDetected: true,
+          rolledBackToBlock: reorgResult.rolledBackToBlock,
+          batchAborted: true,
+          fromBlock,
+          toBlock: bn > fromBlock ? bn - 1n : undefined,
+          blocksProcessed,
+          eventsIndexed,
+        };
+      }
+    }
+
+    const effectiveTrackedAssets = new Set<Address>(ctx.trackedAssets);
+    for (const t of newlyDiscoveredTokens) {
+      effectiveTrackedAssets.add(t);
+    }
 
     const dirtyLoans = new Map<bigint, Address | undefined>();
     const dirtyAuctions = new Set<bigint>();
@@ -921,6 +1212,9 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
       );
 
       for (const log of blockLogs) {
+        if (!log.blockHash || log.blockHash.toLowerCase() !== expectedBlockHash) {
+          throw new Error(`Log blockHash mismatch inside tx at block ${bn}`);
+        }
         const source = getAddress(log.address);
         const logIndex = log.logIndex!;
         const txHash = log.transactionHash!;
@@ -1427,7 +1721,7 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
 
           if (decoded.eventName === 'AssetConfigSet') {
             const tokenAddr = normalizeAddress(decoded.args.token);
-            ctx.trackedAssets.add(tokenAddr);
+            effectiveTrackedAssets.add(tokenAddr);
             dirtyAssets.add(tokenAddr);
             await insertLoanEvent(tx, {
               blockNumber: bn,
@@ -1481,7 +1775,7 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
               blockTimestamp: block.timestamp,
             });
           }
-        } else if (ctx.trackedAssets.has(source)) {
+        } else if (effectiveTrackedAssets.has(source)) {
           let decoded;
           try {
             decoded = decodeEventLog({ abi: b20Erc20Abi, data: log.data, topics: log.topics });
@@ -1539,8 +1833,13 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
       );
     });
 
+    for (const token of newlyDiscoveredTokens) {
+      ctx.trackedAssets.add(token);
+    }
     blocksProcessed++;
   }
+
+  await pruneOldIndexedBlocks(db, chainHead);
 
   return {
     reorgDetected: reorgResult.reorgDetected,

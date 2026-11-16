@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
 import { execSync, spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   type Address,
   type Hex,
+  BaseError,
+  ContractFunctionRevertedError,
   createPublicClient,
   createWalletClient,
   defineChain,
@@ -17,10 +20,23 @@ import {
 } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { base } from 'viem/chains';
-import { AuctionStatus, LoanStatus, collateralEscrowAbi, liquidationAuctionAbi, loanCoreAbi, positionNftAbi } from '../src/abi.js';
+import {
+  AuctionStatus,
+  LoanStatus,
+  collateralEscrowAbi,
+  liquidationAuctionAbi,
+  loanCoreAbi,
+  orderSettlementAbi,
+  positionNftAbi,
+} from '../src/abi.js';
 import { loadConfig } from '../src/config.js';
 import { toBigInt } from '../src/db.js';
-import { createIndexerContext, runIndexerSync } from '../src/indexer.js';
+import {
+  createIndexerContext,
+  fetchLogsWithRetryAndSplit,
+  readAtBlock,
+  runIndexerSync,
+} from '../src/indexer.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -783,6 +799,562 @@ async function runTests(): Promise<void> {
       );
       console.log(`PASS STEP 7: Lender claim=${claimableBefore} indexed cleanly after 2 confirmations.`);
 
+      // Reset confirmations to 0 for deterministic immediate-sync tests below
+      ctx.config.confirmations = 0;
+
+      // -----------------------------------------------------------------------
+      // STEP 8: Production DB enforcement when FORK is disabled (config.ts)
+      // -----------------------------------------------------------------------
+      console.log('\n=== STEP 8: Production DATABASE_URL enforcement (FORK=false) ===');
+      const prevDbUrlEnv = process.env.DATABASE_URL;
+      const prevForkEnv = process.env.FORK;
+      delete process.env.DATABASE_URL;
+      delete process.env.FORK;
+      try {
+        const baseAddrOverrides = {
+          rpcUrl: LOCAL_RPC_URL,
+          loanCore: deployed.loanCore,
+          orderSettlement: deployed.orderSettlement,
+          liquidationAuction: deployed.liquidationAuction,
+          positionNft: deployed.positionNFT,
+          collateralEscrow: deployed.collateralEscrow,
+          assetRegistry: deployed.assetRegistry,
+          oracleRouter: deployed.oracleRouter,
+        };
+
+        assert.throws(
+          () => loadConfig({ ...baseAddrOverrides, isFork: false, databaseUrl: 'memory://' }),
+          /postgres:\/\/ or postgresql:\/\//i
+        );
+        assert.throws(
+          () => loadConfig({ ...baseAddrOverrides, isFork: false, databaseUrl: '' }),
+          /postgres:\/\/ or postgresql:\/\//i
+        );
+        assert.throws(
+          () => loadConfig({ ...baseAddrOverrides, isFork: false, databaseUrl: './local-pglite-dir' }),
+          /postgres:\/\/ or postgresql:\/\//i
+        );
+        const prodCfg = loadConfig({
+          ...baseAddrOverrides,
+          isFork: false,
+          databaseUrl: 'postgresql://user:pass@localhost:5432/nostok',
+        });
+        assert.equal(prodCfg.databaseUrl, 'postgresql://user:pass@localhost:5432/nostok');
+
+        const forkCfg = loadConfig({ ...baseAddrOverrides, isFork: true, databaseUrl: 'memory://' });
+        assert.equal(forkCfg.databaseUrl, 'memory://');
+      } finally {
+        if (prevDbUrlEnv !== undefined) process.env.DATABASE_URL = prevDbUrlEnv;
+        if (prevForkEnv !== undefined) process.env.FORK = prevForkEnv;
+      }
+      console.log('PASS STEP 8: Non-fork mode enforces postgres(ql):// and rejects memory:///PGlite.');
+
+      // -----------------------------------------------------------------------
+      // STEP 9: Bounded indexed_blocks reorg query + prune (< head - 1000)
+      // -----------------------------------------------------------------------
+      console.log('\n=== STEP 9: Bounded indexed_blocks query & pruning (< head - 1000) ===');
+      const headForPrune = await publicClient.getBlockNumber();
+      const staleBlock1 = headForPrune - 2000n;
+      const staleBlock2 = headForPrune - 1200n;
+      await ctx.db.query(
+        `INSERT INTO indexed_blocks (block_number, block_hash, parent_hash, block_timestamp)
+         VALUES ($1, $2, $3, $4), ($5, $6, $7, $8)`,
+        [
+          staleBlock1.toString(),
+          '0x' + '11'.repeat(32),
+          '0x' + '00'.repeat(32),
+          '1700000000',
+          staleBlock2.toString(),
+          '0x' + '22'.repeat(32),
+          '0x' + '11'.repeat(32),
+          '1700000002',
+        ]
+      );
+      const eventsBeforePrune = await ctx.db.query<{ cnt: number }>('SELECT COUNT(*)::INT AS cnt FROM loan_events');
+      const seenBlockQueries: string[] = [];
+      const spyDb = new Proxy(ctx.db, {
+        get(target, prop, receiver) {
+          if (prop === 'query') {
+            return async (sql: string, params?: unknown[]) => {
+              if (sql.includes('FROM indexed_blocks')) {
+                seenBlockQueries.push(sql);
+              }
+              return target.query(sql, params);
+            };
+          }
+          const val = Reflect.get(target, prop, receiver);
+          return typeof val === 'function' ? val.bind(target) : val;
+        },
+      });
+      await runIndexerSync({ ...ctx, db: spyDb });
+
+      assert.ok(
+        seenBlockQueries.some((q) => /ORDER BY block_number DESC LIMIT \$1/i.test(q)),
+        'detectAndHandleReorg must query indexed_blocks with ORDER BY block_number DESC LIMIT'
+      );
+      const remainingOld = await ctx.db.query<{ cnt: number }>(
+        'SELECT COUNT(*)::INT AS cnt FROM indexed_blocks WHERE block_number < $1',
+        [(headForPrune - 1000n).toString()]
+      );
+      assert.equal(Number(remainingOld.rows[0].cnt), 0, 'indexed_blocks older than head - 1000 must be pruned');
+      const remainingRecent = await ctx.db.query<{ cnt: number }>('SELECT COUNT(*)::INT AS cnt FROM indexed_blocks');
+      assert.ok(Number(remainingRecent.rows[0].cnt) >= 1, 'Recent canonical indexed_blocks must remain');
+      const eventsAfterPrune = await ctx.db.query<{ cnt: number }>('SELECT COUNT(*)::INT AS cnt FROM loan_events');
+      assert.equal(
+        Number(eventsAfterPrune.rows[0].cnt),
+        Number(eventsBeforePrune.rows[0].cnt),
+        'Pruning indexed_blocks must preserve loan_events'
+      );
+      console.log('PASS STEP 9: Bounded indexed_blocks reorg check & pruning (< head - 1000) verified.');
+
+      // -----------------------------------------------------------------------
+      // STEP 10: readAtBlock enforces archive historical reads (no latest fallback)
+      // -----------------------------------------------------------------------
+      console.log('\n=== STEP 10: readAtBlock archive enforcement (no fallback to latest) ===');
+      const observedBlockArgs: Array<bigint | undefined> = [];
+      let transientAttempts = 0;
+      const retrySuccess = await readAtBlock(
+        async (bn) => {
+          observedBlockArgs.push(bn);
+          transientAttempts++;
+          if (transientAttempts < 3) {
+            throw new Error('header not found temporarily');
+          }
+          return 'ok-at-block';
+        },
+        12345n,
+        'testRetry',
+        3,
+        5
+      );
+      assert.equal(retrySuccess, 'ok-at-block');
+      assert.deepEqual(observedBlockArgs, [12345n, 12345n, 12345n], 'Must never pass undefined (latest)');
+
+      const missingTrieCalls: Array<bigint | undefined> = [];
+      await assert.rejects(
+        () =>
+          readAtBlock(
+            async (bn) => {
+              missingTrieCalls.push(bn);
+              throw new Error('missing trie node: historical state pruned');
+            },
+            12345n,
+            'testArchiveRequired',
+            2,
+            5
+          ),
+        /Archive-capable RPC required/i
+      );
+      assert.equal(missingTrieCalls.length, 3);
+      assert.ok(missingTrieCalls.every((b) => b === 12345n), 'Must not fall back to latest on archive failure');
+
+      let revertAttempts = 0;
+      await assert.rejects(
+        () =>
+          readAtBlock(
+            async () => {
+              revertAttempts++;
+              throw new BaseError('execution reverted', {
+                cause: new ContractFunctionRevertedError({
+                  abi: positionNftAbi,
+                  data: '0x',
+                  functionName: 'ownerOf',
+                }),
+              });
+            },
+            12345n,
+            'testDeterministicRevert',
+            3,
+            5
+          ),
+        BaseError
+      );
+      assert.equal(revertAttempts, 1, 'Deterministic contract reverts must throw immediately without retry');
+      console.log('PASS STEP 10: readAtBlock retries transient errors and refuses fallback to latest.');
+
+      // -----------------------------------------------------------------------
+      // STEP 11: getLogs backoff retry & range splitting
+      // -----------------------------------------------------------------------
+      console.log('\n=== STEP 11: fetchLogsWithRetryAndSplit (backoff + half split) ===');
+      const headForLogs = await publicClient.getBlockNumber();
+      const expectedCoreLogs = await publicClient.getLogs({
+        address: [deployed.loanCore, deployed.orderSettlement],
+        fromBlock: startBlock,
+        toBlock: headForLogs,
+      });
+      assert.ok(expectedCoreLogs.length > 0);
+
+      const queriedRanges: Array<{ fromBlock: bigint; toBlock: bigint }> = [];
+      let injectedTransient = false;
+      const splitMockClient = new Proxy(publicClient, {
+        get(target, prop, receiver) {
+          if (prop === 'getLogs') {
+            return async (args?: Parameters<typeof target.getLogs>[0]) => {
+              const fb = BigInt((args?.fromBlock ?? 0n) as bigint);
+              const tb = BigInt((args?.toBlock ?? 0n) as bigint);
+              queriedRanges.push({ fromBlock: fb, toBlock: tb });
+              if (tb - fb >= 2n) {
+                throw new Error('Log response size exceeded: query returned more than 10000 results (-32005)');
+              }
+              if (!injectedTransient) {
+                injectedTransient = true;
+                throw new Error('HTTP 429 rate limit exceeded');
+              }
+              return target.getLogs(args);
+            };
+          }
+          const val = Reflect.get(target, prop, receiver);
+          return typeof val === 'function' ? val.bind(target) : val;
+        },
+      });
+
+      const splitLogs = await fetchLogsWithRetryAndSplit(
+        splitMockClient,
+        {
+          address: [deployed.loanCore, deployed.orderSettlement],
+          fromBlock: startBlock,
+          toBlock: headForLogs,
+        },
+        3,
+        5
+      );
+      assert.equal(splitLogs.length, expectedCoreLogs.length);
+      const expectedLogIds = expectedCoreLogs
+        .map((l) => `${l.blockNumber}:${l.logIndex}:${l.transactionHash}`)
+        .sort();
+      const splitLogIds = splitLogs
+        .map((l) => `${l.blockNumber}:${l.logIndex}:${l.transactionHash}`)
+        .sort();
+      assert.deepEqual(splitLogIds, expectedLogIds);
+      assert.ok(injectedTransient, 'Transient retry path must have executed');
+      assert.ok(queriedRanges.length > 1, 'Oversized range must have split recursively');
+      console.log(
+        `PASS STEP 11: fetchLogsWithRetryAndSplit fetched ${splitLogs.length} exact logs across ${queriedRanges.length} calls.`
+      );
+
+      // -----------------------------------------------------------------------
+      // STEP 12: log.blockHash != block.hash aborts batch & retries cleanly
+      // -----------------------------------------------------------------------
+      console.log('\n=== STEP 12: log.blockHash mismatch batch abort ===');
+      const bumpReceipt = await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: deployed.orderSettlement,
+          abi: parseAbi(['function bumpNonce() returns (uint256)']),
+          functionName: 'bumpNonce',
+        }),
+      });
+      const abortBlock = bumpReceipt.blockNumber;
+
+      const mismatchClient = new Proxy(publicClient, {
+        get(target, prop, receiver) {
+          if (prop === 'getLogs') {
+            return async (args: Parameters<typeof target.getLogs>[0]) => {
+              const logs = await target.getLogs(args);
+              return logs.map((l) =>
+                l.blockNumber === abortBlock
+                  ? { ...l, blockHash: ('0x' + 'fa'.repeat(32)) as Hex }
+                  : l
+              );
+            };
+          }
+          const val = Reflect.get(target, prop, receiver);
+          return typeof val === 'function' ? val.bind(target) : val;
+        },
+      });
+
+      const abortSync = await runIndexerSync({ ...ctx, publicClient: mismatchClient });
+      assert.equal(abortSync.batchAborted, true, 'Mismatched log.blockHash must abort batch');
+      assert.equal(abortSync.reorgDetected, true);
+      assert.equal(abortSync.blocksProcessed, 0);
+
+      const abortedBlockRow = await ctx.db.query(
+        'SELECT 1 FROM indexed_blocks WHERE block_number = $1',
+        [abortBlock.toString()]
+      );
+      assert.equal(abortedBlockRow.rows.length, 0, 'Aborted block must not be written to indexed_blocks');
+
+      const recoverySync = await runIndexerSync(ctx);
+      assert.ok(!recoverySync.batchAborted);
+      assert.ok(recoverySync.blocksProcessed >= 1);
+      const nonceEvents = await ctx.db.query(
+        `SELECT * FROM loan_events WHERE event_name = 'NonceBumped' AND block_number = $1`,
+        [abortBlock.toString()]
+      );
+      assert.equal(nonceEvents.rows.length, 1, 'Canonical retry poll must index aborted block cleanly');
+      console.log('PASS STEP 12: log.blockHash mismatch aborted batch cleanly & next poll recovered.');
+
+      // -----------------------------------------------------------------------
+      // STEP 13: Mid-batch AssetConfigSet refetches B20 escrow Transfer logs
+      // -----------------------------------------------------------------------
+      console.log('\n=== STEP 13: Mid-batch AssetConfigSet new token refetch ===');
+      const metacReceipt = await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.deployContract({
+          abi: mockB20Artifact.abi,
+          bytecode: mockB20Artifact.bytecode,
+          args: ['Coinbase Wrapped META', 'METAc', 18, 1000313792289598084n],
+        }),
+      });
+      const metac = getAddress(metacReceipt.contractAddress!);
+      const metaFeedReceipt = await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.deployContract({
+          abi: mockAggArtifact.abi,
+          bytecode: mockAggArtifact.bytecode,
+          args: [8, 500_00000000n],
+        }),
+      });
+      const metaFeed = getAddress(metaFeedReceipt.contractAddress!);
+
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: metac,
+          abi: mockB20Artifact.abi,
+          functionName: 'mint',
+          args: [ADDRESSES.borrower, 20n * 10n ** 18n],
+        }),
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: metac,
+          abi: approveAbi,
+          functionName: 'approve',
+          args: [deployed.collateralEscrow, 20n * 10n ** 18n],
+        }),
+      });
+      // Sync prior helper txs so AssetConfigSet(metac) and Loan #2 fall inside a single un-synced batch
+      await runIndexerSync(ctx);
+      assert.equal(ctx.trackedAssets.has(metac), false, 'METAc must not yet be tracked');
+
+      await publicClient.waitForTransactionReceipt({
+        hash: await rawWalletClient.sendTransaction({
+          account: deployed.nostokTimelock,
+          to: deployed.assetRegistry,
+          data: encodeFunctionData({
+            abi: setCfgAbi,
+            functionName: 'setAssetConfig',
+            args: [
+              metac,
+              {
+                feed: metaFeed,
+                feedDecimals: 8,
+                tier: 0,
+                maxInitLtvBps: 6000,
+                marginCallLtvBps: 7000,
+                liqLtvBps: 7800,
+                badDebtLtvBps: 9000,
+                maxDiscountBps: 600,
+                closedMarketHaircutBps: 500,
+                perLoanCap: 50_000_000_000n,
+                assetCap: 100_000_000_000n,
+                maxStaleOpenSecs: 21600,
+                status: 0,
+                restricted: false,
+              },
+            ],
+          }),
+        }),
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: deployed.oracleRouter,
+          abi: parseAbi(['function syncMultiplier(address token)']),
+          functionName: 'syncMultiplier',
+          args: [metac],
+        }),
+      });
+
+      const blk2 = await publicClient.getBlock();
+      const borrowerNonce2 = await publicClient.readContract({
+        address: deployed.orderSettlement,
+        abi: orderSettlementAbi,
+        functionName: 'getMakerNonce',
+        args: [ADDRESSES.borrower],
+      });
+      const order2 = {
+        borrower: ADDRESSES.borrower,
+        collateralToken: metac,
+        collateralAmount: 10n * 10n ** 18n,
+        minUsdc: 800_000_000n,
+        maxRateBps: 1000,
+        termDays: 14,
+        maxLtvBps: 6000,
+        minFill: 500_000_000n,
+        expiry: blk2.timestamp + 3600n,
+        nonce: borrowerNonce2,
+        yieldMode: 0,
+        allowInKindSettlement: false,
+      } as const;
+      const sig2 = await borrowerAccount.signTypedData({
+        domain: {
+          name: 'NOSTOK Order Settlement',
+          version: '1',
+          chainId: 8453,
+          verifyingContract: deployed.orderSettlement,
+        },
+        types: {
+          BorrowOrder: [
+            { name: 'borrower', type: 'address' },
+            { name: 'collateralToken', type: 'address' },
+            { name: 'collateralAmount', type: 'uint128' },
+            { name: 'minUsdc', type: 'uint128' },
+            { name: 'maxRateBps', type: 'uint32' },
+            { name: 'termDays', type: 'uint16' },
+            { name: 'maxLtvBps', type: 'uint16' },
+            { name: 'minFill', type: 'uint128' },
+            { name: 'expiry', type: 'uint64' },
+            { name: 'nonce', type: 'uint256' },
+            { name: 'yieldMode', type: 'uint8' },
+            { name: 'allowInKindSettlement', type: 'bool' },
+          ],
+        },
+        primaryType: 'BorrowOrder',
+        message: order2,
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await lenderClient.writeContract({
+          address: deployed.orderSettlement,
+          abi: fillOrderAbi,
+          functionName: 'fillBorrowOrder',
+          args: [order2, sig2, 800_000_000n],
+        }),
+      });
+
+      const midBatchSync = await runIndexerSync(ctx);
+      assert.ok(midBatchSync.blocksProcessed >= 3);
+      assert.equal(ctx.trackedAssets.has(metac), true, 'METAc must be added to trackedAssets mid-batch');
+
+      const metaEscrowEvents = await ctx.db.query(
+        `SELECT * FROM loan_events WHERE event_name = 'EscrowTransferIn' AND token = $1`,
+        [metac]
+      );
+      assert.equal(metaEscrowEvents.rows.length, 1, 'Refetched METAc EscrowTransferIn event must exist');
+      assert.equal(toBigInt(metaEscrowEvents.rows[0].amount_raw), 10n * 10n ** 18n);
+
+      const metaAssetRow = await ctx.db.query('SELECT * FROM assets WHERE token = $1', [metac]);
+      assert.equal(metaAssetRow.rows.length, 1);
+      assert.equal(toBigInt(metaAssetRow.rows[0].escrow_balance_raw), 10n * 10n ** 18n);
+
+      const loan2Row = await ctx.db.query('SELECT * FROM loans WHERE loan_id = 2');
+      assert.equal(loan2Row.rows.length, 1);
+      await assertLoanMatchesOnchain(publicClient, deployed.loanCore, loan2Row.rows[0], 2n);
+      console.log('PASS STEP 13: Mid-batch AssetConfigSet refetched METAc B20 escrow Transfer & Loan #2.');
+
+      // -----------------------------------------------------------------------
+      // STEP 14: Restart indexer on same PGlite dataDir mid-run (resume test)
+      // -----------------------------------------------------------------------
+      console.log('\n=== STEP 14: Persistent PGlite dataDir mid-run restart & resume ===');
+      const pgliteDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nostok-indexer-pglite-'));
+      try {
+        const headForResume = await publicClient.getBlockNumber();
+        const totalSpan = Number(headForResume - startBlock + 1n);
+        assert.ok(totalSpan >= 4, 'Must have multi-block span to split mid-run');
+        const halfBatch = Math.floor(totalSpan / 2);
+
+        const cfgA = loadConfig({
+          rpcUrl: LOCAL_RPC_URL,
+          isFork: true,
+          forkChainId: 8453,
+          databaseUrl: pgliteDir,
+          startBlock,
+          confirmations: 0,
+          blockBatchSize: halfBatch,
+          loanCore: deployed.loanCore,
+          orderSettlement: deployed.orderSettlement,
+          liquidationAuction: deployed.liquidationAuction,
+          positionNft: deployed.positionNFT,
+          collateralEscrow: deployed.collateralEscrow,
+          assetRegistry: deployed.assetRegistry,
+          oracleRouter: deployed.oracleRouter,
+          assets: [nvdac],
+        });
+        const ctxA = await createIndexerContext(cfgA);
+        const resA = await runIndexerSync(ctxA);
+        const midLastBlock = resA.toBlock!;
+        assert.ok(midLastBlock < headForResume, 'First run must pause mid-run before chain head');
+
+        const stateARow = await ctxA.db.query<{ last_indexed_block: string }>(
+          'SELECT last_indexed_block FROM indexer_state WHERE id = 1'
+        );
+        assert.equal(toBigInt(stateARow.rows[0].last_indexed_block), midLastBlock);
+        await ctxA.db.close();
+
+        // Restart fresh indexer instance pointed at exact same dataDir
+        const cfgB = loadConfig({
+          rpcUrl: LOCAL_RPC_URL,
+          isFork: true,
+          forkChainId: 8453,
+          databaseUrl: pgliteDir,
+          startBlock,
+          confirmations: 0,
+          blockBatchSize: 200,
+          loanCore: deployed.loanCore,
+          orderSettlement: deployed.orderSettlement,
+          liquidationAuction: deployed.liquidationAuction,
+          positionNft: deployed.positionNFT,
+          collateralEscrow: deployed.collateralEscrow,
+          assetRegistry: deployed.assetRegistry,
+          oracleRouter: deployed.oracleRouter,
+          assets: [nvdac],
+        });
+        const ctxB = await createIndexerContext(cfgB);
+        try {
+          const firstResume = await runIndexerSync(ctxB);
+          assert.equal(
+            firstResume.fromBlock,
+            midLastBlock + 1n,
+            'Restarted indexer must resume strictly at indexer_state.last_indexed_block + 1'
+          );
+          while (true) {
+            const st = await ctxB.db.query<{ last_indexed_block: string }>(
+              'SELECT last_indexed_block FROM indexer_state WHERE id = 1'
+            );
+            if (toBigInt(st.rows[0].last_indexed_block) >= headForResume) break;
+            const more = await runIndexerSync(ctxB);
+            if (more.blocksProcessed === 0) break;
+          }
+
+          const dupEvents = await ctxB.db.query(
+            `SELECT block_number, log_index, COUNT(*)::INT AS cnt
+             FROM loan_events
+             GROUP BY block_number, log_index
+             HAVING COUNT(*) > 1`
+          );
+          assert.equal(dupEvents.rows.length, 0, 'Restart must not produce duplicate loan_events');
+
+          const tablesToCompare = [
+            'loans',
+            'loan_events',
+            'orders',
+            'order_fills',
+            'auctions',
+            'auction_buys',
+            'positions',
+            'claims',
+            'assets',
+          ] as const;
+          for (const tbl of tablesToCompare) {
+            const resRef = await ctx.db.query<{ cnt: number }>(`SELECT COUNT(*)::INT AS cnt FROM ${tbl}`);
+            const resResumed = await ctxB.db.query<{ cnt: number }>(`SELECT COUNT(*)::INT AS cnt FROM ${tbl}`);
+            assert.equal(
+              Number(resResumed.rows[0].cnt),
+              Number(resRef.rows[0].cnt),
+              `Resumed DB count mismatch in table ${tbl}`
+            );
+          }
+
+          for (const id of [1n, 2n]) {
+            const row = await ctxB.db.query('SELECT * FROM loans WHERE loan_id = $1', [id.toString()]);
+            await assertLoanMatchesOnchain(publicClient, deployed.loanCore, row.rows[0], id);
+          }
+          console.log(
+            `PASS STEP 14: Indexer restarted on persistent PGlite dataDir at block ${midLastBlock} and resumed to ${headForResume} with zero duplicate/missing rows.`
+          );
+        } finally {
+          await ctxB.db.close();
+        }
+      } finally {
+        fs.rmSync(pgliteDir, { recursive: true, force: true });
+      }
+
       // Print compact summary of DB table counts
       const tables = ['loans', 'loan_events', 'orders', 'order_fills', 'auctions', 'auction_buys', 'positions', 'claims', 'assets'];
       const counts: Record<string, number> = {};
@@ -791,7 +1363,7 @@ async function runTests(): Promise<void> {
         counts[tbl] = Number(res.rows[0].cnt);
       }
       console.log('[INDEXER_TEST] Final PostgreSQL row counts:', counts);
-      console.log('\nALL INDEXER WS2.1 & WS2.2 BASE MAINNET FORK + REORG TESTS PASSED.');
+      console.log('\nALL INDEXER WS2.1 & WS2.2 BASE MAINNET FORK + REORG + RESUME TESTS PASSED.');
     } finally {
       await ctx.db.close();
     }

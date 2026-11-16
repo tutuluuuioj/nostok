@@ -100,7 +100,13 @@ export function loadConfig(overrides: IndexerConfigOverrides = {}): IndexerConfi
 
   const databaseUrl =
     overrides.databaseUrl ??
-    (process.env.DATABASE_URL?.trim() || fileConfig.databaseUrl || 'memory://');
+    (process.env.DATABASE_URL?.trim() || fileConfig.databaseUrl || (isFork ? 'memory://' : ''));
+
+  if (!isFork && !/^postgres(ql)?:\/\//i.test(databaseUrl)) {
+    throw new Error(
+      'DATABASE_URL must be a postgres:// or postgresql:// connection string when FORK is not enabled (memory:// and PGlite are only allowed when FORK=true).'
+    );
+  }
 
   const rawStartBlock = process.env.START_BLOCK
     ? Number(process.env.START_BLOCK)
