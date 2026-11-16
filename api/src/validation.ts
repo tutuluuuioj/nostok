@@ -89,7 +89,7 @@ export function buildPaginationSchema(maxLimit: number) {
 }
 
 export const ordersQuerySchema = z.object({
-  status: z.enum(['cancelled', 'partially_filled', 'filled']).optional(),
+  status: z.enum(['cancelled', 'partially_filled', 'filled', 'unknown']).optional(),
   maker: checksumAddressSchema.optional(),
   asset: checksumAddressSchema.optional(),
 });

@@ -41,6 +41,21 @@ async function rpcRead<T>(fn: () => Promise<T>, label: string): Promise<T> {
   }
 }
 
+export function computeLiquidationPrice(
+  debt: bigint,
+  liqLtvBps: bigint,
+  collateralRaw: bigint,
+  priceScale: bigint
+): bigint {
+  if (debt <= 0n || liqLtvBps <= 0n || collateralRaw <= 0n) return 0n;
+  // LoanCore.startLiquidation checks floor(D * 10_000 / G) >= liqLtvBps where G = floor(c * p * 1e6 / S).
+  // Any G <= gMax = floor(D * 10_000 / liqLtvBps) triggers liquidation; G >= gMax + 1 is the safe region.
+  // Therefore the first strictly non-liquidating price is ceil((gMax + 1) * S / (c * 1e6)), which is
+  // guaranteed >= highestLiquidatingPrice + 1.
+  const gMax = (debt * 10_000n) / liqLtvBps;
+  return ceilDiv((gMax + 1n) * priceScale, collateralRaw * 1_000_000n);
+}
+
 export interface QuoteRejection {
   code: string;
   message: string;
@@ -62,7 +77,7 @@ export interface QuoteResponse {
     token: Address;
     symbol: string;
     decimals: number;
-    status: number;
+    status: number | null;
     status_name: string;
     restricted: boolean;
     oracle_state: number;
@@ -306,7 +321,7 @@ export async function computeLoanQuote(params: {
         token: input.asset,
         symbol: tokenSymbol,
         decimals: tokenDecimals,
-        status: 2,
+        status: null,
         status_name: 'Unsupported',
         restricted: true,
         oracle_state: OracleState.FROZEN_CORPORATE_ACTION,
@@ -687,15 +702,9 @@ export async function computeLoanQuote(params: {
       : 0n;
 
   const priceScale = 10n ** BigInt(tokenDecimals) * 10n ** BigInt(oracleDecimals);
-  // Rounded UP via ceilDiv so liquidation_price reflects the earliest oracle threshold triggering liqLtvBps
-  const liqPriceOrig =
-    collateralRequired > 0n && liqLtvBps > 0n && originationDebt > 0n
-      ? ceilDiv(originationDebt * 10_000n * priceScale, liqLtvBps * collateralRequired * 1_000_000n)
-      : 0n;
-  const liqPriceMat =
-    collateralRequired > 0n && liqLtvBps > 0n && totalRepayment > 0n
-      ? ceilDiv(totalRepayment * 10_000n * priceScale, liqLtvBps * collateralRequired * 1_000_000n)
-      : 0n;
+  // First strictly non-liquidating price: ceil((floor(D * 1e4 / liq) + 1) * S / (c * 1e6))
+  const liqPriceOrig = computeLiquidationPrice(originationDebt, liqLtvBps, collateralRequired, priceScale);
+  const liqPriceMat = computeLiquidationPrice(totalRepayment, liqLtvBps, collateralRequired, priceScale);
 
   const globalRemaining = globalCap > totalOutstanding ? globalCap - totalOutstanding : 0n;
   const assetRemaining =

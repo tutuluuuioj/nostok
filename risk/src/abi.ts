@@ -94,10 +94,27 @@ export const loanCoreAbi = [
   },
   {
     type: 'function',
+    name: 'nextLoanId',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+  {
+    type: 'function',
     name: 'getDueInterest',
     stateMutability: 'view',
     inputs: [{ name: 'loanId', type: 'uint256' }],
     outputs: [{ name: '', type: 'uint128' }],
+  },
+] as const;
+
+export const liquidationAuctionAbi = [
+  {
+    type: 'function',
+    name: 'nextAuctionId',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'uint256' }],
   },
 ] as const;
 

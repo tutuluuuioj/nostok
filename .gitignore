@@ -24,6 +24,11 @@ risk/.env.*
 !risk/.env.example
 risk/node_modules
 risk/dist
+notifications/.env
+notifications/.env.*
+!notifications/.env.example
+notifications/node_modules
+notifications/dist
 contracts/out
 contracts/cache
 contracts/broadcast

@@ -859,6 +859,11 @@ async function runTests(): Promise<void> {
         /single-statement/i
       );
       assert.throws(() => assertReadOnlySql('SELECT /* sneaky */ 1'), /single-statement/i);
+      assert.throws(() => assertReadOnlySql('SELECT U&"pg\\005fsleep"(2)'), /escaped SQL|backslash/i);
+      assert.throws(() => assertReadOnlySql('SELECT u&"\\0050g_sleep"(2)'), /escaped SQL|backslash/i);
+      assert.throws(() => assertReadOnlySql("SELECT E'\\x70g_sleep'(2)"), /escaped SQL/i);
+      assert.throws(() => assertReadOnlySql('SELECT pg\\005fsleep(2)'), /backslash/i);
+      assert.throws(() => assertReadOnlySql('SELECT "pg_sleep"(2)'), /disallowed/i);
       await assert.rejects(() => apiCtx.db.query('UPDATE loans SET status = 0'), /SELECT/i);
 
       // Test ReadOnlyPostgresPool (postgres:// wire protocol): connection drop retry + pool error handler
@@ -960,6 +965,25 @@ async function runTests(): Promise<void> {
         `${baseUrl}/orders?status=open`
       );
       assert.equal(openOrderStatusRejected.status, 400, 'status=open must be rejected with 400');
+
+      // Unknown min_usdc (e.g., filled via wrapper contract) -> status='unknown' and remaining_usdc=null
+      const wrapperOrderHash = '0x' + 'de'.repeat(32);
+      await idxCtx.db.query(
+        `INSERT INTO orders (order_hash, maker, collateral_token, min_usdc, filled_usdc, order_type, cancelled, maker_nonce, first_seen_block, last_updated_block)
+         VALUES ($1, $2, $3, 0, 400000000, 'borrow', FALSE, 0, $4, $4)`,
+        [wrapperOrderHash, ADDRESSES.borrower, nvdac, startBlock.toString()]
+      );
+      try {
+        const unknownOrders = await getJson<typeof ordersPage1.body>(`${baseUrl}/orders?status=unknown`);
+        assert.equal(unknownOrders.status, 200);
+        assert.equal(unknownOrders.body.data.length, 1);
+        assert.equal(unknownOrders.body.data[0].status, 'unknown');
+        assert.equal(unknownOrders.body.data[0].remaining_usdc, null);
+        const filledWithoutUnknown = await getJson<typeof ordersPage1.body>(`${baseUrl}/orders?status=filled`);
+        assert.equal(filledWithoutUnknown.body.data.length, 2, 'unknown min_usdc order must NOT show as filled');
+      } finally {
+        await idxCtx.db.query('DELETE FROM orders WHERE order_hash = $1', [wrapperOrderHash]);
+      }
 
       const metacOrders = await getJson<typeof ordersPage1.body>(`${baseUrl}/orders?asset=${metac}`);
       assert.equal(metacOrders.body.data.length, 2);
@@ -1287,6 +1311,7 @@ async function runTests(): Promise<void> {
 
       // Step Oracle price via setPrice and simulate LoanCore.startLiquidation(4) to find exact threshold
       const quotedLiqPrice = BigInt(quotePost.body.risk.liquidation_price.raw);
+      const quotedLiqPriceAtMat = BigInt(quotePost.body.risk.liquidation_price_at_maturity.raw);
       const startLiqAbi = parseAbi(['function startLiquidation(uint256 loanId) returns (uint256)']);
       async function canStartLiquidationAtPrice(price8: bigint): Promise<boolean> {
         await publicClient.waitForTransactionReceipt({
@@ -1311,14 +1336,9 @@ async function runTests(): Promise<void> {
         }
       }
 
-      // 1 cent above quoted liquidation price must NOT be liquidatable; well below must succeed
-      assert.equal(
-        await canStartLiquidationAtPrice(quotedLiqPrice + 100_000n),
-        false,
-        'Price above quoted liquidation_price (+ $0.001) must revert LoanNotLiquidatable'
-      );
-      let lo = quotedLiqPrice - 5_000_000n;
-      let hi = quotedLiqPrice + 5_000_000n;
+      // Safe-side direction: quotedLiqPrice itself must NOT liquidate, and quotedLiqPrice - 1n (highest liquidating price) MUST!
+      let lo = quotedLiqPrice - 1_000_000n;
+      let hi = quotedLiqPrice + 1_000_000n;
       while (lo < hi) {
         const mid = (lo + hi + 1n) / 2n;
         if (await canStartLiquidationAtPrice(mid)) {
@@ -1327,16 +1347,87 @@ async function runTests(): Promise<void> {
           hi = mid - 1n;
         }
       }
-      const exactContractLiqTrigger = lo;
-      const diffTicks =
-        quotedLiqPrice >= exactContractLiqTrigger
-          ? quotedLiqPrice - exactContractLiqTrigger
-          : exactContractLiqTrigger - quotedLiqPrice;
-      // Should match within <= 50 ticks ($0.0000005 due to USDC 6-dec floor rounding)
+      const exactHighestLiqPrice = lo;
       assert.ok(
-        diffTicks <= 50n,
-        `Quoted liquidation_price (${quotedLiqPrice}) diverged from exact startLiquidation trigger (${exactContractLiqTrigger}) by ${diffTicks}`
+        quotedLiqPrice >= exactHighestLiqPrice + 1n,
+        `Quoted liquidation_price (${quotedLiqPrice}) must be >= highest liquidating price + 1 (${exactHighestLiqPrice + 1n})`
       );
+      assert.equal(
+        quotedLiqPrice,
+        exactHighestLiqPrice + 1n,
+        `Quoted liquidation_price (${quotedLiqPrice}) should be exact first non-liquidating price (${exactHighestLiqPrice + 1n})`
+      );
+
+      // Sweep 51 consecutive prices [-25 .. +25] around quotedLiqPrice
+      for (let delta = -25n; delta <= 25n; delta++) {
+        const probe = quotedLiqPrice + delta;
+        const canLiq = await canStartLiquidationAtPrice(probe);
+        assert.equal(
+          canLiq,
+          probe < quotedLiqPrice,
+          `51-price origination sweep mismatch at price=${probe} (quotedLiqPrice=${quotedLiqPrice})`
+        );
+      }
+
+      // Also verify liquidation_price_at_maturity by snapshotting and setting exact block.timestamp = onchainLoan4.maturity
+      let matSnapId = await rpcCall<string>('evm_snapshot', []);
+      async function canStartLiquidationAtMaturityPrice(price8: bigint): Promise<boolean> {
+        await rpcCall('evm_revert', [matSnapId]);
+        matSnapId = await rpcCall<string>('evm_snapshot', []);
+        await rpcCall('evm_setNextBlockTimestamp', [Number(onchainLoan4.maturity)]);
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdaFeed,
+            abi: mockAggArtifact.abi,
+            functionName: 'setPrice',
+            args: [price8],
+          }),
+        });
+        try {
+          await publicClient.simulateContract({
+            address: deployed.loanCore,
+            abi: startLiqAbi,
+            functionName: 'startLiquidation',
+            args: [4n],
+            account: ADDRESSES.liquidator,
+          });
+          return true;
+        } catch {
+          return false;
+        }
+      }
+
+      let loMat = quotedLiqPriceAtMat - 1_000_000n;
+      let hiMat = quotedLiqPriceAtMat + 1_000_000n;
+      while (loMat < hiMat) {
+        const mid = (loMat + hiMat + 1n) / 2n;
+        if (await canStartLiquidationAtMaturityPrice(mid)) {
+          loMat = mid;
+        } else {
+          hiMat = mid - 1n;
+        }
+      }
+      const exactHighestMatLiqPrice = loMat;
+      assert.ok(
+        quotedLiqPriceAtMat >= exactHighestMatLiqPrice + 1n,
+        `Quoted liquidation_price_at_maturity (${quotedLiqPriceAtMat}) must be >= exact highest at maturity + 1 (${exactHighestMatLiqPrice + 1n})`
+      );
+      assert.equal(
+        quotedLiqPriceAtMat,
+        exactHighestMatLiqPrice + 1n,
+        `Quoted liquidation_price_at_maturity (${quotedLiqPriceAtMat}) must equal exact first non-liquidating price (${exactHighestMatLiqPrice + 1n})`
+      );
+      for (let delta = -25n; delta <= 25n; delta++) {
+        const probe = quotedLiqPriceAtMat + delta;
+        const canLiq = await canStartLiquidationAtMaturityPrice(probe);
+        assert.equal(
+          canLiq,
+          probe < quotedLiqPriceAtMat,
+          `51-price maturity sweep mismatch at price=${probe} (quotedLiqPriceAtMat=${quotedLiqPriceAtMat})`
+        );
+      }
+      await rpcCall('evm_revert', [matSnapId]);
+
       // Restore NVDA feed back to $140.00
       await publicClient.waitForTransactionReceipt({
         hash: await deployerClient.writeContract({
@@ -1347,7 +1438,7 @@ async function runTests(): Promise<void> {
         }),
       });
       console.log(
-        `PASS TEST 5: Quote executed cleanly (Loan #4); quoted liquidation_price=${quotedLiqPrice} vs exact contract trigger=${exactContractLiqTrigger} (diff=${diffTicks}).`
+        `PASS TEST 5: Quote executed CLEANLY (Loan #4); origLiq=${quotedLiqPrice} (exactHighest+1=${exactHighestLiqPrice + 1n}), matLiq=${quotedLiqPriceAtMat} (exactHighestMat+1=${exactHighestMatLiqPrice + 1n}), 102 boundary prices swept.`
       );
 
       // -----------------------------------------------------------------------
@@ -1564,7 +1655,19 @@ async function runTests(): Promise<void> {
       assert.ok(subCodes.has('APR_EXCEEDS_MAX'));
       assert.ok(subCodes.has('BORROWER_INELIGIBLE'));
 
-      console.log('PASS TEST 6: Eligibility parity, caps, uint128 bounds, extend terms, and warning separation verified.');
+      const qUnsupported = await postJson<QuoteResponse>(`${baseUrl}/quote`, {
+        asset: ADDRESSES.treasury,
+        principal: '600000000',
+        term_days: 14,
+        apr_bps: 950,
+      });
+      assert.equal(qUnsupported.status, 200);
+      assert.equal(qUnsupported.body.accepted, false);
+      assert.equal(qUnsupported.body.asset.status, null);
+      assert.equal(qUnsupported.body.asset.status_name, 'Unsupported');
+      assert.ok(qUnsupported.body.rejection_reasons.some((r) => r.code === 'ASSET_NOT_SUPPORTED'));
+
+      console.log('PASS TEST 6: Eligibility parity, caps, uint128 bounds, extend terms, unsupported status, and warning separation verified.');
       console.log('\nALL API WS2.3 BASE MAINNET FORK INTEGRATION TESTS PASSED.');
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));

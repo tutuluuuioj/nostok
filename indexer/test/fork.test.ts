@@ -7,6 +7,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PGlite } from '@electric-sql/pglite';
 import { PGLiteSocketServer } from '@electric-sql/pglite-socket';
+import EmbeddedPostgres from 'embedded-postgres';
+import pgPkg from 'pg';
 import {
   type Address,
   type Hex,
@@ -40,6 +42,7 @@ import {
   isContractRevertError,
   isRangeTooLargeError,
   readAtBlock,
+  resolveOrderMetaFromTx,
   runIndexerSync,
 } from '../src/indexer.js';
 
@@ -1704,6 +1707,135 @@ async function runTests(): Promise<void> {
         await pgServer.stop();
         await wirePglite.close();
       }
+
+      // -----------------------------------------------------------------------
+      // STEP 19: Real PostgreSQL (embedded-postgres) mid-transaction pg_terminate_backend + getTransaction retry
+      // -----------------------------------------------------------------------
+      console.log('\n=== STEP 19: Real PostgreSQL pg_terminate_backend mid-transaction & getTransaction retry ===');
+      const epgPort = await new Promise<number>((resolve, reject) => {
+        const srv = net.createServer();
+        srv.listen(0, '127.0.0.1', () => {
+          const addr = srv.address();
+          srv.close((err) => {
+            if (err) reject(err);
+            else if (addr && typeof addr === 'object') resolve(addr.port);
+            else reject(new Error('Failed to bind ephemeral TCP port'));
+          });
+        });
+        srv.on('error', reject);
+      });
+      const epgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nostok-idx-epg-'));
+      const epg = new EmbeddedPostgres({
+        databaseDir: path.join(epgDir, 'data'),
+        user: 'postgres',
+        password: 'pw',
+        port: epgPort,
+        persistent: false,
+      });
+      await epg.initialise();
+      await epg.start();
+      const realPgUrl = `postgres://postgres:pw@127.0.0.1:${epgPort}/postgres`;
+      try {
+        const cfgRealPg = loadConfig({
+          rpcUrl: LOCAL_RPC_URL,
+          isFork: false,
+          databaseUrl: realPgUrl,
+          startBlock,
+          confirmations: 0,
+          blockBatchSize: 200,
+          loanCore: deployed.loanCore,
+          orderSettlement: deployed.orderSettlement,
+          liquidationAuction: deployed.liquidationAuction,
+          positionNft: deployed.positionNFT,
+          collateralEscrow: deployed.collateralEscrow,
+          assetRegistry: deployed.assetRegistry,
+          oracleRouter: deployed.oracleRouter,
+          assets: [nvdac],
+        });
+        const ctxRealPg = await createIndexerContext(cfgRealPg);
+        const adminClient = new pgPkg.Client({ connectionString: realPgUrl });
+        await adminClient.connect();
+        try {
+          const sync1 = await runIndexerSync(ctxRealPg);
+          assert.ok(sync1.blocksProcessed > 0);
+
+          // Kill the checked-out pooled backend mid-transaction with pg_terminate_backend(pid)
+          await assert.rejects(
+            () =>
+              ctxRealPg.db.transaction(async (tx) => {
+                const pidRes = await tx.query<{ pid: number }>('SELECT pg_backend_pid()::INT AS pid');
+                const backendPid = Number(pidRes.rows[0].pid);
+                await adminClient.query('SELECT pg_terminate_backend($1)', [backendPid]);
+                await tx.query('SELECT 1 AS after_kill');
+              }),
+            (err: unknown) => {
+              const msg = err instanceof Error ? err.message : String(err);
+              const code = err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
+              assert.ok(
+                code === '57P01' || /terminating connection|connection terminated|closed/i.test(msg),
+                `Unexpected error instead of connection termination: ${msg}`
+              );
+              return true;
+            }
+          );
+
+          // Process stayed alive without unhandled client 'error'; mine a block and run the next poll cleanly
+          await rpcCall('anvil_mine', ['0x1', '0x1']);
+          const syncAfterKill = await runIndexerSync(ctxRealPg);
+          assert.equal(syncAfterKill.blocksProcessed, 1, 'Next poll after mid-transaction kill must succeed cleanly');
+          const loansRes = await ctxRealPg.db.query<{ cnt: number }>('SELECT COUNT(*)::INT AS cnt FROM loans');
+          assert.equal(Number(loansRes.rows[0].cnt), 2);
+        } finally {
+          await adminClient.end();
+          await ctxRealPg.db.close();
+        }
+      } finally {
+        await epg.stop();
+        fs.rmSync(epgDir, { recursive: true, force: true });
+      }
+
+      // Test resolveOrderMetaFromTx: transient getTransaction failure retries and is NOT cached as null
+      const step19FillRows = await ctx.db.query<{ tx_hash: string }>(
+        'SELECT tx_hash FROM order_fills ORDER BY id ASC LIMIT 1'
+      );
+      const realFillTxHash = step19FillRows.rows[0].tx_hash as Hex;
+      const metaCache = new Map();
+      let failCalls = 0;
+      const allFailClient = {
+        async getTransaction() {
+          failCalls++;
+          throw new Error('503 temporary RPC timeout');
+        },
+      };
+      const failedMeta = await resolveOrderMetaFromTx(allFailClient, realFillTxHash, metaCache, {
+        attempts: 2,
+        baseDelayMs: 5,
+      });
+      assert.equal(failedMeta, null);
+      assert.equal(failCalls, 2);
+      assert.equal(
+        metaCache.has(realFillTxHash.toLowerCase()),
+        false,
+        'Transient getTransaction RPC failure must NOT be cached permanently'
+      );
+
+      let flakyCalls = 0;
+      const flakyClient = {
+        async getTransaction(args: { hash: Hex }) {
+          flakyCalls++;
+          if (flakyCalls < 3) {
+            throw new Error('transient network reset');
+          }
+          return publicClient.getTransaction(args);
+        },
+      };
+      const recoveredMeta = await resolveOrderMetaFromTx(flakyClient, realFillTxHash, metaCache, {
+        attempts: 4,
+        baseDelayMs: 5,
+      });
+      assert.equal(flakyCalls, 3);
+      assert.ok(recoveredMeta !== null && recoveredMeta.minUsdc !== undefined && recoveredMeta.minUsdc > 0n);
+      console.log('PASS STEP 19: Real PostgreSQL pg_terminate_backend mid-transaction & getTransaction retry verified.');
 
       // Print compact summary of DB table counts
       const tables = ['loans', 'loan_events', 'orders', 'order_fills', 'auctions', 'auction_buys', 'positions', 'claims', 'assets'];

@@ -221,6 +221,30 @@ export function renderPrometheusMetrics(ctx: RiskContext): string {
       lines.push(`nostok_risk_asset_multiplier_drift_bps{${lbl}} ${a.multiplier_drift_bps}`);
       lines.push(`nostok_risk_asset_cap_utilization_bps{${lbl}} ${a.asset_cap_utilization_bps}`);
     }
+
+    lines.push('# HELP nostok_risk_keeper_seconds_since_sync_multiplier Seconds since last MultiplierSynced event (-1 if never observed)');
+    lines.push('# TYPE nostok_risk_keeper_seconds_since_sync_multiplier gauge');
+    lines.push(`nostok_risk_keeper_seconds_since_sync_multiplier ${s.keeper.seconds_since_sync_multiplier ?? -1}`);
+
+    lines.push('# HELP nostok_risk_keeper_seconds_since_start_liquidation Seconds since last startLiquidation auction (-1 if never observed)');
+    lines.push('# TYPE nostok_risk_keeper_seconds_since_start_liquidation gauge');
+    lines.push(`nostok_risk_keeper_seconds_since_start_liquidation ${s.keeper.seconds_since_start_liquidation ?? -1}`);
+
+    lines.push('# HELP nostok_risk_keeper_seconds_since_default_or_restart Seconds since last default auction or auction restart/cancel (-1 if never observed)');
+    lines.push('# TYPE nostok_risk_keeper_seconds_since_default_or_restart gauge');
+    lines.push(`nostok_risk_keeper_seconds_since_default_or_restart ${s.keeper.seconds_since_default_or_restart ?? -1}`);
+
+    lines.push('# HELP nostok_risk_keeper_unacted_liquidatable_loans Count of unacted LTV-liquidatable loans beyond keeper threshold');
+    lines.push('# TYPE nostok_risk_keeper_unacted_liquidatable_loans gauge');
+    lines.push(`nostok_risk_keeper_unacted_liquidatable_loans ${s.keeper.unacted_liquidatable_loans.length}`);
+
+    lines.push('# HELP nostok_risk_keeper_unacted_default_loans Count of unacted loans past maturity + 24h grace');
+    lines.push('# TYPE nostok_risk_keeper_unacted_default_loans gauge');
+    lines.push(`nostok_risk_keeper_unacted_default_loans ${s.keeper.unacted_defaulted_loans.length}`);
+
+    lines.push('# HELP nostok_risk_keeper_unacted_expired_auctions Count of expired auctions awaiting restartOrCancelAuction');
+    lines.push('# TYPE nostok_risk_keeper_unacted_expired_auctions gauge');
+    lines.push(`nostok_risk_keeper_unacted_expired_auctions ${s.keeper.unacted_expired_auctions.length}`);
   }
 
   return lines.join('\n') + '\n';

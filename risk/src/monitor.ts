@@ -16,18 +16,32 @@ import {
   OracleState,
   aggregatorV3Abi,
   assetRegistryAbi,
+  collateralEscrowAbi,
   erc20MetaAbi,
   loanCoreAbi,
   oracleRouterAbi,
 } from './abi.js';
 import { AlertEngine, type AlertObservation, type AlertSeverity } from './alerts.js';
 import type { RiskConfig } from './config.js';
-import { type ReadOnlyDatabase, openReadOnlyDatabase, toBigInt } from './db.js';
+import { type ReadOnlyDatabase, openReadOnlyDatabase } from './db.js';
 import { type FormattedAmount, ceilDiv, formatAmount, formatRay18 } from './format.js';
 
 const USDC_DECIMALS = 6;
 const RATE_DECIMALS = 18;
 const FEED_DECIMALS_DEFAULT = 8;
+const MULTICALL_CHUNK_SIZE = 200;
+const GRACE_PERIOD_SECONDS = 86_400n;
+
+export function computeLiquidationPrice(
+  debt: bigint,
+  liqLtvBps: bigint,
+  collateralRaw: bigint,
+  priceScale: bigint
+): bigint {
+  if (debt <= 0n || liqLtvBps <= 0n || collateralRaw <= 0n) return 0n;
+  const gMax = (debt * 10_000n) / liqLtvBps;
+  return ceilDiv((gMax + 1n) * priceScale, collateralRaw * 1_000_000n);
+}
 
 export type LoanRiskStatus = 'healthy' | 'margin_call' | 'near_liquidation' | 'liquidatable';
 
@@ -77,6 +91,7 @@ export interface AssetRiskSnapshot {
   asset_outstanding_principal: FormattedAmount;
   asset_cap_utilization_bps: number;
   escrow_balance: FormattedAmount;
+  escrow_ledger_balance: FormattedAmount;
   open_loans_collateral_sum: FormattedAmount;
   escrow_matches_open_loans: boolean;
 }
@@ -85,10 +100,13 @@ export interface KeeperLivenessSnapshot {
   last_sync_multiplier_block: string | null;
   last_sync_multiplier_timestamp: string | null;
   seconds_since_sync_multiplier: number | null;
+  seconds_since_start_liquidation: number | null;
+  seconds_since_default_or_restart: number | null;
   last_liquidation_or_auction_block: string | null;
   last_liquidation_or_auction_timestamp: string | null;
   seconds_since_liquidation_or_auction: number | null;
   unacted_liquidatable_loans: Array<{ loan_id: string; stalled_seconds: number }>;
+  unacted_defaulted_loans: Array<{ loan_id: string; stalled_seconds: number }>;
   unacted_expired_auctions: Array<{ auction_id: string; stalled_seconds: number }>;
 }
 
@@ -121,6 +139,7 @@ export interface RiskSummarySnapshot {
 }
 
 export interface MonitorInternalState {
+  chainIdVerified: boolean;
   scanCount: number;
   rpcErrorsTotal: number;
   dbErrorsTotal: number;
@@ -129,6 +148,7 @@ export interface MonitorInternalState {
   lastScanError: string | null;
   previousPrices: Map<string, bigint>;
   liquidatableSinceBlockTs: Map<string, number>;
+  surplusSeenAtMsByAsset: Map<string, { balance: bigint; firstSeenMs: number }>;
   latestSummary: RiskSummarySnapshot | null;
   latestLoans: LoanRiskSnapshot[];
 }
@@ -152,13 +172,55 @@ function validateChainId(chainId: number, config: Pick<RiskConfig, 'isFork' | 'f
   }
 }
 
+async function chunkedMulticall(
+  publicClient: PublicClient<Transport, Chain>,
+  contracts: ReadonlyArray<{
+    address: Address;
+    abi: readonly unknown[];
+    functionName: string;
+    args?: readonly unknown[];
+  }>,
+  blockNumber: bigint
+): Promise<Array<{ status: 'success'; result: unknown } | { status: 'failure'; error: Error }>> {
+  const multicallAddr = base.contracts.multicall3.address;
+  const out: Array<{ status: 'success'; result: unknown } | { status: 'failure'; error: Error }> = [];
+  for (let i = 0; i < contracts.length; i += MULTICALL_CHUNK_SIZE) {
+    const chunk = contracts.slice(i, i + MULTICALL_CHUNK_SIZE);
+    const res = await publicClient.multicall({
+      contracts: chunk as Parameters<typeof publicClient.multicall>[0]['contracts'],
+      allowFailure: true,
+      blockNumber,
+      multicallAddress: multicallAddr,
+    });
+    for (const item of res) {
+      out.push(item as { status: 'success'; result: unknown } | { status: 'failure'; error: Error });
+    }
+  }
+  return out;
+}
+
 export async function createRiskContext(
   config: RiskConfig,
   dbOverride?: ReadOnlyDatabase
 ): Promise<RiskContext> {
   const probeClient = createPublicClient({ transport: viemHttp(config.rpcUrl), cacheTime: 0 });
-  const chainId = await probeClient.getChainId();
-  validateChainId(chainId, config);
+  let chainId = config.isFork ? config.forkChainId : 8453;
+  let chainIdVerified = false;
+  let bootRpcError: string | null = null;
+
+  try {
+    chainId = await probeClient.getChainId();
+    validateChainId(chainId, config);
+    chainIdVerified = true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // Do not mask invalid fork/mainnet chainId configuration mismatches
+    if (/Invalid (fork )?chainId/i.test(msg)) {
+      throw err;
+    }
+    bootRpcError = msg;
+    console.warn(`[RISK_RPC_BOOT_DEGRADED] Initial RPC getChainId failed (starting degraded): ${msg}`);
+  }
 
   const chain = defineChain({
     id: chainId,
@@ -174,8 +236,22 @@ export async function createRiskContext(
     cacheTime: 0,
   });
 
-  const db = dbOverride ?? (await openReadOnlyDatabase(config.databaseUrl));
-  const alerts = new AlertEngine(config.alertCooldownMs, config.webhookUrl);
+  let db: ReadOnlyDatabase;
+  let bootDbError: string | null = null;
+  if (dbOverride) {
+    db = dbOverride;
+  } else {
+    const opened = await openReadOnlyDatabase(config.databaseUrl, true);
+    db = opened.db;
+    bootDbError = opened.bootError ?? null;
+  }
+
+  const alerts = new AlertEngine(config.alertCooldownMs, config.webhookUrl, {
+    minActiveMs: config.alertMinActiveMs,
+    webhookTimeoutMs: config.webhookTimeoutMs,
+  });
+
+  const bootError = bootRpcError ?? bootDbError;
 
   return {
     config,
@@ -183,14 +259,16 @@ export async function createRiskContext(
     db,
     alerts,
     state: {
+      chainIdVerified,
       scanCount: 0,
-      rpcErrorsTotal: 0,
-      dbErrorsTotal: 0,
-      consecutiveRpcFailures: 0,
-      monitorDegraded: false,
-      lastScanError: null,
+      rpcErrorsTotal: bootRpcError ? 1 : 0,
+      dbErrorsTotal: bootDbError ? 1 : 0,
+      consecutiveRpcFailures: bootRpcError ? 1 : 0,
+      monitorDegraded: bootError !== null,
+      lastScanError: bootError,
       previousPrices: new Map(),
       liquidatableSinceBlockTs: new Map(),
+      surplusSeenAtMsByAsset: new Map(),
       latestSummary: null,
       latestLoans: [],
     },
@@ -202,21 +280,11 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
   const nowIso = new Date(nowMs).toISOString();
   const observations: AlertObservation[] = [];
 
-  // Step 1: Read strictly SELECT-only data from indexer DB
+  // Step 1: Read indexer metadata & keeper event timestamps (NEVER use DB principal_repaid / collateral_raw for risk math)
   let idxLastBlock: string | null = null;
   let idxUpdatedAt: string | null = null;
   let idxUpdatedMs: number | null = null;
-  let openLoanRows: Array<{
-    loan_id: string;
-    borrower: string;
-    collateral_token: string;
-    collateral_raw: string;
-    principal: string;
-    principal_repaid: string;
-    margin_call_ltv_bps: number;
-    liq_ltv_bps: number;
-    status: number;
-  }> = [];
+  const terminalLoanIds = new Set<string>();
   let assetDbRows: Array<{
     token: string;
     symbol: string | null;
@@ -233,39 +301,20 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
   }> = [];
   let keeperEventRows: Array<{
     event_name: string;
+    is_default_auction: string;
     max_block: string | null;
     max_ts: string | null;
   }> = [];
 
   try {
-    const [idxStateRes, loansRes, assetsRes, auctionsRes, keeperRes] = await Promise.all([
+    const [idxStateRes, terminalLoansRes, assetsRes, auctionsRes, keeperRes] = await Promise.all([
       ctx.db.query<{ last_indexed_block: string; updated_at: unknown }>(
         'SELECT last_indexed_block::TEXT AS last_indexed_block, updated_at FROM indexer_state WHERE id = 1'
       ),
-      ctx.db.query<{
-        loan_id: string;
-        borrower: string;
-        collateral_token: string;
-        collateral_raw: string;
-        principal: string;
-        principal_repaid: string;
-        margin_call_ltv_bps: number;
-        liq_ltv_bps: number;
-        status: number;
-      }>(
-        `SELECT
-           loan_id::TEXT AS loan_id,
-           borrower,
-           collateral_token,
-           collateral_raw::TEXT AS collateral_raw,
-           principal::TEXT AS principal,
-           principal_repaid::TEXT AS principal_repaid,
-           margin_call_ltv_bps,
-           liq_ltv_bps,
-           status
+      ctx.db.query<{ loan_id: string }>(
+        `SELECT loan_id::TEXT AS loan_id
          FROM loans
-         WHERE status IN (0, 1, 2)
-         ORDER BY loan_id ASC`
+         WHERE status IN (3, 4, 5)`
       ),
       ctx.db.query<{
         token: string;
@@ -294,14 +343,20 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
          WHERE status = 0
          ORDER BY auction_id ASC`
       ),
-      ctx.db.query<{ event_name: string; max_block: string | null; max_ts: string | null }>(
+      ctx.db.query<{
+        event_name: string;
+        is_default_auction: string;
+        max_block: string | null;
+        max_ts: string | null;
+      }>(
         `SELECT
            event_name,
+           COALESCE(payload->>'isDefaultAuction', 'false') AS is_default_auction,
            MAX(block_number)::TEXT AS max_block,
            MAX(block_timestamp)::TEXT AS max_ts
          FROM loan_events
-         WHERE event_name IN ('MultiplierSynced', 'AuctionStarted', 'AuctionRestarted')
-         GROUP BY event_name`
+         WHERE event_name IN ('MultiplierSynced', 'AuctionStarted', 'AuctionRestarted', 'AuctionCancelled')
+         GROUP BY event_name, COALESCE(payload->>'isDefaultAuction', 'false')`
       ),
     ]);
 
@@ -319,7 +374,9 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
         idxUpdatedMs = parsedDate.getTime();
       }
     }
-    openLoanRows = loansRes.rows;
+    for (const r of terminalLoansRes.rows) {
+      terminalLoanIds.add(r.loan_id);
+    }
     assetDbRows = assetsRes.rows;
     activeAuctionRows = auctionsRes.rows;
     keeperEventRows = keeperRes.rows;
@@ -369,10 +426,13 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
         last_sync_multiplier_block: null,
         last_sync_multiplier_timestamp: null,
         seconds_since_sync_multiplier: null,
+        seconds_since_start_liquidation: null,
+        seconds_since_default_or_restart: null,
         last_liquidation_or_auction_block: null,
         last_liquidation_or_auction_timestamp: null,
         seconds_since_liquidation_or_auction: null,
         unacted_liquidatable_loans: [],
+        unacted_defaulted_loans: [],
         unacted_expired_auctions: [],
       },
       loan_counts: { healthy: 0, margin_call: 0, near_liquidation: 0, liquidatable: 0 },
@@ -383,7 +443,7 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
     return degradedSummary;
   }
 
-  // Step 2: Fetch chain head + live protocol state via multicall (with safe degraded isolation on RPC outage)
+  // Step 2: Fetch chain head + live protocol state via chunked multicalls (with safe degraded isolation on RPC outage)
   let headBlock: bigint;
   let blockTimestamp: bigint;
   let paused: boolean;
@@ -393,26 +453,26 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
   let maxStaleClosedSecs: number;
 
   const assetAddrs = assetDbRows.map((a) => getAddress(a.token));
-  const openCollateralByAsset = new Map<string, bigint>();
-  for (const r of openLoanRows) {
-    const key = r.collateral_token.toLowerCase();
-    openCollateralByAsset.set(key, (openCollateralByAsset.get(key) ?? 0n) + toBigInt(r.collateral_raw));
-  }
-
   let assetLiveResults: AssetRiskSnapshot[] = [];
   const assetByLower = new Map<string, AssetRiskSnapshot>();
   let loanSnapshots: LoanRiskSnapshot[] = [];
 
   try {
+    if (!ctx.state.chainIdVerified) {
+      const chainId = await ctx.publicClient.getChainId();
+      validateChainId(chainId, ctx.config);
+      ctx.state.chainIdVerified = true;
+    }
+
     headBlock = await ctx.publicClient.getBlockNumber();
     const headBlockObj = await ctx.publicClient.getBlock({ blockNumber: headBlock });
     blockTimestamp = headBlockObj.timestamp;
 
-    const multicallAddr = base.contracts.multicall3.address;
-    const globalAndAssetContracts = [
+    const headerAndAssetContracts = [
       { address: ctx.config.loanCore, abi: loanCoreAbi, functionName: 'paused' } as const,
       { address: ctx.config.loanCore, abi: loanCoreAbi, functionName: 'globalUsdcCap' } as const,
       { address: ctx.config.loanCore, abi: loanCoreAbi, functionName: 'totalOutstandingPrincipal' } as const,
+      { address: ctx.config.loanCore, abi: loanCoreAbi, functionName: 'nextLoanId' } as const,
       { address: ctx.config.oracleRouter, abi: oracleRouterAbi, functionName: 'isMarketOpen' } as const,
       { address: ctx.config.oracleRouter, abi: oracleRouterAbi, functionName: 'maxStaleClosedSecs' } as const,
       ...assetAddrs.flatMap((tokenAddr, idx) => {
@@ -424,31 +484,21 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
           { address: tokenAddr, abi: erc20MetaAbi, functionName: 'uiMultiplier' } as const,
           { address: ctx.config.loanCore, abi: loanCoreAbi, functionName: 'assetOutstandingPrincipal', args: [tokenAddr] } as const,
           { address: tokenAddr, abi: erc20MetaAbi, functionName: 'balanceOf', args: [ctx.config.collateralEscrow] } as const,
+          { address: ctx.config.collateralEscrow, abi: collateralEscrowAbi, functionName: 'getBalance', args: [tokenAddr] } as const,
           { address: feedAddr, abi: aggregatorV3Abi, functionName: 'latestRoundData' } as const,
-        ];
-      }),
-      ...openLoanRows.flatMap((row) => {
-        const id = BigInt(row.loan_id);
-        return [
-          { address: ctx.config.loanCore, abi: loanCoreAbi, functionName: 'getLoan', args: [id] } as const,
-          { address: ctx.config.loanCore, abi: loanCoreAbi, functionName: 'getDueInterest', args: [id] } as const,
         ];
       }),
     ];
 
-    const mcRes = await ctx.publicClient.multicall({
-      contracts: globalAndAssetContracts,
-      allowFailure: true,
-      blockNumber: headBlock,
-      multicallAddress: multicallAddr,
-    });
+    const mcRes = await chunkedMulticall(ctx.publicClient, headerAndAssetContracts, headBlock);
 
     if (
       mcRes[0].status === 'failure' ||
       mcRes[1].status === 'failure' ||
       mcRes[2].status === 'failure' ||
       mcRes[3].status === 'failure' ||
-      mcRes[4].status === 'failure'
+      mcRes[4].status === 'failure' ||
+      mcRes[5].status === 'failure'
     ) {
       throw new Error('Core protocol multicall returned failure');
     }
@@ -456,13 +506,78 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
     paused = mcRes[0].result as boolean;
     globalCap = mcRes[1].result as bigint;
     totalOutstanding = mcRes[2].result as bigint;
-    marketOpen = mcRes[3].result as boolean;
-    maxStaleClosedSecs = Number(mcRes[4].result as number | bigint);
+    const nextLoanId = mcRes[3].result as bigint;
+    marketOpen = mcRes[4].result as boolean;
+    maxStaleClosedSecs = Number(mcRes[5].result as number | bigint);
 
-    const ASSET_STRIDE = 7;
-    const LOAN_STRIDE = 2;
-    const assetsOffset = 5;
-    const loansOffset = assetsOffset + assetAddrs.length * ASSET_STRIDE;
+    // Fetch all non-terminal on-chain loans directly from LoanCore (so risk/escrow math is 100% immune to indexer lag)
+    const candidateLoanIds: bigint[] = [];
+    for (let id = 1n; id < nextLoanId; id++) {
+      if (!terminalLoanIds.has(id.toString())) {
+        candidateLoanIds.push(id);
+      }
+    }
+
+    const loanContracts = candidateLoanIds.flatMap((id) => [
+      { address: ctx.config.loanCore, abi: loanCoreAbi, functionName: 'getLoan', args: [id] } as const,
+      { address: ctx.config.loanCore, abi: loanCoreAbi, functionName: 'getDueInterest', args: [id] } as const,
+    ]);
+    const loanMcRes =
+      loanContracts.length > 0
+        ? await chunkedMulticall(ctx.publicClient, loanContracts, headBlock)
+        : [];
+
+    const onchainOpenCollateralByAsset = new Map<string, bigint>();
+    const liveOnchainLoans: Array<{
+      loanId: string;
+      onchainLoan: {
+        borrower: Address;
+        collateralToken: Address;
+        collateralRaw: bigint;
+        principal: bigint;
+        maturity: bigint;
+        marginCallLtvBps: number;
+        liqLtvBps: number;
+        status: number;
+        principalRepaid: bigint;
+      };
+      dueInterest: bigint;
+    }> = [];
+
+    for (let i = 0; i < candidateLoanIds.length; i++) {
+      const loanRes = loanMcRes[i * 2];
+      const dueIntRes = loanMcRes[i * 2 + 1];
+      if (!loanRes || !dueIntRes || loanRes.status === 'failure' || dueIntRes.status === 'failure') {
+        continue;
+      }
+      const onchainLoan = loanRes.result as {
+        borrower: Address;
+        collateralToken: Address;
+        collateralRaw: bigint;
+        principal: bigint;
+        maturity: bigint;
+        marginCallLtvBps: number;
+        liqLtvBps: number;
+        status: number;
+        principalRepaid: bigint;
+      };
+      const liveStatus = Number(onchainLoan.status);
+      if (liveStatus >= 3) continue;
+
+      const tokenKey = onchainLoan.collateralToken.toLowerCase();
+      onchainOpenCollateralByAsset.set(
+        tokenKey,
+        (onchainOpenCollateralByAsset.get(tokenKey) ?? 0n) + onchainLoan.collateralRaw
+      );
+      liveOnchainLoans.push({
+        loanId: candidateLoanIds[i].toString(),
+        onchainLoan,
+        dueInterest: dueIntRes.result as bigint,
+      });
+    }
+
+    const ASSET_STRIDE = 8;
+    const assetsOffset = 6;
 
     // Evaluate each asset
     assetLiveResults = [];
@@ -475,8 +590,9 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
       const recMultRes = mcRes[baseIdx + 2];
       const uiMultRes = mcRes[baseIdx + 3];
       const assetOutRes = mcRes[baseIdx + 4];
-      const escrowBalRes = mcRes[baseIdx + 5];
-      const roundRes = mcRes[baseIdx + 6];
+      const erc20BalRes = mcRes[baseIdx + 5];
+      const escrowLedgerRes = mcRes[baseIdx + 6];
+      const roundRes = mcRes[baseIdx + 7];
 
       if (cfgRes.status === 'failure' || priceRes.status === 'failure') {
         continue;
@@ -500,7 +616,9 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
       const recMult = recMultRes.status === 'success' ? (recMultRes.result as bigint) : 0n;
       const uiMult = uiMultRes.status === 'success' ? (uiMultRes.result as bigint) : null;
       const assetOutstanding = assetOutRes.status === 'success' ? (assetOutRes.result as bigint) : 0n;
-      const escrowBal = escrowBalRes.status === 'success' ? (escrowBalRes.result as bigint) : 0n;
+      const erc20EscrowBal = erc20BalRes.status === 'success' ? (erc20BalRes.result as bigint) : 0n;
+      const escrowLedgerBal =
+        escrowLedgerRes.status === 'success' ? (escrowLedgerRes.result as bigint) : 0n;
 
       let feedUpdatedAt = 0n;
       let rawFeedPrice = 0n;
@@ -540,9 +658,11 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
 
       const tokenDecimals = dbRow.decimals !== null ? Number(dbRow.decimals) : 18;
       const symbol = dbRow.symbol ?? tokenAddr;
-      const openLoanColSum = openCollateralByAsset.get(tokenKey) ?? 0n;
+      const openLoanColSum = onchainOpenCollateralByAsset.get(tokenKey) ?? 0n;
       const capUtilBps =
         cfg.assetCap > 0n ? Number((assetOutstanding * 10_000n) / cfg.assetCap) : 0;
+      const escrowMatchesOpenLoans =
+        erc20EscrowBal >= escrowLedgerBal && escrowLedgerBal === openLoanColSum;
 
       const snapshot: AssetRiskSnapshot = {
         token: tokenAddr,
@@ -564,9 +684,10 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
         asset_cap: formatAmount(cfg.assetCap, USDC_DECIMALS, 'USDC'),
         asset_outstanding_principal: formatAmount(assetOutstanding, USDC_DECIMALS, 'USDC'),
         asset_cap_utilization_bps: capUtilBps,
-        escrow_balance: formatAmount(escrowBal, tokenDecimals, symbol),
+        escrow_balance: formatAmount(erc20EscrowBal, tokenDecimals, symbol),
+        escrow_ledger_balance: formatAmount(escrowLedgerBal, tokenDecimals, symbol),
         open_loans_collateral_sum: formatAmount(openLoanColSum, tokenDecimals, symbol),
-        escrow_matches_open_loans: escrowBal === openLoanColSum,
+        escrow_matches_open_loans: escrowMatchesOpenLoans,
       };
       assetLiveResults.push(snapshot);
       assetByLower.set(tokenKey, snapshot);
@@ -710,29 +831,51 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
         }
       }
 
-      // Escrow invariant check (only flag if indexer lag is within healthy threshold to avoid stale DB false positives)
-      const indexerLagBlocks =
-        idxLastBlock !== null && headBlock >= BigInt(idxLastBlock)
-          ? headBlock - BigInt(idxLastBlock)
-          : null;
-      if (
-        escrowBal !== openLoanColSum &&
-        indexerLagBlocks !== null &&
-        indexerLagBlocks <= BigInt(ctx.config.maxHealthyLagBlocks)
-      ) {
+      // Three-way on-chain escrow invariant check:
+      // 1) ERC-20 balanceOf(escrow) vs CollateralEscrow.getBalance(token) ledger vs sum(on-chain loan.collateralRaw)
+      // Completely independent of indexer lag. Shortfalls or ledger mismatches are critical; pure donation
+      // surpluses emit a bounded informational notice and auto-resolve so they never stay active forever.
+      if (!escrowMatchesOpenLoans) {
+        ctx.state.surplusSeenAtMsByAsset.delete(tokenKey);
         observations.push({
           dedupKey: `escrow_mismatch:${tokenKey}`,
           category: 'protocol',
-          severity: escrowBal < openLoanColSum ? 'critical' : 'warning',
+          severity: 'critical',
           title: `Escrow balance mismatch on ${symbol}`,
-          message: `${symbol} CollateralEscrow balance (${escrowBal}) != open loans collateral sum (${openLoanColSum})`,
+          message: `${symbol} escrow check failed (balanceOf=${erc20EscrowBal}, ledger=${escrowLedgerBal}, openLoansSum=${openLoanColSum})`,
           details: {
             token: tokenAddr,
             symbol,
-            escrowBalance: escrowBal.toString(),
+            escrowBalance: erc20EscrowBal.toString(),
+            escrowLedgerBalance: escrowLedgerBal.toString(),
             openLoansCollateralSum: openLoanColSum.toString(),
           },
         });
+      } else if (erc20EscrowBal > escrowLedgerBal) {
+        let seen = ctx.state.surplusSeenAtMsByAsset.get(tokenKey);
+        if (!seen || seen.balance !== erc20EscrowBal) {
+          seen = { balance: erc20EscrowBal, firstSeenMs: nowMs };
+          ctx.state.surplusSeenAtMsByAsset.set(tokenKey, seen);
+        }
+        // Keep informational surplus alert active at most one minActiveMs window for a given balance
+        if (nowMs - seen.firstSeenMs <= ctx.config.alertMinActiveMs) {
+          observations.push({
+            dedupKey: `escrow_surplus:${tokenKey}`,
+            category: 'protocol',
+            severity: 'info',
+            title: `Unaccounted token surplus in escrow for ${symbol}`,
+            message: `${symbol} balanceOf(escrow) (${erc20EscrowBal}) exceeds ledger/loans (${escrowLedgerBal})`,
+            details: {
+              token: tokenAddr,
+              symbol,
+              escrowBalance: erc20EscrowBal.toString(),
+              escrowLedgerBalance: escrowLedgerBal.toString(),
+              surplus: (erc20EscrowBal - escrowLedgerBal).toString(),
+            },
+          });
+        }
+      } else {
+        ctx.state.surplusSeenAtMsByAsset.delete(tokenKey);
       }
     }
 
@@ -816,35 +959,19 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
       });
     }
 
-    // Evaluate per-loan risk metrics matching LoanCore.startLiquidation exactly
+    // Evaluate per-loan risk metrics matching LoanCore.startLiquidation & startDefaultAuction using 100% ON-CHAIN state
     const activeLiquidatableIds = new Set<string>();
     const unactedLiquidatable: Array<{ loan_id: string; stalled_seconds: number }> = [];
+    const unactedDefaulted: Array<{ loan_id: string; stalled_seconds: number }> = [];
 
-    for (let i = 0; i < openLoanRows.length; i++) {
-      const dbLoan = openLoanRows[i];
-      const baseIdx = loansOffset + i * LOAN_STRIDE;
-      const loanRes = mcRes[baseIdx];
-      const dueIntRes = mcRes[baseIdx + 1];
-      if (loanRes.status === 'failure' || dueIntRes.status === 'failure') continue;
-
-      const onchainLoan = loanRes.result as {
-        borrower: Address;
-        collateralToken: Address;
-        collateralRaw: bigint;
-        principal: bigint;
-        marginCallLtvBps: number;
-        liqLtvBps: number;
-        status: number;
-      };
-      const dueInterest = dueIntRes.result as bigint;
+    for (const item of liveOnchainLoans) {
+      const { loanId, onchainLoan, dueInterest } = item;
       const liveStatus = Number(onchainLoan.status);
-      // Skip if settled/repaid on-chain even before indexer catches up
-      if (liveStatus >= 3) continue;
 
       const principalRemaining =
-        onchainLoan.principal > toBigInt(dbLoan.principal_repaid)
-          ? onchainLoan.principal - toBigInt(dbLoan.principal_repaid)
-          : onchainLoan.principal;
+        onchainLoan.principal > onchainLoan.principalRepaid
+          ? onchainLoan.principal - onchainLoan.principalRepaid
+          : 0n;
       const totalDebt = principalRemaining + dueInterest;
 
       const tokenKey = onchainLoan.collateralToken.toLowerCase();
@@ -872,13 +999,13 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
           ? (grossValueUsdc * BigInt(liqLtvBps) * 10n ** 14n) / totalDebt
           : 0n;
 
-      const liqPriceRaw =
-        onchainLoan.collateralRaw > 0n && liqLtvBps > 0 && totalDebt > 0n
-          ? ceilDiv(
-              totalDebt * 10_000n * scaleDenom,
-              BigInt(liqLtvBps) * onchainLoan.collateralRaw * 1_000_000n
-            )
-          : 0n;
+      // Exact first strictly non-liquidating price: ceil((floor(D * 1e4 / liq) + 1) * S / (c * 1e6))
+      const liqPriceRaw = computeLiquidationPrice(
+        totalDebt,
+        BigInt(liqLtvBps),
+        onchainLoan.collateralRaw,
+        scaleDenom
+      );
 
       const distanceBps =
         oraclePrice > 0n && liqPriceRaw > 0n
@@ -891,12 +1018,18 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
         (liveStatus === 0 || liveStatus === 1) &&
         oracleState === OracleState.VALID_OPEN &&
         grossValueUsdc > 0n &&
-        BigInt(currentLtvBps) >= BigInt(liqLtvBps);
+        (totalDebt * 10_000n) / grossValueUsdc >= BigInt(liqLtvBps);
+
+      const graceDeadline = onchainLoan.maturity + GRACE_PERIOD_SECONDS;
+      const isPastGrace = (liveStatus === 0 || liveStatus === 1) && blockTimestamp > graceDeadline;
+      const isInGraceWindow =
+        (liveStatus === 0 || liveStatus === 1) && !isPastGrace && blockTimestamp > onchainLoan.maturity;
 
       let riskStatus: LoanRiskStatus = 'healthy';
-      if (canLiquidateOnchain) {
+      if (canLiquidateOnchain || isPastGrace) {
         riskStatus = 'liquidatable';
       } else if (
+        isInGraceWindow ||
         currentLtvBps >= liqLtvBps ||
         currentLtvBps >= Math.max(marginCallLtvBps, liqLtvBps - ctx.config.nearLiqBufferBps)
       ) {
@@ -905,23 +1038,23 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
         riskStatus = 'margin_call';
       }
 
-      if (riskStatus === 'liquidatable') {
-        activeLiquidatableIds.add(dbLoan.loan_id);
-        const firstSeenTs = ctx.state.liquidatableSinceBlockTs.get(dbLoan.loan_id);
+      if (canLiquidateOnchain) {
+        activeLiquidatableIds.add(loanId);
+        const firstSeenTs = ctx.state.liquidatableSinceBlockTs.get(loanId);
         if (firstSeenTs === undefined) {
-          ctx.state.liquidatableSinceBlockTs.set(dbLoan.loan_id, Number(blockTimestamp));
+          ctx.state.liquidatableSinceBlockTs.set(loanId, Number(blockTimestamp));
         } else {
           const stalledSecs = Math.max(0, Number(blockTimestamp) - firstSeenTs);
           if (stalledSecs >= ctx.config.keeperInactivityAlertSecs) {
-            unactedLiquidatable.push({ loan_id: dbLoan.loan_id, stalled_seconds: stalledSecs });
+            unactedLiquidatable.push({ loan_id: loanId, stalled_seconds: stalledSecs });
             observations.push({
-              dedupKey: `keeper_inactive:loan:${dbLoan.loan_id}`,
+              dedupKey: `keeper_inactive:loan:${loanId}`,
               category: 'keeper',
               severity: 'critical',
-              title: `Keeper inactive on liquidatable loan #${dbLoan.loan_id}`,
-              message: `Loan #${dbLoan.loan_id} has been liquidatable for ${stalledSecs}s without startLiquidation`,
+              title: `Keeper inactive on liquidatable loan #${loanId}`,
+              message: `Loan #${loanId} has been liquidatable for ${stalledSecs}s without startLiquidation`,
               details: {
-                loanId: dbLoan.loan_id,
+                loanId,
                 stalledSeconds: stalledSecs,
                 currentLtvBps,
                 liqLtvBps,
@@ -930,35 +1063,70 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
           }
         }
         observations.push({
-          dedupKey: `loan_risk:${dbLoan.loan_id}:liquidatable`,
+          dedupKey: `loan_risk:${loanId}:liquidatable`,
           category: 'loan_risk',
           severity: 'critical',
-          title: `Loan #${dbLoan.loan_id} is liquidatable`,
-          message: `Loan #${dbLoan.loan_id} LTV=${currentLtvBps} bps >= liq=${liqLtvBps} bps (VALID_OPEN)`,
-          details: { loanId: dbLoan.loan_id, currentLtvBps, liqLtvBps },
+          title: `Loan #${loanId} is liquidatable`,
+          message: `Loan #${loanId} LTV=${currentLtvBps} bps >= liq=${liqLtvBps} bps (VALID_OPEN)`,
+          details: { loanId, currentLtvBps, liqLtvBps },
         });
       } else if (riskStatus === 'near_liquidation') {
-        observations.push({
-          dedupKey: `loan_risk:${dbLoan.loan_id}:near_liq`,
-          category: 'loan_risk',
-          severity: 'warning',
-          title: `Loan #${dbLoan.loan_id} near liquidation`,
-          message: `Loan #${dbLoan.loan_id} LTV=${currentLtvBps} bps (liq threshold=${liqLtvBps} bps, oracle=${oracleStateName})`,
-          details: { loanId: dbLoan.loan_id, currentLtvBps, liqLtvBps, oracleState: oracleStateName },
-        });
+        if (!isInGraceWindow) {
+          observations.push({
+            dedupKey: `loan_risk:${loanId}:near_liq`,
+            category: 'loan_risk',
+            severity: 'warning',
+            title: `Loan #${loanId} near liquidation`,
+            message: `Loan #${loanId} LTV=${currentLtvBps} bps (liq threshold=${liqLtvBps} bps, oracle=${oracleStateName})`,
+            details: { loanId, currentLtvBps, liqLtvBps, oracleState: oracleStateName },
+          });
+        }
       } else if (riskStatus === 'margin_call') {
         observations.push({
-          dedupKey: `loan_risk:${dbLoan.loan_id}:margin_call`,
+          dedupKey: `loan_risk:${loanId}:margin_call`,
           category: 'loan_risk',
           severity: 'info',
-          title: `Loan #${dbLoan.loan_id} in margin call zone`,
-          message: `Loan #${dbLoan.loan_id} LTV=${currentLtvBps} bps >= marginCall=${marginCallLtvBps} bps`,
-          details: { loanId: dbLoan.loan_id, currentLtvBps, marginCallLtvBps },
+          title: `Loan #${loanId} in margin call zone`,
+          message: `Loan #${loanId} LTV=${currentLtvBps} bps >= marginCall=${marginCallLtvBps} bps`,
+          details: { loanId, currentLtvBps, marginCallLtvBps },
+        });
+      }
+
+      if (isPastGrace) {
+        const overdueSecs = Number(blockTimestamp - graceDeadline);
+        observations.push({
+          dedupKey: `loan_risk:${loanId}:default_overdue`,
+          category: 'loan_risk',
+          severity: 'critical',
+          title: `Loan #${loanId} defaulted past 24h grace`,
+          message: `Loan #${loanId} is ${overdueSecs}s past maturity + 24h grace without startDefaultAuction`,
+          details: { loanId, overdueSecs, maturity: onchainLoan.maturity.toString() },
+        });
+        if (overdueSecs >= ctx.config.keeperInactivityAlertSecs) {
+          unactedDefaulted.push({ loan_id: loanId, stalled_seconds: overdueSecs });
+          observations.push({
+            dedupKey: `keeper_inactive:default:${loanId}`,
+            category: 'keeper',
+            severity: 'critical',
+            title: `Keeper inactive on defaulted loan #${loanId}`,
+            message: `Loan #${loanId} is ${overdueSecs}s past maturity + 24h grace without startDefaultAuction`,
+            details: { loanId, stalledSeconds: overdueSecs, maturity: onchainLoan.maturity.toString() },
+          });
+        }
+      } else if (isInGraceWindow) {
+        const graceElapsedSecs = Number(blockTimestamp - onchainLoan.maturity);
+        observations.push({
+          dedupKey: `loan_risk:${loanId}:in_grace`,
+          category: 'loan_risk',
+          severity: 'warning',
+          title: `Loan #${loanId} in 24h grace period`,
+          message: `Loan #${loanId} passed maturity (${graceElapsedSecs}s into 24h grace)`,
+          details: { loanId, graceElapsedSecs, maturity: onchainLoan.maturity.toString() },
         });
       }
 
       loanSnapshots.push({
-        loan_id: dbLoan.loan_id,
+        loan_id: loanId,
         borrower: getAddress(onchainLoan.borrower),
         collateral_token: getAddress(onchainLoan.collateralToken),
         collateral_symbol: assetSnap?.symbol ?? null,
@@ -1010,18 +1178,37 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
       }
     }
 
-    const evMap = new Map(keeperEventRows.map((r) => [r.event_name, r]));
-    const syncEvt = evMap.get('MultiplierSynced');
-    const startedEvt = evMap.get('AuctionStarted');
-    const restartedEvt = evMap.get('AuctionRestarted');
-
+    let syncEvt: { max_block: string | null; max_ts: string | null } | undefined;
+    let startLiqTsNum: number | null = null;
+    let defaultOrRestartTsNum: number | null = null;
     let latestAuctionBlock: string | null = null;
     let latestAuctionTs: string | null = null;
-    for (const cand of [startedEvt, restartedEvt]) {
-      if (!cand?.max_block) continue;
-      if (latestAuctionBlock === null || BigInt(cand.max_block) > BigInt(latestAuctionBlock)) {
-        latestAuctionBlock = cand.max_block;
-        latestAuctionTs = cand.max_ts;
+
+    for (const row of keeperEventRows) {
+      const tsNum = row.max_ts ? Number(row.max_ts) : null;
+      if (row.event_name === 'MultiplierSynced') {
+        syncEvt = row;
+        continue;
+      }
+      if (
+        row.max_block &&
+        (latestAuctionBlock === null || BigInt(row.max_block) > BigInt(latestAuctionBlock))
+      ) {
+        latestAuctionBlock = row.max_block;
+        latestAuctionTs = row.max_ts;
+      }
+      if (row.event_name === 'AuctionStarted' && row.is_default_auction !== 'true') {
+        if (tsNum !== null && (startLiqTsNum === null || tsNum > startLiqTsNum)) {
+          startLiqTsNum = tsNum;
+        }
+      } else if (
+        row.event_name === 'AuctionRestarted' ||
+        row.event_name === 'AuctionCancelled' ||
+        (row.event_name === 'AuctionStarted' && row.is_default_auction === 'true')
+      ) {
+        if (tsNum !== null && (defaultOrRestartTsNum === null || tsNum > defaultOrRestartTsNum)) {
+          defaultOrRestartTsNum = tsNum;
+        }
       }
     }
 
@@ -1080,11 +1267,18 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
         last_sync_multiplier_timestamp: syncEvt?.max_ts ?? null,
         seconds_since_sync_multiplier:
           syncTsNum !== null ? Math.max(0, Number(blockTimestamp) - syncTsNum) : null,
+        seconds_since_start_liquidation:
+          startLiqTsNum !== null ? Math.max(0, Number(blockTimestamp) - startLiqTsNum) : null,
+        seconds_since_default_or_restart:
+          defaultOrRestartTsNum !== null
+            ? Math.max(0, Number(blockTimestamp) - defaultOrRestartTsNum)
+            : null,
         last_liquidation_or_auction_block: latestAuctionBlock,
         last_liquidation_or_auction_timestamp: latestAuctionTs,
         seconds_since_liquidation_or_auction:
           aucTsNum !== null ? Math.max(0, Number(blockTimestamp) - aucTsNum) : null,
         unacted_liquidatable_loans: unactedLiquidatable,
+        unacted_defaulted_loans: unactedDefaulted,
         unacted_expired_auctions: unactedExpiredAuctions,
       },
       loan_counts: counts,
@@ -1148,10 +1342,13 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
         last_sync_multiplier_block: null,
         last_sync_multiplier_timestamp: null,
         seconds_since_sync_multiplier: null,
+        seconds_since_start_liquidation: null,
+        seconds_since_default_or_restart: null,
         last_liquidation_or_auction_block: null,
         last_liquidation_or_auction_timestamp: null,
         seconds_since_liquidation_or_auction: null,
         unacted_liquidatable_loans: [],
+        unacted_defaulted_loans: [],
         unacted_expired_auctions: [],
       },
       loan_counts: prev?.loan_counts ?? { healthy: 0, margin_call: 0, near_liquidation: 0, liquidatable: 0 },

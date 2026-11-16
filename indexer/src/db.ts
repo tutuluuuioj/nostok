@@ -140,8 +140,26 @@ class PostgresPoolAdapter implements DatabaseAdapter {
     }
   }
 
+  /**
+   * Runs fn inside BEGIN/COMMIT on a dedicated pooled client.
+   *
+   * Connection-loss safety (e.g. pg_terminate_backend while a transaction is open):
+   * - A temporary client.on('error') listener is attached while the client is checked out, so an
+   *   asynchronous socket error can never become an unhandled 'error' event that crashes the process.
+   * - ROLLBACK is best-effort and guarded: a failing ROLLBACK is logged but never masks the original error.
+   * - On a connection error the client is released with client.release(err), which destroys it instead of
+   *   returning a broken socket to the pool. The original error is rethrown so the caller retries the poll.
+   */
   async transaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
+    let asyncClientError: Error | null = null;
+    const onClientError = (err: Error) => {
+      asyncClientError = err;
+      console.error('[INDEXER_DB_TX_CLIENT_ERROR] Checked-out PostgreSQL client error:', err.message);
+    };
+    client.on('error', onClientError);
+
+    let releaseErr: Error | undefined;
     try {
       await client.query('BEGIN');
       const q: Queryable = {
@@ -154,10 +172,26 @@ class PostgresPoolAdapter implements DatabaseAdapter {
       await client.query('COMMIT');
       return result;
     } catch (err) {
-      await client.query('ROLLBACK');
+      const dropped = isConnectionDropError(err) || asyncClientError !== null;
+      if (dropped) {
+        releaseErr = err instanceof Error ? err : new Error(String(err));
+      } else {
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackErr) {
+          console.error(
+            '[INDEXER_DB_ROLLBACK_FAILED] ROLLBACK failed (original error preserved):',
+            rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)
+          );
+          releaseErr = rollbackErr instanceof Error ? rollbackErr : new Error(String(rollbackErr));
+        }
+      }
       throw err;
     } finally {
-      client.release();
+      client.removeListener('error', onClientError);
+      // Keep a no-op listener during release so a late socket error on a destroyed client cannot crash.
+      if (releaseErr) client.on('error', () => {});
+      client.release(releaseErr);
     }
   }
 

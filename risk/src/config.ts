@@ -13,7 +13,9 @@ export interface RiskConfig {
   databaseUrl: string;
   pollIntervalMs: number;
   alertCooldownMs: number;
+  alertMinActiveMs: number;
   webhookUrl?: string;
+  webhookTimeoutMs: number;
   nearLiqBufferBps: number;
   priceDeviationWarnBps: number;
   keeperInactivityAlertSecs: number;
@@ -94,7 +96,19 @@ export function loadRiskConfig(overrides: RiskConfigOverrides = {}): RiskConfig 
   }
 
   const webhookRaw = overrides.webhookUrl !== undefined ? overrides.webhookUrl : process.env.WEBHOOK_URL?.trim();
-  const webhookUrl = webhookRaw && webhookRaw.length > 0 ? webhookRaw : undefined;
+  let webhookUrl: string | undefined;
+  if (webhookRaw && webhookRaw.length > 0) {
+    let parsedWebhook: URL;
+    try {
+      parsedWebhook = new URL(webhookRaw);
+    } catch {
+      throw new Error(`Invalid WEBHOOK_URL: ${webhookRaw}`);
+    }
+    if (parsedWebhook.protocol !== 'http:' && parsedWebhook.protocol !== 'https:') {
+      throw new Error(`WEBHOOK_URL must use http:// or https:// protocol (got ${parsedWebhook.protocol})`);
+    }
+    webhookUrl = parsedWebhook.toString();
+  }
 
   return {
     port,
@@ -108,7 +122,13 @@ export function loadRiskConfig(overrides: RiskConfigOverrides = {}): RiskConfig 
     alertCooldownMs:
       overrides.alertCooldownMs ??
       parseNonNegativeInt(process.env.ALERT_COOLDOWN_MS, 300_000, 'ALERT_COOLDOWN_MS'),
+    alertMinActiveMs:
+      overrides.alertMinActiveMs ??
+      parseNonNegativeInt(process.env.ALERT_MIN_ACTIVE_MS, 2_000, 'ALERT_MIN_ACTIVE_MS'),
     webhookUrl,
+    webhookTimeoutMs:
+      overrides.webhookTimeoutMs ??
+      parsePositiveInt(process.env.WEBHOOK_TIMEOUT_MS, 5_000, 'WEBHOOK_TIMEOUT_MS'),
     nearLiqBufferBps:
       overrides.nearLiqBufferBps ??
       parsePositiveInt(process.env.NEAR_LIQ_BUFFER_BPS, 300, 'NEAR_LIQ_BUFFER_BPS'),

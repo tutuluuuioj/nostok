@@ -3,10 +3,11 @@ import { execSync, spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { PGlite } from '@electric-sql/pglite';
-import { PGLiteSocketServer } from '@electric-sql/pglite-socket';
+import EmbeddedPostgres from 'embedded-postgres';
+import pgPkg from 'pg';
 import {
   type Address,
   type Hex,
@@ -22,16 +23,16 @@ import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { base } from 'viem/chains';
 import { loadConfig as loadIndexerConfig } from '../../indexer/src/config.js';
 import { createIndexerContext, runIndexerSync } from '../../indexer/src/indexer.js';
-import { type RiskAlert } from '../src/alerts.js';
+import { AlertEngine, type RiskAlert } from '../src/alerts.js';
 import { loadRiskConfig } from '../src/config.js';
-import { assertReadOnlySql, openReadOnlyDatabase, wrapQueryableAsReadOnly } from '../src/db.js';
+import { assertReadOnlySql, wrapQueryableAsReadOnly } from '../src/db.js';
 import {
   type LoanRiskSnapshot,
   type RiskSummarySnapshot,
   createRiskContext,
   runRiskScan,
 } from '../src/monitor.js';
-import { createRiskServer } from '../src/server.js';
+import { createRiskServer, renderPrometheusMetrics } from '../src/server.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -429,6 +430,7 @@ async function runTests(): Promise<void> {
     const approveAbi = parseAbi(['function approve(address spender, uint256 value) returns (bool)']);
     for (const [client, token, spender, amt] of [
       [borrowerClient, nvdac, deployed.collateralEscrow, 50n * 10n ** 18n],
+      [borrowerClient, BASE_USDC, deployed.loanCore, 2_000_000_000n],
       [lenderClient, BASE_USDC, deployed.loanCore, 10_000_000_000n],
     ] as const) {
       await publicClient.waitForTransactionReceipt({
@@ -656,9 +658,22 @@ async function runTests(): Promise<void> {
       assert.throws(() => assertReadOnlySql('SELECT 1; DROP TABLE loans'), /single-statement/i);
       assert.throws(() => assertReadOnlySql('SELECT /* sneaky */ 1'), /single-statement/i);
       assert.throws(() => assertReadOnlySql('SELECT 1 -- comment'), /single-statement/i);
+      assert.throws(() => assertReadOnlySql('SELECT U&"pg\\005fsleep"(2)'), /escaped SQL|backslash/i);
+      assert.throws(() => assertReadOnlySql('SELECT u&"\\0050g_sleep"(2)'), /escaped SQL|backslash/i);
+      assert.throws(() => assertReadOnlySql("SELECT E'\\x70g_sleep'(2)"), /escaped SQL/i);
+      assert.throws(() => assertReadOnlySql('SELECT pg\\005fsleep(2)'), /backslash/i);
+      assert.throws(() => assertReadOnlySql('SELECT "pg_sleep"(2)'), /disallowed/i);
+      assert.throws(
+        () => loadRiskConfig({ ...riskCfg, webhookUrl: 'ftp://example.com/hook' }),
+        /http:\/\/ or https:\/\//i
+      );
+      assert.throws(
+        () => loadRiskConfig({ ...riskCfg, webhookUrl: 'not-a-url' }),
+        /Invalid WEBHOOK_URL/i
+      );
       assert.doesNotThrow(() => assertReadOnlySql('WITH x AS (SELECT 1) SELECT * FROM x'));
       await assert.rejects(() => riskCtx.db.query('UPDATE loans SET status = 0'), /SELECT/i);
-      console.log('PASS TEST 1: Strict read-only enforcement verified.');
+      console.log('PASS TEST 1: Strict read-only enforcement & WEBHOOK_URL validation verified.');
 
       // -----------------------------------------------------------------------
       // Scenario (a): Price drop progression + startLiquidation sweep parity
@@ -708,23 +723,10 @@ async function runTests(): Promise<void> {
           .some((a) => a.dedup_key === 'loan_risk:1:liquidatable' && a.severity === 'critical')
       );
 
-      // Price sweep comparing monitor liquidatable classification vs LoanCore.startLiquidation simulation
+      // Price sweep comparing monitor liquidatable classification vs LoanCore.startLiquidation across >=50 boundary prices
       const reportedLiqPrice = BigInt(riskCtx.state.latestLoans[0].liquidation_price.raw);
-      for (const offset of [-100_000n, -1_000n, 1_000n, 100_000n]) {
-        const probePrice = reportedLiqPrice + offset;
-        await setNvdaPrice(probePrice);
-        t += 5_000;
-        await runRiskScan(riskCtx, t);
-        const monitorLiq: boolean = riskCtx.state.latestLoans[0].risk_status === 'liquidatable';
-        const chainLiq: boolean = await canStartLiquidationOnchain(1n);
-        assert.equal(
-          monitorLiq,
-          chainLiq,
-          `Monitor liquidatable (${monitorLiq}) must match startLiquidation (${chainLiq}) at price=${probePrice} (reportedLiqPrice=${reportedLiqPrice})`
-        );
-      }
 
-      // Binary search exact on-chain trigger price and check delta against reported liquidation_price
+      // First binary search exact highest liquidating price on-chain
       let lo = reportedLiqPrice - 5_000n;
       let hi = reportedLiqPrice + 5_000n;
       while (lo < hi) {
@@ -737,16 +739,44 @@ async function runTests(): Promise<void> {
         }
       }
       const exactTriggerPrice = lo;
-      const liqPriceDiff =
-        reportedLiqPrice >= exactTriggerPrice
-          ? reportedLiqPrice - exactTriggerPrice
-          : exactTriggerPrice - reportedLiqPrice;
       assert.ok(
-        liqPriceDiff <= 10n,
-        `Monitor liquidation_price (${reportedLiqPrice}) diverged from contract trigger (${exactTriggerPrice}) by ${liqPriceDiff}`
+        reportedLiqPrice >= exactTriggerPrice + 1n,
+        `Risk liquidation_price (${reportedLiqPrice}) must be >= highest liquidating price + 1 (${exactTriggerPrice + 1n})`
+      );
+      assert.equal(
+        reportedLiqPrice,
+        exactTriggerPrice + 1n,
+        `Risk liquidation_price (${reportedLiqPrice}) must equal exact first non-liquidating price (${exactTriggerPrice + 1n})`
       );
 
-      // Restore $140.00 -> healthy + resolve loan/deviation alerts (advance slightly to stabilize previousPrices)
+      // Sweep 51 consecutive prices [-25 .. +25] around reportedLiqPrice (without syncing indexer on every tick to verify 100% on-chain oracle reads too)
+      for (let delta = -25n; delta <= 25n; delta++) {
+        const probePrice = reportedLiqPrice + delta;
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdaFeed,
+            abi: mockAggArtifact.abi,
+            functionName: 'setPrice',
+            args: [probePrice],
+          }),
+        });
+        t += 5_000;
+        await runRiskScan(riskCtx, t);
+        const monitorLiq: boolean = riskCtx.state.latestLoans[0].risk_status === 'liquidatable';
+        const chainLiq: boolean = await canStartLiquidationOnchain(1n);
+        assert.equal(
+          chainLiq,
+          probePrice < reportedLiqPrice,
+          `On-chain boundary mismatch at price=${probePrice} (reportedLiqPrice=${reportedLiqPrice})`
+        );
+        assert.equal(
+          monitorLiq,
+          chainLiq,
+          `51-price sweep mismatch: monitor=${monitorLiq}, chain=${chainLiq} at price=${probePrice}`
+        );
+      }
+
+      // Restore $140.00 -> healthy + sync indexer -> resolve loan/deviation/lag alerts
       await setNvdaPrice(140_00000000n);
       t += 5_000;
       await runRiskScan(riskCtx, t);
@@ -758,7 +788,7 @@ async function runTests(): Promise<void> {
         0
       );
       console.log(
-        `PASS Scenario (a): healthy -> margin_call -> near_liquidation -> liquidatable + startLiquidation parity verified (liqPrice=${reportedLiqPrice} vs exact=${exactTriggerPrice}, diff=${liqPriceDiff}).`
+        `PASS Scenario (a): healthy -> margin_call -> near_liquidation -> liquidatable + 51-price boundary sweep verified (liqPrice=${reportedLiqPrice} === exactHighest+1=${exactTriggerPrice + 1n}).`
       );
 
       // -----------------------------------------------------------------------
@@ -940,7 +970,8 @@ async function runTests(): Promise<void> {
       );
       assert.ok(riskCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === 'global_cap_util' && a.severity === 'warning'));
 
-      // Escrow mismatch warning (surplus) -> critical (shortfall) -> resolve (exact match)
+      // 3-way escrow check:
+      // 1) Token donation surplus (balanceOf=11e18 > ledger=10e18 === openLoans=10e18): info alert, auto-resolves so never permanent
       await publicClient.waitForTransactionReceipt({
         hash: await deployerClient.writeContract({
           address: nvdac,
@@ -952,13 +983,21 @@ async function runTests(): Promise<void> {
       await runIndexerSync(idxCtx);
       t += 5_000;
       summary = await runRiskScan(riskCtx, t);
-      assert.equal(summary.assets[0].escrow_matches_open_loans, false);
+      assert.equal(summary.assets[0].escrow_matches_open_loans, true, 'Donation surplus must not fail solvency check');
       assert.ok(
         riskCtx.alerts
           .getActiveAlerts()
-          .some((a) => a.dedup_key === `escrow_mismatch:${nvdac.toLowerCase()}` && a.severity === 'warning')
+          .some((a) => a.dedup_key === `escrow_surplus:${nvdac.toLowerCase()}` && a.severity === 'info')
+      );
+      // Next scan (> minActiveMs) auto-resolves escrow_surplus so donations do not leave alerts active forever
+      t += 5_000;
+      await runRiskScan(riskCtx, t);
+      assert.equal(
+        riskCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === `escrow_surplus:${nvdac.toLowerCase()}`),
+        false
       );
 
+      // 2) Real shortfall: transfer 2 NVDAc out -> balanceOf=9e18 < ledger=10e18 -> CRITICAL escrow_mismatch
       await rpcCall('anvil_impersonateAccount', [deployed.collateralEscrow]);
       await rpcCall('anvil_setBalance', [deployed.collateralEscrow, '0x56bc75e2d63100000']);
       await publicClient.waitForTransactionReceipt({
@@ -974,7 +1013,8 @@ async function runTests(): Promise<void> {
       });
       await runIndexerSync(idxCtx);
       t += 5_000;
-      await runRiskScan(riskCtx, t);
+      summary = await runRiskScan(riskCtx, t);
+      assert.equal(summary.assets[0].escrow_matches_open_loans, false);
       assert.ok(
         riskCtx.alerts
           .getActiveAlerts()
@@ -991,6 +1031,153 @@ async function runTests(): Promise<void> {
         }),
       });
       await runIndexerSync(idxCtx);
+      t += 5_000;
+      summary = await runRiskScan(riskCtx, t);
+      assert.equal(summary.assets[0].escrow_matches_open_loans, true);
+
+      // Lagging indexer test (Fix 2 & Fix 3):
+      // Snapshot clean state, perform partialRepay on Loan #1 AND open+repay Loan #2 WITHOUT syncing indexer!
+      const lagSnapId = await rpcCall<string>('evm_snapshot', []);
+      try {
+        // Increase cap temporarily so Loan #2 can open, then sync or don't sync — wait: open & repay WITHOUT syncing indexer!
+        await setNvdacCapAndStatus(2_500_000_000n, 0);
+        await publicClient.waitForTransactionReceipt({
+          hash: await rawWalletClient.sendTransaction({
+            account: deployed.nostokTimelock,
+            to: deployed.loanCore,
+            data: encodeFunctionData({
+              abi: parseAbi(['function setGlobalCap(uint128 newCap)']),
+              functionName: 'setGlobalCap',
+              args: [5_000_000_000n],
+            }),
+          }),
+        });
+        await runIndexerSync(idxCtx);
+
+        // Partial repay $400 of $750 principal on Loan #1 -> leaves $350 principal & 4.666... NVDAc collateral (LTV unchanged ~53.6%, WAIT: drop price to $80 -> old DB 750 / 800 = 93.75% LIQUIDATABLE, whereas actually after $400 partialRepay + 4.666 NVDAc... WAIT! Pro-rata collateral release keeps LTV proportional unless topUp or less release! Look: if we partialRepay $400 THEN topUp 5 NVDAc OR repay without proportional? Wait: Contract partialRepay releases pro-rata collateral = 400/750 = 53.33%, leaving 350/4.666 NVDAc! So BOTH ratios match EXCEPT if price is set to $80 and DB had stale collateral OR wait: how does the user's bug happen?! Suppose partialRepay happens on-chain, reducing principal from 750->350 AND collateral 10->4.666. BEFORE our fix, monitor used DB principal_repaid=0 mixed with ON-CHAIN principal=750 & collateralRaw=4.666 -> 750 / (4.666 * 140) = 114%!! THAT'S WHY DB principal_repaid=0 + on-chain collateralRaw=4.666 gave 8932 bps instead of 5361 bps!!)
+        // Re-check! YES!! Mixing on-chain collateralRaw=4.6667 with stale DB principal_repaid=0 ($750 instead of $350) doubles the calculated LTV!
+        await publicClient.waitForTransactionReceipt({
+          hash: await borrowerClient.writeContract({
+            address: deployed.loanCore,
+            abi: parseAbi(['function partialRepay(uint256 loanId, uint128 principalRepayAmount) returns (uint128)']),
+            functionName: 'partialRepay',
+            args: [1n, 400_000_000n],
+          }),
+        });
+        // Also open Loan #2 and repay it in full, ALL WITHOUT running runIndexerSync!
+        const blkL2 = await publicClient.getBlock();
+        const order2 = {
+          borrower: ADDRESSES.borrower,
+          collateralToken: nvdac,
+          collateralAmount: 10n * 10n ** 18n,
+          minUsdc: 600_000_000n,
+          maxRateBps: 1000,
+          termDays: 14,
+          maxLtvBps: 6000,
+          minFill: 500_000_000n,
+          expiry: blkL2.timestamp + 3600n,
+          nonce: 0n,
+          yieldMode: 0,
+          allowInKindSettlement: false,
+        } as const;
+        const sig2 = await borrowerAccount.signTypedData({
+          domain: {
+            name: 'NOSTOK Order Settlement',
+            version: '1',
+            chainId: 8453,
+            verifyingContract: deployed.orderSettlement,
+          },
+          types: borrowTypes,
+          primaryType: 'BorrowOrder',
+          message: order2,
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await lenderClient.writeContract({
+            address: deployed.orderSettlement,
+            abi: fillOrderAbi,
+            functionName: 'fillBorrowOrder',
+            args: [order2, sig2, 600_000_000n],
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await borrowerClient.writeContract({
+            address: deployed.loanCore,
+            abi: parseAbi(['function repay(uint256 loanId) returns (uint128)']),
+            functionName: 'repay',
+            args: [2n],
+          }),
+        });
+
+        // Do NOT sync idxCtx! Run risk scan while indexer lags behind partialRepay + open + repay
+        t += 5_000;
+        const lagSummary = await runRiskScan(riskCtx, t);
+        const loan1Snap = riskCtx.state.latestLoans.find((l) => l.loan_id === '1');
+        assert.ok(loan1Snap, 'Loan #1 must be evaluated on-chain');
+        assert.equal(loan1Snap.principal_remaining.raw, '350000000', 'Must use on-chain principalRepaid (750 - 400 = 350)');
+        assert.equal(loan1Snap.risk_status, 'healthy', 'Lagging DB principal_repaid must NOT cause false liquidatable');
+        assert.equal(lagSummary.assets[0].escrow_matches_open_loans, true, 'Lagging DB after partialRepay + repay must NOT cause false escrow_mismatch');
+        assert.equal(
+          riskCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === `escrow_mismatch:${nvdac.toLowerCase()}`),
+          false
+        );
+
+        // Defaulted loan past maturity + 24h grace without startDefaultAuction (Fix 6)
+        const loan1Chain = await publicClient.readContract({
+          address: deployed.loanCore,
+          abi: parseAbi([
+            'function getLoan(uint256) view returns ((address borrower,address collateralToken,uint128 collateralRaw,uint128 principal,uint64 startTime,uint64 maturity,uint32 rateBps,uint32 penaltySpreadBps,uint16 initLtvBps,uint16 marginCallLtvBps,uint16 liqLtvBps,uint16 minInterestDays,uint8 status,uint8 yieldMode,uint8 coreVersion,uint128 interestPaid,uint128 principalRepaid))',
+          ]),
+          functionName: 'getLoan',
+          args: [1n],
+        });
+        // Jump to maturity + 25 hours (1h past 24h grace) and refresh price so feed is fresh VALID_OPEN
+        await rpcCall('evm_setNextBlockTimestamp', [Number(loan1Chain.maturity) + 25 * 3600]);
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdaFeed,
+            abi: mockAggArtifact.abi,
+            functionName: 'setPrice',
+            args: [140_00000000n],
+          }),
+        });
+        t += 5_000;
+        const defaultSummary = await runRiskScan(riskCtx, t);
+        const defaultedLoan1 = riskCtx.state.latestLoans.find((l) => l.loan_id === '1');
+        assert.equal(
+          defaultedLoan1?.risk_status,
+          'liquidatable',
+          'Loan 25h past maturity without startDefaultAuction must be liquidatable, never healthy'
+        );
+        assert.ok(defaultSummary.keeper.unacted_defaulted_loans.some((u) => u.loan_id === '1'));
+        assert.ok(
+          riskCtx.alerts
+            .getActiveAlerts()
+            .some((a) => a.dedup_key === 'keeper_inactive:default:1' && a.severity === 'critical')
+        );
+        const defMetrics = renderPrometheusMetrics(riskCtx);
+        assert.ok(defMetrics.includes('nostok_risk_keeper_seconds_since_sync_multiplier'));
+        assert.ok(defMetrics.includes('nostok_risk_keeper_seconds_since_start_liquidation'));
+        assert.ok(defMetrics.includes('nostok_risk_keeper_seconds_since_default_or_restart'));
+        assert.ok(defMetrics.includes('nostok_risk_keeper_unacted_default_loans 1'));
+      } finally {
+        await rpcCall('evm_revert', [lagSnapId]);
+      }
+      // Restore 900 USDC caps & clear temporary alerts before pause + Scenario (g)
+      await setNvdacCapAndStatus(900_000_000n, 0);
+      await publicClient.waitForTransactionReceipt({
+        hash: await rawWalletClient.sendTransaction({
+          account: deployed.nostokTimelock,
+          to: deployed.loanCore,
+          data: encodeFunctionData({
+            abi: parseAbi(['function setGlobalCap(uint128 newCap)']),
+            functionName: 'setGlobalCap',
+            args: [900_000_000n],
+          }),
+        }),
+      });
+      await runIndexerSync(idxCtx);
+      t += 5_000;
+      await runRiskScan(riskCtx, t);
 
       // Pause via guardian, unpause via timelock
       await rpcCall('anvil_impersonateAccount', [ADDRESSES.guardian]);
@@ -1032,7 +1219,8 @@ async function runTests(): Promise<void> {
         riskCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === `escrow_mismatch:${nvdac.toLowerCase()}`),
         false
       );
-      console.log('PASS Scenario (f): Caps, escrow mismatch (warning + critical + auto-resolve), and protocol pause verified.');
+      await riskCtx.alerts.flushWebhooks(5_000);
+      console.log('PASS Scenario (f): Caps, 3-way escrow, lagging-indexer partialRepay/repay, default>24h grace, and protocol pause verified.');
 
       // -----------------------------------------------------------------------
       // Scenario (g): Alert dedup, cooldown, escalation, resolve & webhook POSTs
@@ -1050,6 +1238,7 @@ async function runTests(): Promise<void> {
       // Immediate rescan within 60s cooldown must NOT send webhook or increment notifications_sent
       t += 5_000;
       await runRiskScan(riskCtx, t);
+      await riskCtx.alerts.flushWebhooks(5_000);
       const capAlertDedup = riskCtx.alerts
         .getActiveAlerts()
         .find((a) => a.dedup_key === `asset_cap_util:${nvdac.toLowerCase()}`);
@@ -1063,6 +1252,7 @@ async function runTests(): Promise<void> {
       // Advance past 60_000ms cooldown -> repeat webhook dispatched
       t += 65_000;
       await runRiskScan(riskCtx, t);
+      await riskCtx.alerts.flushWebhooks(5_000);
       const repeatEvt = webhookEvents
         .slice(countBeforeDedup)
         .find((e) => e.action === 'repeat' && e.alert.dedup_key === `asset_cap_util:${nvdac.toLowerCase()}`);
@@ -1086,11 +1276,36 @@ async function runTests(): Promise<void> {
       const preEscLen = webhookEvents.length;
       t += 5_000; // within cooldown!
       await runRiskScan(riskCtx, t);
+      await riskCtx.alerts.flushWebhooks(5_000);
       const escEvt = webhookEvents
         .slice(preEscLen)
         .find((e) => e.action === 'escalate' && e.alert.dedup_key === `asset_cap_util:${nvdac.toLowerCase()}`);
       assert.ok(escEvt, 'Escalation must fire webhook immediately even within cooldown');
       assert.equal(escEvt.alert.severity, 'critical');
+
+      // Severity downgrade notification (critical -> warning by relaxing cap 780 -> 900 USDC = 83.33%)
+      await setNvdacCapAndStatus(900_000_000n, 0);
+      await publicClient.waitForTransactionReceipt({
+        hash: await rawWalletClient.sendTransaction({
+          account: deployed.nostokTimelock,
+          to: deployed.loanCore,
+          data: encodeFunctionData({
+            abi: parseAbi(['function setGlobalCap(uint128 newCap)']),
+            functionName: 'setGlobalCap',
+            args: [900_000_000n],
+          }),
+        }),
+      });
+      await runIndexerSync(idxCtx);
+      const preDownLen = webhookEvents.length;
+      t += 5_000;
+      await runRiskScan(riskCtx, t);
+      await riskCtx.alerts.flushWebhooks(5_000);
+      const downEvt = webhookEvents
+        .slice(preDownLen)
+        .find((e) => e.action === 'downgrade' && e.alert.dedup_key === `asset_cap_util:${nvdac.toLowerCase()}`);
+      assert.ok(downEvt, 'Severity downgrade must emit downgrade webhook immediately');
+      assert.equal(downEvt.alert.severity, 'warning');
 
       // Clear caps back to $2,500 / $5,000 -> resolve webhook dispatched
       await setNvdacCapAndStatus(2_500_000_000n, 0);
@@ -1109,6 +1324,7 @@ async function runTests(): Promise<void> {
       const preResLen = webhookEvents.length;
       t += 5_000;
       summary = await runRiskScan(riskCtx, t);
+      await riskCtx.alerts.flushWebhooks(5_000);
       const resEvt = webhookEvents
         .slice(preResLen)
         .find((e) => e.action === 'resolve' && e.alert.dedup_key === `asset_cap_util:${nvdac.toLowerCase()}`);
@@ -1116,7 +1332,50 @@ async function runTests(): Promise<void> {
       assert.equal(resEvt.alert.status, 'resolved');
       assert.ok(resEvt.alert.resolved_at !== null);
       assert.equal(summary.status, 'healthy');
-      console.log(`PASS Scenario (g): Alert lifecycle & ${webhookEvents.length} webhook transitions verified.`);
+
+      // Hanging webhook (never responds) + flap damping + bounded transitions ring buffer test
+      const hangingSockets: net.Socket[] = [];
+      const hangServer = http.createServer((_req, _res) => {
+        // intentionally never reply
+      });
+      hangServer.on('connection', (sock) => hangingSockets.push(sock));
+      await new Promise<void>((resolve) => hangServer.listen(0, '127.0.0.1', resolve));
+      const hangPort = (hangServer.address() as net.AddressInfo).port;
+      try {
+        const hangEngine = new AlertEngine(60_000, `http://127.0.0.1:${hangPort}/hang`, {
+          minActiveMs: 2_000,
+          webhookTimeoutMs: 250,
+          maxWebhookAttempts: 1,
+          maxTransitions: 500,
+        });
+        const tHangStart = Date.now();
+        await hangEngine.syncObservations(
+          [{ dedupKey: 'flap:test', category: 'test', severity: 'warning', title: 'Flap', message: 'm', details: {} }],
+          1_000_000
+        );
+        // Clearing within minActiveMs (500ms < 2000ms) must NOT resolve (flap damping)
+        await hangEngine.syncObservations([], 1_000_500);
+        assert.equal(hangEngine.getActiveAlerts().length, 1, 'Alert must resist resolving before minActiveMs');
+        // Clearing once minActiveMs has elapsed DOES resolve
+        await hangEngine.syncObservations([], 1_002_500);
+        assert.equal(hangEngine.getActiveAlerts().length, 0);
+        const scanElapsedMs = Date.now() - tHangStart;
+        assert.ok(scanElapsedMs < 200, `Non-blocking webhook must not block syncObservations (took ${scanElapsedMs}ms)`);
+        await hangEngine.flushWebhooks(1_500);
+
+        // Verify transitions ring buffer stays bounded at maxTransitions (500) even after 600 transitions
+        for (let idx = 0; idx < 600; idx++) {
+          await hangEngine.syncObservations(
+            [{ dedupKey: `ring:${idx}`, category: 'test', severity: 'info', title: 'R', message: 'r', details: {} }],
+            2_000_000 + idx * 10_000
+          );
+        }
+        assert.ok(hangEngine.transitions.length <= 500, `transitions length must be <= 500, got ${hangEngine.transitions.length}`);
+      } finally {
+        for (const s of hangingSockets) s.destroy();
+        await new Promise<void>((resolve) => hangServer.close(() => resolve()));
+      }
+      console.log(`PASS Scenario (g): Alert lifecycle, downgrade, flap damping, non-blocking hanging webhook, & ${webhookEvents.length} transitions verified.`);
 
       // -----------------------------------------------------------------------
       // HTTP endpoints & hardening (/metrics, /risk/summary, /risk/loans, /risk/alerts, 400, 405, 429)
@@ -1192,39 +1451,72 @@ async function runTests(): Promise<void> {
       console.log('PASS HTTP Endpoints & Security Hardening verified.');
 
       // -----------------------------------------------------------------------
-      // Scenario (h): RPC failure resilience -> monitor_degraded + 503 + recovery
+      // Scenario (h): Real dead TCP port degraded boot, outage preservation & recovery
       // -----------------------------------------------------------------------
-      console.log('\n=== Scenario (h): RPC failure degraded mode & recovery ===');
-      // Trigger a warning alert BEFORE RPC dies to verify degraded scans preserve prior alerts
+      console.log('\n=== Scenario (h): Real dead port degraded boot & RPC outage resilience ===');
+      // 1) Degraded boot when RPC port is dead at startup (must not exit/throw)
+      const closedBootPort = await getFreePort();
+      const bootDegCtx = await createRiskContext(
+        { ...riskCfg, rpcUrl: `http://127.0.0.1:${closedBootPort}`, webhookUrl: undefined },
+        wrapQueryableAsReadOnly(idxCtx.db)
+      );
+      assert.equal(bootDegCtx.state.monitorDegraded, true);
+      const bootDegSum = await runRiskScan(bootDegCtx, Date.now());
+      assert.equal(bootDegSum.monitor_degraded, true);
+      assert.equal(bootDegSum.status, 'degraded');
+
+      // 2) Live relay port to Anvil -> scan 1 triggers warning alert -> stop relay so port is genuinely dead (ECONNREFUSED)
+      const relaySockets: net.Socket[] = [];
+      const relayServer = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on('data', (c: Buffer) => chunks.push(c));
+        req.on('end', async () => {
+          try {
+            const upRes = await fetch(LOCAL_RPC_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: Buffer.concat(chunks),
+            });
+            const bodyTxt = await upRes.text();
+            res.statusCode = upRes.status;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(bodyTxt);
+          } catch (err) {
+            res.statusCode = 502;
+            res.end(String(err));
+          }
+        });
+      });
+      relayServer.on('connection', (sock) => relaySockets.push(sock));
+      await new Promise<void>((resolve) => relayServer.listen(0, '127.0.0.1', resolve));
+      const relayPort = (relayServer.address() as net.AddressInfo).port;
+      const relayCtx = await createRiskContext(
+        { ...riskCfg, rpcUrl: `http://127.0.0.1:${relayPort}`, webhookUrl: undefined },
+        wrapQueryableAsReadOnly(idxCtx.db)
+      );
+
+      // Trigger cap warning while relay is up
       await setNvdacCapAndStatus(900_000_000n, 0);
       t += 5_000;
-      await runRiskScan(riskCtx, t);
-      assert.ok(riskCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === `asset_cap_util:${nvdac.toLowerCase()}`));
+      await runRiskScan(relayCtx, t);
+      assert.ok(relayCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === `asset_cap_util:${nvdac.toLowerCase()}`));
 
-      const deadRpcClient = new Proxy(publicClient, {
-        get(target, prop, receiver) {
-          if (prop === 'getBlockNumber' || prop === 'getBlock' || prop === 'multicall' || prop === 'readContract') {
-            return async () => {
-              throw new Error('ECONNREFUSED 127.0.0.1:9999');
-            };
-          }
-          const val = Reflect.get(target, prop, receiver);
-          return typeof val === 'function' ? val.bind(target) : val;
-        },
-      });
-      const degradedCtx = { ...riskCtx, publicClient: deadRpcClient };
+      // Shut down the relay server so relayPort is a real dead TCP port!
+      for (const s of relaySockets) s.destroy();
+      await new Promise<void>((resolve) => relayServer.close(() => resolve()));
+
       t += 5_000;
-      const degradedSum = await runRiskScan(degradedCtx, t);
+      const degradedSum = await runRiskScan(relayCtx, t);
       assert.equal(degradedSum.monitor_degraded, true);
       assert.equal(degradedSum.status, 'degraded');
       assert.ok(degradedSum.rpc_errors_total >= 1);
-      assert.ok(riskCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === 'monitor:degraded'));
+      assert.ok(relayCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === 'monitor:degraded'));
       assert.ok(
-        riskCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === `asset_cap_util:${nvdac.toLowerCase()}`),
-        'Pre-existing alert must be preserved during RPC outage'
+        relayCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === `asset_cap_util:${nvdac.toLowerCase()}`),
+        'Pre-existing alert must be preserved during real dead-port RPC outage'
       );
 
-      const degSrv = createRiskServer(degradedCtx);
+      const degSrv = createRiskServer(relayCtx);
       await new Promise<void>((resolve) => degSrv.listen(0, '127.0.0.1', resolve));
       const degPort = (degSrv.address() as net.AddressInfo).port;
       try {
@@ -1237,79 +1529,84 @@ async function runTests(): Promise<void> {
         await new Promise<void>((resolve) => degSrv.close(() => resolve()));
       }
 
-      // Restore healthy RPC & clear cap alert
+      // Restore healthy RPC on riskCtx & clear cap alert
       await setNvdacCapAndStatus(2_500_000_000n, 0);
       t += 5_000;
       const recovered = await runRiskScan(riskCtx, t);
       assert.equal(recovered.monitor_degraded, false);
       assert.equal(recovered.status, 'healthy');
-      assert.equal(riskCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === 'monitor:degraded'), false);
-      console.log('PASS Scenario (h): Degraded RPC handling, alert preservation, 503 + metrics, and recovery verified.');
+      console.log('PASS Scenario (h): Dead-port degraded boot, real outage 503/metrics & preservation verified.');
 
       // -----------------------------------------------------------------------
-      // Scenario (i): DB connection drop resilience via PGLiteSocketServer (postgres:// wire)
+      // Scenario (i): Real PostgreSQL (embedded-postgres) pg_terminate_backend recovery
       // -----------------------------------------------------------------------
-      console.log('\n=== Scenario (i): PostgreSQL connection drop & pool error recovery ===');
+      console.log('\n=== Scenario (i): Real PostgreSQL pg_terminate_backend & pool error recovery ===');
       const pgPort = await getFreePort();
-      const pgPglite = idxCtx.db as unknown as { db?: PGlite };
-      const wirePglite = new PGlite();
-      await wirePglite.waitReady;
-      // Copy minimal schema & row data or use wirePglite? Check if idxCtx.db exposes PGlite:
-      const activePglite = pgPglite.db ?? wirePglite;
-      if (!pgPglite.db) {
-        await wirePglite.exec(
-          `CREATE TABLE indexer_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at BIGINT NOT NULL);
-           CREATE TABLE assets (token TEXT PRIMARY KEY, symbol TEXT, decimals INTEGER, feed TEXT, feed_decimals INTEGER, status INTEGER);
-           CREATE TABLE loans (loan_id TEXT PRIMARY KEY, collateral_token TEXT NOT NULL, collateral_raw TEXT NOT NULL, principal TEXT NOT NULL, principal_repaid TEXT NOT NULL, status INTEGER NOT NULL);
-           CREATE TABLE auctions (auction_id TEXT PRIMARY KEY, loan_id TEXT NOT NULL, status INTEGER NOT NULL, start_time TEXT NOT NULL, duration TEXT NOT NULL);
-           CREATE TABLE loan_events (id SERIAL PRIMARY KEY, event_name TEXT NOT NULL, block_number BIGINT NOT NULL, block_timestamp BIGINT NOT NULL);`
-        );
-      }
-
-      const socketServer = new PGLiteSocketServer({
-        db: activePglite,
-        host: '127.0.0.1',
+      const epgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nostok-risk-epg-'));
+      const epg = new EmbeddedPostgres({
+        databaseDir: path.join(epgDir, 'data'),
+        user: 'postgres',
+        password: 'pw',
         port: pgPort,
-        maxConnections: 5,
+        persistent: false,
       });
-      await socketServer.start();
-      const wireDbUrl = `postgres://postgres:postgres@127.0.0.1:${pgPort}/postgres`;
+      await epg.initialise();
+      await epg.start();
+      const realPgUrl = `postgres://postgres:pw@127.0.0.1:${pgPort}/postgres`;
       try {
+        // Populate real PostgreSQL with real indexed state from our fork
+        const idxRealCfg = loadIndexerConfig({
+          rpcUrl: LOCAL_RPC_URL,
+          isFork: false,
+          databaseUrl: realPgUrl,
+          startBlock,
+          confirmations: 0,
+          loanCore: deployed.loanCore,
+          orderSettlement: deployed.orderSettlement,
+          liquidationAuction: deployed.liquidationAuction,
+          positionNft: deployed.positionNFT,
+          collateralEscrow: deployed.collateralEscrow,
+          assetRegistry: deployed.assetRegistry,
+          oracleRouter: deployed.oracleRouter,
+          assets: [nvdac],
+        });
+        const idxRealCtx = await createIndexerContext(idxRealCfg);
+        await runIndexerSync(idxRealCtx);
+        await idxRealCtx.db.close();
+
         const wireRiskCfg = loadRiskConfig({
           ...riskCfg,
-          isFork: false, // also exercises postgres:// acceptance when FORK=false
+          isFork: false,
           forkChainId: 8453,
-          databaseUrl: wireDbUrl,
+          databaseUrl: realPgUrl,
+          webhookUrl: undefined,
         });
         const wireRiskCtx = await createRiskContext(wireRiskCfg);
+        const adminClient = new pgPkg.Client({ connectionString: realPgUrl });
+        await adminClient.connect();
         try {
-          const pool = (
-            wireRiskCtx.db as unknown as {
-              pool: {
-                emit: (ev: string, err: Error) => void;
-                _clients?: Array<{ connection?: { stream?: { destroy: () => void } } }>;
-              };
-            }
-          ).pool;
-          // Emit pool error ('57P01') + tear down underlying TCP stream
-          pool.emit(
-            'error',
-            Object.assign(new Error('terminating connection due to administrator command'), { code: '57P01' })
-          );
-          const stream = pool._clients?.[0]?.connection?.stream;
-          if (stream) stream.destroy();
+          const initialWireScan = await runRiskScan(wireRiskCtx, Date.now());
+          assert.equal(initialWireScan.monitor_degraded, false);
 
-          const scanAfterDrop = await runRiskScan(wireRiskCtx, Date.now());
-          assert.equal(scanAfterDrop.monitor_degraded, false);
-          assert.equal(scanAfterDrop.chain_head_block !== null, true);
+          // Real PostgreSQL pg_terminate_backend against every other client connected to 'postgres'
+          await adminClient.query(
+            `SELECT pg_terminate_backend(pid)
+             FROM pg_stat_activity
+             WHERE datname = 'postgres' AND pid <> pg_backend_pid()`
+          );
+
+          const scanAfterKill = await runRiskScan(wireRiskCtx, Date.now());
+          assert.equal(scanAfterKill.monitor_degraded, false);
+          assert.equal(scanAfterKill.chain_head_block !== null, true);
         } finally {
+          await adminClient.end();
           await wireRiskCtx.db.close();
         }
       } finally {
-        await socketServer.stop();
-        await wirePglite.close();
+        await epg.stop();
+        fs.rmSync(epgDir, { recursive: true, force: true });
       }
-      console.log('PASS Scenario (i): ReadOnlyPostgresPool connection drop recovery verified.');
+      console.log('PASS Scenario (i): Real PostgreSQL pg_terminate_backend & recovery verified.');
 
       console.log('\nALL WS2.4 RISK MONITOR BASE MAINNET FORK INTEGRATION TESTS PASSED.');
     } finally {

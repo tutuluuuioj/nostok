@@ -16,7 +16,7 @@ Defined in [`src/db.ts`](src/db.ts):
 * `indexer_state`, `indexed_blocks`: Canonical block hashes (`block_number`, `block_hash`, `parent_hash`) for reorg detection and resumption.
 * `loans`: Mirrors `LoanCore.getLoan(loanId)` plus `active_auction_id`, `bad_debt_shortfall`, and optimistic concurrency `row_version`.
 * `loan_events`: Chronological `(block_number, log_index)` log across `LoanCore`, `OrderSettlement`, `LiquidationAuction`, `PositionNFT`, `AssetRegistry`, `OracleRouter`, and listed B20 `Transfer`s to/from `CollateralEscrow`.
-* `orders`, `order_fills`: Tracks maker order fill totals, cancellation status, maker nonces, and individual `OrderFilled` fills.
+* `orders`, `order_fills`: Tracks maker order fill totals, cancellation status, maker nonces, `collateral_token`, `order_type`, `min_usdc`, and individual `OrderFilled` fills. `min_usdc` is decoded from `OrderSettlement` transaction calldata via `getTransaction` with exponential-backoff retry (transient `getTransaction` RPC failures are never cached). If an order was filled or cancelled through a wrapper/multicall contract or calldata could not be decoded directly, `min_usdc` stays `0` ("unknown") and the API reports order `status: "unknown"` and `remaining_usdc: null` rather than `"filled"`.
 * `auctions`, `auction_buys`: Tracks `LiquidationAuction.getAuction(auctionId)`, settlement payouts (`total_usdc_collected`, `debt_paid`, `fee_paid`, `surplus_to_borrower`), and per-buy records.
 * `positions`: Tracks current `PositionNFT` `owner`, `auction_locked`, and `is_burned`.
 * `claims`: Tracks `LoanCore.Claimed` USDC withdrawals.

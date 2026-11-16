@@ -28,7 +28,13 @@ import {
   positionNftAbi,
 } from './abi.js';
 import type { IndexerConfig } from './config.js';
-import { type DatabaseAdapter, type Queryable, openDatabase, toBigInt } from './db.js';
+import {
+  type DatabaseAdapter,
+  type Queryable,
+  isConnectionDropError,
+  openDatabase,
+  toBigInt,
+} from './db.js';
 
 export const INDEXED_BLOCKS_RETENTION = 1000n;
 
@@ -756,20 +762,48 @@ interface DirtyOrderMeta {
   orderType?: 'borrow' | 'lend';
 }
 
-async function resolveOrderMetaFromTx(
-  publicClient: PublicClient<Transport, Chain>,
+/**
+ * Decodes order metadata (minUsdc, collateral token, order type) from the transaction calldata.
+ *
+ * - getTransaction is retried with exponential backoff. A transient RPC failure is NEVER cached, so a
+ *   later event (or the next poll) retries it.
+ * - If the calldata cannot be decoded as a direct OrderSettlement call (e.g. a wrapper/multicall contract),
+ *   null is returned. Callers then store min_usdc = 0, which means "unknown" (the API reports status
+ *   "unknown" and remaining = null instead of "filled").
+ */
+export async function resolveOrderMetaFromTx(
+  publicClient: { getTransaction: (args: { hash: Hex }) => Promise<{ input: Hex }> },
   txHash: Hex,
-  cache: Map<Hex, Omit<DirtyOrderMeta, 'maker'> | null>
+  cache: Map<Hex, Omit<DirtyOrderMeta, 'maker'> | null>,
+  opts: { attempts?: number; baseDelayMs?: number } = {}
 ): Promise<Omit<DirtyOrderMeta, 'maker'> | null> {
   const key = txHash.toLowerCase() as Hex;
   if (cache.has(key)) {
     return cache.get(key) ?? null;
   }
 
+  const attempts = Math.max(1, opts.attempts ?? 4);
+  const baseDelayMs = Math.max(0, opts.baseDelayMs ?? 200);
+  let tx: { input: Hex } | null = null;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      tx = await publicClient.getTransaction({ hash: txHash });
+      break;
+    } catch (err) {
+      if (attempt === attempts) {
+        console.warn(
+          `[INDEXER_WARN] getTransaction(${txHash}) failed after ${attempts} attempts; order min_usdc left unknown (not cached): ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`
+        );
+        return null;
+      }
+      await new Promise((r) => setTimeout(r, baseDelayMs * 2 ** (attempt - 1)));
+    }
+  }
+  if (!tx) return null;
+
+  let meta: Omit<DirtyOrderMeta, 'maker'> | null = null;
   try {
-    const tx = await publicClient.getTransaction({ hash: txHash });
     const decoded = decodeFunctionData({ abi: orderSettlementAbi, data: tx.input });
-    let meta: Omit<DirtyOrderMeta, 'maker'> | null = null;
 
     if (
       decoded.functionName === 'fillBorrowOrder' ||
@@ -803,13 +837,14 @@ async function resolveOrderMetaFromTx(
         orderType: 'lend',
       };
     }
-
-    cache.set(key, meta);
-    return meta;
   } catch {
-    cache.set(key, null);
-    return null;
+    // Calldata is not a direct OrderSettlement call (wrapper contract). Deterministic for this tx,
+    // so caching null for the lifetime of this sync batch is safe.
+    meta = null;
   }
+
+  cache.set(key, meta);
+  return meta;
 }
 
 async function reconcileOrder(
@@ -1340,28 +1375,32 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
       effectiveTrackedAssets.add(t);
     }
 
-    const dirtyLoans = new Map<bigint, Address | undefined>();
-    const dirtyAuctions = new Set<bigint>();
-    const dirtyPositions = new Set<bigint>();
-    const dirtyOrders = new Map<Hex, DirtyOrderMeta>();
-    const dirtyAssets = new Set<Address>();
     const orderTxCache = new Map<Hex, Omit<DirtyOrderMeta, 'maker'> | null>();
+    const eventsIndexedBeforeBlock = eventsIndexed;
 
-    await db.transaction(async (tx) => {
-      await tx.query(
-        `INSERT INTO indexed_blocks (block_number, block_hash, parent_hash, block_timestamp)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (block_number) DO UPDATE SET
-           block_hash = EXCLUDED.block_hash,
-           parent_hash = EXCLUDED.parent_hash,
-           block_timestamp = EXCLUDED.block_timestamp`,
-        [
-          bn.toString(),
-          block.hash.toLowerCase(),
-          block.parentHash.toLowerCase(),
-          block.timestamp.toString(),
-        ]
-      );
+    const commitBlockTx = async () => {
+      eventsIndexed = eventsIndexedBeforeBlock;
+      const dirtyLoans = new Map<bigint, Address | undefined>();
+      const dirtyAuctions = new Set<bigint>();
+      const dirtyPositions = new Set<bigint>();
+      const dirtyOrders = new Map<Hex, DirtyOrderMeta>();
+      const dirtyAssets = new Set<Address>();
+
+      await db.transaction(async (tx) => {
+        await tx.query(
+          `INSERT INTO indexed_blocks (block_number, block_hash, parent_hash, block_timestamp)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (block_number) DO UPDATE SET
+             block_hash = EXCLUDED.block_hash,
+             parent_hash = EXCLUDED.parent_hash,
+             block_timestamp = EXCLUDED.block_timestamp`,
+          [
+            bn.toString(),
+            block.hash.toLowerCase(),
+            block.parentHash.toLowerCase(),
+            block.timestamp.toString(),
+          ]
+        );
 
       for (const log of blockLogs) {
         if (!log.blockHash || log.blockHash.toLowerCase() !== expectedBlockHash) {
@@ -1999,7 +2038,21 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
            updated_at = NOW()`,
         [bn.toString(), publicClient.chain.id]
       );
-    });
+      });
+    };
+
+    try {
+      await commitBlockTx();
+    } catch (txErr) {
+      if (isConnectionDropError(txErr)) {
+        console.warn(
+          `[INDEXER_DB_TX_RETRY] Block ${bn} transaction interrupted by connection drop; retrying once...`
+        );
+        await commitBlockTx();
+      } else {
+        throw txErr;
+      }
+    }
 
     for (const token of newlyDiscoveredTokens) {
       ctx.trackedAssets.add(token);

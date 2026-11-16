@@ -485,8 +485,10 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
     conditions.push('o.cancelled = FALSE AND o.filled_usdc > 0 AND o.min_usdc > 0 AND o.filled_usdc < o.min_usdc');
   } else if (filters.status === 'filled') {
     conditions.push(
-      'o.cancelled = FALSE AND o.filled_usdc > 0 AND (o.min_usdc = 0 OR o.filled_usdc >= o.min_usdc)'
+      'o.cancelled = FALSE AND o.filled_usdc > 0 AND o.min_usdc > 0 AND o.filled_usdc >= o.min_usdc'
     );
+  } else if (filters.status === 'unknown') {
+    conditions.push('o.cancelled = FALSE AND o.min_usdc = 0');
   }
 
   if (filters.maker) {
@@ -623,9 +625,11 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
     const remaining = minUsdc > filled ? minUsdc - filled : 0n;
     const derivedStatus = r.cancelled
       ? 'cancelled'
-      : minUsdc > 0n && filled < minUsdc
-        ? 'partially_filled'
-        : 'filled';
+      : minUsdc === 0n
+        ? 'unknown'
+        : filled < minUsdc
+          ? 'partially_filled'
+          : 'filled';
     return {
       order_hash: r.order_hash,
       maker: getAddress(r.maker),
@@ -635,7 +639,7 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
       status: derivedStatus,
       min_usdc: formatAmount(minUsdc, USDC_DECIMALS, 'USDC'),
       filled_usdc: formatAmount(filled, USDC_DECIMALS, 'USDC'),
-      remaining_usdc: formatAmount(remaining, USDC_DECIMALS, 'USDC'),
+      remaining_usdc: minUsdc > 0n ? formatAmount(remaining, USDC_DECIMALS, 'USDC') : null,
       cancelled: r.cancelled,
       maker_nonce: r.maker_nonce,
       fills_count: Number(r.fills_count),

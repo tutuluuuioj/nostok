@@ -20,7 +20,7 @@ export interface ReadOnlyDatabase {
 }
 
 const FORBIDDEN_SQL_PATTERN =
-  /\b(INTO|MERGE|SET|RESET|BEGIN|START|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|LOCK|PREPARE|EXECUTE|DEALLOCATE|LISTEN|NOTIFY|UNLISTEN|LOAD|IMPORT|SECURITY|REINDEX|CLUSTER|REFRESH|COMMENT|DISCARD|SHOW|EXPLAIN|ANALYZE|INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|GRANT|REVOKE|COPY|VACUUM|CALL|DO|FOR\s+UPDATE|FOR\s+SHARE|set_config)\b|\b(pg_|lo_|dblink)[a-zA-Z0-9_]*/i;
+  /\b(INTO|MERGE|SET|RESET|BEGIN|START|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|LOCK|PREPARE|EXECUTE|DEALLOCATE|LISTEN|NOTIFY|UNLISTEN|LOAD|IMPORT|SECURITY|REINDEX|CLUSTER|REFRESH|COMMENT|DISCARD|SHOW|EXPLAIN|ANALYZE|INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|GRANT|REVOKE|COPY|VACUUM|CALL|DO|UESCAPE|FOR\s+UPDATE|FOR\s+SHARE|set_config)\b|\b(pg_|lo_|dblink)[a-zA-Z0-9_]*/i;
 
 export function assertReadOnlySql(sql: string): void {
   if (typeof sql !== 'string' || sql.trim().length === 0) {
@@ -37,9 +37,18 @@ export function assertReadOnlySql(sql: string): void {
     throw new Error('Read-only API database permits SELECT or WITH queries only.');
   }
 
-  // Strip quoted string literals when checking for disallowed keywords/functions
+  // Reject Unicode escape syntax (U&"..." / U&'...') and C-style escape strings (E'...')
+  if (/(^|[^a-zA-Z0-9_])[uU]\s*&/.test(trimmed) || /(^|[^a-zA-Z0-9_])[eE]'/.test(trimmed)) {
+    throw new Error('Read-only API database rejected escaped SQL identifier or literal syntax.');
+  }
+
+  // Strip quoted string literals when checking for backslashes outside string literals & forbidden identifiers
   const withoutStrings = trimmed.replace(/'(?:''|[^'])*'/g, "''");
-  if (FORBIDDEN_SQL_PATTERN.test(withoutStrings)) {
+  if (withoutStrings.includes('\\')) {
+    throw new Error('Read-only API database rejected backslash outside string literal.');
+  }
+  const normalizedIdentifiers = withoutStrings.replace(/"/g, '');
+  if (FORBIDDEN_SQL_PATTERN.test(normalizedIdentifiers)) {
     throw new Error('Read-only API database rejected disallowed SQL keyword or function.');
   }
 }
