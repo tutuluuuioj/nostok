@@ -28,9 +28,20 @@ import { loadRiskConfig } from '../../risk/src/config.js';
 import { wrapQueryableAsReadOnly as wrapRiskReadOnly } from '../../risk/src/db.js';
 import { createRiskContext, runRiskScan } from '../../risk/src/monitor.js';
 import { createRiskServer } from '../../risk/src/server.js';
-import { type ChannelTransports, type NotificationOutboundMessage } from '../src/channels.js';
+import {
+  type ChannelTransports,
+  type DnsLookupFn,
+  type NotificationOutboundMessage,
+  type WebhookHttpRequestOpts,
+  createDefaultTransports,
+  resolveAndValidateWebhookTarget,
+  validateChannelTarget,
+} from '../src/channels.js';
 import { loadNotificationsConfig } from '../src/config.js';
-import { PiiCipher } from '../src/crypto.js';
+import {
+  PiiCipher,
+  verifyWebhookPayloadSignature,
+} from '../src/crypto.js';
 import {
   assertNotifTableSql,
   assertReadOnlySql,
@@ -457,10 +468,10 @@ async function runTests(): Promise<void> {
 
     const approveAbi = parseAbi(['function approve(address spender, uint256 value) returns (bool)']);
     for (const [client, token, spender, amt] of [
-      [borrowerClient, nvdac, deployed.collateralEscrow, 100n * 10n ** 18n],
-      [borrowerClient, BASE_USDC, deployed.loanCore, 5_000_000_000n],
-      [lenderClient, BASE_USDC, deployed.loanCore, 10_000_000_000n],
-      [liquidatorClient, BASE_USDC, deployed.liquidationAuction, 5_000_000_000n],
+      [borrowerClient, nvdac, deployed.collateralEscrow, 500n * 10n ** 18n],
+      [borrowerClient, BASE_USDC, deployed.loanCore, 50_000_000_000n],
+      [lenderClient, BASE_USDC, deployed.loanCore, 50_000_000_000n],
+      [liquidatorClient, BASE_USDC, deployed.liquidationAuction, 50_000_000_000n],
     ] as const) {
       await publicClient.waitForTransactionReceipt({
         hash: await client.writeContract({
@@ -519,29 +530,59 @@ async function runTests(): Promise<void> {
     // Local Webhook transport receiver server + mocked email/Telegram recorders
     const deliveredEmails: NotificationOutboundMessage[] = [];
     const deliveredTelegrams: NotificationOutboundMessage[] = [];
-    const deliveredWebhooks: Array<{ event: string; wallet: string; payload: unknown }> = [];
+    const deliveredWebhooks: Array<{
+      event: string;
+      wallet: string;
+      payload: unknown;
+      rawBody: string;
+      headers: http.IncomingHttpHeaders;
+    }> = [];
     let forceFailEmail = false;
+    let forceFailWebhook = false;
+    let mockWebhookInvokeCount = 0;
 
     const webhookReceiver = http.createServer((req, res) => {
       const chunks: Buffer[] = [];
       req.on('data', (c: Buffer) => chunks.push(c));
       req.on('end', () => {
-        const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+        const rawBody = Buffer.concat(chunks).toString('utf8');
+        const parsed = JSON.parse(rawBody) as {
           event: string;
           wallet: string;
           payload: unknown;
         };
-        deliveredWebhooks.push(parsed);
+        deliveredWebhooks.push({ ...parsed, rawBody, headers: req.headers });
         res.statusCode = 200;
         res.end('ok');
       });
     });
     await new Promise<void>((r) => webhookReceiver.listen(0, '127.0.0.1', r));
     const webhookRxPort = (webhookReceiver.address() as net.AddressInfo).port;
-    const webhookTargetUrl = `http://127.0.0.1:${webhookRxPort}/user-hook`;
+    const webhookTargetUrl = 'https://hooks.nostok-test.example/user-hook';
+
+    const mockDnsLookup: DnsLookupFn = async (hostname: string) => {
+      const lower = hostname.toLowerCase();
+      if (lower === 'hooks.nostok-test.example') {
+        return [{ address: '93.184.216.34', family: 4 }];
+      }
+      if (lower === 'rebind-private.example') {
+        return [{ address: '10.0.0.12', family: 4 }];
+      }
+      if (lower === 'rebind-meta.example') {
+        return [{ address: '169.254.169.254', family: 4 }];
+      }
+      if (lower === 'rebind-ipv6.example') {
+        return [{ address: '::1', family: 6 }];
+      }
+      return [{ address: '93.184.216.35', family: 4 }];
+    };
 
     const key1 = crypto.randomBytes(32).toString('hex');
     const key2 = crypto.randomBytes(32).toString('hex');
+    const unsubSecret = crypto.randomBytes(32).toString('hex');
+    const sessionSecret = crypto.randomBytes(32).toString('hex');
+    const piiHashSecret = crypto.randomBytes(32).toString('hex');
+    const webhookSigningSecret = crypto.randomBytes(32).toString('hex');
 
     const notifCfg = loadNotificationsConfig({
       rpcUrl: LOCAL_RPC_URL,
@@ -554,14 +595,22 @@ async function runTests(): Promise<void> {
       siweUri: 'https://app.nostok.xyz',
       encryptionKeyId: 'k1',
       encryptionKeys: { k1: key1, k2: key2 },
-      unsubscribeSecret: 'unsub-secret-key-at-least-16-bytes',
-      sessionSecret: 'session-secret-key-at-least-16-bytes',
-      piiHashSecret: 'pii-hash-secret-key-at-least-16-bytes',
+      unsubscribeSecret: unsubSecret,
+      sessionSecret,
+      piiHashSecret,
+      webhookSigningSecret,
       publicBaseUrl: 'http://127.0.0.1:3003',
+      corsOrigins: ['https://app.nostok.xyz'],
       maxDeliveryAttempts: 3,
       retryBaseMs: 100,
-      userRateLimitPerHour: 50,
-      rateLimitMax: 200,
+      userRateLimitPerHour: 200,
+      maxSubscriptionsPerWallet: 5,
+      authNonceRateLimitMax: 100,
+      authVerifyRateLimitMax: 100,
+      subscriptionsRateLimitMax: 100,
+      circuitBreakerThreshold: 3,
+      circuitBreakerCooldownMs: 30_000,
+      rateLimitMax: 500,
       maxBodyBytes: 4096,
       loanCore: deployed.loanCore,
       liquidationAuction: deployed.liquidationAuction,
@@ -573,7 +622,7 @@ async function runTests(): Promise<void> {
     const mockTransports: ChannelTransports = {
       async sendEmail(msg) {
         if (forceFailEmail) {
-          throw new Error('502 Mock SMTP gateway timeout');
+          throw new Error('502 Mock SMTP gateway timeout secret_internal_trace');
         }
         deliveredEmails.push(msg);
       },
@@ -581,18 +630,32 @@ async function runTests(): Promise<void> {
         deliveredTelegrams.push(msg);
       },
       async sendWebhook(msg) {
-        const res = await fetch(msg.target, {
+        await resolveAndValidateWebhookTarget(msg.target, mockDnsLookup);
+        mockWebhookInvokeCount++;
+        if (forceFailWebhook) {
+          throw new Error('503 Mock webhook upstream down secret_trace');
+        }
+        const rawBody = JSON.stringify({
+          event: msg.alertType,
+          severity: msg.severity,
+          wallet: msg.wallet,
+          title: msg.title,
+          message: msg.message,
+          payload: msg.payload,
+          unsubscribe_url: msg.unsubscribeUrl,
+        });
+        const tsSec = msg.timestampSec ?? Math.floor(Date.now() / 1000);
+        const { signWebhookPayload } = await import('../src/crypto.js');
+        const sig = signWebhookPayload(notifCfg.webhookSigningSecret, tsSec, rawBody);
+        const res = await fetch(`http://127.0.0.1:${webhookRxPort}/user-hook`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            event: msg.alertType,
-            severity: msg.severity,
-            wallet: msg.wallet,
-            title: msg.title,
-            message: msg.message,
-            payload: msg.payload,
-            unsubscribe_url: msg.unsubscribeUrl,
-          }),
+          redirect: 'manual',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Nostok-Timestamp': sig.timestampHeader,
+            'X-Nostok-Signature': sig.signatureHeader,
+          },
+          body: rawBody,
           signal: AbortSignal.timeout(notifCfg.outboundTimeoutMs),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -605,6 +668,7 @@ async function runTests(): Promise<void> {
         async close() {},
       }),
       transportsOverride: mockTransports,
+      dnsLookupOverride: mockDnsLookup,
     });
 
     const notifServer = createNotificationsServer(notifCtx);
@@ -615,7 +679,7 @@ async function runTests(): Promise<void> {
 
     try {
       // -----------------------------------------------------------------------
-      // TEST 1: Security boundaries, PII encryption + rotation, & real PG mid-tx kill
+      // TEST 1: Security boundaries, SQL tokenizer, production config, PII AES-256-GCM + PG drop
       // -----------------------------------------------------------------------
       console.log('\n=== TEST 1: SQL guards, PII AES-256-GCM encryption + key rotation, & real PG drop ===');
       assert.throws(
@@ -627,12 +691,81 @@ async function runTests(): Promise<void> {
           }),
         /postgres/i
       );
+      const prodBaseOverrides = {
+        ...notifCfg,
+        isFork: false,
+        databaseUrl: 'postgres://nostok_notif:pw@localhost:5432/nostok',
+        indexerDatabaseUrl: 'postgres://nostok_ro:pw@localhost:5432/nostok',
+        publicBaseUrl: 'https://notifications.nostok.xyz',
+      };
+      const prevCorsEnv = process.env.CORS_ORIGINS;
+      delete process.env.CORS_ORIGINS;
+      try {
+        assert.throws(
+          () =>
+            loadNotificationsConfig({
+              ...prodBaseOverrides,
+              corsOrigins: undefined,
+            }),
+          /CORS_ORIGINS/i
+        );
+      } finally {
+        if (prevCorsEnv !== undefined) process.env.CORS_ORIGINS = prevCorsEnv;
+      }
+      assert.throws(
+        () =>
+          loadNotificationsConfig({
+            ...prodBaseOverrides,
+            corsOrigins: ['*'],
+          }),
+        /wildcard/i
+      );
+      assert.throws(
+        () =>
+          loadNotificationsConfig({
+            ...prodBaseOverrides,
+            publicBaseUrl: 'http://notifications.nostok.xyz',
+          }),
+        /https:\/\//i
+      );
+      assert.throws(
+        () =>
+          loadNotificationsConfig({
+            ...notifCfg,
+            unsubscribeSecret: 'a'.repeat(32),
+          }),
+        /entropy/i
+      );
+      assert.throws(
+        () =>
+          loadNotificationsConfig({
+            ...notifCfg,
+            sessionSecret: notifCfg.unsubscribeSecret,
+          }),
+        /distinct/i
+      );
+
       assert.throws(() => assertReadOnlySql('DELETE FROM loans'), /SELECT/i);
       assert.throws(() => assertReadOnlySql('SELECT U&"pg\\005fsleep"(2)'), /escaped SQL|backslash/i);
       assert.throws(() => assertReadOnlySql("SELECT E'\\x70'"), /escaped SQL/i);
+      assert.throws(() => assertReadOnlySql(`SELECT 1 AS "a'b", pg_sleep(0.5), 2 AS "c'd"`), /disallowed/i);
+      assert.throws(
+        () => assertReadOnlySql(`WITH "a'b" AS (SELECT 1), x AS (DELETE FROM loans RETURNING 1), "c'd" AS (SELECT 2) SELECT 1`),
+        /disallowed/i
+      );
+      assert.throws(() => assertReadOnlySql('SELECT $tag$1$tag$'), /dollar-quoted/i);
+      assert.throws(() => assertReadOnlySql("SELECT query_to_xml('SELECT 1', true, true, '')"), /disallowed/i);
+      assert.throws(() => assertReadOnlySql("SELECT nextval('loans_seq')"), /disallowed/i);
+      assert.throws(() => assertReadOnlySql("SELECT setval('loans_seq', 1)"), /disallowed/i);
+      assert.throws(() => assertReadOnlySql('SELECT txid_current()'), /disallowed/i);
+      assert.throws(() => assertReadOnlySql('SELECT * FROM information_schema.tables'), /disallowed/i);
+      assert.throws(() => assertReadOnlySql("SELECT xpath('/a', '<a/>')"), /disallowed/i);
+
       assert.throws(() => assertNotifTableSql('INSERT INTO loans VALUES (1)'), /notif_\*/i);
       assert.throws(() => assertNotifTableSql('UPDATE assets SET status=0'), /notif_\*/i);
       assert.throws(() => assertNotifTableSql('DELETE FROM loan_events'), /notif_\*/i);
+      assert.throws(() => assertNotifTableSql('SELECT pg_sleep(1)'), /Disallowed SQL function/i);
+      assert.throws(() => assertNotifTableSql('SELECT * FROM (UPDATE notif_nonces SET used=true)'), /Write keyword/i);
 
       // PiiCipher encryption & key rotation (k1 -> k2)
       const cipherV1 = new PiiCipher('k1', { k1: key1, k2: key2 }, notifCfg.piiHashSecret);
@@ -713,14 +846,48 @@ async function runTests(): Promise<void> {
         expirationTime: futureIso,
       });
       const bSiweSig = await borrowerAccount.signMessage({ message: bSiweMsg });
-      const bAuthRes = await httpJson<{ token: string; wallet_address: string }>(
+      const bAuthRes = await httpJson<{ token: string; jti: string; wallet_address: string }>(
         'POST',
         `${notifUrl}/auth/verify`,
         { message: bSiweMsg, signature: bSiweSig }
       );
       assert.equal(bAuthRes.status, 200);
       assert.equal(bAuthRes.body.wallet_address, ADDRESSES.borrower);
+      assert.ok(bAuthRes.body.jti && bAuthRes.body.jti.length >= 8, 'Session must include jti');
       const borrowerToken = bAuthRes.body.token;
+
+      // Logout revocation test on a secondary borrower session
+      const revNonce = await getNonce(ADDRESSES.borrower);
+      const revMsg = formatSiweMessage({
+        domain: 'app.nostok.xyz',
+        address: ADDRESSES.borrower,
+        uri: 'https://app.nostok.xyz',
+        chainId: 8453,
+        nonce: revNonce,
+        issuedAt: nowIso,
+        expirationTime: futureIso,
+      });
+      const revVerify = await httpJson<{ token: string; jti: string }>('POST', `${notifUrl}/auth/verify`, {
+        message: revMsg,
+        signature: await borrowerAccount.signMessage({ message: revMsg }),
+      });
+      assert.equal(revVerify.status, 200);
+      const revLogout = await httpJson<{ revoked: boolean }>(
+        'POST',
+        `${notifUrl}/auth/logout`,
+        {},
+        { Authorization: `Bearer ${revVerify.body.token}` }
+      );
+      assert.equal(revLogout.status, 200);
+      assert.equal(revLogout.body.revoked, true);
+      const afterLogout = await httpJson<{ error: { code: string } }>(
+        'GET',
+        `${notifUrl}/subscriptions`,
+        undefined,
+        { Authorization: `Bearer ${revVerify.body.token}` }
+      );
+      assert.equal(afterLogout.status, 401);
+      assert.equal(afterLogout.body.error.code, 'SESSION_REVOKED');
 
       // Reused nonce MUST fail with 401
       const reuseRes = await httpJson<{ error: { code: string } }>(
@@ -819,13 +986,75 @@ async function runTests(): Promise<void> {
       );
       assert.equal(lAuthRes.status, 200);
       const lenderToken = lAuthRes.body.token;
-      console.log('PASS TEST 2: SIWE EOA + EIP-1271 + all negative SIWE rejections verified.');
+
+      // 2c: Scoped per-IP & per-wallet rate limits on /auth/nonce, /auth/verify, and /subscriptions
+      const rlSrv = createNotificationsServer({
+        ...notifCtx,
+        config: {
+          ...notifCtx.config,
+          authNonceRateLimitMax: 2,
+          authVerifyRateLimitMax: 2,
+          subscriptionsRateLimitMax: 2,
+        },
+      });
+      await new Promise<void>((r) => rlSrv.listen(0, '127.0.0.1', r));
+      const rlUrl = `http://127.0.0.1:${(rlSrv.address() as net.AddressInfo).port}`;
+      try {
+        assert.equal(
+          (await httpJson('POST', `${rlUrl}/auth/nonce`, { wallet_address: ADDRESSES.borrower })).status,
+          200
+        );
+        assert.equal(
+          (await httpJson('POST', `${rlUrl}/auth/nonce`, { wallet_address: ADDRESSES.borrower })).status,
+          200
+        );
+        const nonce429 = await httpJson<{ error: { code: string } }>('POST', `${rlUrl}/auth/nonce`, {
+          wallet_address: ADDRESSES.borrower,
+        });
+        assert.equal(nonce429.status, 429);
+        assert.equal(nonce429.body.error.code, 'RATE_LIMIT_EXCEEDED');
+
+        for (let k = 0; k < 2; k++) {
+          await httpJson('POST', `${rlUrl}/auth/verify`, { message: bSiweMsg, signature: bSiweSig });
+        }
+        const verify429 = await httpJson<{ error: { code: string } }>('POST', `${rlUrl}/auth/verify`, {
+          message: bSiweMsg,
+          signature: bSiweSig,
+        });
+        assert.equal(verify429.status, 429);
+
+        for (let k = 0; k < 2; k++) {
+          await httpJson(
+            'POST',
+            `${rlUrl}/subscriptions`,
+            { channel: 'webhook', target: 'https://0x7f000001/hook' },
+            { Authorization: `Bearer ${borrowerToken}` }
+          );
+        }
+        const sub429 = await httpJson<{ error: { code: string } }>(
+          'POST',
+          `${rlUrl}/subscriptions`,
+          { channel: 'webhook', target: 'https://hooks.nostok-test.example/hook' },
+          { Authorization: `Bearer ${borrowerToken}` }
+        );
+        assert.equal(sub429.status, 429);
+      } finally {
+        await new Promise<void>((r) => rlSrv.close(() => r()));
+      }
+      console.log('PASS TEST 2: SIWE EOA + EIP-1271 + session jti revocation + scoped rate limits + negative rejections verified.');
 
       // -----------------------------------------------------------------------
-      // TEST 3: Subscribe borrower (email+telegram+webhook) & lender (email), verify encryption in DB
+      // TEST 3: Ownership confirmation, SSRF blocks, DNS pinning, redirect block, per-wallet cap & encryption
       // -----------------------------------------------------------------------
-      console.log('\n=== TEST 3: Encrypted subscriptions across email, telegram, and webhook ===');
-      const subEmail = await httpJson<{ id: string; masked_target: string; key_id: string }>(
+      console.log('\n=== TEST 3: Encrypted subscriptions, confirmation, SSRF guards, & per-wallet cap ===');
+      const subEmail = await httpJson<{
+        id: string;
+        masked_target: string;
+        key_id: string;
+        enabled: boolean;
+        verified: boolean;
+        verification_required: boolean;
+      }>(
         'POST',
         `${notifUrl}/subscriptions`,
         { channel: 'email', target: 'borrower@nostok.xyz' },
@@ -833,23 +1062,75 @@ async function runTests(): Promise<void> {
       );
       assert.equal(subEmail.status, 201);
       assert.equal(subEmail.body.masked_target, 'bo***@nostok.xyz');
+      assert.equal(subEmail.body.enabled, false, 'Unconfirmed email must start disabled');
+      assert.equal(subEmail.body.verified, false, 'Unconfirmed email must start unverified');
+      assert.equal(subEmail.body.verification_required, true);
 
-      const subTg = await httpJson<{ id: string; masked_target: string }>(
+      // Wrong code / wrong confirm token rejected
+      const badCodeRes = await httpJson(
+        'POST',
+        `${notifUrl}/subscriptions/confirm`,
+        { subscription_id: subEmail.body.id, code: '000000' },
+        { Authorization: `Bearer ${borrowerToken}` }
+      );
+      assert.equal(badCodeRes.status, 400);
+      const badTokenRes = await httpJson('POST', `${notifUrl}/subscriptions/confirm`, {
+        token: 'tampered.confirm.token',
+      });
+      assert.equal(badTokenRes.status, 400);
+
+      // Confirm borrower email using code delivered in verification email
+      const emailVerifyMsg = deliveredEmails.find((m) => m.subscriptionId === subEmail.body.id)!;
+      assert.ok(emailVerifyMsg, 'Expected verification email to be dispatched');
+      const okEmailConfirm = await httpJson<{ confirmed: boolean; enabled: boolean; verified: boolean }>(
+        'POST',
+        `${notifUrl}/subscriptions/confirm`,
+        {
+          subscription_id: subEmail.body.id,
+          code: String(emailVerifyMsg.payload.verification_code),
+        },
+        { Authorization: `Bearer ${borrowerToken}` }
+      );
+      assert.equal(okEmailConfirm.status, 200);
+      assert.equal(okEmailConfirm.body.confirmed, true);
+      assert.equal(okEmailConfirm.body.verified, true);
+
+      // Telegram subscription starts disabled -> confirm via signed token link
+      const subTg = await httpJson<{ id: string; enabled: boolean; verified: boolean }>(
         'POST',
         `${notifUrl}/subscriptions`,
         { channel: 'telegram', target: '-10099887766' },
         { Authorization: `Bearer ${borrowerToken}` }
       );
       assert.equal(subTg.status, 201);
+      assert.equal(subTg.body.verified, false);
+      const tgVerifyMsg = deliveredTelegrams.find((m) => m.subscriptionId === subTg.body.id)!;
+      const getConfirmCheck = await httpJson<{ confirmation_required: boolean; method: string }>(
+        'GET',
+        String(tgVerifyMsg.payload.confirm_url)
+      );
+      assert.equal(getConfirmCheck.status, 200);
+      assert.equal(getConfirmCheck.body.confirmation_required, true);
+      const okTgConfirm = await httpJson<{ confirmed: boolean; verified: boolean }>(
+        'POST',
+        `${notifUrl}/subscriptions/confirm`,
+        { token: String(tgVerifyMsg.payload.confirm_token) }
+      );
+      assert.equal(okTgConfirm.status, 200);
+      assert.equal(okTgConfirm.body.verified, true);
 
-      const subHook = await httpJson<{ id: string }>(
+      // Valid HTTPS webhook subscription
+      const subHook = await httpJson<{ id: string; enabled: boolean; verified: boolean }>(
         'POST',
         `${notifUrl}/subscriptions`,
         { channel: 'webhook', target: webhookTargetUrl },
         { Authorization: `Bearer ${borrowerToken}` }
       );
       assert.equal(subHook.status, 201);
+      assert.equal(subHook.body.enabled, true);
+      assert.equal(subHook.body.verified, true);
 
+      // Lender email subscription + confirm
       const subLenderEmail = await httpJson<{ id: string }>(
         'POST',
         `${notifUrl}/subscriptions`,
@@ -857,17 +1138,150 @@ async function runTests(): Promise<void> {
         { Authorization: `Bearer ${lenderToken}` }
       );
       assert.equal(subLenderEmail.status, 201);
+      const lenderVerifyMsg = deliveredEmails.find((m) => m.subscriptionId === subLenderEmail.body.id)!;
+      assert.equal(
+        (
+          await httpJson('POST', `${notifUrl}/subscriptions/confirm`, {
+            token: String(lenderVerifyMsg.payload.confirm_token),
+          })
+        ).status,
+        200
+      );
+
+      // SSRF negative tests (API registration + default transport direct sendWebhook + 302 redirect + DNS pinning)
+      const ssrfTargets = [
+        'http://hooks.nostok-test.example/hook',
+        'https://localhost/hook',
+        'https://169.254.169.254/latest/meta-data/',
+        'https://[::1]/hook',
+        'https://0x7f000001/hook',
+        'https://0177.0.0.1/hook',
+        'https://2130706433/hook',
+        'https://rebind-private.example/hook',
+        'https://rebind-meta.example/hook',
+        'https://rebind-ipv6.example/hook',
+      ];
+      for (const badUrl of ssrfTargets) {
+        const resBad = await httpJson(
+          'POST',
+          `${notifUrl}/subscriptions`,
+          { channel: 'webhook', target: badUrl },
+          { Authorization: `Bearer ${borrowerToken}` }
+        );
+        assert.equal(resBad.status, 400, `SSRF URL must be rejected at subscription: ${badUrl}`);
+      }
+
+      // Direct default transport checks: DNS IP pinning, redirect: 'manual' no-follow, & 302 rejection
+      const capturedReqOpts: WebhookHttpRequestOpts[] = [];
+      const redirectTransport = createDefaultTransports({
+        emailFrom: notifCfg.emailFrom,
+        telegramApiBase: notifCfg.telegramApiBase,
+        outboundTimeoutMs: notifCfg.outboundTimeoutMs,
+        webhookSigningSecret: notifCfg.webhookSigningSecret,
+        dnsLookup: mockDnsLookup,
+        webhookRequester: async (opts) => {
+          capturedReqOpts.push(opts);
+          return { status: 302 };
+        },
+      });
+      for (const badUrl of ssrfTargets) {
+        if (!badUrl.includes('rebind-')) {
+          assert.throws(() => validateChannelTarget('webhook', badUrl));
+        }
+        await assert.rejects(() =>
+          redirectTransport.sendWebhook({
+            wallet: ADDRESSES.borrower,
+            subscriptionId: subHook.body.id,
+            channel: 'webhook',
+            target: badUrl,
+            alertType: 'test',
+            severity: 'info',
+            title: 't',
+            message: 'm',
+            payload: {},
+            unsubscribeUrl: `${notifUrl}/unsubscribe?token=x`,
+          })
+        );
+      }
+      await assert.rejects(
+        () =>
+          redirectTransport.sendWebhook({
+            wallet: ADDRESSES.borrower,
+            subscriptionId: subHook.body.id,
+            channel: 'webhook',
+            target: webhookTargetUrl,
+            alertType: 'test',
+            severity: 'info',
+            title: 't',
+            message: 'm',
+            payload: {},
+            unsubscribeUrl: `${notifUrl}/unsubscribe?token=x`,
+          }),
+        /redirect blocked/i
+      );
+      assert.equal(capturedReqOpts.length, 1, '302 redirect must NOT issue a follow-up request');
+      assert.equal(capturedReqOpts[0].redirect, 'manual');
+      assert.equal(capturedReqOpts[0].pinnedIp, '93.184.216.34');
+      assert.ok(
+        verifyWebhookPayloadSignature(
+          notifCfg.webhookSigningSecret,
+          capturedReqOpts[0].body,
+          capturedReqOpts[0].headers['X-Nostok-Signature']
+        ),
+        'Direct webhook requester must carry valid HMAC timestamp signature'
+      );
+
+      // Per-wallet subscription cap (maxSubscriptionsPerWallet = 5) verified cleanly via lender SIWE or borrower?
+      // Use liquidator wallet so borrower retains strictly its 3 primary channels for TEST 4/5 assertions!
+      const liqNonce = await getNonce(ADDRESSES.liquidator);
+      const liqMsg = formatSiweMessage({
+        domain: 'app.nostok.xyz',
+        address: ADDRESSES.liquidator,
+        uri: 'https://app.nostok.xyz',
+        chainId: 8453,
+        nonce: liqNonce,
+        issuedAt: nowIso,
+        expirationTime: futureIso,
+      });
+      const liqAuth = await httpJson<{ token: string }>('POST', `${notifUrl}/auth/verify`, {
+        message: liqMsg,
+        signature: await privateKeyToAccount(KEYS.liquidator).signMessage({ message: liqMsg }),
+      });
+      assert.equal(liqAuth.status, 200);
+      for (let i = 1; i <= 5; i++) {
+        const capOk = await httpJson(
+          'POST',
+          `${notifUrl}/subscriptions`,
+          { channel: 'webhook', target: `https://hooks.nostok-test.example/cap-${i}` },
+          { Authorization: `Bearer ${liqAuth.body.token}` }
+        );
+        assert.equal(capOk.status, 201, `Subscription ${i}/5 must succeed`);
+      }
+      const capExceeded = await httpJson<{ error: { code: string } }>(
+        'POST',
+        `${notifUrl}/subscriptions`,
+        { channel: 'webhook', target: 'https://hooks.nostok-test.example/cap-6' },
+        { Authorization: `Bearer ${liqAuth.body.token}` }
+      );
+      assert.equal(capExceeded.status, 400);
+      assert.equal(capExceeded.body.error.code, 'SUBSCRIPTION_LIMIT_EXCEEDED');
 
       // Verify NO plaintext email or telegram id in notif_subscriptions table
       const rawDbSubs = await notifCtx.notifDb.query<{ target_ciphertext: string; target_hash: string }>(
         'SELECT target_ciphertext, target_hash FROM notif_subscriptions'
       );
-      assert.equal(rawDbSubs.rows.length, 4);
+      assert.equal(rawDbSubs.rows.length, 9);
       for (const r of rawDbSubs.rows) {
         assert.equal(r.target_ciphertext.includes('borrower@nostok.xyz'), false);
         assert.equal(r.target_ciphertext.includes('-10099887766'), false);
         assert.equal(r.target_hash.includes('borrower@nostok.xyz'), false);
       }
+
+      // Reset recorder arrays after verification emails before TEST 4 lifecycle assertions
+      deliveredEmails.length = 0;
+      deliveredTelegrams.length = 0;
+      deliveredWebhooks.length = 0;
+      console.log('PASS TEST 3: Ownership confirmation, SSRF guards, IP pinning, manual redirect, 5-cap & encryption verified.');
 
       // -----------------------------------------------------------------------
       // TEST 4: Full Loan Lifecycle Alerts on Base Fork
@@ -970,11 +1384,12 @@ async function runTests(): Promise<void> {
 
       let t = Date.now();
 
-      // 4A: Loan #1 -> Margin Call -> Near Liquidation -> startLiquidation -> Partial Buy -> Final Settle + Claimable
+      // 4A: Loan #1 -> Margin Call -> 200 bps Hysteresis -> Full Recovery -> Re-arm Margin Call (sends twice)
+      // -> Near Liq -> Liquidation -> Auction Restart -> Partial Buy -> Settle
       const loan1Id = await openLoan(750_000_000n, 14);
       assert.equal(loan1Id, 1n);
 
-      // Price $105 -> margin_call
+      // Price $105 -> margin_call episode 1
       await publicClient.waitForTransactionReceipt({
         hash: await deployerClient.writeContract({
           address: nvdaFeed,
@@ -985,17 +1400,26 @@ async function runTests(): Promise<void> {
       });
       t += 5_000;
       await syncAll(t);
-      assert.ok(
-        deliveredEmails.some((m) => m.wallet === ADDRESSES.borrower && m.alertType === 'loan_margin_call'),
-        'Expected loan_margin_call email'
+      assert.equal(
+        deliveredEmails.filter((m) => m.wallet === ADDRESSES.borrower && m.alertType === 'loan_margin_call').length,
+        1,
+        'Expected loan_margin_call episode 1 email'
       );
       assert.ok(
         deliveredTelegrams.some((m) => m.wallet === ADDRESSES.borrower && m.alertType === 'loan_margin_call'),
         'Expected loan_margin_call Telegram'
       );
+      const mcWebhook = deliveredWebhooks.find(
+        (w) => w.wallet === ADDRESSES.borrower && w.event === 'loan_margin_call'
+      );
+      assert.ok(mcWebhook, 'Expected loan_margin_call webhook');
       assert.ok(
-        deliveredWebhooks.some((w) => w.wallet === ADDRESSES.borrower && w.event === 'loan_margin_call'),
-        'Expected loan_margin_call webhook'
+        verifyWebhookPayloadSignature(
+          notifCfg.webhookSigningSecret,
+          mcWebhook.rawBody,
+          String(mcWebhook.headers['x-nostok-signature'] ?? '')
+        ),
+        'Webhook payload MUST carry valid X-Nostok-Signature HMAC header'
       );
 
       // Verify dedup: immediate rescan must NOT send duplicate loan_margin_call
@@ -1005,7 +1429,62 @@ async function runTests(): Promise<void> {
       assert.equal(
         deliveredEmails.slice(emailsBeforeDedup).some((m) => m.alertType === 'loan_margin_call'),
         false,
-        'Duplicate loan_margin_call must be suppressed by dedup_key'
+        'Duplicate loan_margin_call must be suppressed by episode dedup_key'
+      );
+
+      // 200 bps hysteresis band check: uptick to $109 (LTV ~6881 bps, < 7000 but > 6800) must NOT clear episode 1,
+      // so dipping back to $106 (LTV ~7075 >= 7000) must NOT re-send!
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdaFeed,
+          abi: mockAggArtifact.abi,
+          functionName: 'setPrice',
+          args: [109_00000000n],
+        }),
+      });
+      t += 5_000;
+      await syncAll(t);
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdaFeed,
+          abi: mockAggArtifact.abi,
+          functionName: 'setPrice',
+          args: [106_00000000n],
+        }),
+      });
+      t += 5_000;
+      await syncAll(t);
+      assert.equal(
+        deliveredEmails.filter((m) => m.wallet === ADDRESSES.borrower && m.alertType === 'loan_margin_call').length,
+        1,
+        'Hysteresis band (LTV > marginCall-200) must NOT reset episode'
+      );
+
+      // Full recovery to $140 (LTV ~5360 <= 6800) clears episode 1; second drop to $105 fires episode 2!
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdaFeed,
+          abi: mockAggArtifact.abi,
+          functionName: 'setPrice',
+          args: [140_00000000n],
+        }),
+      });
+      t += 5_000;
+      await syncAll(t);
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdaFeed,
+          abi: mockAggArtifact.abi,
+          functionName: 'setPrice',
+          args: [105_00000000n],
+        }),
+      });
+      t += 5_000;
+      await syncAll(t);
+      assert.equal(
+        deliveredEmails.filter((m) => m.wallet === ADDRESSES.borrower && m.alertType === 'loan_margin_call').length,
+        2,
+        'Margin -> healthy (past hysteresis) -> margin must fire second loan_margin_call episode'
       );
 
       // Price $99 -> near_liquidation
@@ -1024,7 +1503,7 @@ async function runTests(): Promise<void> {
         'Expected loan_near_liquidation'
       );
 
-      // Price $92 -> liquidatable -> startLiquidation(1) -> partial buy -> final settle
+      // Price $92 -> liquidatable -> startLiquidation(1) -> Auction #1
       await publicClient.waitForTransactionReceipt({
         hash: await deployerClient.writeContract({
           address: nvdaFeed,
@@ -1043,13 +1522,41 @@ async function runTests(): Promise<void> {
       });
       t += 5_000;
       await syncAll(t);
-      assert.ok(
-        deliveredEmails.some((m) => m.wallet === ADDRESSES.borrower && m.alertType === 'liquidation_started'),
+      assert.equal(
+        deliveredEmails.filter((m) => m.wallet === ADDRESSES.borrower && m.alertType === 'liquidation_started').length,
+        1,
         'Expected liquidation_started for borrower'
       );
       assert.ok(
         deliveredEmails.some((m) => m.wallet === ADDRESSES.lender && m.alertType === 'liquidation_started'),
         'Expected liquidation_started for lender'
+      );
+
+      // Warp 31 minutes past auction start & call restartOrCancelAuction(1) -> must emit second liquidation_started!
+      const blkPreRestart = await publicClient.getBlock();
+      await rpcCall('evm_setNextBlockTimestamp', [Number(blkPreRestart.timestamp) + 1860]);
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdaFeed,
+          abi: mockAggArtifact.abi,
+          functionName: 'setPrice',
+          args: [92_00000000n],
+        }),
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await liquidatorClient.writeContract({
+          address: deployed.liquidationAuction,
+          abi: parseAbi(['function restartOrCancelAuction(uint256 auctionId)']),
+          functionName: 'restartOrCancelAuction',
+          args: [1n],
+        }),
+      });
+      t += 5_000;
+      await syncAll(t);
+      assert.equal(
+        deliveredEmails.filter((m) => m.wallet === ADDRESSES.borrower && m.alertType === 'liquidation_started').length,
+        2,
+        'Auction restart must trigger a new liquidation_started alert'
       );
 
       // Partial buy (2 NVDAc of 5 NVDAc partial-liquidation auction) -> auction_bid;
@@ -1111,14 +1618,16 @@ async function runTests(): Promise<void> {
         }),
       });
 
+      const getLoanAbi = parseAbi([
+        'function getLoan(uint256) view returns ((address borrower,address collateralToken,uint128 collateralRaw,uint128 principal,uint64 startTime,uint64 maturity,uint32 rateBps,uint32 penaltySpreadBps,uint16 initLtvBps,uint16 marginCallLtvBps,uint16 liqLtvBps,uint16 minInterestDays,uint8 status,uint8 yieldMode,uint8 coreVersion,uint128 interestPaid,uint128 principalRepaid))',
+      ]);
+
       // 4B: Loan #2 (7d term) -> warp time for 3d, 1d, 6h maturity reminders -> repay -> claimable
       const loan2Id = await openLoan(600_000_000n, 7);
       assert.equal(loan2Id, 2n);
       const loan2Chain = await publicClient.readContract({
         address: deployed.loanCore,
-        abi: parseAbi([
-          'function getLoan(uint256) view returns ((address borrower,address collateralToken,uint128 collateralRaw,uint128 principal,uint64 startTime,uint64 maturity,uint32 rateBps,uint32 penaltySpreadBps,uint16 initLtvBps,uint16 marginCallLtvBps,uint16 liqLtvBps,uint16 minInterestDays,uint8 status,uint8 yieldMode,uint8 coreVersion,uint128 interestPaid,uint128 principalRepaid))',
-        ]),
+        abi: getLoanAbi,
         functionName: 'getLoan',
         args: [2n],
       });
@@ -1165,9 +1674,123 @@ async function runTests(): Promise<void> {
         'Expected lender_claimable on repay'
       );
 
-      // 4C: Loan #3 -> Corporate Action freeze (2x multiplier) + Stale Feed
+      // 4B-2: On-chain re-check before maturity reminder (no reminder for repaid loan even with lagging indexer DB)
+      const loan2bId = await openLoan(600_000_000n, 7);
+      const loan2bChain = await publicClient.readContract({
+        address: deployed.loanCore,
+        abi: getLoanAbi,
+        functionName: 'getLoan',
+        args: [loan2bId],
+      });
+      await runIndexerSync(idxCtx); // Index Loan #2b as Active (status=0)
+      await rpcCall('evm_setNextBlockTimestamp', [Number(loan2bChain.maturity) - 4 * 3600]);
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdaFeed,
+          abi: mockAggArtifact.abi,
+          functionName: 'setPrice',
+          args: [140_00000000n],
+        }),
+      });
+      // Repay Loan #2b WITHOUT calling runIndexerSync!
+      await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: deployed.loanCore,
+          abi: parseAbi(['function repay(uint256 loanId) returns (uint128)']),
+          functionName: 'repay',
+          args: [loan2bId],
+        }),
+      });
+      const rem6hBefore = deliveredEmails.filter(
+        (m) => m.wallet === ADDRESSES.borrower && m.alertType === 'maturity_reminder_6h'
+      ).length;
+      t += 5_000;
+      await runRiskScan(riskCtx, t);
+      await runNotificationsCycle(notifCtx, t);
+      assert.equal(
+        deliveredEmails.filter(
+          (m) => m.wallet === ADDRESSES.borrower && m.alertType === 'maturity_reminder_6h'
+        ).length,
+        rem6hBefore,
+        'Repaid loan on-chain MUST NOT trigger maturity reminder even if indexer lags'
+      );
+      await runIndexerSync(idxCtx);
+
+      // 4B-3: Post-maturity grace entry, penalty interest, & default auction pending
+      const loan2cId = await openLoan(600_000_000n, 7);
+      const loan2cChain = await publicClient.readContract({
+        address: deployed.loanCore,
+        abi: getLoanAbi,
+        functionName: 'getLoan',
+        args: [loan2cId],
+      });
+      await runIndexerSync(idxCtx);
+      // 10m past maturity (inside 24h grace)
+      await rpcCall('evm_setNextBlockTimestamp', [Number(loan2cChain.maturity) + 600]);
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdaFeed,
+          abi: mockAggArtifact.abi,
+          functionName: 'setPrice',
+          args: [140_00000000n],
+        }),
+      });
+      t += 5_000;
+      await syncAll(t);
+      assert.ok(
+        deliveredEmails.some(
+          (m) =>
+            m.wallet === ADDRESSES.borrower &&
+            m.alertType === 'loan_grace_entry' &&
+            String(m.payload.loan_id) === loan2cId.toString()
+        ),
+        'Expected loan_grace_entry after maturity'
+      );
+      assert.ok(
+        deliveredEmails.some(
+          (m) =>
+            m.wallet === ADDRESSES.borrower &&
+            m.alertType === 'penalty_interest_accruing' &&
+            String(m.payload.loan_id) === loan2cId.toString()
+        ),
+        'Expected penalty_interest_accruing after maturity'
+      );
+
+      // 25h past maturity (> 24h grace) -> default_auction_pending
+      await rpcCall('evm_setNextBlockTimestamp', [Number(loan2cChain.maturity) + 90_000]);
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdaFeed,
+          abi: mockAggArtifact.abi,
+          functionName: 'setPrice',
+          args: [140_00000000n],
+        }),
+      });
+      t += 5_000;
+      await syncAll(t);
+      assert.ok(
+        deliveredEmails.some(
+          (m) =>
+            m.wallet === ADDRESSES.borrower &&
+            m.alertType === 'default_auction_pending' &&
+            String(m.payload.loan_id) === loan2cId.toString()
+        ),
+        'Expected default_auction_pending past maturity + 24h grace'
+      );
+      // Repay overdue Loan #2c to clean up state
+      await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: deployed.loanCore,
+          abi: parseAbi(['function repay(uint256 loanId) returns (uint128)']),
+          functionName: 'repay',
+          args: [loan2cId],
+        }),
+      });
+      t += 5_000;
+      await syncAll(t);
+
+      // 4C: Corporate Action freeze (2x multiplier) + Stale Feed
       const loan3Id = await openLoan(600_000_000n, 14);
-      assert.equal(loan3Id, 3n);
       await publicClient.waitForTransactionReceipt({
         hash: await deployerClient.writeContract({
           address: nvdac,
@@ -1180,7 +1803,10 @@ async function runTests(): Promise<void> {
       await syncAll(t);
       assert.ok(
         deliveredEmails.some(
-          (m) => m.wallet === ADDRESSES.borrower && m.alertType === 'asset_frozen_or_corporate_action'
+          (m) =>
+            m.wallet === ADDRESSES.borrower &&
+            m.alertType === 'asset_frozen_or_corporate_action' &&
+            String(m.payload.loan_id) === loan3Id.toString()
         ),
         'Expected asset_frozen_or_corporate_action'
       );
@@ -1217,14 +1843,15 @@ async function runTests(): Promise<void> {
           args: [140_00000000n],
         }),
       });
-      console.log('PASS TEST 4: Full loan lifecycle (11+ alert types across borrower & lender) verified.');
+      t += 5_000;
+      await syncAll(t);
+      console.log('PASS TEST 4: Full loan lifecycle, hysteresis/re-arm, auction restart, on-chain re-check, & post-maturity alerts verified.');
 
       // -----------------------------------------------------------------------
-      // TEST 5: Quiet hours (critical override), preferences, user rate limit, retry + DLQ, unsubscribe & DELETE /user/data
+      // TEST 5: Quiet hours re-queue, critical rate-limit bypass, decrypt catch, circuit breaker, generic DLQ, POST unsub & DELETE /user/data
       // -----------------------------------------------------------------------
-      console.log('\n=== TEST 5: Quiet hours, preferences, per-user rate limit, DLQ retry, unsubscribe, & delete-my-data ===');
-      // 5A: Quiet hours covering current UTC hour:
-      // Disable all alerts except oracle_stale & liquidation_started, enable quiet hours for current UTC hour
+      console.log('\n=== TEST 5: Quiet hours, preferences, per-user rate limit, DLQ retry, circuit breaker, unsubscribe, & delete-my-data ===');
+      // 5A: Margin call suppressed during quiet hours, then automatically re-queued & delivered when quiet hours end!
       const qTimeMs = t + 5_000;
       const utcHour = new Date(qTimeMs).getUTCHours();
       const prefRes = await httpJson(
@@ -1240,32 +1867,55 @@ async function runTests(): Promise<void> {
       );
       assert.equal(prefRes.status, 200);
 
-      // Trigger stale feed again during quiet hours -> suppressed_quiet_hours (NOT delivered)
-      // Wait: need a fresh dedup key, so check suppressed_quiet_hours via Loan #4!
-      const loan4Id = await openLoan(600_000_000n, 14);
-      const blkStale = await publicClient.getBlock();
+      const loanQuietId = await openLoan(750_000_000n, 14);
       await publicClient.waitForTransactionReceipt({
         hash: await deployerClient.writeContract({
           address: nvdaFeed,
           abi: mockAggArtifact.abi,
-          functionName: 'setUpdatedAt',
-          args: [blkStale.timestamp - 30_000n],
+          functionName: 'setPrice',
+          args: [105_00000000n],
         }),
       });
       const emailCountBeforeQuiet = deliveredEmails.length;
       await syncAll(qTimeMs);
       const quietSuppressed = await notifCtx.notifDb.query<{ cnt: number }>(
-        "SELECT COUNT(*)::INT AS cnt FROM notif_deliveries WHERE status = 'suppressed_quiet_hours' AND alert_type = 'oracle_stale'"
+        "SELECT COUNT(*)::INT AS cnt FROM notif_deliveries WHERE status = 'suppressed_quiet_hours' AND alert_type = 'loan_margin_call'"
       );
-      assert.ok(Number(quietSuppressed.rows[0].cnt) >= 1, 'Non-critical alert during quiet hours must be suppressed');
+      assert.ok(Number(quietSuppressed.rows[0].cnt) >= 1, 'Margin call during quiet hours must be suppressed');
       assert.equal(
         deliveredEmails
           .slice(emailCountBeforeQuiet)
-          .some((m) => m.wallet === ADDRESSES.borrower && m.alertType === 'oracle_stale'),
-        false
+          .some((m) => m.wallet === ADDRESSES.borrower && m.alertType === 'loan_margin_call'),
+        false,
+        'Suppressed quiet hours margin call must not deliver during quiet window'
       );
 
-      // Trigger critical alert (startLiquidation on Loan #4) DURING quiet hours -> critical override bypasses quiet hours!
+      // End quiet hours -> suppressed margin call is re-queued and delivered!
+      await httpJson(
+        'PUT',
+        `${notifUrl}/preferences`,
+        { quiet_hours_start: null, quiet_hours_end: null, max_per_hour: 100 },
+        { Authorization: `Bearer ${borrowerToken}` }
+      );
+      await syncAll(qTimeMs + 3_000);
+      assert.ok(
+        deliveredEmails
+          .slice(emailCountBeforeQuiet)
+          .some((m) => m.wallet === ADDRESSES.borrower && m.alertType === 'loan_margin_call'),
+        'Margin call suppressed during quiet hours MUST be delivered after quiet hours end'
+      );
+
+      // Re-enable quiet hours AND set max_per_hour = 1 on borrower -> critical liquidation_started MUST bypass BOTH quiet hours & rate limit!
+      await httpJson(
+        'PUT',
+        `${notifUrl}/preferences`,
+        {
+          quiet_hours_start: utcHour,
+          quiet_hours_end: (utcHour + 1) % 24,
+          max_per_hour: 1,
+        },
+        { Authorization: `Bearer ${borrowerToken}` }
+      );
       await publicClient.waitForTransactionReceipt({
         hash: await deployerClient.writeContract({
           address: nvdaFeed,
@@ -1274,32 +1924,28 @@ async function runTests(): Promise<void> {
           args: [92_00000000n],
         }),
       });
-      // Loan #4 LTV at $92 with $600 debt / 10 NVDAc is 6521; open Loan #5 at $750 OR lower price to $75 -> liquidate Loan #4!
-      await publicClient.waitForTransactionReceipt({
-        hash: await deployerClient.writeContract({
-          address: nvdaFeed,
-          abi: mockAggArtifact.abi,
-          functionName: 'setPrice',
-          args: [75_00000000n],
-        }),
-      });
       await publicClient.waitForTransactionReceipt({
         hash: await liquidatorClient.writeContract({
           address: deployed.loanCore,
           abi: parseAbi(['function startLiquidation(uint256 loanId) returns (uint256)']),
           functionName: 'startLiquidation',
-          args: [loan4Id],
+          args: [loanQuietId],
         }),
       });
-      await syncAll(qTimeMs + 5_000);
+      await syncAll(qTimeMs + 6_000);
       assert.ok(
         deliveredEmails
           .slice(emailCountBeforeQuiet)
-          .some((m) => m.wallet === ADDRESSES.borrower && m.alertType === 'liquidation_started'),
-        'Critical liquidation_started must override quiet hours'
+          .some(
+            (m) =>
+              m.wallet === ADDRESSES.borrower &&
+              m.alertType === 'liquidation_started' &&
+              String(m.payload.loan_id) === loanQuietId.toString()
+          ),
+        'Critical liquidation_started MUST bypass both quiet hours AND per-user hourly rate limit'
       );
 
-      // 5B: Clear quiet hours, test per-user rate limit (max_per_hour=1), and failing email -> retry -> DLQ
+      // 5B: Restore price & test per-user rate limit suppression for non-critical lender notice
       await publicClient.waitForTransactionReceipt({
         hash: await deployerClient.writeContract({
           address: nvdaFeed,
@@ -1314,8 +1960,6 @@ async function runTests(): Promise<void> {
         { quiet_hours_start: null, quiet_hours_end: null, max_per_hour: 1 },
         { Authorization: `Bearer ${lenderToken}` }
       );
-      // Enqueue rate-limited notice for lender by opening & repaying Loan #5 twice? Lender ALREADY exceeded 1 delivery in last hour,
-      // so the next candidate for lender MUST hit suppressed_rate_limit!
       const loan5Id = await openLoan(600_000_000n, 14);
       await publicClient.waitForTransactionReceipt({
         hash: await borrowerClient.writeContract({
@@ -1332,13 +1976,36 @@ async function runTests(): Promise<void> {
       );
       assert.ok(Number(rlSupp.rows[0].cnt) >= 1, 'Expected per-user rate limit suppression');
 
-      // 5C: Retry with exponential backoff -> Dead Letter Queue
+      // 5C: Decrypt failure resilience (GET /subscriptions != 500 + queue continues) + DLQ generic error + Circuit breaker
       await httpJson(
         'PUT',
         `${notifUrl}/preferences`,
         { quiet_hours_start: null, quiet_hours_end: null, max_per_hour: 200 },
         { Authorization: `Bearer ${borrowerToken}` }
       );
+      await notifCtx.notifDb.query(
+        `INSERT INTO notif_subscriptions (id, wallet, channel, target_ciphertext, key_id, target_hash, enabled, verified)
+         VALUES ('sub_corrupt_key', $1, 'email', 'invalid-cipher', 'retired_missing_key', 'corrupt_hash_1', TRUE, TRUE)`,
+        [ADDRESSES.borrower.toLowerCase()]
+      );
+      await notifCtx.notifDb.query(
+        `INSERT INTO notif_deliveries (
+           id, wallet, subscription_id, channel, alert_type, severity, dedup_key,
+           title, message, payload_json, status, attempts, next_attempt_at, created_at
+         ) VALUES ('dlv_corrupt_key', $1, 'sub_corrupt_key', 'email', 'loan_repaid', 'info', 'corrupt_key_test',
+           'test', 'test', '{}', 'pending', 0, $2, $2)`,
+        [ADDRESSES.borrower.toLowerCase(), (qTimeMs + 12_000).toString()]
+      );
+      const subsWithCorrupt = await httpJson<{
+        data: Array<{ id: string; masked_target: string; decryption_error?: boolean }>;
+      }>('GET', `${notifUrl}/subscriptions`, undefined, { Authorization: `Bearer ${borrowerToken}` });
+      assert.equal(subsWithCorrupt.status, 200, 'GET /subscriptions must NOT 500 on unknown key_id');
+      assert.equal(
+        subsWithCorrupt.body.data.find((s) => s.id === 'sub_corrupt_key')?.decryption_error,
+        true
+      );
+
+      // Run failing email retry -> DLQ (at same cycle, corrupt delivery is dead-lettered cleanly without crashing queue)
       forceFailEmail = true;
       const loan6Id = await openLoan(600_000_000n, 14);
       await publicClient.waitForTransactionReceipt({
@@ -1350,41 +2017,98 @@ async function runTests(): Promise<void> {
         }),
       });
       let dlqTime = qTimeMs + 15_000;
-      await syncAll(dlqTime); // attempt 1 -> retry
+      await syncAll(dlqTime); // attempt 1 -> retry (and dlv_corrupt_key -> dead_letter!)
+      const corruptDlv = await notifCtx.notifDb.query<{ status: string; last_error: string }>(
+        "SELECT status, last_error FROM notif_deliveries WHERE id = 'dlv_corrupt_key'"
+      );
+      assert.equal(corruptDlv.rows[0].status, 'dead_letter');
+      assert.equal(corruptDlv.rows[0].last_error, 'delivery failed');
       dlqTime += 5_000;
       await runNotificationsCycle(notifCtx, dlqTime); // attempt 2 -> retry
       dlqTime += 10_000;
       await runNotificationsCycle(notifCtx, dlqTime); // attempt 3 -> dead_letter!
       forceFailEmail = false;
 
-      const dlqRes = await httpJson<{ data: Array<{ alert_type: string; attempts: number }> }>(
-        'GET',
-        `${notifUrl}/dead-letters`,
-        undefined,
-        { Authorization: `Bearer ${borrowerToken}` }
-      );
+      const dlqRes = await httpJson<{
+        data: Array<{ alert_type: string; attempts: number; last_error: string }>;
+      }>('GET', `${notifUrl}/dead-letters`, undefined, { Authorization: `Bearer ${borrowerToken}` });
       assert.equal(dlqRes.status, 200);
-      assert.ok(dlqRes.body.data.some((d) => d.alert_type === 'loan_repaid' && Number(d.attempts) === 3));
+      assert.ok(
+        dlqRes.body.data.some((d) => d.alert_type === 'loan_repaid' && Number(d.attempts) === 3)
+      );
+      for (const row of dlqRes.body.data) {
+        assert.equal(row.last_error, 'delivery failed', 'Dead-letter last_error must be generic (never leak internal errors)');
+      }
 
-      // 5D: Signed single-purpose Unsubscribe URL + tampered token rejection + HTTP body/rate hardening
+      // Per-host circuit breaker test on webhook host hooks.nostok-test.example (threshold = 3)
+      notifCtx.state.circuitBreakers.clear();
+      forceFailWebhook = true;
+      mockWebhookInvokeCount = 0;
+      const prevConcurrency = notifCfg.deliveryConcurrency;
+      notifCfg.deliveryConcurrency = 1;
+      for (let i = 1; i <= 4; i++) {
+        await notifCtx.notifDb.query(
+          `INSERT INTO notif_deliveries (
+             id, wallet, subscription_id, channel, alert_type, severity, dedup_key,
+             title, message, payload_json, status, attempts, next_attempt_at, created_at
+           ) VALUES ($1, $2, $3, 'webhook', 'loan_repaid', 'info', $4, 'cb', 'cb', '{}', 'pending', 0, $5, $5)`,
+          [
+            `dlv_cb_${i}`,
+            ADDRESSES.borrower.toLowerCase(),
+            subHook.body.id,
+            `cb_test_${i}`,
+            (dlqTime + 1_000).toString(),
+          ]
+        );
+      }
+      await runNotificationsCycle(notifCtx, dlqTime + 2_000);
+      notifCfg.deliveryConcurrency = prevConcurrency;
+      forceFailWebhook = false;
+      assert.equal(
+        mockWebhookInvokeCount,
+        3,
+        'Circuit breaker MUST open after 3 consecutive failures and skip calling transport on the 4th'
+      );
+
+      // 5D: Signed Unsubscribe: GET is read-only confirmation preview; POST mutates state
       const anyEmail = deliveredEmails.find((m) => m.subscriptionId === subEmail.body.id)!;
       const badUnsub = await fetch(`${notifUrl}/unsubscribe?token=tampered.token`);
       assert.equal(badUnsub.status, 400);
 
-      const okUnsub = await httpJson<{ unsubscribed: boolean }>(
+      const getUnsub = await httpJson<{ confirmation_required: boolean; method: string }>(
         'GET',
         anyEmail.unsubscribeUrl
       );
-      assert.equal(okUnsub.status, 200);
-      assert.equal(okUnsub.body.unsubscribed, true);
+      assert.equal(getUnsub.status, 200);
+      assert.equal(getUnsub.body.confirmation_required, true);
+      assert.equal(getUnsub.body.method, 'POST');
 
-      const subsAfterUnsub = await httpJson<{ data: Array<{ id: string; enabled: boolean }> }>(
+      const subsAfterGetUnsub = await httpJson<{ data: Array<{ id: string; enabled: boolean }> }>(
         'GET',
         `${notifUrl}/subscriptions`,
         undefined,
         { Authorization: `Bearer ${borrowerToken}` }
       );
-      assert.equal(subsAfterUnsub.body.data.find((s) => s.id === subEmail.body.id)?.enabled, false);
+      assert.equal(
+        subsAfterGetUnsub.body.data.find((s) => s.id === subEmail.body.id)?.enabled,
+        true,
+        'GET /unsubscribe MUST NOT mutate subscription state'
+      );
+
+      const unsubTokenParam = new URL(anyEmail.unsubscribeUrl).searchParams.get('token')!;
+      const postUnsub = await httpJson<{ unsubscribed: boolean }>('POST', `${notifUrl}/unsubscribe`, {
+        token: unsubTokenParam,
+      });
+      assert.equal(postUnsub.status, 200);
+      assert.equal(postUnsub.body.unsubscribed, true);
+
+      const subsAfterPostUnsub = await httpJson<{ data: Array<{ id: string; enabled: boolean }> }>(
+        'GET',
+        `${notifUrl}/subscriptions`,
+        undefined,
+        { Authorization: `Bearer ${borrowerToken}` }
+      );
+      assert.equal(subsAfterPostUnsub.body.data.find((s) => s.id === subEmail.body.id)?.enabled, false);
 
       // 5E: DELETE /user/data wipes all PII, subscriptions, preferences, deliveries, dead-letters & nonces
       const delRes = await httpJson<{ deleted: boolean }>(
@@ -1419,7 +2143,7 @@ async function runTests(): Promise<void> {
       assert.equal(hugeRes.status, 413);
       assert.equal(hugeRes.body.error.code, 'PAYLOAD_TOO_LARGE');
 
-      console.log('PASS TEST 5: Quiet hours, rate limit, DLQ retry, signed unsubscribe, DELETE /user/data, & HTTP hardening verified.');
+      console.log('PASS TEST 5: Quiet hours re-queue, critical bypass, decrypt catch, circuit breaker, generic DLQ, POST unsub, & DELETE /user/data verified.');
       console.log('\nALL WS2.6 USER NOTIFICATIONS BASE MAINNET FORK INTEGRATION TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));

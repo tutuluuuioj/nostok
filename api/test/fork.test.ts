@@ -861,9 +861,21 @@ async function runTests(): Promise<void> {
       assert.throws(() => assertReadOnlySql('SELECT /* sneaky */ 1'), /single-statement/i);
       assert.throws(() => assertReadOnlySql('SELECT U&"pg\\005fsleep"(2)'), /escaped SQL|backslash/i);
       assert.throws(() => assertReadOnlySql('SELECT u&"\\0050g_sleep"(2)'), /escaped SQL|backslash/i);
-      assert.throws(() => assertReadOnlySql("SELECT E'\\x70g_sleep'(2)"), /escaped SQL/i);
+      assert.throws(() => assertReadOnlySql("SELECT E'\\x70g_sleep'(2)"), /escaped SQL|backslash/i);
       assert.throws(() => assertReadOnlySql('SELECT pg\\005fsleep(2)'), /backslash/i);
       assert.throws(() => assertReadOnlySql('SELECT "pg_sleep"(2)'), /disallowed/i);
+      assert.throws(() => assertReadOnlySql(`SELECT 1 AS "a'b", pg_sleep(0.5), 2 AS "c'd"`), /disallowed/i);
+      assert.throws(
+        () => assertReadOnlySql(`WITH "a'b" AS (SELECT 1), x AS (DELETE FROM loans RETURNING 1), "c'd" AS (SELECT 2) SELECT 1`),
+        /disallowed/i
+      );
+      assert.throws(() => assertReadOnlySql('SELECT $tag$1$tag$'), /dollar-quoted/i);
+      assert.throws(() => assertReadOnlySql("SELECT query_to_xml('SELECT 1', true, true, '')"), /disallowed/i);
+      assert.throws(() => assertReadOnlySql("SELECT nextval('loans_seq')"), /disallowed/i);
+      assert.throws(() => assertReadOnlySql("SELECT setval('loans_seq', 1)"), /disallowed/i);
+      assert.throws(() => assertReadOnlySql('SELECT txid_current()'), /disallowed/i);
+      assert.throws(() => assertReadOnlySql('SELECT * FROM information_schema.tables'), /disallowed/i);
+      assert.throws(() => assertReadOnlySql("SELECT xpath('/a', '<a/>')"), /disallowed/i);
       await assert.rejects(() => apiCtx.db.query('UPDATE loans SET status = 0'), /SELECT/i);
 
       // Test ReadOnlyPostgresPool (postgres:// wire protocol): connection drop retry + pool error handler

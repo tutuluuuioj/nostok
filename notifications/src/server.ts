@@ -2,17 +2,22 @@ import crypto from 'node:crypto';
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
 import { type Address, type Hex, getAddress } from 'viem';
 import { ZodError } from 'zod';
-import { validateChannelTarget } from './channels.js';
+import { resolveAndValidateWebhookTarget, validateChannelTarget } from './channels.js';
 import {
+  hashVerificationCode,
   maskTarget,
+  signConfirmSubscriptionToken,
   signSessionToken,
-  verifySessionToken,
+  signUnsubscribeToken,
+  verifyConfirmSubscriptionToken,
+  verifySessionTokenClaims,
   verifyUnsubscribeToken,
 } from './crypto.js';
 import { type NotificationsContext, defaultPreferencesMap } from './engine.js';
-import { issueSiweNonce, verifySiweAuth } from './siwe.js';
+import { issueSiweNonce, parseSiweMessage, verifySiweAuth } from './siwe.js';
 import {
   buildPaginationSchema,
+  confirmSubscriptionSchema,
   createSubscriptionSchema,
   nonceRequestSchema,
   siweVerifyRequestSchema,
@@ -59,11 +64,11 @@ class IpRateLimiter {
     this.evictionTimer.unref();
   }
 
-  check(ip: string): { allowed: boolean; remaining: number; resetEpochSec: number; retryAfterSec: number } {
+  check(key: string): { allowed: boolean; remaining: number; resetEpochSec: number; retryAfterSec: number } {
     const now = Date.now();
-    let bucket = this.buckets.get(ip);
+    let bucket = this.buckets.get(key);
     if (bucket && bucket.resetAtMs <= now) {
-      this.buckets.delete(ip);
+      this.buckets.delete(key);
       bucket = undefined;
     }
     if (!bucket) {
@@ -76,7 +81,7 @@ class IpRateLimiter {
         };
       }
       bucket = { count: 0, resetAtMs: now + this.windowMs };
-      this.buckets.set(ip, bucket);
+      this.buckets.set(key, bucket);
     }
 
     bucket.count += 1;
@@ -107,9 +112,7 @@ function resolveClientIp(req: IncomingMessage, trustProxyHops: number): string {
 
 function setCorsHeaders(req: IncomingMessage, res: ServerResponse, allowedOrigins: string[]): void {
   const reqOrigin = typeof req.headers.origin === 'string' ? req.headers.origin : undefined;
-  if (allowedOrigins.includes('*')) {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-  } else if (reqOrigin && allowedOrigins.includes(reqOrigin)) {
+  if (reqOrigin && allowedOrigins.includes(reqOrigin)) {
     res.setHeader('Access-Control-Allow-Origin', reqOrigin);
     res.setHeader('Vary', 'Origin');
   }
@@ -168,19 +171,51 @@ function urlSearchParamsToObject(sp: URLSearchParams): Record<string, string> {
   return out;
 }
 
+function enforceScopedRateLimit(
+  res: ServerResponse,
+  limiter: IpRateLimiter,
+  key: string,
+  scopeLabel: string
+): void {
+  const r = limiter.check(key);
+  if (!r.allowed) {
+    res.setHeader('Retry-After', String(r.retryAfterSec));
+    throw new HttpError(
+      429,
+      'RATE_LIMIT_EXCEEDED',
+      `Rate limit exceeded for ${scopeLabel}; retry later.`
+    );
+  }
+}
+
+interface AuthenticatedCaller {
+  wallet: Address;
+  jti?: string;
+  exp?: number;
+}
+
 async function authenticateRequest(
   req: IncomingMessage,
   ctx: NotificationsContext,
   body?: unknown
-): Promise<Address> {
+): Promise<AuthenticatedCaller> {
   const auth = req.headers.authorization;
   if (auth && auth.startsWith('Bearer ')) {
     const token = auth.slice('Bearer '.length).trim();
+    let claims: { wallet: string; jti: string; exp: number };
     try {
-      return getAddress(verifySessionToken(ctx.config.sessionSecret, token));
+      claims = verifySessionTokenClaims(ctx.config.sessionSecret, token);
     } catch (err) {
       throw new HttpError(401, 'UNAUTHORIZED', err instanceof Error ? err.message : 'Invalid session token');
     }
+    const rev = await ctx.notifDb.query<{ jti: string }>(
+      'SELECT jti FROM notif_revoked_sessions WHERE jti = $1',
+      [claims.jti]
+    );
+    if (rev.rows.length > 0) {
+      throw new HttpError(401, 'SESSION_REVOKED', 'Session token has been revoked');
+    }
+    return { wallet: getAddress(claims.wallet), jti: claims.jti, exp: claims.exp };
   }
 
   // Allow direct SIWE payload when present in request body { siwe: { message, signature } }
@@ -188,13 +223,14 @@ async function authenticateRequest(
     const siweRaw = (body as { siwe?: unknown }).siwe;
     const parsedSiwe = parseOrThrow(siweVerifyRequestSchema, siweRaw);
     try {
-      return await verifySiweAuth(
+      const wallet = await verifySiweAuth(
         ctx.publicClient,
         ctx.notifDb,
         ctx.config,
         parsedSiwe.message,
         parsedSiwe.signature as Hex
       );
+      return { wallet };
     } catch (err) {
       throw new HttpError(401, 'UNAUTHORIZED', err instanceof Error ? err.message : 'SIWE verification failed');
     }
@@ -206,6 +242,36 @@ async function authenticateRequest(
 export function createNotificationsServer(ctx: NotificationsContext): http.Server {
   const rateLimiter = new IpRateLimiter(
     ctx.config.rateLimitMax,
+    ctx.config.rateLimitWindowMs,
+    ctx.config.rateLimitMaxBuckets
+  );
+  const nonceIpLimiter = new IpRateLimiter(
+    ctx.config.authNonceRateLimitMax,
+    ctx.config.rateLimitWindowMs,
+    ctx.config.rateLimitMaxBuckets
+  );
+  const nonceWalletLimiter = new IpRateLimiter(
+    ctx.config.authNonceRateLimitMax,
+    ctx.config.rateLimitWindowMs,
+    ctx.config.rateLimitMaxBuckets
+  );
+  const verifyIpLimiter = new IpRateLimiter(
+    ctx.config.authVerifyRateLimitMax,
+    ctx.config.rateLimitWindowMs,
+    ctx.config.rateLimitMaxBuckets
+  );
+  const verifyWalletLimiter = new IpRateLimiter(
+    ctx.config.authVerifyRateLimitMax,
+    ctx.config.rateLimitWindowMs,
+    ctx.config.rateLimitMaxBuckets
+  );
+  const subIpLimiter = new IpRateLimiter(
+    ctx.config.subscriptionsRateLimitMax,
+    ctx.config.rateLimitWindowMs,
+    ctx.config.rateLimitMaxBuckets
+  );
+  const subWalletLimiter = new IpRateLimiter(
+    ctx.config.subscriptionsRateLimitMax,
     ctx.config.rateLimitWindowMs,
     ctx.config.rateLimitMaxBuckets
   );
@@ -230,7 +296,8 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
       }
     }
 
-    const rl = rateLimiter.check(resolveClientIp(req, ctx.config.trustProxyHops));
+    const clientIp = resolveClientIp(req, ctx.config.trustProxyHops);
+    const rl = rateLimiter.check(clientIp);
     res.setHeader('X-RateLimit-Limit', String(ctx.config.rateLimitMax));
     res.setHeader('X-RateLimit-Remaining', String(rl.remaining));
     res.setHeader('X-RateLimit-Reset', String(rl.resetEpochSec));
@@ -276,7 +343,14 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
       }
 
       if (pathname === '/auth/nonce' && req.method === 'POST') {
+        enforceScopedRateLimit(res, nonceIpLimiter, clientIp, '/auth/nonce IP');
         const body = parseOrThrow(nonceRequestSchema, await readJsonBody(req, ctx.config.maxBodyBytes));
+        enforceScopedRateLimit(
+          res,
+          nonceWalletLimiter,
+          body.wallet_address.toLowerCase(),
+          '/auth/nonce wallet'
+        );
         const issued = await issueSiweNonce(ctx.notifDb, body.wallet_address, ctx.config);
         sendJson(res, 200, {
           nonce: issued.nonce,
@@ -289,7 +363,19 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
       }
 
       if (pathname === '/auth/verify' && req.method === 'POST') {
+        enforceScopedRateLimit(res, verifyIpLimiter, clientIp, '/auth/verify IP');
         const body = parseOrThrow(siweVerifyRequestSchema, await readJsonBody(req, ctx.config.maxBodyBytes));
+        try {
+          const parsedMsg = parseSiweMessage(body.message);
+          enforceScopedRateLimit(
+            res,
+            verifyWalletLimiter,
+            parsedMsg.address.toLowerCase(),
+            '/auth/verify wallet'
+          );
+        } catch (err) {
+          if (err instanceof HttpError) throw err;
+        }
         let wallet: Address;
         try {
           wallet = await verifySiweAuth(
@@ -306,21 +392,62 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
         sendJson(res, 200, {
           wallet_address: wallet,
           token: sess.token,
+          jti: sess.jti,
           expires_at: sess.expiresAt,
         });
         return;
       }
 
-      if (pathname === '/unsubscribe' && (req.method === 'GET' || req.method === 'POST')) {
-        let rawToken: string;
-        if (req.method === 'GET') {
-          rawToken = parseOrThrow(unsubscribeBodySchema, { token: queryObj.token }).token;
-        } else {
-          rawToken = parseOrThrow(
-            unsubscribeBodySchema,
-            await readJsonBody(req, ctx.config.maxBodyBytes)
-          ).token;
+      if (pathname === '/auth/logout' && req.method === 'POST') {
+        const caller = await authenticateRequest(req, ctx);
+        if (!caller.jti || !caller.exp) {
+          throw new HttpError(400, 'VALIDATION_ERROR', 'Bearer session token required for logout');
         }
+        const nowSec = Math.floor(Date.now() / 1000);
+        await ctx.notifDb.query(
+          `INSERT INTO notif_revoked_sessions (jti, wallet, expires_at, revoked_at)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (jti) DO NOTHING`,
+          [caller.jti, caller.wallet.toLowerCase(), caller.exp.toString(), nowSec.toString()]
+        );
+        await ctx.notifDb.query('DELETE FROM notif_revoked_sessions WHERE expires_at < $1', [
+          (nowSec - 3600).toString(),
+        ]);
+        sendJson(res, 200, { revoked: true, jti: caller.jti });
+        return;
+      }
+
+      if (pathname === '/unsubscribe' && req.method === 'GET') {
+        const rawToken = parseOrThrow(unsubscribeBodySchema, { token: queryObj.token }).token;
+        let verified: { subId: string; wallet: string };
+        try {
+          verified = verifyUnsubscribeToken(ctx.config.unsubscribeSecret, rawToken);
+        } catch (err) {
+          throw new HttpError(400, 'INVALID_UNSUBSCRIBE_TOKEN', err instanceof Error ? err.message : 'Invalid token');
+        }
+        const found = await ctx.notifDb.query<{ id: string }>(
+          'SELECT id FROM notif_subscriptions WHERE id = $1 AND LOWER(wallet) = LOWER($2)',
+          [verified.subId, verified.wallet]
+        );
+        if (found.rows.length === 0) {
+          throw new HttpError(404, 'SUBSCRIPTION_NOT_FOUND', 'Subscription not found or already deleted');
+        }
+        sendJson(res, 200, {
+          confirmation_required: true,
+          method: 'POST',
+          subscription_id: verified.subId,
+          wallet_address: getAddress(verified.wallet),
+        });
+        return;
+      }
+
+      if (pathname === '/unsubscribe' && req.method === 'POST') {
+        const rawBody = await readJsonBody(req, ctx.config.maxBodyBytes);
+        const bodyObj =
+          rawBody && typeof rawBody === 'object' && 'token' in rawBody
+            ? rawBody
+            : { token: queryObj.token };
+        const rawToken = parseOrThrow(unsubscribeBodySchema, bodyObj).token;
         let verified: { subId: string; wallet: string };
         try {
           verified = verifyUnsubscribeToken(ctx.config.unsubscribeSecret, rawToken);
@@ -346,60 +473,262 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
       }
 
       if (pathname === '/subscriptions' && req.method === 'POST') {
+        enforceScopedRateLimit(res, subIpLimiter, clientIp, '/subscriptions IP');
         const rawBody = await readJsonBody(req, ctx.config.maxBodyBytes);
-        const wallet = await authenticateRequest(req, ctx, rawBody);
+        const caller = await authenticateRequest(req, ctx, rawBody);
+        const wallet = caller.wallet;
+        enforceScopedRateLimit(res, subWalletLimiter, wallet.toLowerCase(), '/subscriptions wallet');
         const input = parseOrThrow(createSubscriptionSchema, rawBody);
 
         let normalizedTarget: string;
         try {
           normalizedTarget = validateChannelTarget(input.channel, input.target);
+          if (input.channel === 'webhook') {
+            await resolveAndValidateWebhookTarget(normalizedTarget, ctx.dnsLookup);
+          }
         } catch (err) {
           throw new HttpError(400, 'VALIDATION_ERROR', err instanceof Error ? err.message : 'Invalid target');
         }
 
         const encrypted = ctx.cipher.encrypt(normalizedTarget);
         const targetHash = ctx.cipher.computeTargetHash(wallet, input.channel, normalizedTarget);
-        const newId = `sub_${crypto.randomUUID().replace(/-/g, '')}`;
+
+        const existingSub = await ctx.notifDb.query<{ id: string }>(
+          'SELECT id FROM notif_subscriptions WHERE wallet = $1 AND channel = $2 AND target_hash = $3',
+          [wallet.toLowerCase(), input.channel, targetHash]
+        );
+        if (existingSub.rows.length === 0) {
+          const cntRes = await ctx.notifDb.query<{ cnt: number }>(
+            'SELECT COUNT(*)::INT AS cnt FROM notif_subscriptions WHERE wallet = $1',
+            [wallet.toLowerCase()]
+          );
+          if (Number(cntRes.rows[0]?.cnt ?? 0) >= ctx.config.maxSubscriptionsPerWallet) {
+            throw new HttpError(
+              400,
+              'SUBSCRIPTION_LIMIT_EXCEEDED',
+              `Wallet reached maximum cap of ${ctx.config.maxSubscriptionsPerWallet} subscriptions`
+            );
+          }
+        }
+
+        const newId = existingSub.rows[0]?.id ?? `sub_${crypto.randomUUID().replace(/-/g, '')}`;
+        const isWebhook = input.channel === 'webhook';
+        const verificationCode = isWebhook ? null : String(crypto.randomInt(100_000, 1_000_000));
+        const codeHash = verificationCode ? hashVerificationCode(verificationCode) : null;
+        const expiresAtSec = verificationCode ? Math.floor(Date.now() / 1000) + 3600 : null;
 
         const resSub = await ctx.notifDb.query<{
           id: string;
           channel: 'email' | 'telegram' | 'webhook';
           enabled: boolean;
+          verified: boolean;
         }>(
           `INSERT INTO notif_subscriptions (
-             id, wallet, channel, target_ciphertext, key_id, target_hash, enabled, updated_at
-           ) VALUES ($1, $2, $3, $4, $5, $6, TRUE, NOW())
+             id, wallet, channel, target_ciphertext, key_id, target_hash, enabled, verified,
+             verify_code_hash, verify_expires_at, updated_at
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, NOW())
            ON CONFLICT (wallet, channel, target_hash) DO UPDATE SET
              target_ciphertext = EXCLUDED.target_ciphertext,
              key_id = EXCLUDED.key_id,
-             enabled = TRUE,
+             enabled = EXCLUDED.enabled,
+             verified = EXCLUDED.verified,
+             verify_code_hash = EXCLUDED.verify_code_hash,
+             verify_expires_at = EXCLUDED.verify_expires_at,
              updated_at = NOW()
-           RETURNING id, channel, enabled`,
-          [newId, wallet.toLowerCase(), input.channel, encrypted.ciphertext, encrypted.keyId, targetHash]
+           RETURNING id, channel, enabled, verified`,
+          [
+            newId,
+            wallet.toLowerCase(),
+            input.channel,
+            encrypted.ciphertext,
+            encrypted.keyId,
+            targetHash,
+            isWebhook,
+            codeHash,
+            expiresAtSec !== null ? expiresAtSec.toString() : null,
+          ]
         );
 
+        const created = resSub.rows[0];
+        if (!isWebhook && verificationCode && codeHash) {
+          const confirmToken = signConfirmSubscriptionToken(
+            ctx.config.unsubscribeSecret,
+            created.id,
+            wallet,
+            codeHash,
+            3600
+          );
+          const confirmUrl = `${ctx.config.publicBaseUrl}/subscriptions/confirm?token=${encodeURIComponent(confirmToken)}`;
+          const unsubToken = signUnsubscribeToken(
+            ctx.config.unsubscribeSecret,
+            created.id,
+            wallet
+          );
+          const unsubscribeUrl = `${ctx.config.publicBaseUrl}/unsubscribe?token=${encodeURIComponent(unsubToken)}`;
+          const verifyMsg = {
+            wallet,
+            subscriptionId: created.id,
+            channel: input.channel,
+            target: normalizedTarget,
+            alertType: 'subscription_verification',
+            severity: 'info' as const,
+            title: 'Confirm your NOSTOK alert subscription',
+            message: `Verification code: ${verificationCode}. Confirm link: ${confirmUrl}`,
+            payload: {
+              subscription_id: created.id,
+              verification_code: verificationCode,
+              confirm_token: confirmToken,
+              confirm_url: confirmUrl,
+            },
+            unsubscribeUrl,
+          };
+          if (input.channel === 'email') {
+            await ctx.transports.sendEmail(verifyMsg);
+          } else {
+            await ctx.transports.sendTelegram(verifyMsg);
+          }
+        }
+
         sendJson(res, 201, {
-          id: resSub.rows[0].id,
+          id: created.id,
           wallet_address: wallet,
-          channel: resSub.rows[0].channel,
+          channel: created.channel,
           masked_target: maskTarget(input.channel, normalizedTarget),
           key_id: encrypted.keyId,
-          enabled: resSub.rows[0].enabled,
+          enabled: created.enabled,
+          verified: created.verified,
+          verification_required: !created.verified,
+        });
+        return;
+      }
+
+      if (pathname === '/subscriptions/confirm' && req.method === 'GET') {
+        const rawToken = parseOrThrow(unsubscribeBodySchema, { token: queryObj.token }).token;
+        let verified: { subId: string; wallet: string; codeHash: string };
+        try {
+          verified = verifyConfirmSubscriptionToken(ctx.config.unsubscribeSecret, rawToken);
+        } catch (err) {
+          throw new HttpError(400, 'VALIDATION_ERROR', err instanceof Error ? err.message : 'Invalid token');
+        }
+        sendJson(res, 200, {
+          confirmation_required: true,
+          method: 'POST',
+          subscription_id: verified.subId,
+          wallet_address: getAddress(verified.wallet),
+        });
+        return;
+      }
+
+      if (pathname === '/subscriptions/confirm' && req.method === 'POST') {
+        const rawBody = await readJsonBody(req, ctx.config.maxBodyBytes);
+        const input = parseOrThrow(confirmSubscriptionSchema, rawBody);
+        const nowSec = Math.floor(Date.now() / 1000);
+
+        if ('token' in input) {
+          let verified: { subId: string; wallet: string; codeHash: string };
+          try {
+            verified = verifyConfirmSubscriptionToken(ctx.config.unsubscribeSecret, input.token);
+          } catch (err) {
+            throw new HttpError(400, 'VALIDATION_ERROR', err instanceof Error ? err.message : 'Invalid token');
+          }
+          const subRes = await ctx.notifDb.query<{
+            id: string;
+            channel: 'email' | 'telegram' | 'webhook';
+            verify_code_hash: string | null;
+            verify_expires_at: string | null;
+          }>(
+            `SELECT id, channel, verify_code_hash, verify_expires_at::TEXT AS verify_expires_at
+             FROM notif_subscriptions
+             WHERE id = $1 AND LOWER(wallet) = LOWER($2)`,
+            [verified.subId, verified.wallet]
+          );
+          const row = subRes.rows[0];
+          if (!row) {
+            throw new HttpError(404, 'SUBSCRIPTION_NOT_FOUND', 'Subscription not found');
+          }
+          if (
+            !row.verify_code_hash ||
+            row.verify_code_hash !== verified.codeHash ||
+            !row.verify_expires_at ||
+            nowSec > Number(row.verify_expires_at)
+          ) {
+            throw new HttpError(400, 'VALIDATION_ERROR', 'Invalid or expired confirmation token');
+          }
+          await ctx.notifDb.query(
+            `UPDATE notif_subscriptions
+             SET enabled = TRUE, verified = TRUE, verify_code_hash = NULL, verify_expires_at = NULL, updated_at = NOW()
+             WHERE id = $1`,
+            [row.id]
+          );
+          sendJson(res, 200, {
+            confirmed: true,
+            id: row.id,
+            wallet_address: getAddress(verified.wallet),
+            channel: row.channel,
+            enabled: true,
+            verified: true,
+          });
+          return;
+        }
+
+        const caller = await authenticateRequest(req, ctx, rawBody);
+        const subRes = await ctx.notifDb.query<{
+          id: string;
+          channel: 'email' | 'telegram' | 'webhook';
+          verify_code_hash: string | null;
+          verify_expires_at: string | null;
+        }>(
+          `SELECT id, channel, verify_code_hash, verify_expires_at::TEXT AS verify_expires_at
+           FROM notif_subscriptions
+           WHERE id = $1 AND wallet = $2`,
+          [input.subscription_id, caller.wallet.toLowerCase()]
+        );
+        const row = subRes.rows[0];
+        if (!row) {
+          throw new HttpError(404, 'SUBSCRIPTION_NOT_FOUND', 'Subscription not found');
+        }
+        const providedHash = hashVerificationCode(input.code);
+        const aBuf = Buffer.from(providedHash, 'utf8');
+        const bBuf = Buffer.from(row.verify_code_hash ?? '', 'utf8');
+        if (
+          !row.verify_code_hash ||
+          aBuf.length !== bBuf.length ||
+          !crypto.timingSafeEqual(aBuf, bBuf) ||
+          !row.verify_expires_at ||
+          nowSec > Number(row.verify_expires_at)
+        ) {
+          throw new HttpError(400, 'VALIDATION_ERROR', 'Invalid or expired verification code');
+        }
+        await ctx.notifDb.query(
+          `UPDATE notif_subscriptions
+           SET enabled = TRUE, verified = TRUE, verify_code_hash = NULL, verify_expires_at = NULL, updated_at = NOW()
+           WHERE id = $1`,
+          [row.id]
+        );
+        sendJson(res, 200, {
+          confirmed: true,
+          id: row.id,
+          wallet_address: caller.wallet,
+          channel: row.channel,
+          enabled: true,
+          verified: true,
         });
         return;
       }
 
       if (pathname === '/subscriptions' && req.method === 'GET') {
-        const wallet = await authenticateRequest(req, ctx);
+        const caller = await authenticateRequest(req, ctx);
+        const wallet = caller.wallet;
         const rows = await ctx.notifDb.query<{
           id: string;
           channel: 'email' | 'telegram' | 'webhook';
           target_ciphertext: string;
           key_id: string;
           enabled: boolean;
+          verified: boolean;
           created_at: unknown;
         }>(
-          `SELECT id, channel, target_ciphertext, key_id, enabled, created_at
+          `SELECT id, channel, target_ciphertext, key_id, enabled, verified, created_at
            FROM notif_subscriptions
            WHERE wallet = $1
            ORDER BY created_at DESC`,
@@ -407,13 +736,22 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
         );
 
         const data = rows.rows.map((r) => {
-          const decrypted = ctx.cipher.decrypt(r.target_ciphertext, r.key_id);
+          let masked = '***';
+          let decryptionError = false;
+          try {
+            const decrypted = ctx.cipher.decrypt(r.target_ciphertext, r.key_id);
+            masked = maskTarget(r.channel, decrypted);
+          } catch {
+            decryptionError = true;
+          }
           return {
             id: r.id,
             channel: r.channel,
-            masked_target: maskTarget(r.channel, decrypted),
+            masked_target: masked,
             key_id: r.key_id,
             enabled: r.enabled,
+            verified: r.verified,
+            ...(decryptionError ? { decryption_error: true } : {}),
           };
         });
         sendJson(res, 200, { wallet_address: wallet, data });
@@ -421,7 +759,8 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
       }
 
       if (pathname === '/preferences' && req.method === 'GET') {
-        const wallet = await authenticateRequest(req, ctx);
+        const caller = await authenticateRequest(req, ctx);
+        const wallet = caller.wallet;
         const resPref = await ctx.notifDb.query<{
           alert_types_json: string;
           quiet_hours_start: number | null;
@@ -444,7 +783,8 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
 
       if (pathname === '/preferences' && req.method === 'PUT') {
         const rawBody = await readJsonBody(req, ctx.config.maxBodyBytes);
-        const wallet = await authenticateRequest(req, ctx, rawBody);
+        const caller = await authenticateRequest(req, ctx, rawBody);
+        const wallet = caller.wallet;
         const input = parseOrThrow(updatePreferencesSchema, rawBody);
 
         const existingRes = await ctx.notifDb.query<{
@@ -493,7 +833,8 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
       }
 
       if (pathname === '/deliveries' && req.method === 'GET') {
-        const wallet = await authenticateRequest(req, ctx);
+        const caller = await authenticateRequest(req, ctx);
+        const wallet = caller.wallet;
         const pag = parseOrThrow(buildPaginationSchema(ctx.config.maxPageLimit), queryObj);
         const rows = await ctx.notifDb.query<{
           id: string;
@@ -522,7 +863,8 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
       }
 
       if (pathname === '/dead-letters' && req.method === 'GET') {
-        const wallet = await authenticateRequest(req, ctx);
+        const caller = await authenticateRequest(req, ctx);
+        const wallet = caller.wallet;
         const pag = parseOrThrow(buildPaginationSchema(ctx.config.maxPageLimit), queryObj);
         const rows = await ctx.notifDb.query<{
           id: string;
@@ -532,23 +874,27 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
           alert_type: string;
           dedup_key: string;
           attempts: number;
-          last_error: string;
           failed_at: string;
         }>(
-          `SELECT id, delivery_id, subscription_id, channel, alert_type, dedup_key, attempts, last_error, failed_at::TEXT AS failed_at
+          `SELECT id, delivery_id, subscription_id, channel, alert_type, dedup_key, attempts, failed_at::TEXT AS failed_at
            FROM notif_dead_letters
            WHERE wallet = $1
            ORDER BY failed_at DESC, id ASC
            LIMIT $2 OFFSET $3`,
           [wallet.toLowerCase(), pag.limit, pag.offset]
         );
-        sendJson(res, 200, { wallet_address: wallet, data: rows.rows });
+        const data = rows.rows.map((r) => ({
+          ...r,
+          last_error: 'delivery failed',
+        }));
+        sendJson(res, 200, { wallet_address: wallet, data });
         return;
       }
 
       if (pathname === '/user/data' && req.method === 'DELETE') {
         const rawBody = await readJsonBody(req, ctx.config.maxBodyBytes);
-        const wallet = await authenticateRequest(req, ctx, rawBody);
+        const caller = await authenticateRequest(req, ctx, rawBody);
+        const wallet = caller.wallet;
         const w = wallet.toLowerCase();
 
         await ctx.notifDb.transaction(async (tx) => {
@@ -587,6 +933,12 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
 
   server.on('close', () => {
     rateLimiter.close();
+    nonceIpLimiter.close();
+    nonceWalletLimiter.close();
+    verifyIpLimiter.close();
+    verifyWalletLimiter.close();
+    subIpLimiter.close();
+    subWalletLimiter.close();
   });
 
   return server;

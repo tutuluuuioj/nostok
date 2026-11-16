@@ -90,10 +90,10 @@ export interface AssetRiskSnapshot {
   asset_cap: FormattedAmount;
   asset_outstanding_principal: FormattedAmount;
   asset_cap_utilization_bps: number;
-  escrow_balance: FormattedAmount;
-  escrow_ledger_balance: FormattedAmount;
+  escrow_balance: FormattedAmount | 'unknown';
+  escrow_ledger_balance: FormattedAmount | 'unknown';
   open_loans_collateral_sum: FormattedAmount;
-  escrow_matches_open_loans: boolean;
+  escrow_matches_open_loans: boolean | 'unknown';
 }
 
 export interface KeeperLivenessSnapshot {
@@ -616,9 +616,13 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
       const recMult = recMultRes.status === 'success' ? (recMultRes.result as bigint) : 0n;
       const uiMult = uiMultRes.status === 'success' ? (uiMultRes.result as bigint) : null;
       const assetOutstanding = assetOutRes.status === 'success' ? (assetOutRes.result as bigint) : 0n;
-      const erc20EscrowBal = erc20BalRes.status === 'success' ? (erc20BalRes.result as bigint) : 0n;
-      const escrowLedgerBal =
-        escrowLedgerRes.status === 'success' ? (escrowLedgerRes.result as bigint) : 0n;
+      const erc20EscrowBal: bigint | null =
+        erc20BalRes.status === 'success' ? (erc20BalRes.result as bigint) : null;
+      const escrowLedgerBal: bigint | null =
+        escrowLedgerRes.status === 'success' ? (escrowLedgerRes.result as bigint) : null;
+      if (erc20EscrowBal === null || escrowLedgerBal === null) {
+        ctx.state.rpcErrorsTotal += 1;
+      }
 
       let feedUpdatedAt = 0n;
       let rawFeedPrice = 0n;
@@ -661,8 +665,10 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
       const openLoanColSum = onchainOpenCollateralByAsset.get(tokenKey) ?? 0n;
       const capUtilBps =
         cfg.assetCap > 0n ? Number((assetOutstanding * 10_000n) / cfg.assetCap) : 0;
-      const escrowMatchesOpenLoans =
-        erc20EscrowBal >= escrowLedgerBal && escrowLedgerBal === openLoanColSum;
+      const escrowMatchesOpenLoans: boolean | 'unknown' =
+        erc20EscrowBal === null || escrowLedgerBal === null
+          ? 'unknown'
+          : erc20EscrowBal >= escrowLedgerBal && escrowLedgerBal === openLoanColSum;
 
       const snapshot: AssetRiskSnapshot = {
         token: tokenAddr,
@@ -684,8 +690,10 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
         asset_cap: formatAmount(cfg.assetCap, USDC_DECIMALS, 'USDC'),
         asset_outstanding_principal: formatAmount(assetOutstanding, USDC_DECIMALS, 'USDC'),
         asset_cap_utilization_bps: capUtilBps,
-        escrow_balance: formatAmount(erc20EscrowBal, tokenDecimals, symbol),
-        escrow_ledger_balance: formatAmount(escrowLedgerBal, tokenDecimals, symbol),
+        escrow_balance:
+          erc20EscrowBal !== null ? formatAmount(erc20EscrowBal, tokenDecimals, symbol) : 'unknown',
+        escrow_ledger_balance:
+          escrowLedgerBal !== null ? formatAmount(escrowLedgerBal, tokenDecimals, symbol) : 'unknown',
         open_loans_collateral_sum: formatAmount(openLoanColSum, tokenDecimals, symbol),
         escrow_matches_open_loans: escrowMatchesOpenLoans,
       };
@@ -833,9 +841,12 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
 
       // Three-way on-chain escrow invariant check:
       // 1) ERC-20 balanceOf(escrow) vs CollateralEscrow.getBalance(token) ledger vs sum(on-chain loan.collateralRaw)
-      // Completely independent of indexer lag. Shortfalls or ledger mismatches are critical; pure donation
-      // surpluses emit a bounded informational notice and auto-resolve so they never stay active forever.
-      if (!escrowMatchesOpenLoans) {
+      // Completely independent of indexer lag. If either read failed ("unknown"), skip alerting rather than
+      // defaulting to 0n. Shortfalls or ledger mismatches are critical; pure donation surpluses emit a bounded
+      // informational notice and auto-resolve so they never stay active forever.
+      if (escrowMatchesOpenLoans === 'unknown' || erc20EscrowBal === null || escrowLedgerBal === null) {
+        ctx.state.surplusSeenAtMsByAsset.delete(tokenKey);
+      } else if (!escrowMatchesOpenLoans) {
         ctx.state.surplusSeenAtMsByAsset.delete(tokenKey);
         observations.push({
           dedupKey: `escrow_mismatch:${tokenKey}`,

@@ -660,9 +660,21 @@ async function runTests(): Promise<void> {
       assert.throws(() => assertReadOnlySql('SELECT 1 -- comment'), /single-statement/i);
       assert.throws(() => assertReadOnlySql('SELECT U&"pg\\005fsleep"(2)'), /escaped SQL|backslash/i);
       assert.throws(() => assertReadOnlySql('SELECT u&"\\0050g_sleep"(2)'), /escaped SQL|backslash/i);
-      assert.throws(() => assertReadOnlySql("SELECT E'\\x70g_sleep'(2)"), /escaped SQL/i);
+      assert.throws(() => assertReadOnlySql("SELECT E'\\x70g_sleep'(2)"), /escaped SQL|backslash/i);
       assert.throws(() => assertReadOnlySql('SELECT pg\\005fsleep(2)'), /backslash/i);
       assert.throws(() => assertReadOnlySql('SELECT "pg_sleep"(2)'), /disallowed/i);
+      assert.throws(() => assertReadOnlySql(`SELECT 1 AS "a'b", pg_sleep(0.5), 2 AS "c'd"`), /disallowed/i);
+      assert.throws(
+        () => assertReadOnlySql(`WITH "a'b" AS (SELECT 1), x AS (DELETE FROM loans RETURNING 1), "c'd" AS (SELECT 2) SELECT 1`),
+        /disallowed/i
+      );
+      assert.throws(() => assertReadOnlySql('SELECT $tag$1$tag$'), /dollar-quoted/i);
+      assert.throws(() => assertReadOnlySql("SELECT query_to_xml('SELECT 1', true, true, '')"), /disallowed/i);
+      assert.throws(() => assertReadOnlySql("SELECT nextval('loans_seq')"), /disallowed/i);
+      assert.throws(() => assertReadOnlySql("SELECT setval('loans_seq', 1)"), /disallowed/i);
+      assert.throws(() => assertReadOnlySql('SELECT txid_current()'), /disallowed/i);
+      assert.throws(() => assertReadOnlySql('SELECT * FROM information_schema.tables'), /disallowed/i);
+      assert.throws(() => assertReadOnlySql("SELECT xpath('/a', '<a/>')"), /disallowed/i);
       assert.throws(
         () => loadRiskConfig({ ...riskCfg, webhookUrl: 'ftp://example.com/hook' }),
         /http:\/\/ or https:\/\//i
@@ -1034,6 +1046,23 @@ async function runTests(): Promise<void> {
       t += 5_000;
       summary = await runRiskScan(riskCtx, t);
       assert.equal(summary.assets[0].escrow_matches_open_loans, true);
+
+      // Failed getBalance read must produce "unknown" and skip escrow_mismatch alert (Fix 9)
+      const escrowSnapId = await rpcCall<string>('evm_snapshot', []);
+      try {
+        await rpcCall('anvil_setCode', [deployed.collateralEscrow, '0xfe']);
+        t += 5_000;
+        const unknownEscrowSummary = await runRiskScan(riskCtx, t);
+        assert.equal(unknownEscrowSummary.assets[0].escrow_ledger_balance, 'unknown');
+        assert.equal(unknownEscrowSummary.assets[0].escrow_matches_open_loans, 'unknown');
+        assert.equal(
+          riskCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === `escrow_mismatch:${nvdac.toLowerCase()}`),
+          false,
+          'Failed getBalance read must NOT default to 0n or fire escrow_mismatch'
+        );
+      } finally {
+        await rpcCall('evm_revert', [escrowSnapId]);
+      }
 
       // Lagging indexer test (Fix 2 & Fix 3):
       // Snapshot clean state, perform partialRepay on Loan #1 AND open+repay Loan #2 WITHOUT syncing indexer!

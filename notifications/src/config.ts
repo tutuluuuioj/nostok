@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { type Address, getAddress, isAddress } from 'viem';
+import { assertDistinctSecrets, assertSecretEntropy } from './crypto.js';
 
 export interface NotificationsConfig {
   port: number;
@@ -19,6 +20,7 @@ export interface NotificationsConfig {
   unsubscribeSecret: string;
   sessionSecret: string;
   piiHashSecret: string;
+  webhookSigningSecret: string;
   publicBaseUrl: string;
   smtpApiUrl?: string;
   smtpApiKey?: string;
@@ -30,6 +32,13 @@ export interface NotificationsConfig {
   maxDeliveryAttempts: number;
   retryBaseMs: number;
   userRateLimitPerHour: number;
+  maxSubscriptionsPerWallet: number;
+  authNonceRateLimitMax: number;
+  authVerifyRateLimitMax: number;
+  subscriptionsRateLimitMax: number;
+  deliveryConcurrency: number;
+  circuitBreakerThreshold: number;
+  circuitBreakerCooldownMs: number;
   corsOrigins: string[];
   rateLimitMax: number;
   rateLimitWindowMs: number;
@@ -53,22 +62,26 @@ function requireAddress(value: string | undefined, name: string): Address {
   return getAddress(value);
 }
 
-function requireSecret(value: string | undefined, name: string, minLen = 16): string {
+function requireSecret(value: string | undefined, name: string, minLen = 24): string {
   const clean = value?.trim();
-  if (!clean || clean.length < minLen) {
-    throw new Error(`Missing or weak ${name} (must be provided via env, min length ${minLen})`);
+  if (!clean) {
+    throw new Error(`Missing ${name} (must be provided via env, min length ${minLen})`);
   }
-  return clean;
+  return assertSecretEntropy(clean, name, { minLen, minUnique: 8, minEntropyBits: 2.8 });
 }
 
-function validateHttpUrl(raw: string, name: string): string {
+function validateHttpUrl(raw: string, name: string, requireHttps = false): string {
   let u: URL;
   try {
     u = new URL(raw);
   } catch {
     throw new Error(`Invalid URL for ${name}: ${raw}`);
   }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+  if (requireHttps) {
+    if (u.protocol !== 'https:') {
+      throw new Error(`${name} must use https:// when FORK is not enabled (got ${u.protocol})`);
+    }
+  } else if (u.protocol !== 'http:' && u.protocol !== 'https:') {
     throw new Error(`${name} must use http:// or https:// protocol (got ${u.protocol})`);
   }
   return u.toString().replace(/\/+$/, '');
@@ -92,12 +105,37 @@ function parseNonNegativeInt(raw: string | undefined, fallback: number, name: st
   return num;
 }
 
-function parseCorsOrigins(raw: string | undefined): string[] {
-  if (!raw || raw.trim() === '') return ['*'];
-  return raw
+function parseCorsOrigins(raw: string | undefined, isFork: boolean): string[] {
+  if (!raw || raw.trim() === '') {
+    if (!isFork) {
+      throw new Error('CORS_ORIGINS is required when FORK is not enabled (wildcard "*" is disallowed).');
+    }
+    return ['https://app.nostok.xyz'];
+  }
+  const origins = raw
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+  if (origins.length === 0) {
+    throw new Error('CORS_ORIGINS cannot be empty.');
+  }
+  const normalized: string[] = [];
+  for (const origin of origins) {
+    if (origin === '*') {
+      throw new Error('CORS_ORIGINS cannot contain wildcard "*". Specify explicit origin(s).');
+    }
+    let u: URL;
+    try {
+      u = new URL(origin);
+    } catch {
+      throw new Error(`Invalid CORS origin URL: ${origin}`);
+    }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+      throw new Error(`Invalid CORS origin protocol: ${origin}`);
+    }
+    normalized.push(u.origin);
+  }
+  return normalized;
 }
 
 function parseEncryptionKeys(
@@ -172,8 +210,12 @@ export function loadNotificationsConfig(
   const smtpApiUrl = smtpApiRaw && smtpApiRaw.length > 0 ? validateHttpUrl(smtpApiRaw, 'SMTP_API_URL') : undefined;
 
   const publicBaseRaw =
-    overrides.publicBaseUrl ?? (process.env.PUBLIC_BASE_URL?.trim() || `http://${host}:${port}`);
-  const publicBaseUrl = validateHttpUrl(publicBaseRaw, 'PUBLIC_BASE_URL');
+    overrides.publicBaseUrl ??
+    (process.env.PUBLIC_BASE_URL?.trim() || (isFork ? `http://${host}:${port}` : ''));
+  if (!publicBaseRaw) {
+    throw new Error('PUBLIC_BASE_URL is required and must use https:// when FORK is not enabled.');
+  }
+  const publicBaseUrl = validateHttpUrl(publicBaseRaw, 'PUBLIC_BASE_URL', !isFork);
 
   const telegramApiRaw =
     overrides.telegramApiBase ?? (process.env.TELEGRAM_API_BASE?.trim() || 'https://api.telegram.org');
@@ -187,6 +229,46 @@ export function loadNotificationsConfig(
   const encryptionKeys =
     overrides.encryptionKeys ??
     parseEncryptionKeys(process.env.ENCRYPTION_KEYS, process.env.ENCRYPTION_KEY, encryptionKeyId);
+  for (const [kId, kVal] of Object.entries(encryptionKeys)) {
+    assertSecretEntropy(kVal, `ENCRYPTION_KEYS[${kId}]`, {
+      minLen: 64,
+      minUnique: 8,
+      minEntropyBits: 2.8,
+    });
+  }
+
+  const unsubscribeSecret = requireSecret(
+    overrides.unsubscribeSecret ?? process.env.UNSUBSCRIBE_SECRET,
+    'UNSUBSCRIBE_SECRET'
+  );
+  const sessionSecret = requireSecret(
+    overrides.sessionSecret ?? process.env.SESSION_SECRET,
+    'SESSION_SECRET'
+  );
+  const piiHashSecret = requireSecret(
+    overrides.piiHashSecret ?? process.env.PII_HASH_SECRET,
+    'PII_HASH_SECRET'
+  );
+  const webhookSigningSecret = requireSecret(
+    overrides.webhookSigningSecret ?? process.env.WEBHOOK_SIGNING_SECRET,
+    'WEBHOOK_SIGNING_SECRET'
+  );
+
+  const secretCheckMap: Record<string, string> = {
+    UNSUBSCRIBE_SECRET: unsubscribeSecret,
+    SESSION_SECRET: sessionSecret,
+    PII_HASH_SECRET: piiHashSecret,
+    WEBHOOK_SIGNING_SECRET: webhookSigningSecret,
+  };
+  for (const [kId, kVal] of Object.entries(encryptionKeys)) {
+    secretCheckMap[`ENCRYPTION_KEYS[${kId}]`] = kVal;
+  }
+  assertDistinctSecrets(secretCheckMap);
+
+  const corsOrigins =
+    overrides.corsOrigins !== undefined
+      ? parseCorsOrigins(overrides.corsOrigins.join(','), isFork)
+      : parseCorsOrigins(process.env.CORS_ORIGINS, isFork);
 
   return {
     port,
@@ -207,12 +289,10 @@ export function loadNotificationsConfig(
       parsePositiveInt(process.env.SESSION_TTL_SECS, 86_400, 'SESSION_TTL_SECS'),
     encryptionKeyId,
     encryptionKeys,
-    unsubscribeSecret:
-      overrides.unsubscribeSecret ?? requireSecret(process.env.UNSUBSCRIBE_SECRET, 'UNSUBSCRIBE_SECRET'),
-    sessionSecret:
-      overrides.sessionSecret ?? requireSecret(process.env.SESSION_SECRET, 'SESSION_SECRET'),
-    piiHashSecret:
-      overrides.piiHashSecret ?? requireSecret(process.env.PII_HASH_SECRET, 'PII_HASH_SECRET'),
+    unsubscribeSecret,
+    sessionSecret,
+    piiHashSecret,
+    webhookSigningSecret,
     publicBaseUrl,
     smtpApiUrl,
     smtpApiKey: overrides.smtpApiKey ?? process.env.SMTP_API_KEY?.trim(),
@@ -232,7 +312,28 @@ export function loadNotificationsConfig(
     userRateLimitPerHour:
       overrides.userRateLimitPerHour ??
       parsePositiveInt(process.env.USER_RATE_LIMIT_PER_HOUR, 30, 'USER_RATE_LIMIT_PER_HOUR'),
-    corsOrigins: overrides.corsOrigins ?? parseCorsOrigins(process.env.CORS_ORIGINS),
+    maxSubscriptionsPerWallet:
+      overrides.maxSubscriptionsPerWallet ??
+      parsePositiveInt(process.env.MAX_SUBSCRIPTIONS_PER_WALLET, 5, 'MAX_SUBSCRIPTIONS_PER_WALLET'),
+    authNonceRateLimitMax:
+      overrides.authNonceRateLimitMax ??
+      parsePositiveInt(process.env.AUTH_NONCE_RATE_LIMIT_MAX, 20, 'AUTH_NONCE_RATE_LIMIT_MAX'),
+    authVerifyRateLimitMax:
+      overrides.authVerifyRateLimitMax ??
+      parsePositiveInt(process.env.AUTH_VERIFY_RATE_LIMIT_MAX, 20, 'AUTH_VERIFY_RATE_LIMIT_MAX'),
+    subscriptionsRateLimitMax:
+      overrides.subscriptionsRateLimitMax ??
+      parsePositiveInt(process.env.SUBSCRIPTIONS_RATE_LIMIT_MAX, 15, 'SUBSCRIPTIONS_RATE_LIMIT_MAX'),
+    deliveryConcurrency:
+      overrides.deliveryConcurrency ??
+      parsePositiveInt(process.env.DELIVERY_CONCURRENCY, 5, 'DELIVERY_CONCURRENCY'),
+    circuitBreakerThreshold:
+      overrides.circuitBreakerThreshold ??
+      parsePositiveInt(process.env.CIRCUIT_BREAKER_THRESHOLD, 3, 'CIRCUIT_BREAKER_THRESHOLD'),
+    circuitBreakerCooldownMs:
+      overrides.circuitBreakerCooldownMs ??
+      parsePositiveInt(process.env.CIRCUIT_BREAKER_COOLDOWN_MS, 30_000, 'CIRCUIT_BREAKER_COOLDOWN_MS'),
+    corsOrigins,
     rateLimitMax:
       overrides.rateLimitMax ?? parsePositiveInt(process.env.RATE_LIMIT_MAX, 120, 'RATE_LIMIT_MAX'),
     rateLimitWindowMs:

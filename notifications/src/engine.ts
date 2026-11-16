@@ -18,8 +18,11 @@ import {
 } from './abi.js';
 import {
   type ChannelTransports,
+  type DnsLookupFn,
   type NotificationChannel,
+  type WebhookHttpRequester,
   createDefaultTransports,
+  defaultDnsLookup,
 } from './channels.js';
 import type { NotificationsConfig } from './config.js';
 import { PiiCipher, signUnsubscribeToken } from './crypto.js';
@@ -42,6 +45,11 @@ export interface NotificationCandidate {
   payload: Record<string, unknown>;
 }
 
+export interface CircuitBreakerEntry {
+  consecutiveFailures: number;
+  openUntilMs: number;
+}
+
 export interface NotificationsContext {
   config: NotificationsConfig;
   publicClient: PublicClient<Transport, Chain>;
@@ -49,11 +57,13 @@ export interface NotificationsContext {
   notifDb: NotifDatabase;
   cipher: PiiCipher;
   transports: ChannelTransports;
+  dnsLookup: DnsLookupFn;
   state: {
     cycleCount: number;
     lastSyncTimestamp: string | null;
     lastError: string | null;
     lastRiskFetchOk: boolean;
+    circuitBreakers: Map<string, CircuitBreakerEntry>;
   };
 }
 
@@ -70,8 +80,12 @@ const CRITICAL_OVERRIDE_TYPES = new Set<AlertType>([
   'liquidation_started',
   'auction_settled',
   'maturity_reminder_6h',
+  'default_auction_pending',
   'asset_frozen_or_corporate_action',
 ]);
+
+const GRACE_PERIOD_SECS = 86_400n;
+const HYSTERESIS_BPS = 200;
 
 function validateChainId(chainId: number, cfg: Pick<NotificationsConfig, 'isFork' | 'forkChainId'>): void {
   if (!cfg.isFork && chainId !== 8453) {
@@ -89,6 +103,8 @@ export async function createNotificationsContext(
     notifDbOverride?: NotifDatabase;
     transportsOverride?: ChannelTransports;
     cipherOverride?: PiiCipher;
+    dnsLookupOverride?: DnsLookupFn;
+    webhookRequesterOverride?: WebhookHttpRequester;
   } = {}
 ): Promise<NotificationsContext> {
   const probeClient = createPublicClient({ transport: viemHttp(config.rpcUrl), cacheTime: 0 });
@@ -115,6 +131,7 @@ export async function createNotificationsContext(
   const cipher =
     opts.cipherOverride ??
     new PiiCipher(config.encryptionKeyId, config.encryptionKeys, config.piiHashSecret);
+  const dnsLookup = opts.dnsLookupOverride ?? defaultDnsLookup;
   const transports =
     opts.transportsOverride ??
     createDefaultTransports({
@@ -124,6 +141,9 @@ export async function createNotificationsContext(
       telegramBotToken: config.telegramBotToken,
       telegramApiBase: config.telegramApiBase,
       outboundTimeoutMs: config.outboundTimeoutMs,
+      webhookSigningSecret: config.webhookSigningSecret,
+      dnsLookup,
+      webhookRequester: opts.webhookRequesterOverride,
     });
 
   return {
@@ -133,11 +153,13 @@ export async function createNotificationsContext(
     notifDb,
     cipher,
     transports,
+    dnsLookup,
     state: {
       cycleCount: 0,
       lastSyncTimestamp: null,
       lastError: null,
       lastRiskFetchOk: false,
+      circuitBreakers: new Map(),
     },
   };
 }
@@ -161,6 +183,9 @@ interface RiskLoanApiRow {
   collateral_token: string;
   risk_status: 'healthy' | 'margin_call' | 'near_liquidation' | 'liquidatable';
   current_ltv_bps: number;
+  margin_call_ltv_bps?: number;
+  liq_ltv_bps?: number;
+  loan_status?: number;
   oracle_state: number;
   oracle_state_name: string;
   block_number: string;
@@ -216,6 +241,83 @@ async function fetchRiskMonitorState(ctx: NotificationsContext): Promise<{
   }
 }
 
+function parseEventPayload(raw: unknown): Record<string, unknown> {
+  if (!raw) return {};
+  if (typeof raw === 'string') {
+    try {
+      const p = JSON.parse(raw) as unknown;
+      return p && typeof p === 'object' ? (p as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  }
+  return typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+}
+
+async function resolveEpisodeKey(
+  db: NotifDatabase,
+  stateKey: string,
+  isTriggered: boolean,
+  shouldClear: boolean,
+  currentValueBps: number | null,
+  nowMs: number
+): Promise<string | null> {
+  const existing = await db.query<{ active: boolean; episode: number }>(
+    'SELECT active, episode FROM notif_alert_episodes WHERE state_key = $1',
+    [stateKey]
+  );
+  const row = existing.rows[0];
+  const wasActive = row?.active ?? false;
+  const prevEpisode = Number(row?.episode ?? 0);
+
+  if (isTriggered) {
+    if (!wasActive) {
+      const nextEpisode = prevEpisode + 1;
+      await db.query(
+        `INSERT INTO notif_alert_episodes (state_key, active, episode, last_value_bps, updated_at)
+         VALUES ($1, TRUE, $2, $3, $4)
+         ON CONFLICT (state_key) DO UPDATE SET
+           active = TRUE,
+           episode = EXCLUDED.episode,
+           last_value_bps = EXCLUDED.last_value_bps,
+           updated_at = EXCLUDED.updated_at`,
+        [stateKey, nextEpisode, currentValueBps, nowMs.toString()]
+      );
+      return `${stateKey}:ep:${nextEpisode}`;
+    }
+    await db.query(
+      `UPDATE notif_alert_episodes
+       SET last_value_bps = $2, updated_at = $3
+       WHERE state_key = $1`,
+      [stateKey, currentValueBps, nowMs.toString()]
+    );
+    return `${stateKey}:ep:${prevEpisode}`;
+  }
+
+  if (shouldClear && wasActive) {
+    await db.query(
+      `UPDATE notif_alert_episodes
+       SET active = FALSE, last_value_bps = $2, updated_at = $3
+       WHERE state_key = $1`,
+      [stateKey, currentValueBps, nowMs.toString()]
+    );
+  }
+  return null;
+}
+
+interface OnchainLoanSnapshot {
+  borrower: Address;
+  collateralToken: Address;
+  collateralRaw: bigint;
+  principal: bigint;
+  maturity: bigint;
+  penaltySpreadBps: number;
+  marginCallLtvBps: number;
+  liqLtvBps: number;
+  status: number;
+  principalRepaid: bigint;
+}
+
 export async function runNotificationsCycle(
   ctx: NotificationsContext,
   nowMs = Date.now()
@@ -223,7 +325,7 @@ export async function runNotificationsCycle(
   ctx.state.cycleCount += 1;
   ctx.state.lastSyncTimestamp = new Date(nowMs).toISOString();
 
-  // 1. Identify subscribed wallets and preferences
+  // 1. Identify verified, enabled subscribed wallets and preferences
   const [subRows, prefRows, cursorRes] = await Promise.all([
     ctx.notifDb.query<{
       id: string;
@@ -234,7 +336,7 @@ export async function runNotificationsCycle(
     }>(
       `SELECT id, wallet, channel, target_ciphertext, key_id
        FROM notif_subscriptions
-       WHERE enabled = TRUE`
+       WHERE enabled = TRUE AND verified = TRUE`
     ),
     ctx.notifDb.query<{
       wallet: string;
@@ -266,8 +368,8 @@ export async function runNotificationsCycle(
   let maxProcessedEventId = lastEventId;
 
   if (subscribedWallets.length > 0) {
-    // 2. Read open loans, lender owners, assets, and new events strictly via SELECT-only queries
-    const [openLoansRes, eventsRes, assetsRes, riskState, latestBlock] = await Promise.all([
+    // 2. Read open loans, auctions, assets, and new events strictly via SELECT-only queries
+    const [openLoansRes, allAuctionsRes, eventsRes, assetsRes, riskState, latestBlock] = await Promise.all([
       ctx.indexerDb.query<{
         loan_id: string;
         borrower: string;
@@ -288,6 +390,23 @@ export async function runNotificationsCycle(
          FROM loans l
          LEFT JOIN positions p ON p.loan_id = l.loan_id AND p.is_burned = FALSE
          WHERE l.status IN (0, 1, 2)`
+      ),
+      ctx.indexerDb.query<{
+        auction_id: string;
+        loan_id: string;
+        borrower: string;
+        lender: string | null;
+        nft_owner: string | null;
+      }>(
+        `SELECT
+           a.auction_id::TEXT AS auction_id,
+           a.loan_id::TEXT AS loan_id,
+           l.borrower,
+           l.lender,
+           p.owner AS nft_owner
+         FROM auctions a
+         JOIN loans l ON l.loan_id = a.loan_id
+         LEFT JOIN positions p ON p.loan_id = l.loan_id AND p.is_burned = FALSE`
       ),
       ctx.indexerDb.query<{
         id: string;
@@ -338,10 +457,92 @@ export async function runNotificationsCycle(
     const symbolByToken = new Map(
       assetsRes.rows.map((a) => [a.token.toLowerCase(), a.symbol ?? a.token])
     );
+    const assetDecMap = new Map(
+      assetsRes.rows.map((a) => [a.token.toLowerCase(), a.decimals !== null ? Number(a.decimals) : 18])
+    );
+    const auctionMetaById = new Map(
+      allAuctionsRes.rows.map((a) => [a.auction_id, a])
+    );
 
-    // Build set of open loans by wallet (for maturity countdowns, risk states, oracle/asset alerts)
-    const openLoansByAsset = new Map<string, Array<{ loan_id: string; borrower: string; lender: string | null }>>();
+    // Fetch live on-chain loan & due interest for every candidate open loan (re-verifies repaid loans)
+    const onchainByLoanId = new Map<string, { loan: OnchainLoanSnapshot; dueInt: bigint }>();
+    await Promise.all(
+      openLoansRes.rows.map(async (loan) => {
+        try {
+          const [onchainLoan, dueInt] = await Promise.all([
+            ctx.publicClient.readContract({
+              address: ctx.config.loanCore,
+              abi: loanCoreAbi,
+              functionName: 'getLoan',
+              args: [BigInt(loan.loan_id)],
+            }),
+            ctx.publicClient.readContract({
+              address: ctx.config.loanCore,
+              abi: loanCoreAbi,
+              functionName: 'getDueInterest',
+              args: [BigInt(loan.loan_id)],
+            }),
+          ]);
+          onchainByLoanId.set(loan.loan_id, {
+            loan: {
+              borrower: onchainLoan.borrower,
+              collateralToken: onchainLoan.collateralToken,
+              collateralRaw: onchainLoan.collateralRaw,
+              principal: onchainLoan.principal,
+              maturity: onchainLoan.maturity,
+              penaltySpreadBps: Number(onchainLoan.penaltySpreadBps),
+              marginCallLtvBps: Number(onchainLoan.marginCallLtvBps),
+              liqLtvBps: Number(onchainLoan.liqLtvBps),
+              status: Number(onchainLoan.status),
+              principalRepaid: onchainLoan.principalRepaid,
+            },
+            dueInt,
+          });
+        } catch (err) {
+          console.warn(
+            `[NOTIF_ONCHAIN_LOAN_WARN] Loan #${loan.loan_id}: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      })
+    );
+
+    // Build set of genuinely open loans by asset (excluding loans already repaid/closed on-chain)
+    const openLoansByAsset = new Map<
+      string,
+      Array<{ loan_id: string; borrower: string; lender: string | null }>
+    >();
+    const activeOpenLoanIds = new Set<string>();
     for (const loan of openLoansRes.rows) {
+      const oc = onchainByLoanId.get(loan.loan_id);
+      if (oc) {
+        const principalRem =
+          oc.loan.principal > oc.loan.principalRepaid
+            ? oc.loan.principal - oc.loan.principalRepaid
+            : 0n;
+        if (oc.loan.status >= 3 || principalRem === 0n || oc.loan.collateralRaw === 0n) {
+          // Clear open-loan alert episodes for loans already closed on-chain
+          await resolveEpisodeKey(ctx.notifDb, `margin_call:${loan.loan_id}`, false, true, 0, nowMs);
+          await resolveEpisodeKey(ctx.notifDb, `near_liq:${loan.loan_id}`, false, true, 0, nowMs);
+          await resolveEpisodeKey(
+            ctx.notifDb,
+            `oracle_stale:${loan.collateral_token.toLowerCase()}:${loan.loan_id}`,
+            false,
+            true,
+            null,
+            nowMs
+          );
+          await resolveEpisodeKey(
+            ctx.notifDb,
+            `asset_frozen:${loan.collateral_token.toLowerCase()}:${loan.loan_id}`,
+            false,
+            true,
+            null,
+            nowMs
+          );
+          continue;
+        }
+      }
+      activeOpenLoanIds.add(loan.loan_id);
       const tok = loan.collateral_token.toLowerCase();
       const holder = (loan.nft_owner ?? loan.lender)?.toLowerCase() ?? null;
       const arr = openLoansByAsset.get(tok) ?? [];
@@ -349,28 +550,66 @@ export async function runNotificationsCycle(
       openLoansByAsset.set(tok, arr);
     }
 
-    // 3. Process chronological events from indexer (liquidation started, auction bid, settled, repaid, claimable)
+    // 3. Process chronological events from indexer (liquidation started/restarted, bid, settled, repaid, claimable)
     for (const ev of eventsRes.rows) {
       const eid = BigInt(ev.id);
       if (eid > maxProcessedEventId) maxProcessedEventId = eid;
 
-      const borrower = ev.borrower?.toLowerCase() ?? null;
-      const lenderHolder = (ev.nft_owner ?? ev.lender)?.toLowerCase() ?? null;
+      const pl = parseEventPayload(ev.payload);
+      let resolvedLoanId = ev.loan_id;
+      let borrower = ev.borrower?.toLowerCase() ?? null;
+      let lenderHolder = (ev.nft_owner ?? ev.lender)?.toLowerCase() ?? null;
+
+      if ((!resolvedLoanId || !borrower) && pl.auctionId !== undefined) {
+        const aMeta = auctionMetaById.get(String(pl.auctionId));
+        if (aMeta) {
+          resolvedLoanId = aMeta.loan_id;
+          borrower = aMeta.borrower.toLowerCase();
+          lenderHolder = (aMeta.nft_owner ?? aMeta.lender)?.toLowerCase() ?? null;
+        }
+      }
+
       const recipients = new Set<string>();
       if (borrower && subsByWallet.has(borrower)) recipients.add(borrower);
       if (lenderHolder && subsByWallet.has(lenderHolder)) recipients.add(lenderHolder);
 
       if (ev.event_name === 'AuctionStarted') {
+        const auctionIdStr = pl.auctionId !== undefined ? String(pl.auctionId) : ev.id;
         for (const wallet of recipients) {
           candidates.push({
             wallet,
             alertType: 'liquidation_started',
             severity: 'critical',
             criticalOverride: true,
-            dedupKey: `liquidation_started:${ev.loan_id ?? ev.id}`,
-            title: `Liquidation started on Loan #${ev.loan_id ?? '?'}`,
-            message: `Loan #${ev.loan_id ?? '?'} entered liquidation auction at block ${ev.block_number}.`,
-            payload: { loan_id: ev.loan_id, event_id: ev.id, block_number: ev.block_number },
+            dedupKey: `liquidation_started:${resolvedLoanId ?? '0'}:auction:${auctionIdStr}:block:${ev.block_number}`,
+            title: `Liquidation started on Loan #${resolvedLoanId ?? '?'}`,
+            message: `Loan #${resolvedLoanId ?? '?'} entered liquidation auction #${auctionIdStr} at block ${ev.block_number}.`,
+            payload: {
+              loan_id: resolvedLoanId,
+              auction_id: auctionIdStr,
+              event_id: ev.id,
+              block_number: ev.block_number,
+            },
+          });
+        }
+      } else if (ev.event_name === 'AuctionRestarted') {
+        const auctionIdStr = pl.auctionId !== undefined ? String(pl.auctionId) : ev.id;
+        for (const wallet of recipients) {
+          candidates.push({
+            wallet,
+            alertType: 'liquidation_started',
+            severity: 'critical',
+            criticalOverride: true,
+            dedupKey: `liquidation_started:${resolvedLoanId ?? '0'}:restarted:${auctionIdStr}:block:${ev.block_number}:${ev.id}`,
+            title: `Liquidation auction restarted on Loan #${resolvedLoanId ?? '?'}`,
+            message: `Liquidation auction #${auctionIdStr} for Loan #${resolvedLoanId ?? '?'} restarted at block ${ev.block_number}.`,
+            payload: {
+              loan_id: resolvedLoanId,
+              auction_id: auctionIdStr,
+              event_id: ev.id,
+              block_number: ev.block_number,
+              restarted: true,
+            },
           });
         }
       } else if (ev.event_name === 'AuctionBought') {
@@ -381,10 +620,10 @@ export async function runNotificationsCycle(
             severity: 'info',
             criticalOverride: false,
             dedupKey: `auction_bid:${ev.id}`,
-            title: `Auction bid filled on Loan #${ev.loan_id ?? '?'}`,
-            message: `Auction fill executed (${ev.secondary_amount ?? '0'} USDC raw) for Loan #${ev.loan_id ?? '?'}.`,
+            title: `Auction bid filled on Loan #${resolvedLoanId ?? '?'}`,
+            message: `Auction fill executed (${ev.secondary_amount ?? '0'} USDC raw) for Loan #${resolvedLoanId ?? '?'}.`,
             payload: {
-              loan_id: ev.loan_id,
+              loan_id: resolvedLoanId,
               event_id: ev.id,
               usdc_paid_raw: ev.secondary_amount,
               collateral_bought_raw: ev.amount_raw,
@@ -398,10 +637,10 @@ export async function runNotificationsCycle(
             alertType: 'auction_settled',
             severity: 'critical',
             criticalOverride: true,
-            dedupKey: `auction_settled:${ev.loan_id ?? ev.id}`,
-            title: `Auction settled on Loan #${ev.loan_id ?? '?'}`,
-            message: `Auction settled for Loan #${ev.loan_id ?? '?'} (total USDC ${ev.amount_raw ?? '0'} raw).`,
-            payload: { loan_id: ev.loan_id, event_id: ev.id, total_usdc_raw: ev.amount_raw },
+            dedupKey: `auction_settled:${resolvedLoanId ?? ev.id}`,
+            title: `Auction settled on Loan #${resolvedLoanId ?? '?'}`,
+            message: `Auction settled for Loan #${resolvedLoanId ?? '?'} (total USDC ${ev.amount_raw ?? '0'} raw).`,
+            payload: { loan_id: resolvedLoanId, event_id: ev.id, total_usdc_raw: ev.amount_raw },
           });
         }
         if (lenderHolder && subsByWallet.has(lenderHolder)) {
@@ -410,10 +649,10 @@ export async function runNotificationsCycle(
             alertType: 'lender_claimable',
             severity: 'info',
             criticalOverride: false,
-            dedupKey: `lender_claimable:settled:${ev.loan_id ?? ev.id}`,
-            title: `Claimable funds available for Loan #${ev.loan_id ?? '?'}`,
-            message: `Settlement proceeds from Loan #${ev.loan_id ?? '?'} can now be claimed via LoanCore.claim().`,
-            payload: { loan_id: ev.loan_id, event_id: ev.id },
+            dedupKey: `lender_claimable:settled:${resolvedLoanId ?? ev.id}`,
+            title: `Claimable funds available for Loan #${resolvedLoanId ?? '?'}`,
+            message: `Settlement proceeds from Loan #${resolvedLoanId ?? '?'} can now be claimed via LoanCore.claim().`,
+            payload: { loan_id: resolvedLoanId, event_id: ev.id },
           });
         }
       } else if (ev.event_name === 'Repaid' || ev.event_name === 'PartialRepaid') {
@@ -426,10 +665,14 @@ export async function runNotificationsCycle(
             dedupKey: `loan_repaid:${ev.event_name}:${ev.id}`,
             title:
               ev.event_name === 'Repaid'
-                ? `Loan #${ev.loan_id ?? '?'} repaid in full`
-                : `Partial repayment on Loan #${ev.loan_id ?? '?'}`,
-            message: `Repayment recorded on Loan #${ev.loan_id ?? '?'} (principal=${ev.amount_raw ?? '0'} raw).`,
-            payload: { loan_id: ev.loan_id, event_name: ev.event_name, principal_paid_raw: ev.amount_raw },
+                ? `Loan #${resolvedLoanId ?? '?'} repaid in full`
+                : `Partial repayment on Loan #${resolvedLoanId ?? '?'}`,
+            message: `Repayment recorded on Loan #${resolvedLoanId ?? '?'} (principal=${ev.amount_raw ?? '0'} raw).`,
+            payload: {
+              loan_id: resolvedLoanId,
+              event_name: ev.event_name,
+              principal_paid_raw: ev.amount_raw,
+            },
           });
         }
         if (lenderHolder && subsByWallet.has(lenderHolder)) {
@@ -439,43 +682,77 @@ export async function runNotificationsCycle(
             severity: 'info',
             criticalOverride: false,
             dedupKey: `lender_claimable:repay:${ev.id}`,
-            title: `Lender claimable funds from Loan #${ev.loan_id ?? '?'}`,
-            message: `Repayment on Loan #${ev.loan_id ?? '?'} added claimable USDC to your lender balance.`,
-            payload: { loan_id: ev.loan_id, event_id: ev.id },
+            title: `Lender claimable funds from Loan #${resolvedLoanId ?? '?'}`,
+            message: `Repayment on Loan #${resolvedLoanId ?? '?'} added claimable USDC to your lender balance.`,
+            payload: { loan_id: resolvedLoanId, event_id: ev.id },
           });
         }
       }
     }
 
-    // 4. Risk state: consume Risk Monitor HTTP state if available, otherwise compute directly on-chain
-    const riskLoans = riskState?.loans ?? [];
+    // 4. Risk state & episode-based dedup with 200 bps hysteresis
+    const seenStaleAssetLoan = new Set<string>();
+    const seenFrozenAssetLoan = new Set<string>();
+
     if (riskState) {
-      for (const rl of riskLoans) {
+      for (const rl of riskState.loans) {
+        const oc = onchainByLoanId.get(rl.loan_id);
+        if (oc && (oc.loan.status >= 3 || oc.loan.principal <= oc.loan.principalRepaid)) {
+          continue;
+        }
         const borrower = rl.borrower.toLowerCase();
         if (!subsByWallet.has(borrower)) continue;
-        if (rl.risk_status === 'margin_call') {
+
+        const marginCallLtvBps = oc?.loan.marginCallLtvBps ?? rl.margin_call_ltv_bps ?? 7000;
+        const liqLtvBps = oc?.loan.liqLtvBps ?? rl.liq_ltv_bps ?? 7800;
+        const nearThresh = Math.max(marginCallLtvBps, liqLtvBps - 300);
+        const ltvBps = rl.current_ltv_bps;
+
+        const inMarginBand = rl.risk_status === 'margin_call';
+        const clearMargin = ltvBps <= marginCallLtvBps - HYSTERESIS_BPS;
+        const mcDedup = await resolveEpisodeKey(
+          ctx.notifDb,
+          `margin_call:${rl.loan_id}`,
+          inMarginBand,
+          clearMargin,
+          ltvBps,
+          nowMs
+        );
+        if (mcDedup) {
           candidates.push({
             wallet: borrower,
             alertType: 'loan_margin_call',
             severity: 'warning',
             criticalOverride: false,
-            dedupKey: `margin_call:${rl.loan_id}`,
+            dedupKey: mcDedup,
             title: `Margin call on Loan #${rl.loan_id}`,
-            message: `Loan #${rl.loan_id} LTV reached ${rl.current_ltv_bps} bps. Add collateral or repay to lower risk.`,
-            payload: { loan_id: rl.loan_id, current_ltv_bps: rl.current_ltv_bps },
+            message: `Loan #${rl.loan_id} LTV reached ${ltvBps} bps. Add collateral or repay to lower risk.`,
+            payload: { loan_id: rl.loan_id, current_ltv_bps: ltvBps },
           });
-        } else if (rl.risk_status === 'near_liquidation' || rl.risk_status === 'liquidatable') {
+        }
+
+        const inNearOrLiq = rl.risk_status === 'near_liquidation' || rl.risk_status === 'liquidatable';
+        const clearNear = ltvBps <= nearThresh - HYSTERESIS_BPS;
+        const nearDedup = await resolveEpisodeKey(
+          ctx.notifDb,
+          `near_liq:${rl.loan_id}`,
+          inNearOrLiq,
+          clearNear,
+          ltvBps,
+          nowMs
+        );
+        if (nearDedup) {
           candidates.push({
             wallet: borrower,
             alertType: 'loan_near_liquidation',
             severity: 'warning',
             criticalOverride: false,
-            dedupKey: `near_liq:${rl.loan_id}`,
+            dedupKey: nearDedup,
             title: `Loan #${rl.loan_id} near liquidation`,
-            message: `Loan #${rl.loan_id} LTV is ${rl.current_ltv_bps} bps (status=${rl.risk_status}). Immediate action advised.`,
+            message: `Loan #${rl.loan_id} LTV is ${ltvBps} bps (status=${rl.risk_status}). Immediate action advised.`,
             payload: {
               loan_id: rl.loan_id,
-              current_ltv_bps: rl.current_ltv_bps,
+              current_ltv_bps: ltvBps,
               risk_status: rl.risk_status,
             },
           });
@@ -483,6 +760,30 @@ export async function runNotificationsCycle(
       }
 
       for (const ra of riskState.alerts) {
+        if (ra.category === 'keeper' && ra.dedup_key.startsWith('keeper_inactive:default:')) {
+          const defLoanId = ra.dedup_key.slice('keeper_inactive:default:'.length);
+          const loanRow = openLoansRes.rows.find((l) => l.loan_id === defLoanId);
+          const oc = onchainByLoanId.get(defLoanId);
+          if (loanRow && (!oc || (oc.loan.status < 3 && oc.loan.principal > oc.loan.principalRepaid))) {
+            const b = loanRow.borrower.toLowerCase();
+            const h = (loanRow.nft_owner ?? loanRow.lender)?.toLowerCase() ?? null;
+            for (const w of [b, h]) {
+              if (!w || !subsByWallet.has(w)) continue;
+              candidates.push({
+                wallet: w,
+                alertType: 'default_auction_pending',
+                severity: 'critical',
+                criticalOverride: true,
+                dedupKey: `default_auction_pending:${defLoanId}:${loanRow.maturity}`,
+                title: `Default auction pending on Loan #${defLoanId}`,
+                message: `Loan #${defLoanId} passed maturity + 24h grace period without full repayment and awaits default auction.`,
+                payload: { loan_id: defLoanId, maturity: loanRow.maturity },
+              });
+            }
+          }
+          continue;
+        }
+
         const tok = typeof ra.details?.token === 'string' ? ra.details.token.toLowerCase() : null;
         if (!tok) continue;
         const sym = symbolByToken.get(tok) ?? tok;
@@ -493,6 +794,10 @@ export async function runNotificationsCycle(
           (ra.category === 'asset_status' && ra.dedup_key.endsWith(':frozen'))
         ) {
           for (const entry of affected) {
+            const stateKey = `asset_frozen:${tok}:${entry.loan_id}`;
+            seenFrozenAssetLoan.add(stateKey);
+            const dedupKey = await resolveEpisodeKey(ctx.notifDb, stateKey, true, false, null, nowMs);
+            if (!dedupKey) continue;
             for (const w of [entry.borrower, entry.lender]) {
               if (!w || !subsByWallet.has(w)) continue;
               candidates.push({
@@ -500,7 +805,7 @@ export async function runNotificationsCycle(
                 alertType: 'asset_frozen_or_corporate_action',
                 severity: 'critical',
                 criticalOverride: true,
-                dedupKey: `asset_frozen:${tok}:${entry.loan_id}:${ra.dedup_key}`,
+                dedupKey,
                 title: `${sym} corporate action / frozen notice (Loan #${entry.loan_id})`,
                 message: ra.message,
                 payload: { loan_id: entry.loan_id, token: tok, alert_key: ra.dedup_key },
@@ -509,6 +814,10 @@ export async function runNotificationsCycle(
           }
         } else if (ra.category === 'oracle' && ra.dedup_key.startsWith('oracle_stale:')) {
           for (const entry of affected) {
+            const stateKey = `oracle_stale:${tok}:${entry.loan_id}`;
+            seenStaleAssetLoan.add(stateKey);
+            const dedupKey = await resolveEpisodeKey(ctx.notifDb, stateKey, true, false, null, nowMs);
+            if (!dedupKey) continue;
             for (const w of [entry.borrower, entry.lender]) {
               if (!w || !subsByWallet.has(w)) continue;
               candidates.push({
@@ -516,7 +825,7 @@ export async function runNotificationsCycle(
                 alertType: 'oracle_stale',
                 severity: 'warning',
                 criticalOverride: false,
-                dedupKey: `oracle_stale:${tok}:${entry.loan_id}`,
+                dedupKey,
                 title: `Oracle stale notice for ${sym} (Loan #${entry.loan_id})`,
                 message: ra.message,
                 payload: { loan_id: entry.loan_id, token: tok },
@@ -525,30 +834,32 @@ export async function runNotificationsCycle(
           }
         }
       }
+
+      // Clear stale / frozen episodes for open loans when riskState no longer reports those alerts
+      for (const [tok, affected] of openLoansByAsset.entries()) {
+        for (const entry of affected) {
+          const staleKey = `oracle_stale:${tok}:${entry.loan_id}`;
+          if (!seenStaleAssetLoan.has(staleKey)) {
+            await resolveEpisodeKey(ctx.notifDb, staleKey, false, true, null, nowMs);
+          }
+          const frozenKey = `asset_frozen:${tok}:${entry.loan_id}`;
+          if (!seenFrozenAssetLoan.has(frozenKey)) {
+            await resolveEpisodeKey(ctx.notifDb, frozenKey, false, true, null, nowMs);
+          }
+        }
+      }
     } else {
-      // On-chain read-only fallback when RISK_API_URL is omitted/down
-      const assetDecMap = new Map(
-        assetsRes.rows.map((a) => [a.token.toLowerCase(), a.decimals !== null ? Number(a.decimals) : 18])
-      );
+      // On-chain read-only fallback when RISK_API_URL is omitted/unreachable
       for (const l of openLoansRes.rows) {
-        if (l.status >= 2) continue;
+        if (!activeOpenLoanIds.has(l.loan_id)) continue;
+        const oc = onchainByLoanId.get(l.loan_id);
+        if (!oc || oc.loan.status >= 2) continue;
+
         const tok = l.collateral_token.toLowerCase();
         const borrower = l.borrower.toLowerCase();
         const holder = (l.nft_owner ?? l.lender)?.toLowerCase() ?? null;
         try {
-          const [onchainLoan, dueInt, priceRes, cfgRes] = await Promise.all([
-            ctx.publicClient.readContract({
-              address: ctx.config.loanCore,
-              abi: loanCoreAbi,
-              functionName: 'getLoan',
-              args: [BigInt(l.loan_id)],
-            }),
-            ctx.publicClient.readContract({
-              address: ctx.config.loanCore,
-              abi: loanCoreAbi,
-              functionName: 'getDueInterest',
-              args: [BigInt(l.loan_id)],
-            }),
+          const [priceRes, cfgRes] = await Promise.all([
             ctx.publicClient.readContract({
               address: ctx.config.oracleRouter,
               abi: oracleRouterAbi,
@@ -569,7 +880,16 @@ export async function runNotificationsCycle(
           const oState = Number(priceRes[2]);
           const aStatus = Number(cfgRes.status);
 
-          if (oState === OracleState.FROZEN_CORPORATE_ACTION || aStatus === 3) {
+          const isFrozen = oState === OracleState.FROZEN_CORPORATE_ACTION || aStatus === 3;
+          const frozenDedup = await resolveEpisodeKey(
+            ctx.notifDb,
+            `asset_frozen:${tok}:${l.loan_id}`,
+            isFrozen,
+            !isFrozen,
+            null,
+            nowMs
+          );
+          if (frozenDedup) {
             for (const w of [borrower, holder]) {
               if (!w || !subsByWallet.has(w)) continue;
               candidates.push({
@@ -577,14 +897,24 @@ export async function runNotificationsCycle(
                 alertType: 'asset_frozen_or_corporate_action',
                 severity: 'critical',
                 criticalOverride: true,
-                dedupKey: `asset_frozen:${tok}:${l.loan_id}:${oState}:${aStatus}`,
+                dedupKey: frozenDedup,
                 title: `${sym} corporate action / frozen notice (Loan #${l.loan_id})`,
                 message: `${sym} collateral has oracle state ${oState} / AssetStatus ${aStatus}.`,
                 payload: { loan_id: l.loan_id, token: tok, oracle_state: oState, asset_status: aStatus },
               });
             }
           }
-          if (oState === OracleState.STALE_FEED) {
+
+          const isStale = oState === OracleState.STALE_FEED;
+          const staleDedup = await resolveEpisodeKey(
+            ctx.notifDb,
+            `oracle_stale:${tok}:${l.loan_id}`,
+            isStale,
+            !isStale,
+            null,
+            nowMs
+          );
+          if (staleDedup) {
             for (const w of [borrower, holder]) {
               if (!w || !subsByWallet.has(w)) continue;
               candidates.push({
@@ -592,7 +922,7 @@ export async function runNotificationsCycle(
                 alertType: 'oracle_stale',
                 severity: 'warning',
                 criticalOverride: false,
-                dedupKey: `oracle_stale:${tok}:${l.loan_id}`,
+                dedupKey: staleDedup,
                 title: `Oracle stale notice for ${sym} (Loan #${l.loan_id})`,
                 message: `Oracle price feed for ${sym} is STALE_FEED.`,
                 payload: { loan_id: l.loan_id, token: tok },
@@ -600,41 +930,59 @@ export async function runNotificationsCycle(
             }
           }
 
-          if (subsByWallet.has(borrower) && onchainLoan.status < 2) {
+          if (subsByWallet.has(borrower) && oc.loan.status < 2) {
             const dec = assetDecMap.get(tok) ?? 18;
             const scale = 10n ** BigInt(dec) * 10n ** BigInt(oDec);
             const grossUsdc =
-              onchainLoan.collateralRaw > 0n && oPrice > 0n
-                ? (onchainLoan.collateralRaw * oPrice * 1_000_000n) / scale
+              oc.loan.collateralRaw > 0n && oPrice > 0n
+                ? (oc.loan.collateralRaw * oPrice * 1_000_000n) / scale
                 : 0n;
             const principalRem =
-              onchainLoan.principal > onchainLoan.principalRepaid
-                ? onchainLoan.principal - onchainLoan.principalRepaid
+              oc.loan.principal > oc.loan.principalRepaid
+                ? oc.loan.principal - oc.loan.principalRepaid
                 : 0n;
-            const totalDebt = principalRem + dueInt;
+            const totalDebt = principalRem + oc.dueInt;
             const ltvBps = grossUsdc > 0n ? Number((totalDebt * 10_000n) / grossUsdc) : 100_000;
-            const nearThresh = Math.max(onchainLoan.marginCallLtvBps, onchainLoan.liqLtvBps - 300);
+            const nearThresh = Math.max(oc.loan.marginCallLtvBps, oc.loan.liqLtvBps - 300);
 
-            if (ltvBps >= nearThresh) {
-              candidates.push({
-                wallet: borrower,
-                alertType: 'loan_near_liquidation',
-                severity: 'warning',
-                criticalOverride: false,
-                dedupKey: `near_liq:${l.loan_id}`,
-                title: `Loan #${l.loan_id} near liquidation`,
-                message: `Loan #${l.loan_id} LTV is ${ltvBps} bps (liq threshold=${onchainLoan.liqLtvBps} bps).`,
-                payload: { loan_id: l.loan_id, current_ltv_bps: ltvBps },
-              });
-            } else if (ltvBps >= onchainLoan.marginCallLtvBps) {
+            const mcDedup = await resolveEpisodeKey(
+              ctx.notifDb,
+              `margin_call:${l.loan_id}`,
+              ltvBps >= oc.loan.marginCallLtvBps && ltvBps < nearThresh,
+              ltvBps <= oc.loan.marginCallLtvBps - HYSTERESIS_BPS,
+              ltvBps,
+              nowMs
+            );
+            if (mcDedup) {
               candidates.push({
                 wallet: borrower,
                 alertType: 'loan_margin_call',
                 severity: 'warning',
                 criticalOverride: false,
-                dedupKey: `margin_call:${l.loan_id}`,
+                dedupKey: mcDedup,
                 title: `Margin call on Loan #${l.loan_id}`,
                 message: `Loan #${l.loan_id} LTV reached ${ltvBps} bps.`,
+                payload: { loan_id: l.loan_id, current_ltv_bps: ltvBps },
+              });
+            }
+
+            const nearDedup = await resolveEpisodeKey(
+              ctx.notifDb,
+              `near_liq:${l.loan_id}`,
+              ltvBps >= nearThresh,
+              ltvBps <= nearThresh - HYSTERESIS_BPS,
+              ltvBps,
+              nowMs
+            );
+            if (nearDedup) {
+              candidates.push({
+                wallet: borrower,
+                alertType: 'loan_near_liquidation',
+                severity: 'warning',
+                criticalOverride: false,
+                dedupKey: nearDedup,
+                title: `Loan #${l.loan_id} near liquidation`,
+                message: `Loan #${l.loan_id} LTV is ${ltvBps} bps (liq threshold=${oc.loan.liqLtvBps} bps).`,
                 payload: { loan_id: l.loan_id, current_ltv_bps: ltvBps },
               });
             }
@@ -647,48 +995,116 @@ export async function runNotificationsCycle(
       }
     }
 
-    // 5. Maturity reminders (3d / 1d / 6h before maturity) using block.timestamp
+    // 5. Maturity reminders (re-checked strictly on-chain) & post-maturity grace/penalty/default alerts
     const blockTs = latestBlock.timestamp;
     for (const loan of openLoansRes.rows) {
-      if (loan.status !== 0) continue;
+      const oc = onchainByLoanId.get(loan.loan_id);
+      if (!oc) continue; // Do not guess maturity/default alerts without verified on-chain status
+
+      const onchainStatus = oc.loan.status;
+      const principalRem =
+        oc.loan.principal > oc.loan.principalRepaid
+          ? oc.loan.principal - oc.loan.principalRepaid
+          : 0n;
+      if (onchainStatus >= 3 || principalRem === 0n || oc.loan.collateralRaw === 0n) {
+        continue; // Repaid or settled on-chain even if indexer DB lags
+      }
+
       const borrower = loan.borrower.toLowerCase();
-      if (!subsByWallet.has(borrower)) continue;
-      const maturity = BigInt(loan.maturity);
-      if (blockTs >= maturity) continue;
-      const secsLeft = Number(maturity - blockTs);
-      if (secsLeft <= 21_600) {
-        candidates.push({
-          wallet: borrower,
-          alertType: 'maturity_reminder_6h',
-          severity: 'critical',
-          criticalOverride: true,
-          dedupKey: `maturity_6h:${loan.loan_id}:${loan.maturity}`,
-          title: `Urgent: Loan #${loan.loan_id} matures in < 6 hours`,
-          message: `Loan #${loan.loan_id} reaches maturity in ${Math.max(1, Math.floor(secsLeft / 60))} minutes.`,
-          payload: { loan_id: loan.loan_id, seconds_remaining: secsLeft, maturity: loan.maturity },
-        });
-      } else if (secsLeft <= 86_400) {
-        candidates.push({
-          wallet: borrower,
-          alertType: 'maturity_reminder_1d',
-          severity: 'warning',
-          criticalOverride: false,
-          dedupKey: `maturity_1d:${loan.loan_id}:${loan.maturity}`,
-          title: `Reminder: Loan #${loan.loan_id} matures in < 24 hours`,
-          message: `Loan #${loan.loan_id} matures in ${Math.max(1, Math.floor(secsLeft / 3600))} hours.`,
-          payload: { loan_id: loan.loan_id, seconds_remaining: secsLeft, maturity: loan.maturity },
-        });
-      } else if (secsLeft <= 259_200) {
-        candidates.push({
-          wallet: borrower,
-          alertType: 'maturity_reminder_3d',
-          severity: 'warning',
-          criticalOverride: false,
-          dedupKey: `maturity_3d:${loan.loan_id}:${loan.maturity}`,
-          title: `Reminder: Loan #${loan.loan_id} matures within 3 days`,
-          message: `Loan #${loan.loan_id} matures in ${Math.max(1, Math.floor(secsLeft / 3600))} hours.`,
-          payload: { loan_id: loan.loan_id, seconds_remaining: secsLeft, maturity: loan.maturity },
-        });
+      const holder = (loan.nft_owner ?? loan.lender)?.toLowerCase() ?? null;
+      const maturity = oc.loan.maturity;
+
+      if (onchainStatus === 0 && blockTs < maturity) {
+        if (!subsByWallet.has(borrower)) continue;
+        const secsLeft = Number(maturity - blockTs);
+        if (secsLeft <= 21_600) {
+          candidates.push({
+            wallet: borrower,
+            alertType: 'maturity_reminder_6h',
+            severity: 'critical',
+            criticalOverride: true,
+            dedupKey: `maturity_6h:${loan.loan_id}:${maturity.toString()}`,
+            title: `Urgent: Loan #${loan.loan_id} matures in < 6 hours`,
+            message: `Loan #${loan.loan_id} reaches maturity in ${Math.max(1, Math.floor(secsLeft / 60))} minutes.`,
+            payload: { loan_id: loan.loan_id, seconds_remaining: secsLeft, maturity: maturity.toString() },
+          });
+        } else if (secsLeft <= 86_400) {
+          candidates.push({
+            wallet: borrower,
+            alertType: 'maturity_reminder_1d',
+            severity: 'warning',
+            criticalOverride: false,
+            dedupKey: `maturity_1d:${loan.loan_id}:${maturity.toString()}`,
+            title: `Reminder: Loan #${loan.loan_id} matures in < 24 hours`,
+            message: `Loan #${loan.loan_id} matures in ${Math.max(1, Math.floor(secsLeft / 3600))} hours.`,
+            payload: { loan_id: loan.loan_id, seconds_remaining: secsLeft, maturity: maturity.toString() },
+          });
+        } else if (secsLeft <= 259_200) {
+          candidates.push({
+            wallet: borrower,
+            alertType: 'maturity_reminder_3d',
+            severity: 'warning',
+            criticalOverride: false,
+            dedupKey: `maturity_3d:${loan.loan_id}:${maturity.toString()}`,
+            title: `Reminder: Loan #${loan.loan_id} matures within 3 days`,
+            message: `Loan #${loan.loan_id} matures in ${Math.max(1, Math.floor(secsLeft / 3600))} hours.`,
+            payload: { loan_id: loan.loan_id, seconds_remaining: secsLeft, maturity: maturity.toString() },
+          });
+        }
+      } else if ((onchainStatus === 0 || onchainStatus === 1) && blockTs > maturity) {
+        // Post-maturity: Grace entry, penalty interest accruing, & default auction pending
+        const overdueSecs = Number(blockTs - maturity);
+        if (blockTs <= maturity + GRACE_PERIOD_SECS || onchainStatus === 1) {
+          for (const w of [borrower, holder]) {
+            if (!w || !subsByWallet.has(w)) continue;
+            candidates.push({
+              wallet: w,
+              alertType: 'loan_grace_entry',
+              severity: 'warning',
+              criticalOverride: false,
+              dedupKey: `loan_grace_entry:${loan.loan_id}:${maturity.toString()}`,
+              title: `Loan #${loan.loan_id} entered post-maturity grace period`,
+              message: `Loan #${loan.loan_id} passed maturity and entered its 24h grace window (${overdueSecs}s overdue).`,
+              payload: { loan_id: loan.loan_id, overdue_seconds: overdueSecs, maturity: maturity.toString() },
+            });
+          }
+        }
+        if (subsByWallet.has(borrower)) {
+          candidates.push({
+            wallet: borrower,
+            alertType: 'penalty_interest_accruing',
+            severity: 'warning',
+            criticalOverride: false,
+            dedupKey: `penalty_interest:${loan.loan_id}:${maturity.toString()}`,
+            title: `Penalty interest accruing on overdue Loan #${loan.loan_id}`,
+            message: `Loan #${loan.loan_id} is accruing overdue penalty interest (+${oc.loan.penaltySpreadBps} bps spread). Repay promptly to avoid default auction.`,
+            payload: {
+              loan_id: loan.loan_id,
+              penalty_spread_bps: oc.loan.penaltySpreadBps,
+              due_interest_raw: oc.dueInt.toString(),
+              overdue_seconds: overdueSecs,
+            },
+          });
+        }
+        if (blockTs > maturity + GRACE_PERIOD_SECS) {
+          for (const w of [borrower, holder]) {
+            if (!w || !subsByWallet.has(w)) continue;
+            candidates.push({
+              wallet: w,
+              alertType: 'default_auction_pending',
+              severity: 'critical',
+              criticalOverride: true,
+              dedupKey: `default_auction_pending:${loan.loan_id}:${maturity.toString()}`,
+              title: `Default auction pending on Loan #${loan.loan_id}`,
+              message: `Loan #${loan.loan_id} exceeded maturity + 24h grace period (${overdueSecs}s overdue) and is eligible for default liquidation.`,
+              payload: {
+                loan_id: loan.loan_id,
+                overdue_seconds: overdueSecs,
+                maturity: maturity.toString(),
+              },
+            });
+          }
+        }
       }
     }
 
@@ -719,14 +1135,28 @@ export async function runNotificationsCycle(
     }
   }
 
-  // 7. Filter by preferences, dedup, quiet hours (critical override), per-user hourly rate limit & enqueue
+  // 7. Filter by preferences, dedup, quiet hours (critical override), per-user hourly rate limit (critical bypasses),
+  //    re-queue suppressed rows when suppression clears, and enqueue.
   let enqueued = 0;
   let suppressedQuiet = 0;
   let suppressedRateLimit = 0;
   const nowUtcHour = new Date(nowMs).getUTCHours();
 
-  // Track in-batch per-wallet hourly counts to avoid burst bypass within a single scan
   const batchSentCountByWallet = new Map<string, number>();
+
+  async function getWalletSentLastHour(wallet: string): Promise<number> {
+    const cached = batchSentCountByWallet.get(wallet);
+    if (cached !== undefined) return cached;
+    const rlRes = await ctx.notifDb.query<{ cnt: number }>(
+      `SELECT COUNT(*)::INT AS cnt
+       FROM notif_deliveries
+       WHERE wallet = $1 AND status IN ('sent', 'pending', 'retry', 'sending') AND created_at >= $2`,
+      [wallet, (nowMs - 3_600_000).toString()]
+    );
+    const val = Number(rlRes.rows[0]?.cnt ?? 0);
+    batchSentCountByWallet.set(wallet, val);
+    return val;
+  }
 
   for (const cand of candidates) {
     const subs = subsByWallet.get(cand.wallet);
@@ -749,17 +1179,7 @@ export async function runNotificationsCycle(
       pref !== undefined &&
       isWithinQuietHours(nowUtcHour, pref.quiet_hours_start, pref.quiet_hours_end);
     const maxPerHour = pref?.max_per_hour ?? ctx.config.userRateLimitPerHour;
-
-    let walletSentLastHour = batchSentCountByWallet.get(cand.wallet);
-    if (walletSentLastHour === undefined) {
-      const rlRes = await ctx.notifDb.query<{ cnt: number }>(
-        `SELECT COUNT(*)::INT AS cnt
-         FROM notif_deliveries
-         WHERE wallet = $1 AND status IN ('sent', 'pending', 'retry') AND created_at >= $2`,
-        [cand.wallet, (nowMs - 3_600_000).toString()]
-      );
-      walletSentLastHour = Number(rlRes.rows[0]?.cnt ?? 0);
-    }
+    let walletSentLastHour = await getWalletSentLastHour(cand.wallet);
 
     const isCritical = CRITICAL_OVERRIDE_TYPES.has(cand.alertType) || cand.criticalOverride;
 
@@ -767,18 +1187,25 @@ export async function runNotificationsCycle(
       let initialStatus: string = 'pending';
       if (quietActive && !isCritical) {
         initialStatus = 'suppressed_quiet_hours';
-      } else if (walletSentLastHour >= maxPerHour) {
+      } else if (!isCritical && walletSentLastHour >= maxPerHour) {
         initialStatus = 'suppressed_rate_limit';
       }
 
       const id = `dlv_${crypto.randomUUID().replace(/-/g, '')}`;
-      const ins = await ctx.notifDb.query<{ id: string }>(
+      const ins = await ctx.notifDb.query<{ id: string; status: string }>(
         `INSERT INTO notif_deliveries (
            id, wallet, subscription_id, channel, alert_type, severity, dedup_key,
            title, message, payload_json, status, attempts, next_attempt_at, created_at
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0, $12, $12)
-         ON CONFLICT (subscription_id, dedup_key) DO NOTHING
-         RETURNING id`,
+         ON CONFLICT (subscription_id, dedup_key) DO UPDATE SET
+           status = 'pending',
+           title = EXCLUDED.title,
+           message = EXCLUDED.message,
+           payload_json = EXCLUDED.payload_json,
+           next_attempt_at = EXCLUDED.next_attempt_at
+         WHERE notif_deliveries.status IN ('suppressed_quiet_hours', 'suppressed_rate_limit')
+           AND EXCLUDED.status = 'pending'
+         RETURNING id, status`,
         [
           id,
           cand.wallet,
@@ -796,15 +1223,58 @@ export async function runNotificationsCycle(
       );
 
       if (ins.rows.length > 0) {
-        if (initialStatus === 'suppressed_quiet_hours') {
+        if (ins.rows[0].status === 'suppressed_quiet_hours') {
           suppressedQuiet++;
-        } else if (initialStatus === 'suppressed_rate_limit') {
+        } else if (ins.rows[0].status === 'suppressed_rate_limit') {
           suppressedRateLimit++;
         } else {
           enqueued++;
           walletSentLastHour++;
           batchSentCountByWallet.set(cand.wallet, walletSentLastHour);
         }
+      }
+    }
+  }
+
+  // 7b. Drain suppressed_quiet_hours deliveries automatically when quiet hours end
+  for (const wallet of subscribedWallets) {
+    const pref = prefByWallet.get(wallet);
+    const quietActive =
+      pref !== undefined &&
+      isWithinQuietHours(nowUtcHour, pref.quiet_hours_start, pref.quiet_hours_end);
+    if (quietActive) continue;
+
+    const suppressedRes = await ctx.notifDb.query<{
+      id: string;
+      alert_type: AlertType;
+      severity: 'info' | 'warning' | 'critical';
+    }>(
+      `SELECT id, alert_type, severity
+       FROM notif_deliveries
+       WHERE wallet = $1 AND status = 'suppressed_quiet_hours'
+       ORDER BY created_at ASC
+       LIMIT 100`,
+      [wallet]
+    );
+    if (suppressedRes.rows.length === 0) continue;
+
+    const maxPerHour = pref?.max_per_hour ?? ctx.config.userRateLimitPerHour;
+    let walletSentLastHour = await getWalletSentLastHour(wallet);
+    for (const row of suppressedRes.rows) {
+      const isCrit =
+        row.severity === 'critical' || CRITICAL_OVERRIDE_TYPES.has(row.alert_type);
+      if (!isCrit && walletSentLastHour >= maxPerHour) continue;
+      const upd = await ctx.notifDb.query<{ id: string }>(
+        `UPDATE notif_deliveries
+         SET status = 'pending', next_attempt_at = $2
+         WHERE id = $1 AND status = 'suppressed_quiet_hours'
+         RETURNING id`,
+        [row.id, nowMs.toString()]
+      );
+      if (upd.rows.length > 0) {
+        enqueued++;
+        walletSentLastHour++;
+        batchSentCountByWallet.set(wallet, walletSentLastHour);
       }
     }
   }
@@ -819,7 +1289,7 @@ export async function runNotificationsCycle(
     );
   }
 
-  // 8. Dispatch due pending & retry deliveries (backoff + dead-letter queue)
+  // 8. Dispatch due pending & retry deliveries (FOR UPDATE SKIP LOCKED + decrypt catch + circuit breaker + DLQ)
   const dispatchStats = await processDeliveryQueue(ctx, nowMs);
 
   return {
@@ -832,52 +1302,117 @@ export async function runNotificationsCycle(
   };
 }
 
+type ClaimedDeliveryRow = {
+  id: string;
+  wallet: string;
+  subscription_id: string;
+  channel: NotificationChannel;
+  alert_type: string;
+  severity: 'info' | 'warning' | 'critical';
+  dedup_key: string;
+  title: string;
+  message: string;
+  payload_json: string;
+  attempts: number;
+  target_ciphertext: string;
+  key_id: string;
+  sub_enabled: boolean;
+  sub_verified: boolean;
+};
+
+async function moveToDeadLetter(
+  db: NotifDatabase,
+  row: ClaimedDeliveryRow,
+  attempts: number,
+  nowMs: number
+): Promise<void> {
+  const dlqId = `dlq_${crypto.randomUUID().replace(/-/g, '')}`;
+  await db.transaction(async (tx) => {
+    await tx.query(
+      `UPDATE notif_deliveries
+       SET status = 'dead_letter', attempts = $2, last_error = 'delivery failed'
+       WHERE id = $1`,
+      [row.id, attempts]
+    );
+    await tx.query(
+      `INSERT INTO notif_dead_letters (
+         id, delivery_id, wallet, subscription_id, channel, alert_type, dedup_key,
+         payload_json, attempts, last_error, failed_at
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'delivery failed', $10)`,
+      [
+        dlqId,
+        row.id,
+        row.wallet,
+        row.subscription_id,
+        row.channel,
+        row.alert_type,
+        row.dedup_key,
+        row.payload_json,
+        attempts,
+        nowMs.toString(),
+      ]
+    );
+  });
+}
+
 export async function processDeliveryQueue(
   ctx: NotificationsContext,
   nowMs = Date.now()
 ): Promise<{ sent: number; retried: number; deadLettered: number }> {
-  const dueRes = await ctx.notifDb.query<{
-    id: string;
-    wallet: string;
-    subscription_id: string;
-    channel: NotificationChannel;
-    alert_type: string;
-    severity: 'info' | 'warning' | 'critical';
-    dedup_key: string;
-    title: string;
-    message: string;
-    payload_json: string;
-    attempts: number;
-    target_ciphertext: string;
-    key_id: string;
-    sub_enabled: boolean;
-  }>(
-    `SELECT
-       d.id, d.wallet, d.subscription_id, d.channel, d.alert_type, d.severity, d.dedup_key,
-       d.title, d.message, d.payload_json, d.attempts,
-       s.target_ciphertext, s.key_id, s.enabled AS sub_enabled
-     FROM notif_deliveries d
-     JOIN notif_subscriptions s ON s.id = d.subscription_id
-     WHERE d.status IN ('pending', 'retry') AND d.next_attempt_at <= $1
-     ORDER BY d.created_at ASC
-     LIMIT 100`,
-    [nowMs.toString()]
-  );
+  const claimed = await ctx.notifDb.transaction(async (tx) => {
+    const sel = await tx.query<ClaimedDeliveryRow>(
+      `SELECT
+         d.id, d.wallet, d.subscription_id, d.channel, d.alert_type, d.severity, d.dedup_key,
+         d.title, d.message, d.payload_json, d.attempts,
+         s.target_ciphertext, s.key_id, s.enabled AS sub_enabled, s.verified AS sub_verified
+       FROM notif_deliveries d
+       JOIN notif_subscriptions s ON s.id = d.subscription_id
+       WHERE d.status IN ('pending', 'retry') AND d.next_attempt_at <= $1
+       ORDER BY d.created_at ASC
+       LIMIT 100
+       FOR UPDATE OF d SKIP LOCKED`,
+      [nowMs.toString()]
+    );
+    for (const r of sel.rows) {
+      await tx.query("UPDATE notif_deliveries SET status = 'sending' WHERE id = $1", [r.id]);
+    }
+    return sel.rows;
+  });
 
   let sent = 0;
   let retried = 0;
   let deadLettered = 0;
+  let nextIdx = 0;
 
-  for (const row of dueRes.rows) {
-    if (!row.sub_enabled) {
-      await ctx.notifDb.query(
-        "UPDATE notif_deliveries SET status = 'unsubscribed' WHERE id = $1",
-        [row.id]
-      );
-      continue;
+  async function processOne(row: ClaimedDeliveryRow): Promise<void> {
+    if (!row.sub_enabled || !row.sub_verified) {
+      await ctx.notifDb.query("UPDATE notif_deliveries SET status = 'unsubscribed' WHERE id = $1", [
+        row.id,
+      ]);
+      return;
     }
 
-    const decryptedTarget = ctx.cipher.decrypt(row.target_ciphertext, row.key_id);
+    let decryptedTarget: string;
+    try {
+      decryptedTarget = ctx.cipher.decrypt(row.target_ciphertext, row.key_id);
+    } catch (err) {
+      console.warn(
+        `[NOTIF_DECRYPT_WARN] Unable to decrypt subscription ${row.subscription_id}: ${err instanceof Error ? err.message : String(err)}`
+      );
+      await moveToDeadLetter(ctx.notifDb, row, Number(row.attempts) + 1, nowMs);
+      deadLettered++;
+      return;
+    }
+
+    let hostKey = `channel:${row.channel}`;
+    if (row.channel === 'webhook') {
+      try {
+        hostKey = new URL(decryptedTarget).host.toLowerCase();
+      } catch {
+        hostKey = 'invalid-webhook-host';
+      }
+    }
+
     const unsubToken = signUnsubscribeToken(
       ctx.config.unsubscribeSecret,
       row.subscription_id,
@@ -905,13 +1440,20 @@ export async function processDeliveryQueue(
       message: row.message,
       payload: payloadObj,
       unsubscribeUrl,
+      timestampSec: Math.floor(nowMs / 1000),
     };
 
     try {
+      const existingBreaker = ctx.state.circuitBreakers.get(hostKey);
+      if (existingBreaker && existingBreaker.openUntilMs > nowMs) {
+        throw new Error(`Circuit breaker open for ${hostKey}`);
+      }
+
       if (row.channel === 'email') await ctx.transports.sendEmail(msg);
       else if (row.channel === 'telegram') await ctx.transports.sendTelegram(msg);
       else await ctx.transports.sendWebhook(msg);
 
+      ctx.state.circuitBreakers.set(hostKey, { consecutiveFailures: 0, openUntilMs: 0 });
       await ctx.notifDb.query(
         `UPDATE notif_deliveries
          SET status = 'sent', attempts = attempts + 1, sent_at = $2, last_error = NULL
@@ -921,50 +1463,50 @@ export async function processDeliveryQueue(
       sent++;
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
+      const isCircuitOpenErr = errMsg.startsWith('Circuit breaker open for ');
+      if (!isCircuitOpenErr) {
+        const prev = ctx.state.circuitBreakers.get(hostKey) ?? {
+          consecutiveFailures: 0,
+          openUntilMs: 0,
+        };
+        const consecutiveFailures = prev.consecutiveFailures + 1;
+        const openUntilMs =
+          consecutiveFailures >= ctx.config.circuitBreakerThreshold
+            ? nowMs + ctx.config.circuitBreakerCooldownMs
+            : 0;
+        ctx.state.circuitBreakers.set(hostKey, { consecutiveFailures, openUntilMs });
+      }
+      console.warn(
+        `[NOTIF_DELIVERY_WARN] Delivery ${row.id} (${row.channel}/${hostKey}) failed: ${errMsg}`
+      );
+
       const nextAttempts = Number(row.attempts) + 1;
       if (nextAttempts >= ctx.config.maxDeliveryAttempts) {
-        const dlqId = `dlq_${crypto.randomUUID().replace(/-/g, '')}`;
-        await ctx.notifDb.transaction(async (tx) => {
-          await tx.query(
-            `UPDATE notif_deliveries
-             SET status = 'dead_letter', attempts = $2, last_error = $3
-             WHERE id = $1`,
-            [row.id, nextAttempts, errMsg]
-          );
-          await tx.query(
-            `INSERT INTO notif_dead_letters (
-               id, delivery_id, wallet, subscription_id, channel, alert_type, dedup_key,
-               payload_json, attempts, last_error, failed_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-            [
-              dlqId,
-              row.id,
-              row.wallet,
-              row.subscription_id,
-              row.channel,
-              row.alert_type,
-              row.dedup_key,
-              row.payload_json,
-              nextAttempts,
-              errMsg,
-              nowMs.toString(),
-            ]
-          );
-        });
+        await moveToDeadLetter(ctx.notifDb, row, nextAttempts, nowMs);
         deadLettered++;
       } else {
         const delayMs = ctx.config.retryBaseMs * 2 ** (nextAttempts - 1);
         const nextAt = nowMs + delayMs;
         await ctx.notifDb.query(
           `UPDATE notif_deliveries
-           SET status = 'retry', attempts = $2, next_attempt_at = $3, last_error = $4
+           SET status = 'retry', attempts = $2, next_attempt_at = $3, last_error = 'delivery failed'
            WHERE id = $1`,
-          [row.id, nextAttempts, nextAt.toString(), errMsg]
+          [row.id, nextAttempts, nextAt.toString()]
         );
         retried++;
       }
     }
   }
+
+  const concurrency = Math.max(1, Math.min(ctx.config.deliveryConcurrency, claimed.length));
+  await Promise.all(
+    Array.from({ length: concurrency }, async () => {
+      while (nextIdx < claimed.length) {
+        const current = claimed[nextIdx++];
+        if (current) await processOne(current);
+      }
+    })
+  );
 
   return { sent, retried, deadLettered };
 }

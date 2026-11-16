@@ -10,6 +10,9 @@ export const ALL_ALERT_TYPES = [
   'maturity_reminder_3d',
   'maturity_reminder_1d',
   'maturity_reminder_6h',
+  'loan_grace_entry',
+  'penalty_interest_accruing',
+  'default_auction_pending',
   'loan_repaid',
   'lender_claimable',
   'asset_frozen_or_corporate_action',
@@ -66,6 +69,16 @@ export const updatePreferencesSchema = z
 export const unsubscribeBodySchema = z.object({
   token: z.string().trim().min(10).max(2048),
 });
+
+export const confirmSubscriptionSchema = z.union([
+  z.object({
+    token: z.string().trim().min(10).max(2048),
+  }),
+  z.object({
+    subscription_id: z.string().trim().min(4).max(128),
+    code: z.string().trim().regex(/^\d{6}$/, 'Verification code must be 6 digits'),
+  }),
+]);
 
 export function buildPaginationSchema(maxLimit: number) {
   return z
