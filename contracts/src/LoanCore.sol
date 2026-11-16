@@ -62,6 +62,8 @@ contract LoanCore is
     mapping(uint256 => uint256) public loanActiveAuction;
     mapping(uint256 => uint64) public loanLastInterestAccruedTime;
     mapping(uint256 => uint128) public loanUnpaidInterest;
+    mapping(uint256 => uint128) public loanTotalRealInterestAccrued;
+    mapping(uint256 => uint32) public loanInitialRateBps;
 
     error UnauthorizedCaller();
     error ZeroAddress();
@@ -262,6 +264,8 @@ contract LoanCore is
 
         loanLastInterestAccruedTime[loanId] = startTime;
         loanUnpaidInterest[loanId] = 0;
+        loanTotalRealInterestAccrued[loanId] = 0;
+        loanInitialRateBps[loanId] = rateBps;
 
         totalOutstandingPrincipal += principal;
         assetOutstandingPrincipal[collateralToken] += principal;
@@ -298,8 +302,9 @@ contract LoanCore is
     function _getMinInterestFloor(uint256 loanId) internal view returns (uint128) {
         Loan storage l = loans[loanId];
         uint256 minSecs = uint256(l.minInterestDays) * 1 days;
+        uint32 rate = loanInitialRateBps[loanId] > 0 ? loanInitialRateBps[loanId] : l.rateBps;
         return uint128(
-            (uint256(l.principal) * l.rateBps * minSecs + (10000 * SECONDS_PER_YEAR - 1)) /
+            (uint256(l.principal) * rate * minSecs + (10000 * SECONDS_PER_YEAR - 1)) /
                 (10000 * SECONDS_PER_YEAR)
         );
     }
@@ -360,10 +365,10 @@ contract LoanCore is
         }
 
         uint128 newAccrual = _calculateInterestAccrual(loanId, block.timestamp);
-        uint256 totalAccruedSoFar = uint256(l.interestPaid) + uint256(loanUnpaidInterest[loanId]) + uint256(newAccrual);
+        uint256 totalRealAccrued = uint256(loanTotalRealInterestAccrued[loanId]) + uint256(newAccrual);
 
         uint128 minFloor = _getMinInterestFloor(loanId);
-        uint256 totalOwed = totalAccruedSoFar < minFloor ? uint256(minFloor) : totalAccruedSoFar;
+        uint256 totalOwed = totalRealAccrued < minFloor ? uint256(minFloor) : totalRealAccrued;
 
         return totalOwed > l.interestPaid ? uint128(totalOwed - l.interestPaid) : 0;
     }
@@ -402,6 +407,8 @@ contract LoanCore is
         address holder = IPositionNFT(positionNft).ownerOf(loanId);
         claimable[holder] += (remainingPrincipal + netInterest);
 
+        uint128 newAccrual = _calculateInterestAccrual(loanId, block.timestamp);
+        loanTotalRealInterestAccrued[loanId] += newAccrual;
         l.principalRepaid = l.principal;
         l.interestPaid += interestDue;
         loanUnpaidInterest[loanId] = 0;
@@ -437,13 +444,15 @@ contract LoanCore is
 
         // 1. Accrue interest on full active principal up to now
         uint128 newAccrual = _calculateInterestAccrual(loanId, block.timestamp);
+        loanTotalRealInterestAccrued[loanId] += newAccrual;
         loanUnpaidInterest[loanId] += newAccrual;
         loanLastInterestAccruedTime[loanId] = uint64(block.timestamp);
 
         // 2. Determine pro-rata interest for the repaid portion respecting min interest floor
         uint128 minFloor = _getMinInterestFloor(loanId);
-        uint256 totalAccrued = uint256(l.interestPaid) + uint256(loanUnpaidInterest[loanId]);
-        uint256 totalDueOwed = totalAccrued < minFloor ? uint256(minFloor) - l.interestPaid : loanUnpaidInterest[loanId];
+        uint256 totalRealAccrued = uint256(loanTotalRealInterestAccrued[loanId]);
+        uint256 totalOwed = totalRealAccrued < minFloor ? uint256(minFloor) : totalRealAccrued;
+        uint256 totalDueOwed = totalOwed > l.interestPaid ? totalOwed - l.interestPaid : 0;
         uint128 interestOnRepaid = uint128((totalDueOwed * principalRepayAmount) / remainingPrincipal);
 
         loanUnpaidInterest[loanId] = loanUnpaidInterest[loanId] > interestOnRepaid
@@ -535,8 +544,10 @@ contract LoanCore is
             revert InvalidSignature();
         }
 
-        // Accrue interest up to now at old rate so new rate is not retroactive
-        loanUnpaidInterest[loanId] = getDueInterest(loanId);
+        // Accrue real interest up to now at old rate so new rate is not retroactive
+        uint128 realAccrual = _calculateInterestAccrual(loanId, block.timestamp);
+        loanTotalRealInterestAccrued[loanId] += realAccrual;
+        loanUnpaidInterest[loanId] += realAccrual;
         loanLastInterestAccruedTime[loanId] = uint64(block.timestamp);
 
         l.maturity = newMaturity;
@@ -562,6 +573,7 @@ contract LoanCore is
         uint128 debtPrincipal = l.principal - l.principalRepaid;
         uint128 debtInterest = getDueInterest(loanId);
         uint128 newAccrual = _calculateInterestAccrual(loanId, block.timestamp);
+        loanTotalRealInterestAccrued[loanId] += newAccrual;
         loanUnpaidInterest[loanId] += newAccrual;
         loanLastInterestAccruedTime[loanId] = uint64(block.timestamp);
         uint256 currentDebt = debtPrincipal + debtInterest;
@@ -611,6 +623,7 @@ contract LoanCore is
         uint128 debtPrincipal = l.principal - l.principalRepaid;
         uint128 debtInterest = getDueInterest(loanId);
         uint128 newAccrual = _calculateInterestAccrual(loanId, block.timestamp);
+        loanTotalRealInterestAccrued[loanId] += newAccrual;
         loanUnpaidInterest[loanId] += newAccrual;
         loanLastInterestAccruedTime[loanId] = uint64(block.timestamp);
 
@@ -662,6 +675,7 @@ contract LoanCore is
 
         // Accrue interest elapsed between auction checkpoint and this settlement buy
         uint128 newAccrual = _calculateInterestAccrual(loanId, block.timestamp);
+        loanTotalRealInterestAccrued[loanId] += newAccrual;
         loanUnpaidInterest[loanId] += newAccrual;
 
         l.collateralRaw -= collateralSold;

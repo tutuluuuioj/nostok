@@ -179,8 +179,13 @@ contract LiquidationAuction is
         Auction storage a = auctions[auctionId];
         if (a.status != AuctionStatus.Active) revert AuctionNotActive();
         address router = ILoanCore(loanCore).oracleRouter();
+        (, , IOracleRouter.OracleState oState) = IOracleRouter(router).getPrice(a.collateralToken);
+        bool isStaleOrFrozen = (oState == IOracleRouter.OracleState.STALE_FEED || oState == IOracleRouter.OracleState.FROZEN_CORPORATE_ACTION);
         bool marketOpen = IOracleRouter(router).isMarketOpen();
-        if (block.timestamp > a.startTime + a.duration && marketOpen) {
+
+        // Require fresh Dutch auction restart during open market unless oracle feed is stale or frozen.
+        // During closed market (weekend) or stale/frozen feeds, floor buys are permitted to prevent deadlock.
+        if (block.timestamp > a.startTime + a.duration && marketOpen && !isStaleOrFrozen) {
             revert AuctionExpired();
         }
         if (collateralAmount == 0 || collateralAmount > a.collateralRemaining) {
@@ -237,6 +242,10 @@ contract LiquidationAuction is
         }
 
         uint128 netProceeds = usdcPaid - totalFee;
+
+        // Recompute real-time due interest so zero interest is dropped between auction snapshot and buy
+        uint128 currentDueInterest = ILoanCore(loanCore).getDueInterest(a.loanId);
+        a.debtInterestRemaining = currentDueInterest;
 
         // Debt waterfall: Interest paid first, then principal
         uint128 interestPayment = netProceeds > a.debtInterestRemaining
@@ -295,6 +304,19 @@ contract LiquidationAuction is
         Auction storage a = auctions[auctionId];
         if (a.status != AuctionStatus.Active) revert AuctionNotActive();
         a.status = AuctionStatus.Cancelled;
+        emit AuctionCancelled(auctionId, a.loanId);
+    }
+
+    /**
+     * @notice Protocol guardian or owner emergency action to cancel a stuck auction if oracle is frozen or stale.
+     */
+    function emergencyCancelAuction(uint256 auctionId) external {
+        address guardian = ILoanCore(loanCore).guardian();
+        if (msg.sender != owner() && msg.sender != guardian) revert UnauthorizedCaller();
+        Auction storage a = auctions[auctionId];
+        if (a.status != AuctionStatus.Active) revert AuctionNotActive();
+        a.status = AuctionStatus.Cancelled;
+        ILoanCore(loanCore).onAuctionCancelled(a.loanId);
         emit AuctionCancelled(auctionId, a.loanId);
     }
 

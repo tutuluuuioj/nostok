@@ -601,4 +601,77 @@ contract LiquidationAuctionTest is Test {
         assertEq(stockToken.balanceOf(address(escrow)), l.collateralRaw);
         assertEq(escrow.getBalance(address(stockToken)), l.collateralRaw);
     }
+
+    function test_Auction_StaleOrFrozenWhileOpen_FloorBuyAndEmergencyCancel() public {
+        // Market is OPEN
+        vm.prank(owner);
+        router.setMarketSession(true, true);
+        assertTrue(router.isMarketOpen());
+
+        vm.prank(mockOrderSettlement);
+        uint256 loan1 = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            50e6,
+            5800e6,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        feed.setPrice(145e8);
+        vm.prank(keeper);
+        uint256 auction1 = core.startLiquidation(loan1);
+
+        // 1. Auction expires past 30 minutes, and feed becomes STALE during open market
+        vm.warp(block.timestamp + 1801);
+        feed.setUpdatedAt(block.timestamp - 90000); // Exceeds 86400s maxStaleOpenSecs
+
+        // Normal healthy feed would revert AuctionExpired(), but stale feed permits floor buy to avoid lockup
+        vm.prank(liquidator);
+        uint128 paid = auction.buy(auction1, 10e6, 20_000e6);
+        assertGt(paid, 0);
+
+        // 2. Emergency cancel by guardian when oracle is frozen or stuck
+        feed.setUpdatedAt(block.timestamp);
+        vm.prank(mockOrderSettlement);
+        uint256 loan2 = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            50e6,
+            4000e6,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        feed.setUpdatedAt(block.timestamp);
+        feed.setPrice(100e8);
+        vm.prank(keeper);
+        uint256 auction2 = core.startLiquidation(loan2);
+
+        // Freeze asset
+        vm.prank(guardian);
+        registry.setAssetStatus(address(stockToken), IAssetRegistry.AssetStatus.Frozen);
+
+        // Unauthorized caller cannot emergency cancel
+        address randomUser = address(0x9999);
+        vm.prank(randomUser);
+        vm.expectRevert(LiquidationAuction.UnauthorizedCaller.selector);
+        auction.emergencyCancelAuction(auction2);
+
+        // Protocol guardian cancels stuck auction
+        vm.prank(guardian);
+        auction.emergencyCancelAuction(auction2);
+
+        ILiquidationAuction.Auction memory a2 = auction.getAuction(auction2);
+        assertEq(uint8(a2.status), uint8(ILiquidationAuction.AuctionStatus.Cancelled));
+        assertFalse(nft.isAuctionLocked(loan2));
+    }
 }

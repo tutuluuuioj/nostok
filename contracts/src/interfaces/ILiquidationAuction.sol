@@ -79,6 +79,7 @@ interface ILiquidationAuction {
     ) external returns (uint128 usdcPaid);
 
     function cancelAuction(uint256 auctionId) external;
+    function emergencyCancelAuction(uint256 auctionId) external;
     function restartOrCancelAuction(uint256 auctionId) external;
 
     function getCurrentPrice(uint256 auctionId) external view returns (uint256 price);

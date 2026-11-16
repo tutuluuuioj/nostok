@@ -99,4 +99,5 @@ interface ILoanCore {
     function loanUnpaidInterest(uint256 loanId) external view returns (uint128);
     function oracleRouter() external view returns (address);
     function assetRegistry() external view returns (address);
+    function guardian() external view returns (address);
 }

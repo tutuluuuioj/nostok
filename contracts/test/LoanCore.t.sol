@@ -657,4 +657,89 @@ contract LoanCoreTest is Test {
         // Paid exactly principal + 3-day min interest floor (no double counting!)
         assertEq(totalPaid, 5000e6 + expected3DaysFloor);
     }
+
+    function test_ExtendInsideMinInterest_RepayAtDay2_ChargesMinFloor() public {
+        test_OpenLoan_Success();
+
+        // 3 days min interest floor on $5,000 at 8% APR = 3287672 ($3.287672)
+        uint128 expected3DaysFloor = uint128(
+            (uint256(5000e6) * 800 * 3 days + (365 days * 10000 - 1)) / (365 days * 10000)
+        );
+
+        // Day 1: Extend inside min-interest window (new rate 12% APR = 1200 bps)
+        vm.warp(block.timestamp + 1 days);
+        ILoanCore.Loan memory l0 = core.getLoan(1);
+        uint64 newMaturity = l0.maturity + 15 days;
+        uint64 deadline = uint64(block.timestamp + 1 days);
+
+        bytes32 structHash = keccak256(
+            abi.encode(EXTEND_ORDER_TYPEHASH, 1, newMaturity, 1200, 0, deadline)
+        );
+        bytes32 digest = _hashTypedData(structHash);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(lenderPrivateKey, digest);
+
+        vm.prank(borrower);
+        core.extend(1, newMaturity, 1200, deadline, abi.encodePacked(r, s, v));
+
+        // Day 2: 1 day later (total 2 days elapsed < 3 minInterestDays), borrower repays
+        vm.warp(block.timestamp + 1 days);
+
+        // Total due interest must STILL be strictly floored at 3 days, NOT 4+ days!
+        uint128 dueAtDay2 = core.getDueInterest(1);
+        assertEq(dueAtDay2, expected3DaysFloor);
+
+        usdc.mint(borrower, 6000e6);
+        vm.prank(borrower);
+        usdc.approve(address(core), type(uint256).max);
+
+        vm.prank(borrower);
+        uint128 totalPaid = core.repay(1);
+        assertEq(totalPaid, 5000e6 + expected3DaysFloor);
+    }
+
+    function test_LiquidationPlusPartialBuyInsideMinInterest_FairFloor() public {
+        test_OpenLoan_Success();
+
+        // 3 days min interest floor = 3287672
+        uint128 expected3DaysFloor = uint128(
+            (uint256(5000e6) * 800 * 3 days + (365 days * 10000 - 1)) / (365 days * 10000)
+        );
+
+        // Day 1: Liquidation triggers
+        vm.warp(block.timestamp + 1 days);
+        feed.setPrice(120e8);
+        vm.prank(keeper);
+        uint256 auctionId = core.startLiquidation(1);
+
+        // Day 1 + 15 minutes: Liquidator buys 10 shares (partial buy inside 30-min auction)
+        vm.warp(block.timestamp + 15 minutes);
+        address liquidator = address(0xCCCC);
+        usdc.mint(liquidator, 50_000e6);
+        vm.prank(liquidator);
+        usdc.approve(address(auction), type(uint256).max);
+
+        vm.prank(liquidator);
+        auction.buy(auctionId, 10e6, 20_000e6);
+
+        ILoanCore.Loan memory lPartial = core.getLoan(1);
+        uint128 interestPaidSoFar = lPartial.interestPaid;
+        assertGt(interestPaidSoFar, 0);
+
+        // Day 2 (total 2 days elapsed < 3 minInterestDays): Borrower repays remaining loan
+        vm.warp(block.timestamp + 85500);
+
+        uint128 dueAtDay2 = core.getDueInterest(1);
+        // Total interest paid + due must equal exactly the 3-day minimum floor!
+        assertEq(interestPaidSoFar + dueAtDay2, expected3DaysFloor);
+
+        usdc.mint(borrower, 6000e6);
+        vm.prank(borrower);
+        usdc.approve(address(core), type(uint256).max);
+
+        vm.prank(borrower);
+        core.repay(1);
+
+        ILoanCore.Loan memory lFinal = core.getLoan(1);
+        assertEq(lFinal.interestPaid, expected3DaysFloor);
+    }
 }

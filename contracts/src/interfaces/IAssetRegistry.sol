@@ -41,4 +41,6 @@ interface IAssetRegistry {
     function getAssetConfig(address token) external view returns (AssetConfig memory);
     function getAssetStatus(address token) external view returns (AssetStatus);
     function isAssetSupported(address token) external view returns (bool);
+    function setOracleRouter(address router) external;
+    function oracleRouter() external view returns (address);
 }

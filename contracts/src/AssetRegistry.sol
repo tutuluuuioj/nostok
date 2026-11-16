@@ -5,6 +5,7 @@ import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Ini
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {IAssetRegistry} from "./interfaces/IAssetRegistry.sol";
+import {IOracleRouter} from "./interfaces/IOracleRouter.sol";
 
 /**
  * @title AssetRegistry
@@ -12,6 +13,7 @@ import {IAssetRegistry} from "./interfaces/IAssetRegistry.sol";
  */
 contract AssetRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable, IAssetRegistry {
     address public guardian;
+    address public oracleRouter;
 
     mapping(address => AssetConfig) private _configs;
     mapping(address => bool) private _supported;
@@ -49,6 +51,11 @@ contract AssetRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable, IA
         emit GuardianUpdated(newGuardian);
     }
 
+    function setOracleRouter(address router) external onlyOwner {
+        if (router == address(0)) revert ZeroAddress();
+        oracleRouter = router;
+    }
+
     /**
      * @notice Configures risk parameters for an asset. Only owner (multisig / timelock).
      */
@@ -71,6 +78,11 @@ contract AssetRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable, IA
 
         _configs[token] = config;
         _supported[token] = true;
+
+        if (oracleRouter != address(0)) {
+            // Automatically record token baseline multiplier upon listing
+            IOracleRouter(oracleRouter).syncMultiplier(token);
+        }
 
         emit AssetConfigSet(token, config);
     }

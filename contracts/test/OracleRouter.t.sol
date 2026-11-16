@@ -217,12 +217,12 @@ contract OracleRouterTest is Test {
 
         // Real on-chain B20 token (NVDAc = 1.000537939576369481e18) does NOT freeze at launch!
         stockToken.setUiMultiplier(1000537939576369481);
+        // Baseline synced at listing
+        router.syncMultiplier(address(stockToken));
+
         (uint256 pNvidia, , IOracleRouter.OracleState stateNvidia) = router.getPrice(address(stockToken));
         assertEq(uint8(stateNvidia), uint8(IOracleRouter.OracleState.VALID_OPEN));
         assertEq(pNvidia, 180e8); // Not double-multiplied!
-
-        // Baseline synced
-        router.syncMultiplier(address(stockToken));
 
         // Normal dividend drift (+15 bps) does NOT freeze
         stockToken.setUiMultiplier(1002000000000000000);
@@ -273,10 +273,22 @@ contract OracleRouterTest is Test {
         // PMc real multiplier ~ 1.5588e18
         stockToken.setUiMultiplier(1558800000000000000);
 
-        // First read initializes baseline from token; NOT frozen at launch!
+        // Baseline synced at listing / deploy
+        router.syncMultiplier(address(stockToken));
+
         (uint256 p, , IOracleRouter.OracleState state) = router.getPrice(address(stockToken));
         assertEq(uint8(state), uint8(IOracleRouter.OracleState.VALID_OPEN));
         assertEq(p, 180e8);
+    }
+
+    function test_SplitBeforeFirstSync_Freezes() public {
+        feed.setUpdatedAt(block.timestamp);
+        // Token has split to 10e18 before ever being synced (recMult == 0)
+        stockToken.setUiMultiplier(10e18);
+
+        // Unsynced token freezes upon split
+        (, , IOracleRouter.OracleState state) = router.getPrice(address(stockToken));
+        assertEq(uint8(state), uint8(IOracleRouter.OracleState.FROZEN_CORPORATE_ACTION));
     }
 
     function test_DividendDrift_RepeatedRatchet_NotFrozen() public {

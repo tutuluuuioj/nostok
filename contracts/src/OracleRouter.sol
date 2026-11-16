@@ -306,7 +306,7 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
             if (currentMult > 0) {
                 uint256 recMult = recordedMultiplier[token];
                 if (recMult == 0) {
-                    recMult = currentMult;
+                    return (0, decimals, OracleState.FROZEN_CORPORATE_ACTION);
                 }
                 uint256 diff = currentMult > recMult ? currentMult - recMult : recMult - currentMult;
                 uint256 diffBps = (diff * 10000) / recMult;
