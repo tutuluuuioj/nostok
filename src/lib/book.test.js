@@ -215,9 +215,10 @@ assert.throws(() => {
 }, /https:\/\//);
 
 // Low CSP: exact origins instead of https: wildcard
-const prodCspHeader = buildContentSecurityPolicy(baseProdCfg);
+const prodCspHeader = buildContentSecurityPolicy(baseProdCfg, { allowDevInlineScripts: true });
 assert.ok(!/connect-src[^;]*\shttps:(?:\s|;|$)/.test(prodCspHeader), 'Prod CSP must not use https: wildcard');
 assert.ok(!prodCspHeader.includes('127.0.0.1'), 'Prod CSP must not allow loopback');
+assert.ok(!prodCspHeader.includes('unsafe-inline\'; font-src') && /script-src 'self';/.test(prodCspHeader), 'Prod script-src MUST ignore allowDevInlineScripts and stay strictly self');
 assert.ok(prodCspHeader.includes('https://base-mainnet.private-rpc.example'));
 assert.ok(prodCspHeader.includes('https://api.nostok.xyz'));
 assert.ok(prodCspHeader.includes('https://notifications.nostok.xyz'));
@@ -225,6 +226,9 @@ assert.ok(prodCspHeader.includes('https://risk.nostok.xyz'));
 assert.ok(prodCspHeader.includes("frame-ancestors 'none'"));
 const prodCspMeta = buildContentSecurityPolicy(baseProdCfg, { includeFrameAncestors: false });
 assert.ok(!prodCspMeta.includes('frame-ancestors'));
+const devCspHeader = buildContentSecurityPolicy({ ...baseProdCfg, isProd: false }, { allowDevInlineScripts: true });
+assert.ok(devCspHeader.includes("script-src 'self' 'unsafe-inline'"), 'Dev serve CSP must allow Vite React preamble inline script');
+assert.ok(devCspHeader.includes('ws://127.0.0.1:*'), 'Dev CSP must allow Vite HMR websocket');
 
 // Low Data.jsx: '+' suffix on every loan/order/auction count & sum when loansTruncated=true
 const truncSummary = buildBookSummary(

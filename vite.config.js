@@ -53,14 +53,22 @@ function resolveBestAvailableConfig(env, allowProdFallback = true) {
 
 function nostokConfigAndCspPlugin(command, mode, env) {
   let validatedBuildCfg = null;
+  const isDevServe = command === 'serve';
 
-  const attachSecurityHeaders = (middlewares) => {
+  const attachSecurityHeaders = (middlewares, { allowDevInlineScripts }) => {
     middlewares.use((_req, res, next) => {
-      const cfg = validatedBuildCfg ?? resolveBestAvailableConfig(env, true);
+      const cfg =
+        validatedBuildCfg ??
+        (allowDevInlineScripts
+          ? resolveFrontendConfigFromEnv(env, false)
+          : resolveBestAvailableConfig(env, true));
       if (cfg) {
         res.setHeader(
           'Content-Security-Policy',
-          buildContentSecurityPolicy(cfg, { includeFrameAncestors: true })
+          buildContentSecurityPolicy(cfg, {
+            includeFrameAncestors: true,
+            allowDevInlineScripts,
+          })
         );
       }
       res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -79,15 +87,20 @@ function nostokConfigAndCspPlugin(command, mode, env) {
       }
     },
     configureServer(server) {
-      attachSecurityHeaders(server.middlewares);
+      attachSecurityHeaders(server.middlewares, { allowDevInlineScripts: true });
     },
     configurePreviewServer(server) {
-      attachSecurityHeaders(server.middlewares);
+      attachSecurityHeaders(server.middlewares, { allowDevInlineScripts: false });
     },
     transformIndexHtml(html) {
-      const cfg = validatedBuildCfg ?? resolveBestAvailableConfig(env, true);
+      const cfg = isDevServe
+        ? resolveFrontendConfigFromEnv(env, false)
+        : (validatedBuildCfg ?? resolveBestAvailableConfig(env, true));
       if (!cfg) return html;
-      const metaCsp = buildContentSecurityPolicy(cfg, { includeFrameAncestors: false });
+      const metaCsp = buildContentSecurityPolicy(cfg, {
+        includeFrameAncestors: false,
+        allowDevInlineScripts: isDevServe,
+      });
       return html.replace(
         /<meta\s+http-equiv="Content-Security-Policy"\s+content="[^"]*"\s*\/?>/i,
         `<meta http-equiv="Content-Security-Policy" content="${metaCsp}" />`

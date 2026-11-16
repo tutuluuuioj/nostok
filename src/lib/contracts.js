@@ -601,7 +601,7 @@ export function getFrontendConfig() {
 
 export function buildContentSecurityPolicy(
   cfg = getFrontendConfig(),
-  { includeFrameAncestors = true } = {}
+  { includeFrameAncestors = true, allowDevInlineScripts = false } = {}
 ) {
   const connectSources = new Set(["'self'"]);
   const urls = [cfg?.rpcUrl, cfg?.apiUrl, cfg?.notificationsUrl, cfg?.riskUrl, cfg?.siweOrigin];
@@ -619,10 +619,14 @@ export function buildContentSecurityPolicy(
   if (!cfg?.isProd) {
     connectSources.add('http://127.0.0.1:*');
     connectSources.add('http://localhost:*');
+    connectSources.add('ws://127.0.0.1:*');
+    connectSources.add('ws://localhost:*');
   }
+  const scriptSrc =
+    !cfg?.isProd && allowDevInlineScripts ? "script-src 'self' 'unsafe-inline'" : "script-src 'self'";
   const directives = [
     "default-src 'self'",
-    "script-src 'self'",
+    scriptSrc,
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data:",
     "font-src 'self' data:",
