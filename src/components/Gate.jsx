@@ -6,19 +6,20 @@ const CHECKS = [
   ['escrow', 'I understand the stock sits in escrow, and the lender receives a Position NFT, not the stock.'],
   ['surplus', 'I understand a default sells only enough collateral, and any surplus comes back to the borrower.'],
   ['oracle', 'I understand liquidation does not run when the market is closed, the oracle is stale, or the asset is frozen.'],
-  ['preview', 'I understand this preview sends no transaction and moves no funds.'],
+  ['onchain', 'I understand orders and settlements interact with real NOSTOK smart contracts on Base.'],
 ];
 
 export function Gate() {
-  const { act } = useStore();
+  const { act, web3 } = useStore();
   const [region, setRegion] = useState('');
   const [checks, setChecks] = useState({});
   const eligible = region === 'eligible';
-  const ready = eligible && CHECKS.every(([id]) => checks[id]);
+  const walletRevoked = Boolean(web3?.walletState?.eligibility?.isRevoked);
+  const ready = eligible && !walletRevoked && CHECKS.every(([id]) => checks[id]);
 
   function submit(event) {
     event.preventDefault();
-    if (region === 'restricted') {
+    if (region === 'restricted' || walletRevoked) {
       act({ type: 'restrict' });
       return;
     }
@@ -31,7 +32,7 @@ export function Gate() {
       <p className="kicker">Eligibility</p>
       <h1>Eligible persons outside the United States.</h1>
       <p className="lede">
-        Tokenized stocks on Base are offered only to eligible non-US persons. This interface asks you to confirm that before you see a loan.
+        Tokenized stocks on Base are offered only to eligible non-US persons. Confirm your eligibility and review protocol mechanics before entering the desk.
       </p>
       <form onSubmit={submit}>
         <fieldset>
@@ -60,10 +61,29 @@ export function Gate() {
             ))}
           </fieldset>
         ) : null}
-        {region === 'restricted' ? (
-          <p className="lede">US persons and sanctioned jurisdictions cannot use this interface.</p>
+        {web3?.connected ? (
+          <div className="note">
+            <p className="hint">
+              On-chain EligibilityGate check for {web3.address}:{' '}
+              {web3.walletState?.eligibility
+                ? web3.walletState.eligibility.isRevoked
+                  ? 'REVOKED — address cannot enter'
+                  : web3.walletState.eligibility.isEligible
+                    ? 'Eligible'
+                    : 'Allowlist or signed attestation required for settlement'
+                : 'Awaiting EligibilityGate read'}
+            </p>
+          </div>
+        ) : null}
+        {region === 'restricted' || walletRevoked ? (
+          <p className="err">US persons, sanctioned jurisdictions, and revoked addresses cannot use this interface.</p>
         ) : null}
         <div className="actions">
+          {!web3?.connected ? (
+            <button className="btn secondary" type="button" onClick={() => void web3?.connect()}>
+              Check connected wallet
+            </button>
+          ) : null}
           <button className="btn" type="submit" disabled={!region || (eligible && !ready)}>
             {region === 'restricted' ? 'Continue' : 'Enter NOSTOK'}
           </button>
@@ -81,10 +101,7 @@ export function Restricted() {
       <p className="kicker">Unavailable</p>
       <h1>This interface is not available here.</h1>
       <p className="lede">
-        NOSTOK does not offer stock-backed loans to US persons or to sanctioned jurisdictions. The contracts are not shown from this region.
-      </p>
-      <p className="lede">
-        In production this page is the end of the road. This preview lets you return so the block can be checked.
+        NOSTOK does not offer stock-backed loans to US persons or to sanctioned jurisdictions. The contracts are not accessible from restricted regions.
       </p>
       <div className="actions">
         <button className="btn secondary" type="button" onClick={() => act({ type: 'reset-gate' })}>

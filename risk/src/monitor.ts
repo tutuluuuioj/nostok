@@ -275,6 +275,14 @@ export async function createRiskContext(
   };
 }
 
+function preserveLoanAlertKeys(preserveKeys: Set<string>, loanId: string): void {
+  for (const suffix of ['liquidatable', 'near_liq', 'margin_call', 'default_overdue', 'in_grace']) {
+    preserveKeys.add(`loan_risk:${loanId}:${suffix}`);
+  }
+  preserveKeys.add(`keeper_inactive:loan:${loanId}`);
+  preserveKeys.add(`keeper_inactive:default:${loanId}`);
+}
+
 export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise<RiskSummarySnapshot> {
   ctx.state.scanCount += 1;
   const nowIso = new Date(nowMs).toISOString();
@@ -529,6 +537,8 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
         : [];
 
     const onchainOpenCollateralByAsset = new Map<string, bigint>();
+    const activeLiquidatableIds = new Set<string>();
+    let anyLoanReadFailed = false;
     const liveOnchainLoans: Array<{
       loanId: string;
       onchainLoan: {
@@ -549,6 +559,11 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
       const loanRes = loanMcRes[i * 2];
       const dueIntRes = loanMcRes[i * 2 + 1];
       if (!loanRes || !dueIntRes || loanRes.status === 'failure' || dueIntRes.status === 'failure') {
+        anyLoanReadFailed = true;
+        ctx.state.rpcErrorsTotal += 1;
+        const failedLoanId = candidateLoanIds[i].toString();
+        preserveLoanAlertKeys(preserveKeys, failedLoanId);
+        activeLiquidatableIds.add(failedLoanId);
         continue;
       }
       const onchainLoan = loanRes.result as {
@@ -685,7 +700,7 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
       const capUtilBps =
         cfg.assetCap > 0n ? Number((assetOutstanding * 10_000n) / cfg.assetCap) : 0;
       const escrowMatchesOpenLoans: boolean | 'unknown' =
-        erc20EscrowBal === null || escrowLedgerBal === null
+        anyLoanReadFailed || erc20EscrowBal === null || escrowLedgerBal === null
           ? 'unknown'
           : erc20EscrowBal >= escrowLedgerBal && escrowLedgerBal === openLoanColSum;
 
@@ -992,7 +1007,6 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
     }
 
     // Evaluate per-loan risk metrics matching LoanCore.startLiquidation & startDefaultAuction using 100% ON-CHAIN state
-    const activeLiquidatableIds = new Set<string>();
     const unactedLiquidatable: Array<{ loan_id: string; stalled_seconds: number }> = [];
     const unactedDefaulted: Array<{ loan_id: string; stalled_seconds: number }> = [];
 
@@ -1008,6 +1022,11 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
 
       const tokenKey = onchainLoan.collateralToken.toLowerCase();
       const assetSnap = assetByLower.get(tokenKey);
+      if (!assetSnap) {
+        preserveLoanAlertKeys(preserveKeys, loanId);
+        activeLiquidatableIds.add(loanId);
+        continue;
+      }
       const tokenDecimals = assetSnap?.decimals ?? 18;
       const feedDecimals = assetSnap?.oracle_price.decimals ?? FEED_DECIMALS_DEFAULT;
       const oraclePrice = assetSnap ? BigInt(assetSnap.oracle_price.raw) : 0n;

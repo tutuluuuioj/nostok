@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
+import { shortAddress } from '../lib/web3.js';
 import { useStore } from '../store.jsx';
 
 const LINKS = [
@@ -27,7 +28,7 @@ const TITLES = {
 };
 
 export function Shell({ children }) {
-  const { alerts } = useStore();
+  const { alerts, web3 } = useStore();
   const { pathname } = useLocation();
   const [menu, setMenu] = useState(false);
 
@@ -52,6 +53,16 @@ export function Shell({ children }) {
     );
   }
 
+  const walletLabel = web3?.connected
+    ? `${shortAddress(web3.address)}${web3.siweSession ? ' · SIWE' : ''}`
+    : 'Connect wallet';
+
+  const networkLabel = web3?.wrongNetwork
+    ? `Wrong network (${web3.chainId}) — switch to Base (${web3.config.chainId})`
+    : `Base Mainnet (${web3?.config?.chainId ?? 8453})`;
+
+  const degradedMsg = web3?.walletError || web3?.walletState?.rpcError || web3?.walletState?.apiError;
+
   return (
     <>
       <a className="skip" href="#main">Skip to content</a>
@@ -64,8 +75,13 @@ export function Shell({ children }) {
               {item('/alerts', 'Alerts')}
             </nav>
             <div className="bar-end">
-              <Link to="/wallet" aria-current={pathname === '/wallet' ? 'page' : undefined}>Wallet</Link>
-              <button className="menu-btn" type="button" aria-expanded={menu} onClick={() => { setMenu((open) => !open); setAccount(false); }}>
+              {!web3?.connected ? (
+                <button className="bar-action" type="button" onClick={() => void web3?.connect()} disabled={web3?.connecting}>
+                  {web3?.connecting ? 'Connecting…' : 'Connect'}
+                </button>
+              ) : null}
+              <Link to="/wallet" aria-current={pathname === '/wallet' ? 'page' : undefined}>{walletLabel}</Link>
+              <button className="menu-btn" type="button" aria-expanded={menu} onClick={() => setMenu((open) => !open)}>
                 Menu
               </button>
             </div>
@@ -76,11 +92,20 @@ export function Shell({ children }) {
             {item('/data', 'Book')}
             {item('/builders', 'Builders')}
             {item('/terms', 'Terms')}
+            {item('/wallet', walletLabel)}
           </nav>
         </div>
       </header>
       <div className="wrap">
-        <p className="preview-line">Illustrative preview. Contracts are not deployed, and no funds move.</p>
+        <div className={web3?.wrongNetwork || degradedMsg ? 'status-line err' : 'status-line'}>
+          <span>{networkLabel}</span>
+          {web3?.connected ? (
+            <span>
+              {web3.siweSession ? `SIWE verified (${shortAddress(web3.address)})` : 'SIWE not signed in'}
+            </span>
+          ) : null}
+          {degradedMsg ? <span>{degradedMsg}</span> : null}
+        </div>
       </div>
       <main id="main" className="wrap">{children}</main>
       <footer className="site-foot">
@@ -92,7 +117,7 @@ export function Shell({ children }) {
             <Link to="/data">Book</Link>
             <Link to="/builders">Builders</Link>
           </nav>
-          <p className="hint">Fixed-term repo for tokenized stocks on Base. The stock comes back when the loan is repaid. Yield on it is off unless both sides turn it on.</p>
+          <p className="hint">Fixed-term repo for tokenized stocks on Base. Collateral remains in escrow until repayment or auction settlement.</p>
         </div>
       </footer>
     </>

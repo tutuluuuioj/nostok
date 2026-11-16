@@ -271,7 +271,12 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
     ctx.config.rateLimitWindowMs,
     ctx.config.rateLimitMaxBuckets
   );
-  const confirmTargetLimiter = new IpRateLimiter(
+  const confirmTargetWalletLimiter = new IpRateLimiter(
+    ctx.config.confirmTargetPerHourMax,
+    3_600_000,
+    ctx.config.rateLimitMaxBuckets
+  );
+  const confirmTargetIpLimiter = new IpRateLimiter(
     ctx.config.confirmTargetPerHourMax,
     3_600_000,
     ctx.config.rateLimitMaxBuckets
@@ -522,13 +527,19 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
 
         const isWebhook = input.channel === 'webhook';
         if (!isWebhook) {
-          // Enforce wallet-independent per-target confirmation limit (prevents email/Telegram bombing across wallets)
-          const globalTargetHash = ctx.cipher.computeGlobalTargetHash(input.channel, normalizedTarget);
+          // Enforce per-wallet & per-IP limits on canonicalized target (normalizes email +subaddress, prevents cross-wallet attacker exhausting victim quota)
+          const canonicalTargetHash = ctx.cipher.computeGlobalTargetHash(input.channel, normalizedTarget);
           enforceScopedRateLimit(
             res,
-            confirmTargetLimiter,
-            globalTargetHash,
-            `confirmation sends to ${input.channel} target`
+            confirmTargetWalletLimiter,
+            `${wallet.toLowerCase()}:${canonicalTargetHash}`,
+            `wallet confirmation sends to ${input.channel} target`
+          );
+          enforceScopedRateLimit(
+            res,
+            confirmTargetIpLimiter,
+            `${clientIp}:${canonicalTargetHash}`,
+            `IP confirmation sends to ${input.channel} target`
           );
         }
 
@@ -1101,7 +1112,8 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
     verifyWalletLimiter.close();
     subIpLimiter.close();
     subWalletLimiter.close();
-    confirmTargetLimiter.close();
+    confirmTargetWalletLimiter.close();
+    confirmTargetIpLimiter.close();
     confirmIpLimiter.close();
     confirmWalletLimiter.close();
     confirmSubLimiter.close();

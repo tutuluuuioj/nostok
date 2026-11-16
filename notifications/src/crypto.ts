@@ -125,11 +125,27 @@ export class PiiCipher {
   }
 
   computeGlobalTargetHash(channel: string, normalizedTarget: string): string {
+    const canonical = canonicalizeTargetForRateLimit(channel, normalizedTarget);
     return crypto
       .createHmac('sha256', this.hashKey)
-      .update(`global|${channel}|${normalizedTarget}`)
+      .update(`global|${channel}|${canonical}`)
       .digest('hex');
   }
+}
+
+export function canonicalizeTargetForRateLimit(channel: string, normalizedTarget: string): string {
+  const trimmed = normalizedTarget.trim();
+  if (channel === 'email') {
+    const lower = trimmed.toLowerCase();
+    const atIdx = lower.lastIndexOf('@');
+    if (atIdx > 0) {
+      const local = lower.slice(0, atIdx).replace(/\+.*$/, '');
+      const domain = lower.slice(atIdx + 1);
+      return `${local}@${domain}`;
+    }
+    return lower;
+  }
+  return trimmed;
 }
 
 export function maskTarget(channel: 'email' | 'telegram' | 'webhook', plaintext: string): string {

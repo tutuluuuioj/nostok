@@ -191,11 +191,33 @@ img, svg, pre { max-width: 100%; }
   font-size: clamp(18px, 3vw, 22px);
 }
 
-.preview-line {
+.status-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
   margin: 0;
   padding: 14px 0 0;
   color: var(--muted);
   font-size: 14px;
+}
+.status-line.err {
+  color: var(--danger);
+  font-weight: 600;
+}
+.bar-action {
+  min-height: 36px;
+  padding: 0 12px;
+  border-radius: var(--radius-control);
+  border: 1px solid var(--clay);
+  background: var(--clay);
+  color: var(--clay-ink);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.bar-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 main { padding-bottom: 32px; }

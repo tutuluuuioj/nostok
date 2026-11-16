@@ -2676,39 +2676,109 @@ async function runTests(): Promise<void> {
         'Delayed suppressed_rate_limit event alerts must drain and send once hourly budget opens'
       );
 
-      // 6.6 Email bombing protection (3/hour limit per target across DIFFERENT wallets)
-      const sharedBombEmail = 'victim-bomb@nostok.xyz';
-      for (let wIdx = 1; wIdx <= 4; wIdx++) {
-        const wKey = generatePrivateKey();
-        const wAcct = privateKeyToAccount(wKey);
-        const wNonce = await getNonce(wAcct.address);
-        const wSiwe = formatSiweMessage({
+      // 6.6 Email bombing protection (3/hour limit per canonical target normalized for +subaddress;
+      // attackers from another IP cannot consume the legitimate victim's own quota)
+      const bombProxySrv = createNotificationsServer({
+        ...notifCtx,
+        config: { ...notifCtx.config, trustProxyHops: 1 },
+      });
+      await new Promise<void>((r) => bombProxySrv.listen(0, '127.0.0.1', r));
+      const bombUrl = `http://127.0.0.1:${(bombProxySrv.address() as net.AddressInfo).port}`;
+      try {
+        // Part A: Same wallet tries +subaddress normalization bypasses (victim-bomb+1..4@nostok.xyz -> 4th blocked 429)
+        const plusKey = generatePrivateKey();
+        const plusAcct = privateKeyToAccount(plusKey);
+        const plusNonce = await getNonce(plusAcct.address);
+        const plusSiwe = formatSiweMessage({
           domain: 'app.nostok.xyz',
-          address: wAcct.address,
+          address: plusAcct.address,
           uri: 'https://app.nostok.xyz',
           chainId: 8453,
-          nonce: wNonce,
+          nonce: plusNonce,
           issuedAt: nowIso,
           expirationTime: futureIso,
         });
-        const wTok = (
-          await httpJson<{ token: string }>('POST', `${notifUrl}/auth/verify`, {
-            message: wSiwe,
-            signature: await wAcct.signMessage({ message: wSiwe }),
+        const plusTok = (
+          await httpJson<{ token: string }>('POST', `${bombUrl}/auth/verify`, {
+            message: plusSiwe,
+            signature: await plusAcct.signMessage({ message: plusSiwe }),
           })
         ).body.token;
-        const subRes = await httpJson<{ error?: { code: string } }>(
-          'POST',
-          `${notifUrl}/subscriptions`,
-          { channel: 'email', target: sharedBombEmail },
-          { Authorization: `Bearer ${wTok}` }
-        );
-        if (wIdx <= 3) {
-          assert.equal(subRes.status, 201, `Target confirmation ${wIdx}/3 across wallets should succeed`);
-        } else {
-          assert.equal(subRes.status, 429, '4th confirmation email to same target across wallets must be blocked');
-          assert.equal(subRes.body.error?.code, 'RATE_LIMIT_EXCEEDED');
+        for (let idx = 1; idx <= 4; idx++) {
+          const pRes = await httpJson<{ error?: { code: string } }>(
+            'POST',
+            `${bombUrl}/subscriptions`,
+            { channel: 'email', target: `victim-plus+${idx}@nostok.xyz` },
+            { Authorization: `Bearer ${plusTok}`, 'X-Forwarded-For': '203.0.113.70' }
+          );
+          if (idx <= 3) {
+            assert.equal(pRes.status, 201, `Normalized +subaddress ${idx}/3 should succeed`);
+          } else {
+            assert.equal(pRes.status, 429, '4th +subaddress email from same wallet must be rate-limited');
+            assert.equal(pRes.body.error?.code, 'RATE_LIMIT_EXCEEDED');
+          }
         }
+
+        // Part B: Attacker at 198.51.100.55 rotates 4 wallets targeting real-victim@nostok.xyz -> attacker 4th blocked 429,
+        // while legitimate victim at 203.0.113.88 STILL succeeds cleanly!
+        for (let wIdx = 1; wIdx <= 4; wIdx++) {
+          const wKey = generatePrivateKey();
+          const wAcct = privateKeyToAccount(wKey);
+          const wNonce = await getNonce(wAcct.address);
+          const wSiwe = formatSiweMessage({
+            domain: 'app.nostok.xyz',
+            address: wAcct.address,
+            uri: 'https://app.nostok.xyz',
+            chainId: 8453,
+            nonce: wNonce,
+            issuedAt: nowIso,
+            expirationTime: futureIso,
+          });
+          const wTok = (
+            await httpJson<{ token: string }>('POST', `${bombUrl}/auth/verify`, {
+              message: wSiwe,
+              signature: await wAcct.signMessage({ message: wSiwe }),
+            })
+          ).body.token;
+          const subRes = await httpJson<{ error?: { code: string } }>(
+            'POST',
+            `${bombUrl}/subscriptions`,
+            { channel: 'email', target: `real-victim+spam${wIdx}@nostok.xyz` },
+            { Authorization: `Bearer ${wTok}`, 'X-Forwarded-For': '198.51.100.55' }
+          );
+          if (wIdx <= 3) {
+            assert.equal(subRes.status, 201);
+          } else {
+            assert.equal(subRes.status, 429, 'Attacker IP rotating wallets against target must hit 429');
+          }
+        }
+        const realVictimKey = generatePrivateKey();
+        const realVictimAcct = privateKeyToAccount(realVictimKey);
+        const rvNonce = await getNonce(realVictimAcct.address);
+        const rvSiwe = formatSiweMessage({
+          domain: 'app.nostok.xyz',
+          address: realVictimAcct.address,
+          uri: 'https://app.nostok.xyz',
+          chainId: 8453,
+          nonce: rvNonce,
+          issuedAt: nowIso,
+          expirationTime: futureIso,
+        });
+        const rvTok = (
+          await httpJson<{ token: string }>('POST', `${bombUrl}/auth/verify`, {
+            message: rvSiwe,
+            signature: await realVictimAcct.signMessage({ message: rvSiwe }),
+          })
+        ).body.token;
+        const rvRes = await httpJson(
+          'POST',
+          `${bombUrl}/subscriptions`,
+          { channel: 'email', target: 'real-victim@nostok.xyz' },
+          { Authorization: `Bearer ${rvTok}`, 'X-Forwarded-For': '203.0.113.88' }
+        );
+        assert.equal(rvRes.status, 201, 'Other wallets from attacker IP must NOT consume legitimate victim quota');
+      } finally {
+        await new Promise<void>((r) => bombProxySrv.close(() => r()));
       }
 
       // 6.7 No pre-auth login lockout across IPs

@@ -6,16 +6,19 @@
     "dev": "vite --host 127.0.0.1 --port 3020 --strictPort",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1 --port 3020 --strictPort",
-    "test": "node src/lib/money.test.js && node src/lib/book.test.js && node src/lib/contrast.test.js"
+    "test": "node src/lib/money.test.js && node src/lib/book.test.js && node src/lib/contrast.test.js",
+    "test:fork": "tsx test/ws3_1.fork.test.ts"
   },
   "dependencies": {
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.28.1"
+    "react-router-dom": "^6.28.1",
+    "viem": "^2.57.20"
   },
   "devDependencies": {
     "@fontsource/public-sans": "^5.2.5",
     "@vitejs/plugin-react": "^4.3.4",
+    "tsx": "^4.23.15",
     "vite": "^6.0.6"
   }
 }

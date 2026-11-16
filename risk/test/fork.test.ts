@@ -1583,7 +1583,79 @@ async function runTests(): Promise<void> {
       const recovered = await runRiskScan(riskCtx, t);
       assert.equal(recovered.monitor_degraded, false);
       assert.equal(recovered.status, 'healthy');
-      console.log('PASS Scenario (h): Dead-port degraded boot, real outage 503/metrics & preservation verified.');
+
+      // 3) Single loan getLoan(uint256) read failure preserves active loan_risk alerts without false escrow_mismatch
+      let failGetLoan = false;
+      const loanFailProxy = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on('data', (c: Buffer) => chunks.push(c));
+        req.on('end', async () => {
+          const bodyBuf = Buffer.concat(chunks);
+          if (failGetLoan && bodyBuf.toString('utf8').toLowerCase().includes('504006ca')) {
+            res.statusCode = 500;
+            res.end('Injected getLoan read failure');
+            return;
+          }
+          const upRes = await fetch(LOCAL_RPC_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: bodyBuf,
+          });
+          res.statusCode = upRes.status;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(await upRes.text());
+        });
+      });
+      await new Promise<void>((resolve) => loanFailProxy.listen(0, '127.0.0.1', resolve));
+      const loanFailPort = (loanFailProxy.address() as net.AddressInfo).port;
+      try {
+        const lfCtx = await createRiskContext(
+          { ...riskCfg, rpcUrl: `http://127.0.0.1:${loanFailPort}`, webhookUrl: undefined },
+          wrapQueryableAsReadOnly(idxCtx.db)
+        );
+        // Trigger margin call on Loan #4 at $105
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdaFeed,
+            abi: mockAggArtifact.abi,
+            functionName: 'setPrice',
+            args: [105_00000000n],
+          }),
+        });
+        t += 5_000;
+        await runRiskScan(lfCtx, t);
+        const activeMc = lfCtx.alerts
+          .getActiveAlerts()
+          .find((a) => a.dedup_key.endsWith(':margin_call') || a.dedup_key.endsWith(':liquidatable'));
+        assert.ok(activeMc, 'Expected an active loan_risk alert before injecting getLoan failure');
+
+        failGetLoan = true;
+        t += 5_000;
+        const lfSummary = await runRiskScan(lfCtx, t);
+        assert.equal(lfSummary.monitor_degraded, false);
+        assert.equal(lfSummary.assets[0].escrow_matches_open_loans, 'unknown');
+        assert.ok(
+          lfCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === activeMc.dedup_key),
+          'Active loan alert MUST be preserved when getLoan() read fails'
+        );
+        assert.equal(
+          lfCtx.alerts.getActiveAlerts().some((a) => a.dedup_key.startsWith('escrow_mismatch:')),
+          false,
+          'Missing getLoan() read must NOT emit false escrow_mismatch'
+        );
+      } finally {
+        failGetLoan = false;
+        await new Promise<void>((resolve) => loanFailProxy.close(() => resolve()));
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdaFeed,
+            abi: mockAggArtifact.abi,
+            functionName: 'setPrice',
+            args: [140_00000000n],
+          }),
+        });
+      }
+      console.log('PASS Scenario (h): Dead-port degraded boot, getLoan preservation & recovery verified.');
 
       // -----------------------------------------------------------------------
       // Scenario (i): Real PostgreSQL (embedded-postgres) pg_terminate_backend recovery

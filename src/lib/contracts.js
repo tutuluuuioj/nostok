@@ -1,0 +1,411 @@
+import { createPublicClient, defineChain, getAddress, http, isAddress } from 'viem';
+import { base } from 'viem/chains';
+
+export const BASE_CHAIN_ID = 8453;
+export const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+export const USDC_DECIMALS = 6;
+export const ETH_DECIMALS = 18;
+export const DEFAULT_B20_DECIMALS = 18;
+
+export const OracleState = {
+  VALID_OPEN: 0,
+  VALID_CLOSED: 1,
+  FROZEN_CORPORATE_ACTION: 2,
+  STALE_FEED: 3,
+  INVALID_SEQUENCER: 4,
+  DISPUTED: 5,
+};
+
+export const ORACLE_STATE_NAMES = {
+  0: 'VALID_OPEN',
+  1: 'VALID_CLOSED',
+  2: 'FROZEN_CORPORATE_ACTION',
+  3: 'STALE_FEED',
+  4: 'INVALID_SEQUENCER',
+  5: 'DISPUTED',
+};
+
+export const ASSET_STATUS_NAMES = {
+  0: 'Active',
+  1: 'ReduceOnly',
+  2: 'WindDown',
+  3: 'Frozen',
+};
+
+export const LOAN_STATUS_NAMES = {
+  0: 'Active',
+  1: 'Grace',
+  2: 'Auction',
+  3: 'Repaid',
+  4: 'SettledDefault',
+  5: 'SettledLiquidated',
+};
+
+export const erc20Abi = [
+  { type: 'function', name: 'symbol', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'string' }] },
+  { type: 'function', name: 'decimals', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint8' }] },
+  { type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
+  {
+    type: 'function',
+    name: 'allowance',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'owner', type: 'address' },
+      { name: 'spender', type: 'address' },
+    ],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'approve',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'spender', type: 'address' },
+      { name: 'value', type: 'uint256' },
+    ],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+  { type: 'function', name: 'uiMultiplier', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint256' }] },
+];
+
+export const eligibilityGateAbi = [
+  { type: 'function', name: 'permissionlessMode', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'bool' }] },
+  { type: 'function', name: 'allowlist', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ name: '', type: 'bool' }] },
+  { type: 'function', name: 'isRevoked', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ name: '', type: 'bool' }] },
+  { type: 'function', name: 'userNonce', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
+  {
+    type: 'function',
+    name: 'isEligible',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'account', type: 'address' },
+      { name: 'context', type: 'bytes' },
+    ],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+];
+
+export const loanCoreAbi = [
+  { type: 'function', name: 'paused', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'bool' }] },
+  { type: 'function', name: 'globalUsdcCap', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint128' }] },
+  { type: 'function', name: 'totalOutstandingPrincipal', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint128' }] },
+  { type: 'function', name: 'assetOutstandingPrincipal', stateMutability: 'view', inputs: [{ name: '', type: 'address' }], outputs: [{ name: '', type: 'uint128' }] },
+  { type: 'function', name: 'nextLoanId', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint256' }] },
+  { type: 'function', name: 'SECONDS_PER_YEAR', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint256' }] },
+  {
+    type: 'function',
+    name: 'getLoan',
+    stateMutability: 'view',
+    inputs: [{ name: 'loanId', type: 'uint256' }],
+    outputs: [
+      {
+        name: '',
+        type: 'tuple',
+        components: [
+          { name: 'borrower', type: 'address' },
+          { name: 'collateralToken', type: 'address' },
+          { name: 'collateralRaw', type: 'uint128' },
+          { name: 'principal', type: 'uint128' },
+          { name: 'startTime', type: 'uint64' },
+          { name: 'maturity', type: 'uint64' },
+          { name: 'rateBps', type: 'uint32' },
+          { name: 'penaltySpreadBps', type: 'uint32' },
+          { name: 'initLtvBps', type: 'uint16' },
+          { name: 'marginCallLtvBps', type: 'uint16' },
+          { name: 'liqLtvBps', type: 'uint16' },
+          { name: 'minInterestDays', type: 'uint16' },
+          { name: 'status', type: 'uint8' },
+          { name: 'yieldMode', type: 'uint8' },
+          { name: 'coreVersion', type: 'uint8' },
+          { name: 'interestPaid', type: 'uint128' },
+          { name: 'principalRepaid', type: 'uint128' },
+        ],
+      },
+    ],
+  },
+  { type: 'function', name: 'getDueInterest', stateMutability: 'view', inputs: [{ name: 'loanId', type: 'uint256' }], outputs: [{ name: 'interestOwed', type: 'uint128' }] },
+  { type: 'function', name: 'getClaimable', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ name: 'amount', type: 'uint128' }] },
+  { type: 'function', name: 'repay', stateMutability: 'nonpayable', inputs: [{ name: 'loanId', type: 'uint256' }], outputs: [{ name: 'totalPaid', type: 'uint128' }] },
+  {
+    type: 'function',
+    name: 'partialRepay',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'loanId', type: 'uint256' },
+      { name: 'principalRepayAmount', type: 'uint128' },
+    ],
+    outputs: [{ name: 'totalPaid', type: 'uint128' }],
+  },
+  {
+    type: 'function',
+    name: 'topUp',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'loanId', type: 'uint256' },
+      { name: 'additionalCollateral', type: 'uint128' },
+    ],
+    outputs: [],
+  },
+  { type: 'function', name: 'claim', stateMutability: 'nonpayable', inputs: [{ name: 'to', type: 'address' }], outputs: [{ name: 'claimedAmount', type: 'uint128' }] },
+];
+
+export const orderSettlementAbi = [
+  { type: 'function', name: 'getMakerNonce', stateMutability: 'view', inputs: [{ name: 'maker', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
+  { type: 'function', name: 'getOrderFilledAmount', stateMutability: 'view', inputs: [{ name: 'orderHash', type: 'bytes32' }], outputs: [{ name: '', type: 'uint128' }] },
+  { type: 'function', name: 'isOrderCancelled', stateMutability: 'view', inputs: [{ name: 'orderHash', type: 'bytes32' }], outputs: [{ name: '', type: 'bool' }] },
+  { type: 'function', name: 'bumpNonce', stateMutability: 'nonpayable', inputs: [], outputs: [{ name: 'newNonce', type: 'uint256' }] },
+  {
+    type: 'function',
+    name: 'fillBorrowOrder',
+    stateMutability: 'nonpayable',
+    inputs: [
+      {
+        name: 'order',
+        type: 'tuple',
+        components: [
+          { name: 'borrower', type: 'address' },
+          { name: 'collateralToken', type: 'address' },
+          { name: 'collateralAmount', type: 'uint128' },
+          { name: 'minUsdc', type: 'uint128' },
+          { name: 'maxRateBps', type: 'uint32' },
+          { name: 'termDays', type: 'uint16' },
+          { name: 'maxLtvBps', type: 'uint16' },
+          { name: 'minFill', type: 'uint128' },
+          { name: 'expiry', type: 'uint64' },
+          { name: 'nonce', type: 'uint256' },
+          { name: 'yieldMode', type: 'uint8' },
+          { name: 'allowInKindSettlement', type: 'bool' },
+        ],
+      },
+      { name: 'signature', type: 'bytes' },
+      { name: 'fillUsdc', type: 'uint128' },
+    ],
+    outputs: [{ name: 'loanId', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'fillLendOffer',
+    stateMutability: 'nonpayable',
+    inputs: [
+      {
+        name: 'offer',
+        type: 'tuple',
+        components: [
+          { name: 'lender', type: 'address' },
+          { name: 'usdcAmount', type: 'uint128' },
+          { name: 'minRateBps', type: 'uint32' },
+          { name: 'termDays', type: 'uint16' },
+          { name: 'allowedCollateral', type: 'address' },
+          { name: 'maxLtvBps', type: 'uint16' },
+          { name: 'minFill', type: 'uint128' },
+          { name: 'expiry', type: 'uint64' },
+          { name: 'nonce', type: 'uint256' },
+          { name: 'yieldMode', type: 'uint8' },
+        ],
+      },
+      { name: 'signature', type: 'bytes' },
+      { name: 'collateralToken', type: 'address' },
+      { name: 'collateralAmount', type: 'uint128' },
+      { name: 'fillUsdc', type: 'uint128' },
+    ],
+    outputs: [{ name: 'loanId', type: 'uint256' }],
+  },
+];
+
+export const assetRegistryAbi = [
+  { type: 'function', name: 'isAssetSupported', stateMutability: 'view', inputs: [{ name: 'token', type: 'address' }], outputs: [{ name: '', type: 'bool' }] },
+  {
+    type: 'function',
+    name: 'getAssetConfig',
+    stateMutability: 'view',
+    inputs: [{ name: 'token', type: 'address' }],
+    outputs: [
+      {
+        name: '',
+        type: 'tuple',
+        components: [
+          { name: 'feed', type: 'address' },
+          { name: 'feedDecimals', type: 'uint8' },
+          { name: 'tier', type: 'uint8' },
+          { name: 'maxInitLtvBps', type: 'uint16' },
+          { name: 'marginCallLtvBps', type: 'uint16' },
+          { name: 'liqLtvBps', type: 'uint16' },
+          { name: 'badDebtLtvBps', type: 'uint16' },
+          { name: 'maxDiscountBps', type: 'uint16' },
+          { name: 'closedMarketHaircutBps', type: 'uint16' },
+          { name: 'perLoanCap', type: 'uint128' },
+          { name: 'assetCap', type: 'uint128' },
+          { name: 'maxStaleOpenSecs', type: 'uint32' },
+          { name: 'status', type: 'uint8' },
+          { name: 'restricted', type: 'bool' },
+        ],
+      },
+    ],
+  },
+];
+
+export const oracleRouterAbi = [
+  {
+    type: 'function',
+    name: 'getPrice',
+    stateMutability: 'view',
+    inputs: [{ name: 'token', type: 'address' }],
+    outputs: [
+      { name: 'price', type: 'uint256' },
+      { name: 'decimals', type: 'uint8' },
+      { name: 'state', type: 'uint8' },
+    ],
+  },
+  {
+    type: 'function',
+    name: 'getValue',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'token', type: 'address' },
+      { name: 'rawAmount', type: 'uint256' },
+    ],
+    outputs: [
+      { name: 'grossValueUsdc', type: 'uint256' },
+      { name: 'effectiveValueUsdc', type: 'uint256' },
+      { name: 'state', type: 'uint8' },
+    ],
+  },
+  { type: 'function', name: 'recordedMultiplier', stateMutability: 'view', inputs: [{ name: 'token', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
+];
+
+export const positionNftAbi = [
+  { type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ name: 'owner', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
+  { type: 'function', name: 'ownerOf', stateMutability: 'view', inputs: [{ name: 'tokenId', type: 'uint256' }], outputs: [{ name: '', type: 'address' }] },
+  { type: 'function', name: 'isAuctionLocked', stateMutability: 'view', inputs: [{ name: 'loanId', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] },
+];
+
+export const collateralEscrowAbi = [
+  { type: 'function', name: 'getBalance', stateMutability: 'view', inputs: [{ name: 'token', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
+];
+
+export const liquidationAuctionAbi = [
+  { type: 'function', name: 'MIN_BUY_USDC', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint128' }] },
+  { type: 'function', name: 'getCurrentPrice', stateMutability: 'view', inputs: [{ name: 'auctionId', type: 'uint256' }], outputs: [{ name: 'price', type: 'uint256' }] },
+  {
+    type: 'function',
+    name: 'getAuction',
+    stateMutability: 'view',
+    inputs: [{ name: 'auctionId', type: 'uint256' }],
+    outputs: [
+      {
+        name: '',
+        type: 'tuple',
+        components: [
+          { name: 'loanId', type: 'uint256' },
+          { name: 'borrower', type: 'address' },
+          { name: 'collateralToken', type: 'address' },
+          { name: 'collateralTotal', type: 'uint128' },
+          { name: 'collateralRemaining', type: 'uint128' },
+          { name: 'debtPrincipalRemaining', type: 'uint128' },
+          { name: 'debtInterestRemaining', type: 'uint128' },
+          { name: 'startPrice', type: 'uint256' },
+          { name: 'floorPrice', type: 'uint256' },
+          { name: 'startTime', type: 'uint64' },
+          { name: 'duration', type: 'uint64' },
+          { name: 'keeper', type: 'address' },
+          { name: 'status', type: 'uint8' },
+          { name: 'isDefaultAuction', type: 'bool' },
+        ],
+      },
+    ],
+  },
+];
+
+let configOverrides = {};
+
+function readEnv(key) {
+  const viteEnv =
+    typeof import.meta !== 'undefined' && import.meta.env
+      ? import.meta.env[key]
+      : undefined;
+  if (viteEnv !== undefined && String(viteEnv).trim() !== '') {
+    return String(viteEnv).trim();
+  }
+  const nodeEnv =
+    typeof process !== 'undefined' && process.env
+      ? process.env[key]
+      : undefined;
+  if (nodeEnv !== undefined && String(nodeEnv).trim() !== '') {
+    return String(nodeEnv).trim();
+  }
+  return undefined;
+}
+
+function normalizeOptionalAddress(raw) {
+  if (!raw || !isAddress(raw)) return undefined;
+  return getAddress(raw);
+}
+
+function stripTrailingSlash(raw) {
+  return String(raw || '').trim().replace(/\/+$/, '');
+}
+
+export function setFrontendConfigOverrides(overrides = {}) {
+  configOverrides = { ...overrides };
+}
+
+export function getFrontendConfig() {
+  const rawChainId = configOverrides.chainId ?? readEnv('VITE_CHAIN_ID');
+  const chainId = rawChainId ? Number(rawChainId) : BASE_CHAIN_ID;
+  const rpcUrl = configOverrides.rpcUrl ?? readEnv('VITE_RPC_URL') ?? 'https://mainnet.base.org';
+  const apiUrl = stripTrailingSlash(
+    configOverrides.apiUrl ?? readEnv('VITE_API_URL') ?? 'http://127.0.0.1:3001'
+  );
+  const notificationsUrl = stripTrailingSlash(
+    configOverrides.notificationsUrl ?? readEnv('VITE_NOTIFICATIONS_URL') ?? 'http://127.0.0.1:3003'
+  );
+  const riskUrl = stripTrailingSlash(
+    configOverrides.riskUrl ?? readEnv('VITE_RISK_URL') ?? 'http://127.0.0.1:3002'
+  );
+
+  return {
+    chainId: Number.isInteger(chainId) && chainId > 0 ? chainId : BASE_CHAIN_ID,
+    rpcUrl,
+    apiUrl,
+    notificationsUrl,
+    riskUrl,
+    usdcAddress: normalizeOptionalAddress(
+      configOverrides.usdcAddress ?? readEnv('VITE_USDC_ADDRESS') ?? BASE_USDC_ADDRESS
+    ) ?? BASE_USDC_ADDRESS,
+    contracts: {
+      loanCore: normalizeOptionalAddress(configOverrides.loanCore ?? readEnv('VITE_LOAN_CORE_ADDRESS')),
+      orderSettlement: normalizeOptionalAddress(
+        configOverrides.orderSettlement ?? readEnv('VITE_ORDER_SETTLEMENT_ADDRESS')
+      ),
+      liquidationAuction: normalizeOptionalAddress(
+        configOverrides.liquidationAuction ?? readEnv('VITE_LIQUIDATION_AUCTION_ADDRESS')
+      ),
+      positionNft: normalizeOptionalAddress(configOverrides.positionNft ?? readEnv('VITE_POSITION_NFT_ADDRESS')),
+      collateralEscrow: normalizeOptionalAddress(
+        configOverrides.collateralEscrow ?? readEnv('VITE_COLLATERAL_ESCROW_ADDRESS')
+      ),
+      assetRegistry: normalizeOptionalAddress(
+        configOverrides.assetRegistry ?? readEnv('VITE_ASSET_REGISTRY_ADDRESS')
+      ),
+      oracleRouter: normalizeOptionalAddress(configOverrides.oracleRouter ?? readEnv('VITE_ORACLE_ROUTER_ADDRESS')),
+      eligibilityGate: normalizeOptionalAddress(
+        configOverrides.eligibilityGate ?? readEnv('VITE_ELIGIBILITY_GATE_ADDRESS')
+      ),
+    },
+  };
+}
+
+export function createProtocolPublicClient(cfg = getFrontendConfig()) {
+  const chain = defineChain({
+    ...base,
+    id: cfg.chainId,
+    name: 'Base',
+    rpcUrls: {
+      default: { http: [cfg.rpcUrl] },
+    },
+  });
+  return createPublicClient({
+    chain,
+    transport: http(cfg.rpcUrl),
+  });
+}
