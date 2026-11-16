@@ -139,8 +139,14 @@ export function canonicalizeTargetForRateLimit(channel: string, normalizedTarget
     const lower = trimmed.toLowerCase();
     const atIdx = lower.lastIndexOf('@');
     if (atIdx > 0) {
-      const local = lower.slice(0, atIdx).replace(/\+.*$/, '');
-      const domain = lower.slice(atIdx + 1);
+      let local = lower.slice(0, atIdx).replace(/\+.*$/, '');
+      let domain = lower.slice(atIdx + 1).replace(/\.+$/, '');
+      if (domain === 'googlemail.com') {
+        domain = 'gmail.com';
+      }
+      if (domain === 'gmail.com') {
+        local = local.replace(/\./g, '');
+      }
       return `${local}@${domain}`;
     }
     return lower;

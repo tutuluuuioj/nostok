@@ -736,7 +736,9 @@ async function runTests(): Promise<void> {
       );
 
       // Price sweep comparing monitor liquidatable classification vs LoanCore.startLiquidation across >=50 boundary prices
-      const reportedLiqPrice = BigInt(riskCtx.state.latestLoans[0].liquidation_price.raw);
+      const liqPrice0 = riskCtx.state.latestLoans[0].liquidation_price;
+      assert.notEqual(liqPrice0, 'unknown');
+      const reportedLiqPrice = BigInt(liqPrice0 === 'unknown' ? '0' : liqPrice0.raw);
 
       // First binary search exact highest liquidating price on-chain
       let lo = reportedLiqPrice - 5_000n;
@@ -1161,7 +1163,12 @@ async function runTests(): Promise<void> {
         const lagSummary = await runRiskScan(riskCtx, t);
         const loan1Snap = riskCtx.state.latestLoans.find((l) => l.loan_id === '1');
         assert.ok(loan1Snap, 'Loan #1 must be evaluated on-chain');
-        assert.equal(loan1Snap.principal_remaining.raw, '350000000', 'Must use on-chain principalRepaid (750 - 400 = 350)');
+        assert.notEqual(loan1Snap.principal_remaining, 'unknown');
+        assert.equal(
+          loan1Snap.principal_remaining === 'unknown' ? null : loan1Snap.principal_remaining.raw,
+          '350000000',
+          'Must use on-chain principalRepaid (750 - 400 = 350)'
+        );
         assert.equal(loan1Snap.risk_status, 'healthy', 'Lagging DB principal_repaid must NOT cause false liquidatable');
         assert.equal(lagSummary.assets[0].escrow_matches_open_loans, true, 'Lagging DB after partialRepay + repay must NOT cause false escrow_mismatch');
         assert.equal(
@@ -1634,6 +1641,13 @@ async function runTests(): Promise<void> {
         const lfSummary = await runRiskScan(lfCtx, t);
         assert.equal(lfSummary.monitor_degraded, false);
         assert.equal(lfSummary.assets[0].escrow_matches_open_loans, 'unknown');
+        assert.ok(
+          lfSummary.loan_counts.unknown >= 1,
+          'Loans whose getLoan() read failed must be counted under loan_counts.unknown'
+        );
+        const unknownLoanSnap = lfCtx.state.latestLoans.find((l) => l.risk_status === 'unknown');
+        assert.ok(unknownLoanSnap, 'Loans whose getLoan() read failed must appear as unknown in latestLoans');
+        assert.equal(unknownLoanSnap.current_ltv_bps, null);
         assert.ok(
           lfCtx.alerts.getActiveAlerts().some((a) => a.dedup_key === activeMc.dedup_key),
           'Active loan alert MUST be preserved when getLoan() read fails'

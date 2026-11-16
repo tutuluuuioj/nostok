@@ -43,30 +43,30 @@ export function computeLiquidationPrice(
   return ceilDiv((gMax + 1n) * priceScale, collateralRaw * 1_000_000n);
 }
 
-export type LoanRiskStatus = 'healthy' | 'margin_call' | 'near_liquidation' | 'liquidatable';
+export type LoanRiskStatus = 'healthy' | 'margin_call' | 'near_liquidation' | 'liquidatable' | 'unknown';
 
 export interface LoanRiskSnapshot {
   loan_id: string;
-  borrower: Address;
-  collateral_token: Address;
+  borrower: Address | null;
+  collateral_token: Address | null;
   collateral_symbol: string | null;
-  collateral_decimals: number;
-  loan_status: number;
+  collateral_decimals: number | null;
+  loan_status: number | null;
   loan_status_name: string;
   risk_status: LoanRiskStatus;
-  principal_remaining: FormattedAmount;
-  due_interest: FormattedAmount;
-  total_debt: FormattedAmount;
-  gross_collateral_value_usdc: FormattedAmount;
-  current_ltv_bps: number;
-  margin_call_ltv_bps: number;
-  liq_ltv_bps: number;
-  health_factor: { raw: string; formatted: string; decimals: number };
-  liquidation_price: FormattedAmount;
-  oracle_price: FormattedAmount;
-  oracle_state: number;
+  principal_remaining: FormattedAmount | 'unknown';
+  due_interest: FormattedAmount | 'unknown';
+  total_debt: FormattedAmount | 'unknown';
+  gross_collateral_value_usdc: FormattedAmount | 'unknown';
+  current_ltv_bps: number | null;
+  margin_call_ltv_bps: number | null;
+  liq_ltv_bps: number | null;
+  health_factor: { raw: string; formatted: string; decimals: number } | 'unknown';
+  liquidation_price: FormattedAmount | 'unknown';
+  oracle_price: FormattedAmount | 'unknown';
+  oracle_state: number | null;
   oracle_state_name: string;
-  distance_to_liquidation_bps: number;
+  distance_to_liquidation_bps: number | null;
   block_number: string;
 }
 
@@ -293,6 +293,7 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
   let idxUpdatedAt: string | null = null;
   let idxUpdatedMs: number | null = null;
   const terminalLoanIds = new Set<string>();
+  const dbLoanMetaById = new Map<string, { borrower: Address; collateralToken: Address }>();
   let assetDbRows: Array<{
     token: string;
     symbol: string | null;
@@ -319,10 +320,9 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
       ctx.db.query<{ last_indexed_block: string; updated_at: unknown }>(
         'SELECT last_indexed_block::TEXT AS last_indexed_block, updated_at FROM indexer_state WHERE id = 1'
       ),
-      ctx.db.query<{ loan_id: string }>(
-        `SELECT loan_id::TEXT AS loan_id
-         FROM loans
-         WHERE status IN (3, 4, 5)`
+      ctx.db.query<{ loan_id: string; status: number; borrower: string; collateral_token: string }>(
+        `SELECT loan_id::TEXT AS loan_id, status::INT AS status, borrower, collateral_token
+         FROM loans`
       ),
       ctx.db.query<{
         token: string;
@@ -383,7 +383,15 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
       }
     }
     for (const r of terminalLoansRes.rows) {
-      terminalLoanIds.add(r.loan_id);
+      const st = Number(r.status);
+      if (st === 3 || st === 4 || st === 5) {
+        terminalLoanIds.add(r.loan_id);
+      } else {
+        dbLoanMetaById.set(r.loan_id, {
+          borrower: getAddress(r.borrower),
+          collateralToken: getAddress(r.collateral_token),
+        });
+      }
     }
     assetDbRows = assetsRes.rows;
     activeAuctionRows = auctionsRes.rows;
@@ -443,7 +451,7 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
         unacted_defaulted_loans: [],
         unacted_expired_auctions: [],
       },
-      loan_counts: { healthy: 0, margin_call: 0, near_liquidation: 0, liquidatable: 0 },
+      loan_counts: { healthy: 0, margin_call: 0, near_liquidation: 0, liquidatable: 0, unknown: 0 },
       active_alerts: ctx.alerts.getActiveCountBySeverity(),
       assets: [],
     };
@@ -539,6 +547,7 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
     const onchainOpenCollateralByAsset = new Map<string, bigint>();
     const activeLiquidatableIds = new Set<string>();
     let anyLoanReadFailed = false;
+    const failedUnknownLoanIds: string[] = [];
     const liveOnchainLoans: Array<{
       loanId: string;
       onchainLoan: {
@@ -564,6 +573,7 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
         const failedLoanId = candidateLoanIds[i].toString();
         preserveLoanAlertKeys(preserveKeys, failedLoanId);
         activeLiquidatableIds.add(failedLoanId);
+        failedUnknownLoanIds.push(failedLoanId);
         continue;
       }
       const onchainLoan = loanRes.result as {
@@ -1010,6 +1020,40 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
     const unactedLiquidatable: Array<{ loan_id: string; stalled_seconds: number }> = [];
     const unactedDefaulted: Array<{ loan_id: string; stalled_seconds: number }> = [];
 
+    // Keep any loan whose on-chain read failed explicitly visible as 'unknown' rather than omitting it
+    for (const failedLoanId of failedUnknownLoanIds) {
+      const dbMeta = dbLoanMetaById.get(failedLoanId);
+      const tokenKey = dbMeta?.collateralToken.toLowerCase();
+      const assetSnap = tokenKey ? assetByLower.get(tokenKey) : undefined;
+      const assetDb = tokenKey
+        ? assetDbRows.find((a) => a.token.toLowerCase() === tokenKey)
+        : undefined;
+      loanSnapshots.push({
+        loan_id: failedLoanId,
+        borrower: dbMeta?.borrower ?? null,
+        collateral_token: dbMeta?.collateralToken ?? null,
+        collateral_symbol: assetSnap?.symbol ?? assetDb?.symbol ?? null,
+        collateral_decimals: assetSnap?.decimals ?? assetDb?.decimals ?? null,
+        loan_status: null,
+        loan_status_name: 'UNKNOWN',
+        risk_status: 'unknown',
+        principal_remaining: 'unknown',
+        due_interest: 'unknown',
+        total_debt: 'unknown',
+        gross_collateral_value_usdc: 'unknown',
+        current_ltv_bps: null,
+        margin_call_ltv_bps: null,
+        liq_ltv_bps: null,
+        health_factor: 'unknown',
+        liquidation_price: 'unknown',
+        oracle_price: 'unknown',
+        oracle_state: null,
+        oracle_state_name: 'UNKNOWN',
+        distance_to_liquidation_bps: null,
+        block_number: headBlock.toString(),
+      });
+    }
+
     for (const item of liveOnchainLoans) {
       const { loanId, onchainLoan, dueInterest } = item;
       const liveStatus = Number(onchainLoan.status);
@@ -1025,6 +1069,30 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
       if (!assetSnap) {
         preserveLoanAlertKeys(preserveKeys, loanId);
         activeLiquidatableIds.add(loanId);
+        loanSnapshots.push({
+          loan_id: loanId,
+          borrower: getAddress(onchainLoan.borrower),
+          collateral_token: getAddress(onchainLoan.collateralToken),
+          collateral_symbol: null,
+          collateral_decimals: null,
+          loan_status: liveStatus,
+          loan_status_name: LOAN_STATUS_NAMES[liveStatus] ?? `UNKNOWN(${liveStatus})`,
+          risk_status: 'unknown',
+          principal_remaining: formatAmount(principalRemaining, USDC_DECIMALS, 'USDC'),
+          due_interest: formatAmount(dueInterest, USDC_DECIMALS, 'USDC'),
+          total_debt: formatAmount(totalDebt, USDC_DECIMALS, 'USDC'),
+          gross_collateral_value_usdc: 'unknown',
+          current_ltv_bps: null,
+          margin_call_ltv_bps: Number(onchainLoan.marginCallLtvBps),
+          liq_ltv_bps: Number(onchainLoan.liqLtvBps),
+          health_factor: 'unknown',
+          liquidation_price: 'unknown',
+          oracle_price: 'unknown',
+          oracle_state: null,
+          oracle_state_name: 'UNKNOWN',
+          distance_to_liquidation_bps: null,
+          block_number: headBlock.toString(),
+        });
         continue;
       }
       const tokenDecimals = assetSnap?.decimals ?? 18;
@@ -1278,6 +1346,7 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
       margin_call: 0,
       near_liquidation: 0,
       liquidatable: 0,
+      unknown: 0,
     };
     for (const l of loanSnapshots) {
       counts[l.risk_status] += 1;
@@ -1402,7 +1471,13 @@ export async function runRiskScan(ctx: RiskContext, nowMs = Date.now()): Promise
         unacted_defaulted_loans: [],
         unacted_expired_auctions: [],
       },
-      loan_counts: prev?.loan_counts ?? { healthy: 0, margin_call: 0, near_liquidation: 0, liquidatable: 0 },
+      loan_counts: prev?.loan_counts ?? {
+        healthy: 0,
+        margin_call: 0,
+        near_liquidation: 0,
+        liquidatable: 0,
+        unknown: 0,
+      },
       active_alerts: ctx.alerts.getActiveCountBySeverity(),
       assets: prev?.assets ?? [],
     };

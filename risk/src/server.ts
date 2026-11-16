@@ -187,7 +187,7 @@ export function renderPrometheusMetrics(ctx: RiskContext): string {
 
   lines.push('# HELP nostok_risk_open_loans_count Open loans grouped by risk status');
   lines.push('# TYPE nostok_risk_open_loans_count gauge');
-  for (const status of ['healthy', 'margin_call', 'near_liquidation', 'liquidatable'] as const) {
+  for (const status of ['healthy', 'margin_call', 'near_liquidation', 'liquidatable', 'unknown'] as const) {
     lines.push(`nostok_risk_open_loans_count{status="${status}"} ${s?.loan_counts[status] ?? 0}`);
   }
 
@@ -203,7 +203,8 @@ export function renderPrometheusMetrics(ctx: RiskContext): string {
   lines.push('# HELP nostok_risk_loan_health_factor Health factor per open loan');
   lines.push('# TYPE nostok_risk_loan_health_factor gauge');
   for (const loan of ctx.state.latestLoans) {
-    const lbl = `loan_id="${escapePromLabel(loan.loan_id)}",asset="${escapePromLabel(loan.collateral_token)}"`;
+    if (loan.current_ltv_bps === null || loan.health_factor === 'unknown') continue;
+    const lbl = `loan_id="${escapePromLabel(loan.loan_id)}",asset="${escapePromLabel(loan.collateral_token ?? 'unknown')}"`;
     lines.push(`nostok_risk_loan_ltv_bps{${lbl}} ${loan.current_ltv_bps}`);
     lines.push(`nostok_risk_loan_health_factor{${lbl}} ${loan.health_factor.formatted}`);
   }
@@ -338,7 +339,7 @@ export function createRiskServer(ctx: RiskContext): http.Server {
         }
         if (filters.asset) {
           const target = filters.asset.toLowerCase();
-          rows = rows.filter((l) => l.collateral_token.toLowerCase() === target);
+          rows = rows.filter((l) => l.collateral_token?.toLowerCase() === target);
         }
         rows = [...rows].sort((a, b) => {
           const bi = BigInt(a.loan_id);

@@ -1,68 +1,155 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Page, Rows } from '../components/ui.jsx';
-import { ASSET_ORDER, ASSETS, FEES, ORACLE_STATES, stateLabel } from '../lib/data.js';
-import { formatApr, formatUsd } from '../lib/format.js';
+import { FEES, ORACLE_STATES } from '../lib/data.js';
+import {
+  fetchMarketSnapshot,
+  fetchRiskSummaryOptional,
+  formatApiAmount,
+  formatBpsPercent,
+} from '../lib/marketsApi.js';
+import { shortAddress } from '../lib/web3.js';
+import { useStore } from '../store.jsx';
 
 export function Risk() {
-  const tierA = ASSET_ORDER.filter((symbol) => ASSETS[symbol].tier === 'A' && ASSETS[symbol].launch);
-  const tierB = ASSET_ORDER.filter((symbol) => ASSETS[symbol].tier === 'B');
-  const a = ASSETS.NVDAc;
-  const b = ASSETS.TSLAc;
+  const { web3 } = useStore();
+  const [state, setState] = useState({ loading: true, market: null, risk: null, riskError: '' });
+  const reqSeqRef = useRef(0);
+
+  const loadRisk = useCallback(async () => {
+    const seq = ++reqSeqRef.current;
+    setState((prev) => ({ ...prev, loading: true }));
+    const [market, riskRes] = await Promise.all([
+      fetchMarketSnapshot({
+        cfg: web3?.config,
+        requestId: seq,
+        includeLoans: false,
+        includeAuctions: false,
+      }),
+      fetchRiskSummaryOptional(web3?.config),
+    ]);
+    if (seq !== reqSeqRef.current) return;
+    setState({
+      loading: false,
+      market,
+      risk: riskRes.data,
+      riskError: riskRes.error || '',
+    });
+  }, [web3?.config]);
+
+  useEffect(() => {
+    void loadRisk();
+  }, [loadRisk]);
+
+  const market = state.market;
+  const assets = market?.assets ?? [];
+  const risk = state.risk;
+
   return (
     <Page
       kicker="Risk"
-      title="Parameters in public."
-      lede="Caps are ceilings, not targets. These launch numbers are a proposal. They are not a measured calibration of weekend gaps."
+      title="Live asset risk & parameters."
+      lede="Collateral is keyed strictly by token address in AssetRegistry and valued at OracleRouter. Never relies on cached or hardcoded oracle prices."
     >
-      <section className="block">
-        <h2>Tiers</h2>
-        <div className="split">
-          <div>
-            <h3>Tier A</h3>
-            <p className="hint">{tierA.join(', ')}. Mega-cap names. METAc is shown frozen so a corporate-action freeze is visible. It is still a Tier A name.</p>
-            <Rows items={[
-              { label: 'Max initial LTV', value: formatApr(a.maxInitLtvBps) },
-              { label: 'Margin call', value: formatApr(a.marginBps) },
-              { label: 'Liquidation', value: formatApr(a.liqBps) },
-              { label: 'Bad-debt level', value: formatApr(a.badBps) },
-              { label: 'Max auction discount', value: formatApr(a.discountBps) },
-              { label: 'Closed-market haircut', value: formatApr(a.haircutBps) },
-            ]} />
-          </div>
-          <div>
-            <h3>Tier B</h3>
-            <p className="hint">{tierB.join(', ')}. Not at launch.</p>
-            <Rows items={[
-              { label: 'Max initial LTV', value: formatApr(b.maxInitLtvBps) },
-              { label: 'Margin call', value: formatApr(b.marginBps) },
-              { label: 'Liquidation', value: formatApr(b.liqBps) },
-              { label: 'Bad-debt level', value: formatApr(b.badBps) },
-              { label: 'Max auction discount', value: formatApr(b.discountBps) },
-              { label: 'Closed-market haircut', value: formatApr(b.haircutBps) },
-            ]} />
-          </div>
-        </div>
-      </section>
+      <div className="actions">
+        <button
+          className="btn secondary"
+          type="button"
+          onClick={() => void loadRisk()}
+          disabled={state.loading}
+        >
+          {state.loading ? 'Refreshing risk state…' : 'Refresh risk state'}
+        </button>
+      </div>
+
+      {market && (market.stale || market.degraded || market.error) ? (
+        <p className="err block" role="alert">
+          Live asset & oracle state unavailable or degraded — {market.error}
+        </p>
+      ) : null}
+
+      {state.riskError && !risk ? (
+        <p className="hint block">
+          Risk monitor summary endpoint unavailable ({state.riskError}); showing AssetRegistry and OracleRouter state from api/.
+        </p>
+      ) : null}
+
+      {risk ? (
+        <section className="block">
+          <h2>Protocol risk summary (risk/)</h2>
+          <Rows
+            items={[
+              { label: 'Monitor status', value: risk.status },
+              { label: 'Chain head block', value: `#${risk.chain_head_block ?? '—'}` },
+              {
+                label: 'Equity market open',
+                value: risk.market_open === null ? '—' : risk.market_open ? 'Open' : 'Closed',
+              },
+              {
+                label: 'Protocol paused',
+                value: risk.protocol_paused === null ? '—' : risk.protocol_paused ? 'Paused' : 'Active',
+              },
+              {
+                label: 'Global cap / outstanding',
+                value: `${formatApiAmount(risk.global_usdc_cap, { prefixUsd: true })} / ${formatApiAmount(risk.total_outstanding_principal, { prefixUsd: true })}`,
+              },
+              {
+                label: 'Loans by risk (H / MC / NL / Liq / Unk)',
+                value: risk.loan_counts
+                  ? `${risk.loan_counts.healthy} / ${risk.loan_counts.margin_call} / ${risk.loan_counts.near_liquidation} / ${risk.loan_counts.liquidatable} / ${risk.loan_counts.unknown ?? 0}`
+                  : '—',
+              },
+            ]}
+          />
+        </section>
+      ) : null}
 
       <section className="block">
-        <h2>Live asset state</h2>
-        {ASSET_ORDER.filter((symbol) => ASSETS[symbol].launch).map((symbol) => {
-          const asset = ASSETS[symbol];
-          return (
-            <article className="order-row" key={symbol}>
+        <h2>Live asset state (GET /assets)</h2>
+        {state.loading && !market ? (
+          <p className="hint">Loading registered collateral assets from api/…</p>
+        ) : assets.length === 0 ? (
+          <p className="lede">
+            {market?.error
+              ? 'Live asset parameters could not be loaded while api/ is unreachable.'
+              : 'No registered assets indexed yet.'}
+          </p>
+        ) : (
+          assets.map((asset) => (
+            <article className="order-row" key={asset.token}>
               <div>
-                <strong>{symbol}</strong>
-                <span className="quiet">{asset.name} · Tier {asset.tier} · {asset.status} · {stateLabel(asset.state)} · market {formatUsd(asset.marketCents)}</span>
+                <strong>
+                  {asset.symbol || shortAddress(asset.token)} · {asset.status_name}
+                </strong>
+                <span className="quiet">
+                  {asset.token} · Tier {asset.tier ?? '—'} · {asset.oracle?.state_name} · Multiplier{' '}
+                  {asset.multiplier?.recorded?.formatted ?? '—'}
+                </span>
+                <span className="quiet">
+                  Init {formatBpsPercent(asset.ltv?.max_init_ltv_bps)} · Margin{' '}
+                  {formatBpsPercent(asset.ltv?.margin_call_ltv_bps)} · Liq{' '}
+                  {formatBpsPercent(asset.ltv?.liq_ltv_bps)} · Bad debt{' '}
+                  {formatBpsPercent(asset.ltv?.bad_debt_ltv_bps)} · Haircut{' '}
+                  {formatBpsPercent(asset.ltv?.closed_market_haircut_bps)}
+                </span>
+                <span className="quiet">
+                  Per loan {formatApiAmount(asset.caps?.per_loan_cap, { prefixUsd: true })} · Outstanding{' '}
+                  {formatApiAmount(asset.caps?.asset_outstanding_principal, { prefixUsd: true })} / Cap{' '}
+                  {formatApiAmount(asset.caps?.asset_cap, { prefixUsd: true })} · Escrow{' '}
+                  {formatApiAmount(asset.escrow_balance, { maxFractionDigits: 6, showSymbol: true })}
+                </span>
               </div>
-              <span className="numline">{formatUsd(asset.oracleCents)}</span>
+              <span className="numline">
+                {formatApiAmount(asset.oracle?.price, { prefixUsd: true, maxFractionDigits: 2 })}
+              </span>
             </article>
-          );
-        })}
-        <p className="hint">Oracle prices in this preview are illustrative. The registry keys each token by address, never by ticker.</p>
+          ))
+        )}
+        <p className="hint">AssetRegistry keys each collateral asset strictly by contract address on Base (block #{market?.health?.live_block_number ?? market?.health?.block_number ?? '—'}).</p>
       </section>
 
       <section className="block">
-        <h2>What the oracle allows</h2>
-        <p className="lede">The feed already includes dividends and splits. Value is raw units times the feed. A fresh timestamp alone is the wrong test, because a quiet market can be hours old on purpose.</p>
+        <h2>Oracle state enforcement rules (protocol specification)</h2>
+        <p className="lede">Feeds incorporate splits/dividends via AssetRegistry multiplier syncs. Closed equity markets apply an origination haircut while pausing automated liquidations.</p>
         <div className="stack" style={{ marginTop: 24 }}>
           {ORACLE_STATES.map((item) => (
             <article key={item.id}>
@@ -74,12 +161,12 @@ export function Risk() {
       </section>
 
       <section className="block">
-        <h2>Auction and surplus</h2>
-        <p className="lede">A price starts 1% under the oracle and falls to the asset’s max discount over 30 minutes. Buyers take what they want. If proceeds exceed the debt and fees, the excess returns to the borrower. A shortfall is the lender’s loss. The safety reserve is not insurance.</p>
+        <h2>Auction and surplus settlement</h2>
+        <p className="lede">Dutch auctions start near oracle price and step toward max auction discount. Buyers take partial or full lots. Any proceeds above debt and fees return to the borrower; uncovered shortfalls fall on the lender position.</p>
       </section>
 
       <section className="block">
-        <h2>Fees</h2>
+        <h2>Protocol fees & caps</h2>
         <div className="stack">
           {FEES.map((fee) => (
             <article key={fee.name}>
@@ -88,11 +175,6 @@ export function Risk() {
             </article>
           ))}
         </div>
-      </section>
-
-      <section className="block">
-        <h2>Guarded launch</h2>
-        <p className="lede">Allowlisted users, two or three Tier A names, about $10,000 per loan, about $250,000 outstanding, and terms of 7 to 30 days. Yield on the locked stock stays off unless both sides of an order turn it on. A pause can stop new loans. It cannot stop repay, top-up, or claim.</p>
       </section>
     </Page>
   );

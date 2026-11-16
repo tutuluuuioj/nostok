@@ -2777,6 +2777,91 @@ async function runTests(): Promise<void> {
           { Authorization: `Bearer ${rvTok}`, 'X-Forwarded-For': '203.0.113.88' }
         );
         assert.equal(rvRes.status, 201, 'Other wallets from attacker IP must NOT consume legitimate victim quota');
+
+        // Part C: Gmail dot normalization + googlemail.com alias + trailing domain dots + rotating IP/wallet global 10/h cap
+        const gmailKey = generatePrivateKey();
+        const gmailAcct = privateKeyToAccount(gmailKey);
+        const gmailNonce = await getNonce(gmailAcct.address);
+        const gmailSiwe = formatSiweMessage({
+          domain: 'app.nostok.xyz',
+          address: gmailAcct.address,
+          uri: 'https://app.nostok.xyz',
+          chainId: 8453,
+          nonce: gmailNonce,
+          issuedAt: nowIso,
+          expirationTime: futureIso,
+        });
+        const gmailTok = (
+          await httpJson<{ token: string }>('POST', `${bombUrl}/auth/verify`, {
+            message: gmailSiwe,
+            signature: await gmailAcct.signMessage({ message: gmailSiwe }),
+          })
+        ).body.token;
+        const gmailVariants = [
+          'a.b.c+one@gmail.com',
+          'ab.c@googlemail.com.',
+          'a.b.c@gmail.com.',
+          'abc+four@googlemail.com',
+        ];
+        for (let gIdx = 0; gIdx < gmailVariants.length; gIdx++) {
+          const gRes = await httpJson<{ error?: { code: string } }>(
+            'POST',
+            `${bombUrl}/subscriptions`,
+            { channel: 'email', target: gmailVariants[gIdx] },
+            { Authorization: `Bearer ${gmailTok}`, 'X-Forwarded-For': `203.0.114.${10 + gIdx}` }
+          );
+          if (gIdx < 3) {
+            assert.equal(gRes.status, 201, `Gmail/googlemail canonical variant ${gIdx + 1}/3 should pass`);
+          } else {
+            assert.equal(
+              gRes.status,
+              429,
+              '4th Gmail dot/googlemail/trailing-dot variant from same wallet must be blocked by per-wallet limiter'
+            );
+            assert.equal(gRes.body.error?.code, 'RATE_LIMIT_EXCEEDED');
+          }
+        }
+
+        // Rotating 11 distinct wallets + 11 distinct IPs against one Gmail canonical target hits global 10/h cap
+        const globalMax = notifCfg.confirmTargetGlobalPerHourMax;
+        for (let rot = 1; rot <= globalMax + 1; rot++) {
+          const rKey = generatePrivateKey();
+          const rAcct = privateKeyToAccount(rKey);
+          const rNonce = await getNonce(rAcct.address);
+          const rSiwe = formatSiweMessage({
+            domain: 'app.nostok.xyz',
+            address: rAcct.address,
+            uri: 'https://app.nostok.xyz',
+            chainId: 8453,
+            nonce: rNonce,
+            issuedAt: nowIso,
+            expirationTime: futureIso,
+          });
+          const rTok = (
+            await httpJson<{ token: string }>('POST', `${bombUrl}/auth/verify`, {
+              message: rSiwe,
+              signature: await rAcct.signMessage({ message: rSiwe }),
+            })
+          ).body.token;
+          const rotTarget =
+            rot % 2 === 0 ? `bombed.target+${rot}@googlemail.com.` : `bombedtarget+r${rot}@gmail.com`;
+          const rotRes = await httpJson<{ error?: { code: string } }>(
+            'POST',
+            `${bombUrl}/subscriptions`,
+            { channel: 'email', target: rotTarget },
+            { Authorization: `Bearer ${rTok}`, 'X-Forwarded-For': `198.51.101.${rot}` }
+          );
+          if (rot <= globalMax) {
+            assert.equal(rotRes.status, 201, `Rotating IP+wallet ${rot}/${globalMax} allowed up to global cap`);
+          } else {
+            assert.equal(
+              rotRes.status,
+              429,
+              'Rotating BOTH IPs and wallets must still hit the global canonical-target cap (10/h)'
+            );
+            assert.equal(rotRes.body.error?.code, 'RATE_LIMIT_EXCEEDED');
+          }
+        }
       } finally {
         await new Promise<void>((r) => bombProxySrv.close(() => r()));
       }

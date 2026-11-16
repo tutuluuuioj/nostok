@@ -8,8 +8,9 @@ export function Wallet() {
   const { web3 } = useStore();
   const [copied, setCopied] = useState(false);
 
-  const ws = web3.walletState;
-  const isLive = Boolean(ws && !ws.stale && !web3.wrongNetwork);
+  const rawWs = web3.walletState;
+  const ws = rawWs && web3.address && rawWs.address === web3.address ? rawWs : null;
+  const isLive = Boolean(ws && !web3.loadingState && ws.address === web3.address && !ws.stale && !web3.wrongNetwork);
 
   async function copyAddress() {
     if (!web3.address) return;
@@ -172,11 +173,11 @@ export function Wallet() {
                 : null,
               {
                 label: 'Open loans you borrow',
-                value: ws && !ws.apiError ? String(ws.openBorrowCount) : ws ? 'Unavailable' : '—',
+                value: ws && !ws.apiError ? (ws.openBorrowDisplay ?? String(ws.openBorrowCount)) : ws ? 'Unavailable' : '—',
               },
               {
                 label: 'Open claims you hold',
-                value: ws && !ws.apiError ? String(ws.openLenderCount) : ws ? 'Unavailable' : '—',
+                value: ws && !ws.apiError ? (ws.openLenderDisplay ?? String(ws.openLenderCount)) : ws ? 'Unavailable' : '—',
               },
             ]}
           />

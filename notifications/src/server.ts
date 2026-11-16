@@ -281,6 +281,11 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
     3_600_000,
     ctx.config.rateLimitMaxBuckets
   );
+  const confirmTargetGlobalLimiter = new IpRateLimiter(
+    ctx.config.confirmTargetGlobalPerHourMax,
+    3_600_000,
+    ctx.config.rateLimitMaxBuckets
+  );
   const confirmIpLimiter = new IpRateLimiter(
     ctx.config.confirmRateLimitMax,
     ctx.config.rateLimitWindowMs,
@@ -527,7 +532,8 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
 
         const isWebhook = input.channel === 'webhook';
         if (!isWebhook) {
-          // Enforce per-wallet & per-IP limits on canonicalized target (normalizes email +subaddress, prevents cross-wallet attacker exhausting victim quota)
+          // Enforce per-wallet (3/h), per-IP (3/h), and generous global cap (10/h) on canonicalized target
+          // (strips +subaddress, trailing domain dots, Gmail dots, and googlemail->gmail alias)
           const canonicalTargetHash = ctx.cipher.computeGlobalTargetHash(input.channel, normalizedTarget);
           enforceScopedRateLimit(
             res,
@@ -540,6 +546,12 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             confirmTargetIpLimiter,
             `${clientIp}:${canonicalTargetHash}`,
             `IP confirmation sends to ${input.channel} target`
+          );
+          enforceScopedRateLimit(
+            res,
+            confirmTargetGlobalLimiter,
+            canonicalTargetHash,
+            `global confirmation sends to ${input.channel} target`
           );
         }
 
@@ -1114,6 +1126,7 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
     subWalletLimiter.close();
     confirmTargetWalletLimiter.close();
     confirmTargetIpLimiter.close();
+    confirmTargetGlobalLimiter.close();
     confirmIpLimiter.close();
     confirmWalletLimiter.close();
     confirmSubLimiter.close();

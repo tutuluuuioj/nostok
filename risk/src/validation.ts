@@ -54,7 +54,7 @@ export function buildPaginationSchema(maxLimit: number) {
 }
 
 export const riskLoansQuerySchema = z.object({
-  status: z.enum(['healthy', 'margin_call', 'near_liquidation', 'liquidatable']).optional(),
+  status: z.enum(['healthy', 'margin_call', 'near_liquidation', 'liquidatable', 'unknown']).optional(),
   asset: checksumAddressSchema.optional(),
 });
 

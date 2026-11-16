@@ -42,6 +42,7 @@ export interface NotificationsConfig {
   maxVerifyAttempts: number;
   confirmRateLimitMax: number;
   confirmTargetPerHourMax: number;
+  confirmTargetGlobalPerHourMax: number;
   authNonceRateLimitMax: number;
   authVerifyRateLimitMax: number;
   subscriptionsRateLimitMax: number;
@@ -376,6 +377,13 @@ export function loadNotificationsConfig(
     confirmTargetPerHourMax:
       overrides.confirmTargetPerHourMax ??
       parsePositiveInt(process.env.CONFIRM_TARGET_PER_HOUR_MAX, 3, 'CONFIRM_TARGET_PER_HOUR_MAX'),
+    confirmTargetGlobalPerHourMax:
+      overrides.confirmTargetGlobalPerHourMax ??
+      parsePositiveInt(
+        process.env.CONFIRM_TARGET_GLOBAL_PER_HOUR_MAX,
+        10,
+        'CONFIRM_TARGET_GLOBAL_PER_HOUR_MAX'
+      ),
     authNonceRateLimitMax:
       overrides.authNonceRateLimitMax ??
       parsePositiveInt(process.env.AUTH_NONCE_RATE_LIMIT_MAX, 20, 'AUTH_NONCE_RATE_LIMIT_MAX'),

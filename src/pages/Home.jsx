@@ -68,10 +68,10 @@ export function Home() {
       </section>
 
       <section className="section">
-        <h2>A 30-day loan, in numbers.</h2>
-        <p className="lede">$10,000 of a Tier A stock, $5,000 borrowed at 8.00% APR. Simple interest, actual/365. Amounts owed round up. Payouts round down.</p>
+        <h2>A 30-day loan, in numbers (illustrative formula).</h2>
+        <p className="lede">Illustrative math example: $10,000 of a Tier A stock, $5,000 borrowed at 8.00% APR. Simple interest, actual/365. Amounts owed round up. Payouts round down.</p>
         <Sheet
-          title="Term sheet"
+          title="Example term sheet (static math illustration)"
           items={[
             { label: 'Interest at maturity', value: formatUsd(EXAMPLE.interest) },
             { label: 'You receive', value: formatUsd(EXAMPLE.proceeds) },
@@ -81,18 +81,18 @@ export function Home() {
             { label: 'Lender receives', value: formatUsd(EXAMPLE.holder) },
             { label: 'Lender yield', value: `${formatHundredths(EXAMPLE.lenderApr)} APR` },
           ]}
-          note="The protocol keeps the $5.00 origination and $3.29 of the interest. Fees do not rise after the loan opens."
+          note="The protocol keeps $5.00 origination (10 bps) and $3.29 of interest (10% cut). Use the live Markets quote simulator for current Base prices and caps."
         />
         <div className="actions">
-          <Link className="btn secondary" to="/borrow">Open this quote</Link>
+          <Link className="btn secondary" to="/markets">Open live quote simulator</Link>
         </div>
       </section>
 
       <section className="section">
-        <h2>Two health numbers.</h2>
-        <p className="lede">Oracle LTV is what the contract uses. Market-implied LTV is a warning from onchain prices while the equity market is closed. It does not liquidate you.</p>
+        <h2>Oracle states & collateral rules.</h2>
+        <p className="lede">Live Chainlink oracle LTV is enforced by AssetRegistry and OracleRouter. Closed-market hours apply a haircut to new originations while pausing automated liquidations.</p>
         <div className="actions">
-          <Link className="btn secondary" to="/loans/1844">See a margin call</Link>
+          <Link className="btn secondary" to="/risk">Inspect live risk parameters</Link>
         </div>
       </section>
 

@@ -8,6 +8,7 @@ import {
   eligibilityGateAbi,
   erc20Abi,
   getFrontendConfig,
+  getMissingContractAddresses,
   loanCoreAbi,
 } from './contracts.js';
 
@@ -32,10 +33,18 @@ export function shortAddress(addr) {
 }
 
 export function formatTokenUnitsDisplay(raw, decimals, maxFractionDigits = 4) {
-  const str = formatUnits(BigInt(raw ?? 0n), decimals);
+  const big = BigInt(raw ?? 0n);
+  const abs = big < 0n ? -big : big;
+  const str = formatUnits(abs, decimals);
   const [whole, frac = ''] = str.split('.');
   const cleanFrac = frac.slice(0, maxFractionDigits).replace(/0+$/, '');
-  return cleanFrac ? `${whole}.${cleanFrac}` : whole;
+  if (abs > 0n && whole === '0' && cleanFrac === '') {
+    const threshold =
+      maxFractionDigits > 0 ? `0.${'0'.repeat(maxFractionDigits - 1)}1` : '1';
+    return big < 0n ? `>-${threshold}` : `<${threshold}`;
+  }
+  const formatted = cleanFrac ? `${whole}.${cleanFrac}` : whole;
+  return big < 0n ? `-${formatted}` : formatted;
 }
 
 export function formatWeb3Error(err) {
@@ -156,26 +165,27 @@ export function formatSiweMessage(params) {
   ].join('\n');
 }
 
-async function fetchJsonStrict(url, options = {}, timeoutMs = 8000) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+export async function fetchJsonStrict(url, options = {}, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { ...options, signal: ctrl.signal });
+    const res = await fetch(url, { ...options, signal: controller.signal });
     const text = await res.text();
-    let parsed = {};
-    if (text) {
-      try {
-        parsed = JSON.parse(text);
-      } catch {
-        throw new Error(`Invalid JSON from ${url} (HTTP ${res.status})`);
-      }
+    let parsed = null;
+    try {
+      parsed = text ? JSON.parse(text) : {};
+    } catch {
+      parsed = null;
     }
     if (!res.ok) {
-      const msg = parsed?.error?.message || parsed?.message || `HTTP ${res.status}`;
+      const msg = parsed?.error?.message || `HTTP ${res.status} from ${url}`;
       const err = new Error(msg);
       err.status = res.status;
       err.code = parsed?.error?.code;
       throw err;
+    }
+    if (parsed === null) {
+      throw new Error(`Invalid JSON response from ${url}`);
     }
     return parsed;
   } catch (err) {
@@ -188,10 +198,61 @@ async function fetchJsonStrict(url, options = {}, timeoutMs = 8000) {
   }
 }
 
+export function verifySiweChallengeParams(nonceResp, cfg, browserWindow) {
+  const win =
+    browserWindow !== undefined
+      ? browserWindow
+      : typeof window !== 'undefined' && window.location
+        ? window
+        : null;
+
+  const expectedChainId = Number(cfg?.chainId ?? BASE_CHAIN_ID);
+  if (Number(nonceResp.chain_id) !== expectedChainId) {
+    throw new Error(
+      `SIWE challenge chain_id mismatch: expected ${expectedChainId}, received ${nonceResp.chain_id}.`
+    );
+  }
+
+  let parsedUri;
+  try {
+    parsedUri = new URL(nonceResp.uri);
+  } catch {
+    throw new Error('Malformed URI in SIWE nonce response.');
+  }
+
+  const expectedDomain = win?.location?.host || cfg?.siweDomain;
+  if (expectedDomain && nonceResp.domain !== expectedDomain) {
+    throw new Error(
+      `SIWE domain mismatch: expected "${expectedDomain}", received "${nonceResp.domain}".`
+    );
+  }
+  if (win?.location?.host && cfg?.siweDomain && cfg.siweDomain !== win.location.host) {
+    throw new Error(
+      `Configured VITE_SIWE_DOMAIN "${cfg.siweDomain}" does not match current host "${win.location.host}".`
+    );
+  }
+
+  const expectedOrigin = win?.location?.origin || cfg?.siweOrigin;
+  if (expectedOrigin && parsedUri.origin !== expectedOrigin) {
+    throw new Error(
+      `SIWE URI origin mismatch: expected "${expectedOrigin}", received "${parsedUri.origin}".`
+    );
+  }
+}
+
+/**
+ * @param {{
+ *   address: string,
+ *   provider?: any,
+ *   cfg?: any,
+ *   browserWindow?: { location?: { host?: string, origin?: string } } | null
+ * }} opts
+ */
 export async function signInWithSiwe({
   address,
   provider = getInjectedProvider(),
   cfg = getFrontendConfig(),
+  browserWindow = undefined,
 }) {
   if (!address || !isAddress(address)) {
     throw new Error('Connect a wallet before signing in with SIWE.');
@@ -219,6 +280,8 @@ export async function signInWithSiwe({
     throw new Error('Malformed nonce response from notifications service.');
   }
 
+  verifySiweChallengeParams(nonceResp, cfg, browserWindow);
+
   const message = formatSiweMessage({
     domain: nonceResp.domain,
     address: checksummed,
@@ -237,6 +300,16 @@ export async function signInWithSiwe({
     throw new Error('Wallet returned invalid SIWE signature.');
   }
 
+  // Re-verify active wallet account & chain after signing in case the user switched accounts mid-prompt
+  const postSignAccounts = await provider.request({ method: 'eth_accounts' });
+  const activeAfterSign =
+    Array.isArray(postSignAccounts) && postSignAccounts[0] && isAddress(postSignAccounts[0])
+      ? getAddress(postSignAccounts[0])
+      : null;
+  if (!activeAfterSign || activeAfterSign.toLowerCase() !== checksummed.toLowerCase()) {
+    throw new Error('Wallet account changed during SIWE signing; sign-in aborted.');
+  }
+
   const verifyResp = await fetchJsonStrict(`${cfg.notificationsUrl}/auth/verify`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -246,9 +319,13 @@ export async function signInWithSiwe({
   if (!verifyResp.token || !verifyResp.jti) {
     throw new Error('Notifications auth verify response missing session token.');
   }
+  const verifiedAddr = getAddress(verifyResp.wallet_address ?? checksummed);
+  if (verifiedAddr.toLowerCase() !== checksummed.toLowerCase()) {
+    throw new Error('Verified SIWE session address mismatch; session discarded.');
+  }
 
   return {
-    walletAddress: getAddress(verifyResp.wallet_address ?? checksummed),
+    walletAddress: verifiedAddr,
     token: verifyResp.token,
     jti: verifyResp.jti,
     expiresAt: verifyResp.expires_at,
@@ -292,9 +369,48 @@ export async function fetchNotificationsSessionState({ token, cfg = getFrontendC
   };
 }
 
+export async function fetchPaginatedApiRows(baseUrl, { limit = 100, maxPages = 10, timeoutMs = 8000 } = {}) {
+  const rows = [];
+  let offset = 0;
+  let total = null;
+  let truncated = false;
+  for (let page = 0; page < maxPages; page++) {
+    const sep = baseUrl.includes('?') ? '&' : '?';
+    const json = await fetchJsonStrict(`${baseUrl}${sep}limit=${limit}&offset=${offset}`, {}, timeoutMs);
+    const pageData = Array.isArray(json?.data) ? json.data : [];
+    rows.push(...pageData);
+    if (typeof json?.pagination?.total === 'number') {
+      total = json.pagination.total;
+    }
+    const hasMore = Boolean(json?.pagination?.has_more);
+    if (!hasMore || pageData.length === 0) {
+      truncated = false;
+      break;
+    }
+    if (page === maxPages - 1) {
+      truncated = true;
+      break;
+    }
+    offset =
+      json.pagination?.next_cursor !== null && json.pagination?.next_cursor !== undefined
+        ? Number(json.pagination.next_cursor)
+        : offset + pageData.length;
+  }
+  return { rows, total: total ?? rows.length, truncated };
+}
+
+/**
+ * @param {string} address
+ * @param {{
+ *   cfg?: any,
+ *   publicClient?: any,
+ *   attestationHex?: string,
+ *   requestId?: number | null
+ * }} [opts]
+ */
 export async function fetchWalletState(
   address,
-  { cfg = getFrontendConfig(), publicClient = createProtocolPublicClient(cfg), attestationHex = '0x' } = {}
+  { cfg = getFrontendConfig(), publicClient = createProtocolPublicClient(cfg), attestationHex = '0x', requestId = null } = {}
 ) {
   if (!address || !isAddress(address)) {
     return null;
@@ -305,7 +421,11 @@ export async function fetchWalletState(
       ? attestationHex.trim()
       : '0x';
 
-  let rpcError = '';
+  const missingContracts = getMissingContractAddresses(cfg);
+  let rpcError =
+    missingContracts.length > 0
+      ? `Missing required protocol contract address(es): ${missingContracts.join(', ')}`
+      : '';
   let apiError = '';
   let rpcChainId = null;
   let ethBalanceRaw = null;
@@ -317,19 +437,23 @@ export async function fetchWalletState(
   let apiAssets = [];
   let borrowerLoans = [];
   let lenderPositions = [];
+  let borrowTruncated = false;
+  let lenderTruncated = false;
 
-  // 1. Live API health, asset roster, borrower loans, & lender positions
+  // 1. Live API health, asset roster, paginated borrower loans, & paginated lender positions
   try {
-    const [healthJson, assetsJson, loansJson, posJson] = await Promise.all([
+    const [healthJson, assetsRes, loansRes, posRes] = await Promise.all([
       fetchJsonStrict(`${cfg.apiUrl}/health`),
-      fetchJsonStrict(`${cfg.apiUrl}/assets`),
-      fetchJsonStrict(`${cfg.apiUrl}/loans?borrower=${wallet}&limit=50`),
-      fetchJsonStrict(`${cfg.apiUrl}/positions?owner=${wallet}&limit=50`),
+      fetchPaginatedApiRows(`${cfg.apiUrl}/assets`, { limit: 100, maxPages: 5 }),
+      fetchPaginatedApiRows(`${cfg.apiUrl}/loans?borrower=${wallet}`, { limit: 100, maxPages: 10 }),
+      fetchPaginatedApiRows(`${cfg.apiUrl}/positions?owner=${wallet}`, { limit: 100, maxPages: 10 }),
     ]);
     apiHealth = healthJson;
-    apiAssets = Array.isArray(assetsJson?.data) ? assetsJson.data : [];
-    borrowerLoans = Array.isArray(loansJson?.data) ? loansJson.data : [];
-    lenderPositions = Array.isArray(posJson?.data) ? posJson.data : [];
+    apiAssets = assetsRes.rows;
+    borrowerLoans = loansRes.rows;
+    lenderPositions = posRes.rows;
+    borrowTruncated = loansRes.truncated;
+    lenderTruncated = posRes.truncated;
     if (healthJson?.status !== 'ok' || healthJson?.rpc_ok === false || healthJson?.db_ok === false) {
       apiError = `Indexer API status is ${healthJson?.status ?? 'degraded'} (lag=${healthJson?.lag_blocks ?? '?'} blocks).`;
     }
@@ -421,17 +545,22 @@ export async function fetchWalletState(
       );
     }
   } catch (err) {
-    rpcError = `On-chain read failed: ${formatWeb3Error(err)}`;
+    const readMsg = `On-chain read failed: ${formatWeb3Error(err)}`;
+    rpcError = rpcError ? `${rpcError}; ${readMsg}` : readMsg;
   }
 
   const openBorrowCount = borrowerLoans.filter((l) => Number(l.status) < 3).length;
   const openLenderCount = lenderPositions.filter((p) => !p.is_burned).length;
-  const stale = Boolean(rpcError || apiError || ethBalanceRaw === null);
+  const openBorrowDisplay = borrowTruncated ? `${openBorrowCount}+` : String(openBorrowCount);
+  const openLenderDisplay = lenderTruncated ? `${openLenderCount}+` : String(openLenderCount);
+  const stale = Boolean(missingContracts.length > 0 || rpcError || apiError || ethBalanceRaw === null);
 
   return {
+    requestId,
     address: wallet,
     expectedChainId: cfg.chainId || BASE_CHAIN_ID,
     rpcChainId,
+    missingContracts,
     stale,
     fetchedAt: new Date().toISOString(),
     rpcError,
@@ -462,5 +591,7 @@ export async function fetchWalletState(
     apiHealth,
     openBorrowCount,
     openLenderCount,
+    openBorrowDisplay,
+    openLenderDisplay,
   };
 }

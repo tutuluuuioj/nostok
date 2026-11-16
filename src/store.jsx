@@ -79,25 +79,66 @@ export function StoreProvider({ children }) {
   siweRef.current = siweState.session;
   const connRef = useRef(walletConn);
   connRef.current = walletConn;
+  const snapshotSeqRef = useRef(0);
+
+  const clearLocalSiweState = useCallback((opts = {}) => {
+    setSiweState({
+      session: null,
+      subscriptions: null,
+      preferences: null,
+      signingIn: false,
+      siweError: opts.siweError ?? '',
+      siweNotice: opts.siweNotice ?? '',
+    });
+  }, []);
 
   const refreshWalletData = useCallback(
     async (targetAddr = connRef.current.address, customAttestation = attestationHex) => {
-      if (!targetAddr) {
+      const requestId = ++snapshotSeqRef.current;
+      if (!targetAddr || connRef.current.wrongNetwork) {
         setWalletSnapshot({ loading: false, data: null });
         return null;
       }
+      const checksumTarget = getAddress(targetAddr);
       const cfg = getFrontendConfig();
-      setWalletSnapshot((prev) => ({ loading: true, data: prev.data }));
-      const snapshot = await fetchWalletState(targetAddr, { cfg, attestationHex: customAttestation });
+      setWalletSnapshot((prev) => ({
+        loading: true,
+        data: prev.data && prev.data.address === checksumTarget ? prev.data : null,
+      }));
+      const snapshot = await fetchWalletState(checksumTarget, {
+        cfg,
+        attestationHex: customAttestation,
+        requestId,
+      });
+
+      // Drop out-of-order or stale responses after account change, chain change, wrong network, or disconnect
+      const activeAddr = connRef.current.address;
+      if (
+        requestId !== snapshotSeqRef.current ||
+        !connRef.current.connected ||
+        connRef.current.wrongNetwork ||
+        !activeAddr ||
+        activeAddr.toLowerCase() !== checksumTarget.toLowerCase()
+      ) {
+        return null;
+      }
       setWalletSnapshot({ loading: false, data: snapshot });
 
       const activeSess = siweRef.current;
-      if (activeSess && activeSess.walletAddress.toLowerCase() === targetAddr.toLowerCase()) {
+      if (activeSess && activeSess.walletAddress.toLowerCase() === checksumTarget.toLowerCase()) {
+        const expectedToken = activeSess.token;
         try {
           const notifState = await fetchNotificationsSessionState({
-            token: activeSess.token,
+            token: expectedToken,
             cfg,
           });
+          if (
+            requestId !== snapshotSeqRef.current ||
+            siweRef.current?.token !== expectedToken ||
+            connRef.current.address?.toLowerCase() !== checksumTarget.toLowerCase()
+          ) {
+            return snapshot;
+          }
           setSiweState((prev) => ({
             ...prev,
             subscriptions: notifState.subscriptions,
@@ -105,14 +146,12 @@ export function StoreProvider({ children }) {
             siweError: '',
           }));
         } catch (err) {
+          if (requestId !== snapshotSeqRef.current || siweRef.current?.token !== expectedToken) {
+            return snapshot;
+          }
           if (err && typeof err === 'object' && err.status === 401) {
-            setSiweState({
-              session: null,
-              subscriptions: null,
-              preferences: null,
-              signingIn: false,
+            clearLocalSiweState({
               siweError: 'Notifications session expired or revoked. Please sign in again.',
-              siweNotice: '',
             });
           } else {
             setSiweState((prev) => ({
@@ -124,7 +163,7 @@ export function StoreProvider({ children }) {
       }
       return snapshot;
     },
-    [attestationHex]
+    [attestationHex, clearLocalSiweState]
   );
 
   // Sync existing authorized account + subscribe to EIP-1193 accountsChanged / chainChanged
@@ -148,6 +187,9 @@ export function StoreProvider({ children }) {
         });
         if (!acc.wrongNetwork) {
           void refreshWalletData(acc.address, attestationHex);
+        } else {
+          ++snapshotSeqRef.current;
+          setWalletSnapshot({ loading: false, data: null });
         }
       })
       .catch(() => {});
@@ -162,14 +204,15 @@ export function StoreProvider({ children }) {
       const nextRaw = Array.isArray(accounts) && accounts.length > 0 ? accounts[0] : null;
       const nextAddr = nextRaw ? getAddress(nextRaw) : null;
       const prevAddr = connRef.current.address;
+      const prevSess = siweRef.current;
+      ++snapshotSeqRef.current;
+      setWalletSnapshot({ loading: false, data: null });
+
       if (!nextAddr || !prevAddr || nextAddr.toLowerCase() !== prevAddr.toLowerCase()) {
-        // Always invalidate in-memory SIWE bearer token on account change or disconnect
-        setSiweState({
-          session: null,
-          subscriptions: null,
-          preferences: null,
-          signingIn: false,
-          siweError: '',
+        if (prevSess?.token) {
+          void web3SignOutSiwe({ token: prevSess.token, cfg: getFrontendConfig() }).catch(() => {});
+        }
+        clearLocalSiweState({
           siweNotice: nextAddr ? 'Wallet changed. Sign in with SIWE for this address.' : '',
         });
       }
@@ -177,12 +220,10 @@ export function StoreProvider({ children }) {
         ...prev,
         connected: Boolean(nextAddr),
         address: nextAddr,
-        walletError: '',
+        walletError: prev.wrongNetwork && nextAddr ? prev.walletError : '',
       }));
-      if (nextAddr) {
+      if (nextAddr && !connRef.current.wrongNetwork) {
         void refreshWalletData(nextAddr, attestationHex);
-      } else {
-        setWalletSnapshot({ loading: false, data: null });
       }
     };
 
@@ -190,6 +231,19 @@ export function StoreProvider({ children }) {
       const nextChainId = parseChainIdHex(rawChain);
       const currentCfg = getFrontendConfig();
       const wrong = nextChainId !== currentCfg.chainId;
+      ++snapshotSeqRef.current;
+      setWalletSnapshot({ loading: false, data: null });
+
+      if (wrong && siweRef.current) {
+        const prevSess = siweRef.current;
+        if (prevSess?.token) {
+          void web3SignOutSiwe({ token: prevSess.token, cfg: currentCfg }).catch(() => {});
+        }
+        clearLocalSiweState({
+          siweNotice: `Network changed away from Base (${currentCfg.chainId}); SIWE session cleared.`,
+        });
+      }
+
       setWalletConn((prev) => ({
         ...prev,
         chainId: Number.isNaN(nextChainId) ? prev.chainId : nextChainId,
@@ -212,10 +266,12 @@ export function StoreProvider({ children }) {
         provider.removeListener('chainChanged', onChainChanged);
       }
     };
-  }, [attestationHex, refreshWalletData]);
+  }, [attestationHex, clearLocalSiweState, refreshWalletData]);
 
   const connect = useCallback(async () => {
     const cfg = getFrontendConfig();
+    ++snapshotSeqRef.current;
+    setWalletSnapshot({ loading: false, data: null });
     setWalletConn((prev) => ({ ...prev, connecting: true, walletError: '' }));
     try {
       const res = await web3ConnectWallet(getInjectedProvider(), cfg);
@@ -227,7 +283,9 @@ export function StoreProvider({ children }) {
         connecting: false,
         walletError: res.error || '',
       });
-      await refreshWalletData(res.address, attestationHex);
+      if (!res.wrongNetwork) {
+        await refreshWalletData(res.address, attestationHex);
+      }
       return res;
     } catch (err) {
       const msg = formatWeb3Error(err);
@@ -273,6 +331,10 @@ export function StoreProvider({ children }) {
         provider: getInjectedProvider(),
         cfg,
       });
+      if (!connRef.current.address || connRef.current.address.toLowerCase() !== addr.toLowerCase()) {
+        void web3SignOutSiwe({ token: session.token, cfg }).catch(() => {});
+        throw new Error('Wallet account changed during SIWE signing; sign-in aborted.');
+      }
       let subscriptions = null;
       let preferences = null;
       try {
@@ -281,6 +343,10 @@ export function StoreProvider({ children }) {
         preferences = loaded.preferences;
       } catch {
         // Non-fatal follow-up read; session itself is established
+      }
+      if (!connRef.current.address || connRef.current.address.toLowerCase() !== addr.toLowerCase()) {
+        void web3SignOutSiwe({ token: session.token, cfg }).catch(() => {});
+        return null;
       }
       setSiweState({
         session,
@@ -304,28 +370,23 @@ export function StoreProvider({ children }) {
   const signOut = useCallback(async () => {
     const cfg = getFrontendConfig();
     const current = siweRef.current;
-    try {
-      if (current?.token) {
-        await web3SignOutSiwe({ token: current.token, cfg });
-      }
-      setSiweState({
-        session: null,
-        subscriptions: null,
-        preferences: null,
-        signingIn: false,
-        siweError: '',
-        siweNotice: 'Signed out and revoked notification session.',
-      });
-    } catch (err) {
-      setSiweState((prev) => ({
-        ...prev,
-        siweError: formatWeb3Error(err),
-      }));
+    if (!current?.token) {
+      clearLocalSiweState({ siweNotice: 'Signed out and revoked notification session.' });
+      return;
     }
-  }, []);
+    try {
+      await web3SignOutSiwe({ token: current.token, cfg });
+      clearLocalSiweState({ siweNotice: 'Signed out and revoked notification session.' });
+    } catch {
+      clearLocalSiweState({
+        siweError: `Server revocation failed; token expires at ${current.expiresAt ?? 'unknown'}`,
+      });
+    }
+  }, [clearLocalSiweState]);
 
   const disconnect = useCallback(async () => {
-    await signOut();
+    ++snapshotSeqRef.current;
+    setWalletSnapshot({ loading: false, data: null });
     setWalletConn({
       connected: false,
       address: null,
@@ -334,8 +395,7 @@ export function StoreProvider({ children }) {
       connecting: false,
       walletError: '',
     });
-    setWalletSnapshot({ loading: false, data: null });
-    setSiweState((prev) => ({ ...prev, siweNotice: '' }));
+    await signOut();
   }, [signOut]);
 
   const web3 = useMemo(

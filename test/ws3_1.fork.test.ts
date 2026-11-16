@@ -32,14 +32,23 @@ import { createNotificationsContext } from '../notifications/src/engine.js';
 import { createNotificationsServer } from '../notifications/src/server.js';
 import {
   BASE_CHAIN_ID,
+  BASE_USDC_ADDRESS,
   USDC_DECIMALS,
   getFrontendConfig,
   setFrontendConfigOverrides,
 } from '../src/lib/contracts.js';
 import {
+  fetchLoanQuote,
+  fetchMarketSnapshot,
+  formatApiAmount,
+  formatBpsPercent,
+} from '../src/lib/marketsApi.js';
+import {
   connectWallet,
   fetchNotificationsSessionState,
+  fetchPaginatedApiRows,
   fetchWalletState,
+  formatTokenUnitsDisplay,
   setInjectedProvider,
   signInWithSiwe,
   signOutSiwe,
@@ -193,11 +202,15 @@ function createMockEip1193Provider(initialAccountKey: Hex, initialChainId = 8453
   let account = privateKeyToAccount(initialAccountKey);
   let chainId = initialChainId;
   let rejectSwitch = false;
+  let midSignNextKey: Hex | null = null;
   const listeners = new Map<string, Set<(...args: unknown[]) => void>>();
 
   return {
     setRejectSwitch(v: boolean) {
       rejectSwitch = v;
+    },
+    setMidSignAccountSwitch(nextKey: Hex | null) {
+      midSignNextKey = nextKey;
     },
     setChainId(nextId: number) {
       chainId = nextId;
@@ -235,7 +248,12 @@ function createMockEip1193Provider(initialAccountKey: Hex, initialChainId = 8453
       }
       if (method === 'personal_sign') {
         const msgHex = params[0] as Hex;
-        return account.signMessage({ message: { raw: msgHex } });
+        const sig = await account.signMessage({ message: { raw: msgHex } });
+        if (midSignNextKey) {
+          account = privateKeyToAccount(midSignNextKey);
+          midSignNextKey = null;
+        }
+        return sig;
       }
       throw new Error(`Unsupported mock EIP-1193 method: ${method}`);
     },
@@ -657,10 +675,14 @@ async function runTests(): Promise<void> {
 
     try {
       setFrontendConfigOverrides({
+        isProd: false,
+        isFork: true,
         chainId: BASE_CHAIN_ID,
         rpcUrl: LOCAL_RPC_URL,
         apiUrl,
         notificationsUrl: notifUrl,
+        siweDomain: 'app.nostok.xyz',
+        siweOrigin: 'https://app.nostok.xyz',
         usdcAddress: BASE_USDC,
         loanCore: deployed.loanCore,
         orderSettlement: deployed.orderSettlement,
@@ -674,6 +696,7 @@ async function runTests(): Promise<void> {
 
       const cfg = getFrontendConfig();
       assert.equal(cfg.chainId, 8453);
+      assert.equal(cfg.usdcAddress, BASE_USDC_ADDRESS);
       assert.equal(cfg.contracts.loanCore, deployed.loanCore);
 
       // 3.1a Wrong network detection & automatic/rejected switch
@@ -817,7 +840,182 @@ async function runTests(): Promise<void> {
       assert.match(rpcDownState?.rpcError ?? '', /On-chain read failed/i);
       console.log('PASS WS3.1e: Failed RPC/API reads explicitly flag stale=true and surface clear errors.');
 
-      console.log('\nALL WS3.1 FRONTEND WALLET + SIWE BASE MAINNET FORK TESTS PASSED.');
+      // 3.1f Review Fixes #1, #2, #3, #5, #6: Snapshot requestId, SIWE domain/origin/mid-sign guard,
+      //      prod config enforcement, missing contracts stale, logout failure, dust display, pagination
+      console.log('\n=== WS3.1f: Security & UX Fixes #1-#6 integration tests ===');
+      // Fix #1: requestId & address tagging
+      const snap1 = await fetchWalletState(ADDRESSES.borrower, { cfg, requestId: 41 });
+      const snap2 = await fetchWalletState(ADDRESSES.lender, { cfg, requestId: 42 });
+      assert.equal(snap1?.address, ADDRESSES.borrower);
+      assert.equal(snap1?.requestId, 41);
+      assert.equal(snap2?.address, ADDRESSES.lender);
+      assert.equal(snap2?.requestId, 42);
+
+      // Fix #2: SIWE domain, origin, chain_id & mid-sign account switch rejection
+      await assert.rejects(
+        () =>
+          signInWithSiwe({
+            address: ADDRESSES.borrower,
+            provider: walletProvider,
+            cfg,
+            browserWindow: { location: { host: 'phish.nostok.xyz', origin: 'https://app.nostok.xyz' } },
+          }),
+        /SIWE domain mismatch/
+      );
+      await assert.rejects(
+        () =>
+          signInWithSiwe({
+            address: ADDRESSES.borrower,
+            provider: walletProvider,
+            cfg,
+            browserWindow: { location: { host: 'app.nostok.xyz', origin: 'https://phish.nostok.xyz' } },
+          }),
+        /SIWE URI origin mismatch/
+      );
+      walletProvider.setMidSignAccountSwitch(KEYS.lender);
+      await assert.rejects(
+        () => signInWithSiwe({ address: ADDRESSES.borrower, provider: walletProvider, cfg }),
+        /Wallet account changed during SIWE signing/
+      );
+      walletProvider.setAccount(KEYS.borrower);
+
+      // Fix #3: Missing contract address marks stale=true with explicit error; prod throws on missing/http/wrong chain
+      const missingContractState = await fetchWalletState(ADDRESSES.borrower, {
+        cfg: { ...cfg, contracts: { ...cfg.contracts, eligibilityGate: undefined } },
+      });
+      assert.equal(missingContractState?.stale, true);
+      assert.match(missingContractState?.rpcError ?? '', /Missing required protocol contract address.*eligibilityGate/);
+
+      assert.throws(() => {
+        setFrontendConfigOverrides({
+          isProd: true,
+          isFork: false,
+          chainId: 1,
+          rpcUrl: 'https://base-private.example',
+          apiUrl: 'https://api.nostok.xyz',
+          notificationsUrl: 'https://notifications.nostok.xyz',
+          riskUrl: 'https://risk.nostok.xyz',
+          loanCore: deployed.loanCore,
+          orderSettlement: deployed.orderSettlement,
+          liquidationAuction: deployed.liquidationAuction,
+          positionNft: deployed.positionNFT,
+          collateralEscrow: deployed.collateralEscrow,
+          assetRegistry: deployed.assetRegistry,
+          oracleRouter: deployed.oracleRouter,
+          eligibilityGate: deployed.eligibilityGate,
+        });
+        getFrontendConfig();
+      }, /VITE_CHAIN_ID=8453/);
+
+      setFrontendConfigOverrides({
+        isProd: false,
+        isFork: true,
+        chainId: BASE_CHAIN_ID,
+        rpcUrl: LOCAL_RPC_URL,
+        apiUrl,
+        notificationsUrl: notifUrl,
+        siweDomain: 'app.nostok.xyz',
+        siweOrigin: 'https://app.nostok.xyz',
+        usdcAddress: BASE_USDC,
+        loanCore: deployed.loanCore,
+        orderSettlement: deployed.orderSettlement,
+        liquidationAuction: deployed.liquidationAuction,
+        positionNft: deployed.positionNFT,
+        collateralEscrow: deployed.collateralEscrow,
+        assetRegistry: deployed.assetRegistry,
+        oracleRouter: deployed.oracleRouter,
+        eligibilityGate: deployed.eligibilityGate,
+      });
+
+      // Fix #5: logout unreachable throws so store clears local session & reports expiry
+      const freshSess = await signInWithSiwe({ address: ADDRESSES.borrower, provider: walletProvider, cfg });
+      await assert.rejects(
+        () => signOutSiwe({ token: freshSess.token, cfg: { ...cfg, notificationsUrl: `http://127.0.0.1:${deadPort}` } }),
+        /.+/
+      );
+      await signOutSiwe({ token: freshSess.token, cfg });
+
+      // Fix #6: Dust formatting & paginated loans/positions
+      assert.equal(formatTokenUnitsDisplay(1n, 6, 2), '<0.01');
+      const pagedLoans = await fetchPaginatedApiRows(`${cfg.apiUrl}/loans?borrower=${ADDRESSES.borrower}`, {
+        limit: 1,
+        maxPages: 5,
+      });
+      assert.equal(pagedLoans.rows.length, 2);
+      assert.equal(pagedLoans.total, 2);
+      assert.equal(pagedLoans.truncated, false);
+      console.log('PASS WS3.1f: Review fixes #1-#6 verified.');
+
+      // 3.2 WS3.2 Live Market Pages (read-only api/ markets, assets, orders, quotes, stale/degraded states)
+      console.log('\n=== WS3.2: Live market pages & GET /quote from api/ ===');
+      const liveMkt = await fetchMarketSnapshot({ cfg, requestId: 101 });
+      assert.equal(liveMkt.stale, false, `Expected live market snapshot (${liveMkt.error})`);
+      assert.equal(liveMkt.degraded, false);
+      assert.equal(liveMkt.assets.length, 1);
+      assert.equal(liveMkt.assets[0].symbol, 'NVDAc');
+      assert.equal(liveMkt.assets[0].decimals, 18);
+      assert.equal(liveMkt.assets[0].oracle.state_name, 'VALID_OPEN');
+      assert.equal(formatApiAmount(liveMkt.assets[0].oracle.price, { prefixUsd: true }), '$140.00');
+      assert.equal(liveMkt.orders.length, 2, 'Expected 2 indexed borrow orders');
+      assert.equal(liveMkt.bookSummary?.borrowOrders.length, 2);
+      assert.equal(liveMkt.bookSummary?.lendOffers.length, 0);
+      assert.equal(liveMkt.bookSummary?.activeLoansCount, 1);
+      assert.equal(liveMkt.bookSummary?.repaidLoansCount, 1);
+      assert.equal(liveMkt.bookSummary?.totalOutstandingUsdc.raw, '600000000');
+      assert.equal(formatBpsPercent(liveMkt.bookSummary?.weightedAverageAprBps), '10.00%');
+
+      // Quote while borrower is revoked must reject BORROWER_INELIGIBLE
+      const revokedQuote = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '500000000',
+        termDays: 30,
+        aprBps: 800,
+        borrower: ADDRESSES.borrower,
+      });
+      assert.equal(revokedQuote.accepted, false);
+      assert.ok(
+        revokedQuote.rejection_reasons.some((r: { code: string }) => r.code === 'BORROWER_INELIGIBLE'),
+        'Revoked borrower quote must report BORROWER_INELIGIBLE'
+      );
+
+      // Restore borrower allowlist and obtain accepted live quote
+      await publicClient.waitForTransactionReceipt({
+        hash: await ownerClient.writeContract({
+          address: deployed.eligibilityGate,
+          abi: parseAbi(['function revokeUser(address account, bool revoked)']),
+          functionName: 'revokeUser',
+          args: [ADDRESSES.borrower, false],
+        }),
+      });
+
+      const okQuote = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '500000000',
+        termDays: 30,
+        aprBps: 800,
+        borrower: ADDRESSES.borrower,
+      });
+      assert.equal(okQuote.accepted, true);
+      assert.equal(okQuote.amounts.principal.raw, '500000000');
+      assert.equal(okQuote.amounts.principal.decimals, 6);
+      assert.equal(okQuote.asset.decimals, 18);
+      assert.ok(BigInt(okQuote.amounts.collateral_required.raw) > 0n);
+
+      // Market snapshot against dead api/ must report stale=true, degraded=true, and zero fallback assets/orders
+      const downMkt = await fetchMarketSnapshot({
+        cfg: { ...cfg, apiUrl: `http://127.0.0.1:${deadPort}` },
+        requestId: 102,
+      });
+      assert.equal(downMkt.stale, true);
+      assert.equal(downMkt.degraded, true);
+      assert.equal(downMkt.assets.length, 0);
+      assert.equal(downMkt.orders.length, 0);
+      assert.match(downMkt.error, /Failed to fetch live market data/i);
+      console.log('PASS WS3.2: Live assets, orders, book metrics, GET /quote, and degraded error states verified.');
+
+      console.log('\nALL WS3.1 + WS3.2 FRONTEND BASE MAINNET FORK TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
       await new Promise<void>((r) => apiServer.close(() => r()));

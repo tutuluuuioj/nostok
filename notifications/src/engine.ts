@@ -263,14 +263,14 @@ export function isWithinQuietHours(
 
 interface RiskLoanApiRow {
   loan_id: string;
-  borrower: string;
-  collateral_token: string;
-  risk_status: 'healthy' | 'margin_call' | 'near_liquidation' | 'liquidatable';
-  current_ltv_bps: number;
-  margin_call_ltv_bps?: number;
-  liq_ltv_bps?: number;
-  loan_status?: number;
-  oracle_state: number;
+  borrower: string | null;
+  collateral_token: string | null;
+  risk_status: 'healthy' | 'margin_call' | 'near_liquidation' | 'liquidatable' | 'unknown';
+  current_ltv_bps: number | null;
+  margin_call_ltv_bps?: number | null;
+  liq_ltv_bps?: number | null;
+  loan_status?: number | null;
+  oracle_state: number | null;
   oracle_state_name: string;
   block_number: string;
 }
@@ -842,6 +842,9 @@ export async function runNotificationsCycle(
     if (riskState) {
       for (const rl of riskState.loans) {
         const oc = onchainByLoanId.get(rl.loan_id);
+        if (rl.risk_status === 'unknown' || rl.current_ltv_bps === null || !rl.borrower) {
+          continue;
+        }
         if (oc && (oc.loan.status >= 3 || oc.loan.principal <= oc.loan.principalRepaid)) {
           continue;
         }

@@ -57,11 +57,22 @@ export function Shell({ children }) {
     ? `${shortAddress(web3.address)}${web3.siweSession ? ' · SIWE' : ''}`
     : 'Connect wallet';
 
-  const networkLabel = web3?.wrongNetwork
-    ? `Wrong network (${web3.chainId}) — switch to Base (${web3.config.chainId})`
-    : `Base Mainnet (${web3?.config?.chainId ?? 8453})`;
+  const wsMatches =
+    web3?.walletState && web3.address && web3.walletState.address === web3.address;
 
-  const degradedMsg = web3?.walletError || web3?.walletState?.rpcError || web3?.walletState?.apiError;
+  const networkLabel = !web3?.connected
+    ? `Wallet not connected · Target Base (${web3?.config?.chainId ?? 8453})`
+    : web3.wrongNetwork
+      ? `Wrong network (${web3.chainId}) — switch to Base (${web3.config.chainId})`
+      : web3.loadingState
+        ? `Base (${web3.chainId ?? web3.config.chainId}) · Refreshing RPC…`
+        : wsMatches && !web3.walletState.stale
+          ? `Base (${web3.walletState.rpcChainId ?? web3.chainId}) · Live RPC`
+          : `Base (${web3.chainId ?? web3.config.chainId}) · Degraded`;
+
+  const degradedMsg =
+    web3?.walletError ||
+    (wsMatches ? web3?.walletState?.rpcError || web3?.walletState?.apiError : '');
 
   return (
     <>

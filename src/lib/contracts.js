@@ -316,6 +316,17 @@ export const liquidationAuctionAbi = [
   },
 ];
 
+export const REQUIRED_CONTRACT_KEYS = [
+  'loanCore',
+  'orderSettlement',
+  'liquidationAuction',
+  'positionNft',
+  'collateralEscrow',
+  'assetRegistry',
+  'oracleRouter',
+  'eligibilityGate',
+];
+
 let configOverrides = {};
 
 function readEnv(key) {
@@ -345,14 +356,41 @@ function stripTrailingSlash(raw) {
   return String(raw || '').trim().replace(/\/+$/, '');
 }
 
+function isProductionEnv(overrides) {
+  if (typeof overrides.isProd === 'boolean') return overrides.isProd;
+  const viteProd =
+    typeof import.meta !== 'undefined' && import.meta.env
+      ? Boolean(import.meta.env.PROD)
+      : false;
+  const nodeProd =
+    typeof process !== 'undefined' && process.env
+      ? process.env.NODE_ENV === 'production'
+      : false;
+  return viteProd || nodeProd;
+}
+
+function isForkEnv(overrides) {
+  if (typeof overrides.isFork === 'boolean') return overrides.isFork;
+  return readEnv('VITE_IS_FORK') === 'true' || readEnv('FORK') === 'true';
+}
+
+export function getMissingContractAddresses(cfg) {
+  const c = cfg?.contracts ?? {};
+  return REQUIRED_CONTRACT_KEYS.filter((key) => !c[key]);
+}
+
 export function setFrontendConfigOverrides(overrides = {}) {
   configOverrides = { ...overrides };
 }
 
 export function getFrontendConfig() {
+  const isProd = isProductionEnv(configOverrides);
+  const isFork = isForkEnv(configOverrides);
   const rawChainId = configOverrides.chainId ?? readEnv('VITE_CHAIN_ID');
-  const chainId = rawChainId ? Number(rawChainId) : BASE_CHAIN_ID;
-  const rpcUrl = configOverrides.rpcUrl ?? readEnv('VITE_RPC_URL') ?? 'https://mainnet.base.org';
+  const parsedChainId = rawChainId !== undefined && rawChainId !== '' ? Number(rawChainId) : BASE_CHAIN_ID;
+  const chainId = Number.isInteger(parsedChainId) && parsedChainId > 0 ? parsedChainId : NaN;
+
+  const rpcUrl = stripTrailingSlash(configOverrides.rpcUrl ?? readEnv('VITE_RPC_URL') ?? 'https://mainnet.base.org');
   const apiUrl = stripTrailingSlash(
     configOverrides.apiUrl ?? readEnv('VITE_API_URL') ?? 'http://127.0.0.1:3001'
   );
@@ -362,36 +400,75 @@ export function getFrontendConfig() {
   const riskUrl = stripTrailingSlash(
     configOverrides.riskUrl ?? readEnv('VITE_RISK_URL') ?? 'http://127.0.0.1:3002'
   );
+  const siweDomain = configOverrides.siweDomain ?? readEnv('VITE_SIWE_DOMAIN');
+  const siweOrigin = configOverrides.siweOrigin ?? readEnv('VITE_SIWE_ORIGIN');
+
+  const rawUsdc = configOverrides.usdcAddress ?? readEnv('VITE_USDC_ADDRESS');
+  const normalizedUsdcOverride = rawUsdc ? normalizeOptionalAddress(rawUsdc) : undefined;
+  if (!isFork && normalizedUsdcOverride && normalizedUsdcOverride !== BASE_USDC_ADDRESS) {
+    throw new Error(
+      `VITE_USDC_ADDRESS override (${normalizedUsdcOverride}) is prohibited outside fork/test mode; Base USDC is pinned to ${BASE_USDC_ADDRESS}.`
+    );
+  }
+  const usdcAddress = isFork ? (normalizedUsdcOverride ?? BASE_USDC_ADDRESS) : BASE_USDC_ADDRESS;
+
+  const contracts = {
+    loanCore: normalizeOptionalAddress(configOverrides.loanCore ?? readEnv('VITE_LOAN_CORE_ADDRESS')),
+    orderSettlement: normalizeOptionalAddress(
+      configOverrides.orderSettlement ?? readEnv('VITE_ORDER_SETTLEMENT_ADDRESS')
+    ),
+    liquidationAuction: normalizeOptionalAddress(
+      configOverrides.liquidationAuction ?? readEnv('VITE_LIQUIDATION_AUCTION_ADDRESS')
+    ),
+    positionNft: normalizeOptionalAddress(configOverrides.positionNft ?? readEnv('VITE_POSITION_NFT_ADDRESS')),
+    collateralEscrow: normalizeOptionalAddress(
+      configOverrides.collateralEscrow ?? readEnv('VITE_COLLATERAL_ESCROW_ADDRESS')
+    ),
+    assetRegistry: normalizeOptionalAddress(
+      configOverrides.assetRegistry ?? readEnv('VITE_ASSET_REGISTRY_ADDRESS')
+    ),
+    oracleRouter: normalizeOptionalAddress(configOverrides.oracleRouter ?? readEnv('VITE_ORACLE_ROUTER_ADDRESS')),
+    eligibilityGate: normalizeOptionalAddress(
+      configOverrides.eligibilityGate ?? readEnv('VITE_ELIGIBILITY_GATE_ADDRESS')
+    ),
+  };
+
+  if (isProd) {
+    if (chainId !== BASE_CHAIN_ID) {
+      throw new Error(`Production builds require VITE_CHAIN_ID=${BASE_CHAIN_ID} (got ${rawChainId ?? 'unset'}).`);
+    }
+    if (!rpcUrl.startsWith('https://') || rpcUrl === 'https://mainnet.base.org') {
+      throw new Error(
+        'Production builds require a private https:// Base RPC endpoint in VITE_RPC_URL (public https://mainnet.base.org is disallowed).'
+      );
+    }
+    if (!apiUrl.startsWith('https://')) {
+      throw new Error(`Production builds require an https:// VITE_API_URL (got "${apiUrl}").`);
+    }
+    if (!notificationsUrl.startsWith('https://')) {
+      throw new Error(`Production builds require an https:// VITE_NOTIFICATIONS_URL (got "${notificationsUrl}").`);
+    }
+    if (riskUrl && !riskUrl.startsWith('https://')) {
+      throw new Error(`Production builds require an https:// VITE_RISK_URL (got "${riskUrl}").`);
+    }
+    const missing = REQUIRED_CONTRACT_KEYS.filter((k) => !contracts[k]);
+    if (missing.length > 0) {
+      throw new Error(`Production build missing required protocol contract address(es): ${missing.join(', ')}.`);
+    }
+  }
 
   return {
-    chainId: Number.isInteger(chainId) && chainId > 0 ? chainId : BASE_CHAIN_ID,
+    isProd,
+    isFork,
+    chainId: Number.isInteger(chainId) ? chainId : BASE_CHAIN_ID,
     rpcUrl,
     apiUrl,
     notificationsUrl,
     riskUrl,
-    usdcAddress: normalizeOptionalAddress(
-      configOverrides.usdcAddress ?? readEnv('VITE_USDC_ADDRESS') ?? BASE_USDC_ADDRESS
-    ) ?? BASE_USDC_ADDRESS,
-    contracts: {
-      loanCore: normalizeOptionalAddress(configOverrides.loanCore ?? readEnv('VITE_LOAN_CORE_ADDRESS')),
-      orderSettlement: normalizeOptionalAddress(
-        configOverrides.orderSettlement ?? readEnv('VITE_ORDER_SETTLEMENT_ADDRESS')
-      ),
-      liquidationAuction: normalizeOptionalAddress(
-        configOverrides.liquidationAuction ?? readEnv('VITE_LIQUIDATION_AUCTION_ADDRESS')
-      ),
-      positionNft: normalizeOptionalAddress(configOverrides.positionNft ?? readEnv('VITE_POSITION_NFT_ADDRESS')),
-      collateralEscrow: normalizeOptionalAddress(
-        configOverrides.collateralEscrow ?? readEnv('VITE_COLLATERAL_ESCROW_ADDRESS')
-      ),
-      assetRegistry: normalizeOptionalAddress(
-        configOverrides.assetRegistry ?? readEnv('VITE_ASSET_REGISTRY_ADDRESS')
-      ),
-      oracleRouter: normalizeOptionalAddress(configOverrides.oracleRouter ?? readEnv('VITE_ORACLE_ROUTER_ADDRESS')),
-      eligibilityGate: normalizeOptionalAddress(
-        configOverrides.eligibilityGate ?? readEnv('VITE_ELIGIBILITY_GATE_ADDRESS')
-      ),
-    },
+    siweDomain: siweDomain ? String(siweDomain).trim() : undefined,
+    siweOrigin: siweOrigin ? stripTrailingSlash(siweOrigin) : undefined,
+    usdcAddress,
+    contracts,
   };
 }
 
