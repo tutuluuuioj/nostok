@@ -280,4 +280,68 @@ contract OrderSettlementTest is Test {
         vm.expectRevert(OrderSettlement.InvalidNonce.selector);
         settlement.fillBorrowOrder(order, sig, 5000e6);
     }
+
+    function test_FillBorrowOrder_WithAttestations() public {
+        uint256 kycPrivateKey = 0x8888;
+        address kycSigner = vm.addr(kycPrivateKey);
+
+        // Put gate into permissioned mode with attestation signer
+        vm.startPrank(owner);
+        gate.setPermissionlessMode(false);
+        gate.setAttestationSigner(kycSigner);
+        vm.stopPrank();
+
+        IOrderSettlement.BorrowOrder memory order = IOrderSettlement.BorrowOrder({
+            borrower: borrower,
+            collateralToken: address(stockToken),
+            collateralAmount: 50e6,
+            minUsdc: 5000e6,
+            maxRateBps: 800,
+            termDays: 30,
+            maxLtvBps: 6000,
+            minFill: 500e6,
+            expiry: uint64(block.timestamp + 7 days),
+            nonce: 0,
+            yieldMode: 0,
+            allowInKindSettlement: false
+        });
+
+        bytes32 digest = settlement.hashBorrowOrder(order);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(borrowerPrivateKey, digest);
+        bytes memory sig = abi.encodePacked(r, s, v);
+
+        // Calling fillBorrowOrder without attestations reverts IneligibleCounterparty
+        vm.prank(lender);
+        vm.expectRevert(OrderSettlement.IneligibleCounterparty.selector);
+        settlement.fillBorrowOrder(order, sig, 5000e6);
+
+        // Sign KYC attestations for borrower and lender
+        uint256 expiry = block.timestamp + 1 days;
+        bytes32 bDigest = gate.getAttestationDigest(borrower, 0, expiry);
+        (uint8 bv, bytes32 br, bytes32 bs) = vm.sign(kycPrivateKey, bDigest);
+        bytes memory bAttestation = abi.encode(expiry, abi.encodePacked(br, bs, bv));
+
+        bytes32 lDigest = gate.getAttestationDigest(lender, 0, expiry);
+        (uint8 lv, bytes32 lr, bytes32 ls) = vm.sign(kycPrivateKey, lDigest);
+        bytes memory lAttestation = abi.encode(expiry, abi.encodePacked(lr, ls, lv));
+
+        // Attempting with expired borrower attestation fails
+        bytes memory expiredB = abi.encode(block.timestamp - 1, abi.encodePacked(br, bs, bv));
+        vm.prank(lender);
+        vm.expectRevert(OrderSettlement.IneligibleCounterparty.selector);
+        settlement.fillBorrowOrderWithAttestations(order, sig, 5000e6, expiredB, lAttestation);
+
+        // Filling with both valid attestations succeeds!
+        vm.prank(lender);
+        uint256 loanId = settlement.fillBorrowOrderWithAttestations(
+            order,
+            sig,
+            5000e6,
+            bAttestation,
+            lAttestation
+        );
+
+        assertEq(loanId, 1);
+        assertEq(core.totalOutstandingPrincipal(), 5000e6);
+    }
 }

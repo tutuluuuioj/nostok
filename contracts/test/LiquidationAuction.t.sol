@@ -400,4 +400,126 @@ contract LiquidationAuctionTest is Test {
         ILoanCore.Loan memory l = core.getLoan(loanId);
         assertEq(uint8(l.status), uint8(ILoanCore.LoanStatus.SettledDefault));
     }
+
+    function test_Auction_TwoLoansSameToken_NoCollateralDrain() public {
+        address borrower2 = address(0xEEEE);
+        stockToken.mint(borrower2, 100e6);
+        vm.prank(borrower2);
+        stockToken.approve(address(escrow), type(uint256).max);
+
+        // Loan 1: borrower deposits 50 NVDAc, borrows $5,800
+        vm.prank(mockOrderSettlement);
+        uint256 loan1 = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            50e6,
+            5800e6,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        // Loan 2: borrower2 deposits 50 NVDAc, borrows $4,000
+        vm.prank(mockOrderSettlement);
+        uint256 loan2 = core.openLoan(
+            borrower2,
+            lender,
+            address(stockToken),
+            50e6,
+            4000e6,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        // Escrow holds exactly 100 NVDAc
+        assertEq(stockToken.balanceOf(address(escrow)), 100e6);
+        assertEq(escrow.getBalance(address(stockToken)), 100e6);
+
+        // Trigger liquidation on Loan 1
+        feed.setPrice(145e8);
+        vm.prank(keeper);
+        uint256 auctionId = core.startLiquidation(loan1);
+
+        // Liquidator buys 25 shares (which pays off all debt)
+        ILiquidationAuction.Auction memory a = auction.getAuction(auctionId);
+        vm.prank(liquidator);
+        auction.buy(auctionId, a.collateralRemaining, 50_000e6);
+
+        // Partial auction sold 25 shares to liquidator; loan 1 remaining 25 shares stay in escrow
+        assertEq(stockToken.balanceOf(liquidator), 25e6);
+
+        // CRITICAL CHECK: Escrow STILL has EXACTLY 75 NVDAc (25 remaining for Loan 1 + 50 for Loan 2)!
+        // Loan 2's collateral was completely untouched and NOT drained!
+        assertEq(stockToken.balanceOf(address(escrow)), 75e6);
+        assertEq(escrow.getBalance(address(stockToken)), 75e6);
+
+        // Borrower 1 repays remaining debt to reclaim their remaining 25 shares
+        usdc.mint(borrower, 4000e6);
+        vm.prank(borrower);
+        usdc.approve(address(core), type(uint256).max);
+        vm.prank(borrower);
+        core.repay(loan1);
+
+        assertEq(stockToken.balanceOf(borrower), 75e6);
+        // Escrow now holds exactly Loan 2's 50 shares
+        assertEq(stockToken.balanceOf(address(escrow)), 50e6);
+        assertEq(escrow.getBalance(address(stockToken)), 50e6);
+
+        // Loan 2 borrower can cleanly repay and get 100% of their 50 NVDAc collateral back without revert!
+        usdc.mint(borrower2, 6000e6);
+        vm.prank(borrower2);
+        usdc.approve(address(core), type(uint256).max);
+        vm.prank(borrower2);
+        core.repay(loan2);
+
+        assertEq(stockToken.balanceOf(borrower2), 100e6);
+        assertEq(stockToken.balanceOf(address(escrow)), 0);
+        assertEq(escrow.getBalance(address(stockToken)), 0);
+    }
+
+    function test_Auction_BuyPastDuration_RevertsAuctionExpired() public {
+        vm.prank(mockOrderSettlement);
+        uint256 loanId = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            50e6,
+            5800e6,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        feed.setPrice(145e8);
+        vm.prank(keeper);
+        uint256 auctionId = core.startLiquidation(loanId);
+
+        // Warp past the 30-minute auction duration (1800s)
+        vm.warp(block.timestamp + 1801);
+
+        // Buying after 30 minutes at stale floor price reverts!
+        vm.prank(liquidator);
+        vm.expectRevert(LiquidationAuction.AuctionExpired.selector);
+        auction.buy(auctionId, 10e6, 20_000e6);
+
+        // Fresh oracle price update
+        feed.setPrice(130e8);
+        feed.setUpdatedAt(block.timestamp);
+
+        // Restart auction with fresh oracle
+        auction.restartOrCancelAuction(auctionId);
+
+        // Now buying at restarted fresh auction succeeds!
+        vm.prank(liquidator);
+        uint128 paid = auction.buy(auctionId, 10e6, 20_000e6);
+        assertGt(paid, 0);
+    }
 }

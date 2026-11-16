@@ -214,29 +214,31 @@ contract OracleRouterTest is Test {
         vm.warp(block.timestamp + 7200);
         feed.setUpdatedAt(block.timestamp);
 
-        // Even with NO manual setup (recordedMultiplier == 0), default baseline is 1e18
-        assertEq(router.recordedMultiplier(address(stockToken)), 0);
+        // Real on-chain B20 token (NVDAc = 1.000537939576369481e18) does NOT freeze at launch!
+        stockToken.setUiMultiplier(1000537939576369481);
+        (uint256 pNvidia, , IOracleRouter.OracleState stateNvidia) = router.getPrice(address(stockToken));
+        assertEq(uint8(stateNvidia), uint8(IOracleRouter.OracleState.VALID_OPEN));
+        assertEq(pNvidia, 180e8); // Not double-multiplied!
 
-        // Standard token with default 1e18 (or 0) multiplier functions normally
-        stockToken.setUiMultiplier(1e18);
-        (uint256 baseP, , IOracleRouter.OracleState state0) = router.getPrice(address(stockToken));
-        assertEq(uint8(state0), uint8(IOracleRouter.OracleState.VALID_OPEN));
-        assertEq(baseP, 180e8);
+        // Normal dividend drift (+15 bps) does NOT freeze
+        stockToken.setUiMultiplier(1002000000000000000);
+        (, , IOracleRouter.OracleState stateDiv) = router.getPrice(address(stockToken));
+        assertEq(uint8(stateDiv), uint8(IOracleRouter.OracleState.VALID_OPEN));
 
-        // Token splits 2-for-1 -> new multiplier 2e18 without governance sync
+        // Token splits 2-for-1 -> new multiplier 2e18 (> 5% jump) without governance sync
         stockToken.setUiMultiplier(2e18);
 
         // OracleRouter detects split mismatch and automatically freezes!
         (, , IOracleRouter.OracleState frozenState) = router.getPrice(address(stockToken));
         assertEq(uint8(frozenState), uint8(IOracleRouter.OracleState.FROZEN_CORPORATE_ACTION));
 
-        // When governance reviews and syncs the new multiplier, it unfreezes AND scales price!
+        // When governance reviews and syncs the new multiplier, it unfreezes without inflating price
         vm.prank(owner);
         router.syncMultiplier(address(stockToken));
-        (uint256 scaledP, , IOracleRouter.OracleState recoveredState) = router.getPrice(address(stockToken));
+        (uint256 unfreezeP, , IOracleRouter.OracleState recoveredState) = router.getPrice(address(stockToken));
         assertEq(uint8(recoveredState), uint8(IOracleRouter.OracleState.VALID_OPEN));
-        // Price per token scaled 2x: $180 * 2 = $360.00
-        assertEq(scaledP, 360e8);
+        // Chainlink feed prices the token directly, no double-counting
+        assertEq(unfreezeP, 180e8);
     }
 
     function test_StaleFeed_DuringClosedHours() public {
@@ -246,15 +248,36 @@ contract OracleRouterTest is Test {
         vm.prank(owner);
         router.setMarketSession(false, true);
 
-        // Feed updated 12 hours ago (43200s <= 86400s maxStaleClosedSecs)
-        feed.setUpdatedAt(block.timestamp - 43200);
+        // Feed updated 42 hours ago (typical Sunday on NVDA feed <= 100h / 360000s) -> VALID_CLOSED
+        feed.setUpdatedAt(block.timestamp - (42 * 3600));
         (, , IOracleRouter.OracleState state1) = router.getPrice(address(stockToken));
         assertEq(uint8(state1), uint8(IOracleRouter.OracleState.VALID_CLOSED));
 
-        // Feed updated 25 hours ago (90000s > 86400s maxStaleClosedSecs)
-        feed.setUpdatedAt(block.timestamp - 90000);
+        // Feed updated 65 hours ago (Monday pre-market <= 100h) -> VALID_CLOSED
+        feed.setUpdatedAt(block.timestamp - (65 * 3600));
         (, , IOracleRouter.OracleState state2) = router.getPrice(address(stockToken));
-        assertEq(uint8(state2), uint8(IOracleRouter.OracleState.STALE_FEED));
+        assertEq(uint8(state2), uint8(IOracleRouter.OracleState.VALID_CLOSED));
+
+        // Feed updated 101 hours ago (> 100h maxStaleClosedSecs) -> STALE_FEED
+        feed.setUpdatedAt(block.timestamp - (101 * 3600));
+        (, , IOracleRouter.OracleState state3) = router.getPrice(address(stockToken));
+        assertEq(uint8(state3), uint8(IOracleRouter.OracleState.STALE_FEED));
+    }
+
+    function test_Holidays_2027_2028_LoadedByDefault() public view {
+        // 2027 New Year's Day (day 20819)
+        assertTrue(router.isHoliday(20819));
+        // 2027 Thanksgiving (day 21147)
+        assertTrue(router.isHoliday(21147));
+        // 2027 Black Friday half-day (day 21148)
+        assertTrue(router.isHalfDay(21148));
+
+        // 2028 MLK Day (day 21200)
+        assertTrue(router.isHoliday(21200));
+        // 2028 Christmas (day 21543)
+        assertTrue(router.isHoliday(21543));
+        // 2028 July 3 half-day (day 21368)
+        assertTrue(router.isHalfDay(21368));
     }
 
     function test_Thanksgiving_IsLoadedByDefault() public {

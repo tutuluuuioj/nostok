@@ -15,6 +15,7 @@ import {OracleRouter} from "../src/OracleRouter.sol";
 import {FeeCollector} from "../src/FeeCollector.sol";
 import {EligibilityGate} from "../src/EligibilityGate.sol";
 import {LiquidationAuction} from "../src/LiquidationAuction.sol";
+import {ILiquidationAuction} from "../src/interfaces/ILiquidationAuction.sol";
 import {ILoanCore} from "../src/interfaces/ILoanCore.sol";
 import {IAssetRegistry} from "../src/interfaces/IAssetRegistry.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -29,12 +30,17 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
     LoanCore public core;
     CollateralEscrow public escrow;
     PositionNFT public nft;
+    LiquidationAuction public auction;
+    MockAggregator public feed;
     MockERC20 public stockToken;
     MockERC20 public usdc;
 
     address public settlement;
-    address public borrower;
+    address public borrower1;
+    address public borrower2;
     address public lender;
+    address public keeper;
+    address public liquidator;
 
     uint256[] public activeLoanIds;
     uint256 public ghost_totalEscrowedCollateral;
@@ -44,34 +50,45 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
         LoanCore _core,
         CollateralEscrow _escrow,
         PositionNFT _nft,
+        LiquidationAuction _auction,
+        MockAggregator _feed,
         MockERC20 _stockToken,
         MockERC20 _usdc,
         address _settlement,
-        address _borrower,
-        address _lender
+        address _borrower1,
+        address _borrower2,
+        address _lender,
+        address _keeper,
+        address _liquidator
     ) {
         core = _core;
         escrow = _escrow;
         nft = _nft;
+        auction = _auction;
+        feed = _feed;
         stockToken = _stockToken;
         usdc = _usdc;
         settlement = _settlement;
-        borrower = _borrower;
+        borrower1 = _borrower1;
+        borrower2 = _borrower2;
         lender = _lender;
+        keeper = _keeper;
+        liquidator = _liquidator;
     }
 
-    function openLoan(uint256 collateralSeed, uint256 principalSeed) external {
+    function openLoan(uint256 collateralSeed, uint256 principalSeed, bool useBorrower2) external {
         // Limit active loans to 10 concurrently
         if (activeLoanIds.length >= 10) return;
 
+        address activeBorrower = useBorrower2 ? borrower2 : borrower1;
         // Bounded collateral between 10 NVDAc and 50 NVDAc ($2,000 to $10,000 at $200/share)
         uint128 collateralAmount = uint128(bound(collateralSeed, 10e6, 50e6));
         // Safe max borrow at 50% LTV: collateral * 100
         uint128 maxPrincipal = uint128((uint256(collateralAmount) * 100));
         uint128 principal = uint128(bound(principalSeed, 500e6, maxPrincipal));
 
-        stockToken.mint(borrower, collateralAmount);
-        vm.prank(borrower);
+        stockToken.mint(activeBorrower, collateralAmount);
+        vm.prank(activeBorrower);
         stockToken.approve(address(escrow), collateralAmount);
 
         usdc.mint(lender, principal);
@@ -80,7 +97,7 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
 
         vm.prank(settlement);
         uint256 loanId = core.openLoan(
-            borrower,
+            activeBorrower,
             lender,
             address(stockToken),
             collateralAmount,
@@ -103,13 +120,16 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
         uint256 idx = loanIndexSeed % activeLoanIds.length;
         uint256 loanId = activeLoanIds[idx];
 
+        ILoanCore.Loan memory l = core.getLoan(loanId);
+        if (l.status != uint8(ILoanCore.LoanStatus.Active) && l.status != uint8(ILoanCore.LoanStatus.Grace)) return;
+
         uint128 additional = uint128(bound(additionalCollateralSeed, 1e6, 10e6));
 
-        stockToken.mint(borrower, additional);
-        vm.prank(borrower);
+        stockToken.mint(l.borrower, additional);
+        vm.prank(l.borrower);
         stockToken.approve(address(escrow), additional);
 
-        vm.prank(borrower);
+        vm.prank(l.borrower);
         core.topUp(loanId, additional);
 
         ghost_totalEscrowedCollateral += additional;
@@ -122,6 +142,7 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
         uint256 loanId = activeLoanIds[idx];
 
         ILoanCore.Loan memory l = core.getLoan(loanId);
+        if (l.status != uint8(ILoanCore.LoanStatus.Active)) return;
         uint128 remaining = l.principal - l.principalRepaid;
         if (remaining <= 200e6) return;
 
@@ -130,11 +151,11 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
             (uint256(l.collateralRaw) * repayAmount) / remaining
         );
 
-        usdc.mint(borrower, repayAmount * 2);
-        vm.prank(borrower);
+        usdc.mint(l.borrower, repayAmount * 2);
+        vm.prank(l.borrower);
         usdc.approve(address(core), repayAmount * 2);
 
-        vm.prank(borrower);
+        vm.prank(l.borrower);
         core.partialRepay(loanId, repayAmount);
 
         ghost_totalEscrowedCollateral -= collateralToRelease;
@@ -148,15 +169,21 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
         uint256 loanId = activeLoanIds[idx];
 
         ILoanCore.Loan memory l = core.getLoan(loanId);
+        if (
+            l.status != uint8(ILoanCore.LoanStatus.Active) &&
+            l.status != uint8(ILoanCore.LoanStatus.Grace) &&
+            l.status != uint8(ILoanCore.LoanStatus.Auction)
+        ) return;
+
         uint128 remaining = l.principal - l.principalRepaid;
         uint128 interest = core.getDueInterest(loanId);
         uint128 totalDue = remaining + interest;
 
-        usdc.mint(borrower, totalDue);
-        vm.prank(borrower);
+        usdc.mint(l.borrower, totalDue);
+        vm.prank(l.borrower);
         usdc.approve(address(core), totalDue);
 
-        vm.prank(borrower);
+        vm.prank(l.borrower);
         core.repay(loanId);
 
         ghost_totalEscrowedCollateral -= l.collateralRaw;
@@ -164,6 +191,83 @@ contract ProtocolHandler is CommonBase, StdCheats, StdUtils {
 
         activeLoanIds[idx] = activeLoanIds[activeLoanIds.length - 1];
         activeLoanIds.pop();
+    }
+
+    function startLiquidationAuction(uint256 loanIndexSeed) external {
+        if (activeLoanIds.length == 0) return;
+
+        uint256 idx = loanIndexSeed % activeLoanIds.length;
+        uint256 loanId = activeLoanIds[idx];
+
+        ILoanCore.Loan memory l = core.getLoan(loanId);
+        if (l.status != uint8(ILoanCore.LoanStatus.Active) && l.status != uint8(ILoanCore.LoanStatus.Grace)) return;
+
+        // Drop price so position breaches liquidation LTV
+        feed.setPrice(120e8);
+        feed.setUpdatedAt(block.timestamp);
+
+        vm.prank(keeper);
+        core.startLiquidation(loanId);
+    }
+
+    function buyAuction(uint256 loanIndexSeed, uint256 buyAmountSeed, bool buyFull) external {
+        if (activeLoanIds.length == 0) return;
+
+        uint256 idx = loanIndexSeed % activeLoanIds.length;
+        uint256 loanId = activeLoanIds[idx];
+
+        uint256 auctionId = core.loanActiveAuction(loanId);
+        if (auctionId == 0) return;
+
+        ILiquidationAuction.Auction memory a = auction.getAuction(auctionId);
+        if (a.status != ILiquidationAuction.AuctionStatus.Active || a.collateralRemaining == 0) return;
+
+        // If auction expired (> 30 mins), restart it
+        if (block.timestamp > a.startTime + a.duration) {
+            feed.setUpdatedAt(block.timestamp);
+            auction.restartOrCancelAuction(auctionId);
+            a = auction.getAuction(auctionId);
+            if (a.status != ILiquidationAuction.AuctionStatus.Active || a.collateralRemaining == 0) return;
+        }
+
+        uint128 collateralToBuy;
+        if (buyFull) {
+            collateralToBuy = a.collateralRemaining;
+        } else {
+            if (a.collateralRemaining <= 10e6) {
+                collateralToBuy = a.collateralRemaining;
+            } else {
+                collateralToBuy = uint128(bound(buyAmountSeed, 10e6, a.collateralRemaining));
+            }
+        }
+
+        ILoanCore.Loan memory l_before = core.getLoan(loanId);
+
+        usdc.mint(liquidator, 50_000e6);
+        vm.prank(liquidator);
+        usdc.approve(address(auction), type(uint256).max);
+
+        vm.prank(liquidator);
+        auction.buy(auctionId, collateralToBuy, type(uint128).max);
+
+        ILoanCore.Loan memory l_after = core.getLoan(loanId);
+
+        uint128 principalPaid = l_after.principalRepaid - l_before.principalRepaid;
+        uint128 collateralSold = l_before.collateralRaw - l_after.collateralRaw;
+
+        if (l_after.status >= uint8(ILoanCore.LoanStatus.SettledDefault)) {
+            // Loan completely settled (either fully repaid or bad debt)
+            uint128 shortfall = l_after.principal - l_after.principalRepaid;
+            ghost_totalOutstandingPrincipal -= (principalPaid + shortfall);
+            ghost_totalEscrowedCollateral -= l_before.collateralRaw;
+
+            activeLoanIds[idx] = activeLoanIds[activeLoanIds.length - 1];
+            activeLoanIds.pop();
+        } else {
+            // Multi-buy or partial liquidation return to active
+            ghost_totalEscrowedCollateral -= collateralSold;
+            ghost_totalOutstandingPrincipal -= principalPaid;
+        }
     }
 
     function activeLoansCount() external view returns (uint256) {
@@ -199,7 +303,10 @@ contract InvariantsTest is Test {
     address public settlement = address(0x5555);
 
     address public borrower = address(0xAAAA);
+    address public borrower2 = address(0xCCCC);
     address public lender = address(0xBBBB);
+    address public keeper = address(0xDDDD);
+    address public liquidator = address(0xEEEE);
 
     function setUp() public {
         vm.warp(1700000000);
@@ -287,11 +394,16 @@ contract InvariantsTest is Test {
             core,
             escrow,
             nft,
+            auction,
+            feed,
             stockToken,
             usdc,
             settlement,
             borrower,
-            lender
+            borrower2,
+            lender,
+            keeper,
+            liquidator
         );
 
         // Target handler for stateful fuzzing

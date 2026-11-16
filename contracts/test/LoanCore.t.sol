@@ -2,6 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {console} from "forge-std/console.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {LoanCore} from "../src/LoanCore.sol";
 import {CollateralEscrow} from "../src/CollateralEscrow.sol";
@@ -17,6 +18,7 @@ import {IAssetRegistry} from "../src/interfaces/IAssetRegistry.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {MockAggregator} from "./mocks/MockAggregator.sol";
 import {MockSequencer} from "./mocks/MockSequencer.sol";
+import {MockSmartWallet} from "./mocks/MockSmartWallet.sol";
 
 contract LoanCoreTest is Test {
     LoanCore public core;
@@ -464,5 +466,160 @@ contract LoanCoreTest is Test {
         uint128 interestDue = core.getDueInterest(loanId);
         // 14 days on $5,000 at 8% = ~$15.34 (1534246)
         assertGt(interestDue, 15e6);
+    }
+
+    function test_PartialAuctionBuy_NoDoubleChargeInterest() public {
+        test_OpenLoan_Success();
+        // Loan 1: $5,000 principal at 8% APR for 30 days
+        // Warp 15 days (halfway)
+        vm.warp(block.timestamp + 15 days);
+        uint128 interestDueAtAuction = core.getDueInterest(1);
+        assertGt(interestDueAtAuction, 0);
+
+        // Price drops to trigger liquidation
+        feed.setPrice(125e8);
+        address keeper = address(0xDDDD);
+        vm.prank(keeper);
+        uint256 auctionId = core.startLiquidation(1);
+
+        // Liquidator buys 15 shares (partial buy: 15 shares out of 25 in auction)
+        address liquidator = address(0xCCCC);
+        usdc.mint(liquidator, 50_000e6);
+        vm.prank(liquidator);
+        usdc.approve(address(auction), type(uint256).max);
+
+        vm.prank(liquidator);
+        auction.buy(auctionId, 15e6, 20_000e6);
+
+        // All accrued interest up to now was paid by the auction!
+        ILoanCore.Loan memory l1 = core.getLoan(1);
+        assertEq(l1.interestPaid, interestDueAtAuction);
+
+        // Immediate check right after auction buy: due interest MUST BE 0!
+        // Previous bug charged remaining principal all the way from startTime again!
+        uint128 immediateDue = core.getDueInterest(1);
+        assertEq(immediateDue, 0);
+
+        // Warp another 10 days
+        vm.warp(block.timestamp + 10 days);
+        uint128 laterDue = core.getDueInterest(1);
+        uint128 remainingPrincipal = l1.principal - l1.principalRepaid;
+        // Interest must ONLY be for the 10 elapsed days on the remaining principal!
+        uint128 expected10DaysInterest = uint128(
+            (uint256(remainingPrincipal) * l1.rateBps * 10 days + (10000 * 365 days - 1)) / (10000 * 365 days)
+        );
+        assertEq(laterDue, expected10DaysInterest);
+    }
+
+    function test_Extend_ChainedPast90Days_Reverts() public {
+        test_OpenLoan_Success();
+        ILoanCore.Loan memory l = core.getLoan(1);
+        uint64 start = l.startTime;
+
+        // 1. Extend from 30 days to 60 days from startTime
+        uint64 maturity60 = start + 60 days;
+        uint64 deadline = uint64(block.timestamp + 1 days);
+        bytes32 structHash1 = keccak256(
+            abi.encode(EXTEND_ORDER_TYPEHASH, 1, maturity60, 1000, 0, deadline)
+        );
+        (uint8 v1, bytes32 r1, bytes32 s1) = vm.sign(lenderPrivateKey, _hashTypedData(structHash1));
+        vm.prank(borrower);
+        core.extend(1, maturity60, 1000, deadline, abi.encodePacked(r1, s1, v1));
+
+        // Warp 20 days forward
+        vm.warp(block.timestamp + 20 days);
+
+        // 2. Chained extend attempt: trying to extend past 90 days from startTime (e.g. 95 days)
+        uint64 maturity95 = start + 95 days;
+        bytes32 structHash2 = keccak256(
+            abi.encode(EXTEND_ORDER_TYPEHASH, 1, maturity95, 1000, 1, deadline + 20 days)
+        );
+        (uint8 v2, bytes32 r2, bytes32 s2) = vm.sign(lenderPrivateKey, _hashTypedData(structHash2));
+
+        // Must revert InvalidLoanTerms because newMaturity > l.startTime + 90 days!
+        vm.prank(borrower);
+        vm.expectRevert(LoanCore.InvalidLoanTerms.selector);
+        core.extend(1, maturity95, 1000, deadline + 20 days, abi.encodePacked(r2, s2, v2));
+
+        // Extending to exactly 90 days from startTime succeeds
+        uint64 maturity90 = start + 90 days;
+        bytes32 structHash3 = keccak256(
+            abi.encode(EXTEND_ORDER_TYPEHASH, 1, maturity90, 1000, 1, deadline + 20 days)
+        );
+        (uint8 v3, bytes32 r3, bytes32 s3) = vm.sign(lenderPrivateKey, _hashTypedData(structHash3));
+        vm.prank(borrower);
+        core.extend(1, maturity90, 1000, deadline + 20 days, abi.encodePacked(r3, s3, v3));
+    }
+
+    function test_Extend_NewRateNotRetroactive() public {
+        test_OpenLoan_Success();
+        ILoanCore.Loan memory l0 = core.getLoan(1);
+
+        // Warp 15 days at original 8% APR
+        uint256 t1 = block.timestamp + 15 days;
+        vm.warp(t1);
+        uint128 interestPeriod1 = core.getDueInterest(1);
+        assertGt(interestPeriod1, 0);
+
+        // Extend to 45 days and raise rate to 20% APR (2000 bps)
+        uint64 newMaturity = l0.startTime + 45 days;
+        uint64 deadline = uint64(block.timestamp + 1 days);
+        bytes32 structHash = keccak256(
+            abi.encode(EXTEND_ORDER_TYPEHASH, 1, newMaturity, 2000, 0, deadline)
+        );
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(lenderPrivateKey, _hashTypedData(structHash));
+        vm.prank(borrower);
+        core.extend(1, newMaturity, 2000, deadline, abi.encodePacked(r, s, v));
+
+        // Immediately after extend: interest due must equal interest from period 1
+        assertEq(core.getDueInterest(1), interestPeriod1);
+
+        // Warp to 30 days from startTime (15 days under new 20% APR)
+        uint256 t2 = l0.startTime + 30 days;
+        vm.warp(t2);
+        uint128 totalDue = core.getDueInterest(1);
+
+        uint128 expectedPeriod2Interest = uint128(
+            (uint256(5000e6) * 2000 * 15 days + (10000 * 365 days - 1)) / (10000 * 365 days)
+        );
+        // Total interest must be period 1 (at 8%) + period 2 (at 20%), NOT 30 days at 20%!
+        assertEq(totalDue, interestPeriod1 + expectedPeriod2Interest);
+
+        uint128 retroactive30DaysAt20 = uint128(
+            (uint256(5000e6) * 2000 * 30 days + (10000 * 365 days - 1)) / (10000 * 365 days)
+        );
+        // It is strictly less than retroactive rate would have been!
+        assertLt(totalDue, retroactive30DaysAt20);
+    }
+
+    function test_Extend_ERC1271_SmartWalletSignature() public {
+        test_OpenLoan_Success();
+
+        // Deploy ERC-1271 mock smart wallet owned by lender
+        MockSmartWallet wallet = new MockSmartWallet(lender);
+
+        // Transfer Position NFT #1 from lender to the smart wallet
+        vm.prank(lender);
+        nft.transferFrom(lender, address(wallet), 1);
+        assertEq(nft.ownerOf(1), address(wallet));
+
+        ILoanCore.Loan memory l = core.getLoan(1);
+        uint64 newMaturity = l.maturity + 15 days;
+        uint64 deadline = uint64(block.timestamp + 1 days);
+
+        bytes32 structHash = keccak256(
+            abi.encode(EXTEND_ORDER_TYPEHASH, 1, newMaturity, 1200, 0, deadline)
+        );
+        bytes32 digest = _hashTypedData(structHash);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(lenderPrivateKey, digest);
+        bytes memory sig = abi.encodePacked(r, s, v);
+
+        // Borrower submits extension with smart wallet's signature via ERC-1271 -> succeeds!
+        vm.prank(borrower);
+        core.extend(1, newMaturity, 1200, deadline, sig);
+
+        ILoanCore.Loan memory updated = core.getLoan(1);
+        assertEq(updated.maturity, newMaturity);
+        assertEq(updated.rateBps, 1200);
     }
 }

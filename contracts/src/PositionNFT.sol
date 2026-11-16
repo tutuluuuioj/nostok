@@ -58,6 +58,8 @@ contract PositionNFT is ERC721, IPositionNFT, Ownable {
         emit LoanClaimMinted(to, loanId);
     }
 
+    bytes private _currentAttestation;
+
     function burn(uint256 loanId) external override onlyAuthorizedCore {
         _burn(loanId);
         emit LoanClaimBurned(loanId);
@@ -66,6 +68,20 @@ contract PositionNFT is ERC721, IPositionNFT, Ownable {
     function setAuctionLock(uint256 loanId, bool locked) external override onlyAuthorizedCore {
         isAuctionLocked[loanId] = locked;
         emit LoanAuctionLocked(loanId, locked);
+    }
+
+    /**
+     * @notice Transfer position NFT passing recipient's regulatory attestation.
+     */
+    function transferWithAttestation(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes calldata recipientAttestation
+    ) external override {
+        _currentAttestation = recipientAttestation;
+        transferFrom(from, to, tokenId);
+        delete _currentAttestation;
     }
 
     /**
@@ -83,7 +99,7 @@ contract PositionNFT is ERC721, IPositionNFT, Ownable {
             if (isAuctionLocked[tokenId]) revert AuctionTransferLocked();
 
             if (eligibilityGate != address(0)) {
-                if (!IEligibilityGate(eligibilityGate).isEligible(to, "")) {
+                if (!IEligibilityGate(eligibilityGate).isEligible(to, _currentAttestation)) {
                     revert IneligibleRecipient();
                 }
             }

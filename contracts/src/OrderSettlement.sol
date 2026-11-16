@@ -141,11 +141,37 @@ contract OrderSettlement is
     /**
      * @notice Taker (Lender) fills an offchain signed Borrow Order.
      */
+    /**
+     * @notice Taker (Lender) fills an offchain signed Borrow Order.
+     */
     function fillBorrowOrder(
         BorrowOrder calldata order,
         bytes calldata signature,
         uint128 fillUsdc
     ) external override returns (uint256 loanId) {
+        return _fillBorrowOrder(order, signature, fillUsdc, "", "");
+    }
+
+    /**
+     * @notice Taker (Lender) fills an offchain signed Borrow Order with regulatory attestations.
+     */
+    function fillBorrowOrderWithAttestations(
+        BorrowOrder calldata order,
+        bytes calldata signature,
+        uint128 fillUsdc,
+        bytes calldata borrowerAttestation,
+        bytes calldata lenderAttestation
+    ) external override returns (uint256 loanId) {
+        return _fillBorrowOrder(order, signature, fillUsdc, borrowerAttestation, lenderAttestation);
+    }
+
+    function _fillBorrowOrder(
+        BorrowOrder calldata order,
+        bytes calldata signature,
+        uint128 fillUsdc,
+        bytes memory borrowerAttestation,
+        bytes memory lenderAttestation
+    ) internal returns (uint256 loanId) {
         if (block.timestamp > order.expiry) revert OrderExpired();
         if (order.nonce != getMakerNonce[order.borrower]) revert InvalidNonce();
 
@@ -157,8 +183,8 @@ contract OrderSettlement is
 
         if (eligibilityGate != address(0)) {
             if (
-                !IEligibilityGate(eligibilityGate).isEligible(order.borrower, "") ||
-                !IEligibilityGate(eligibilityGate).isEligible(msg.sender, "")
+                !IEligibilityGate(eligibilityGate).isEligible(order.borrower, borrowerAttestation) ||
+                !IEligibilityGate(eligibilityGate).isEligible(msg.sender, lenderAttestation)
             ) {
                 revert IneligibleCounterparty();
             }
@@ -202,6 +228,49 @@ contract OrderSettlement is
         uint128 collateralAmount,
         uint128 fillUsdc
     ) external override returns (uint256 loanId) {
+        return _fillLendOffer(
+            offer,
+            signature,
+            collateralToken,
+            collateralAmount,
+            fillUsdc,
+            "",
+            ""
+        );
+    }
+
+    /**
+     * @notice Taker (Borrower) fills an offchain signed Lend Offer with regulatory attestations.
+     */
+    function fillLendOfferWithAttestations(
+        LendOffer calldata offer,
+        bytes calldata signature,
+        address collateralToken,
+        uint128 collateralAmount,
+        uint128 fillUsdc,
+        bytes calldata lenderAttestation,
+        bytes calldata borrowerAttestation
+    ) external override returns (uint256 loanId) {
+        return _fillLendOffer(
+            offer,
+            signature,
+            collateralToken,
+            collateralAmount,
+            fillUsdc,
+            lenderAttestation,
+            borrowerAttestation
+        );
+    }
+
+    function _fillLendOffer(
+        LendOffer calldata offer,
+        bytes calldata signature,
+        address collateralToken,
+        uint128 collateralAmount,
+        uint128 fillUsdc,
+        bytes memory lenderAttestation,
+        bytes memory borrowerAttestation
+    ) internal returns (uint256 loanId) {
         if (block.timestamp > offer.expiry) revert OrderExpired();
         if (offer.nonce != getMakerNonce[offer.lender]) revert InvalidNonce();
         if (offer.allowedCollateral != address(0) && collateralToken != offer.allowedCollateral) {
@@ -216,8 +285,8 @@ contract OrderSettlement is
 
         if (eligibilityGate != address(0)) {
             if (
-                !IEligibilityGate(eligibilityGate).isEligible(offer.lender, "") ||
-                !IEligibilityGate(eligibilityGate).isEligible(msg.sender, "")
+                !IEligibilityGate(eligibilityGate).isEligible(offer.lender, lenderAttestation) ||
+                !IEligibilityGate(eligibilityGate).isEligible(msg.sender, borrowerAttestation)
             ) {
                 revert IneligibleCounterparty();
             }

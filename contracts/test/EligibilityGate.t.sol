@@ -17,6 +17,7 @@ contract EligibilityGateTest is Test {
     address public user3 = address(0x5555);
 
     function setUp() public {
+        vm.warp(1700000000);
         kycSigner = vm.addr(kycSignerPrivateKey);
         vm.prank(owner);
         gate = new EligibilityGate(owner, kycSigner, false);
@@ -52,17 +53,39 @@ contract EligibilityGateTest is Test {
         // User is not on allowlist
         assertFalse(gate.isEligible(user1, ""));
 
-        // KYC provider issues offchain signed non-US attestation
-        bytes32 messageHash = keccak256(
-            abi.encodePacked("NOSTOK_ELIGIBLE_NON_US:", block.chainid, user1)
-        );
-        bytes32 ethHash = keccak256(
-            abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash)
-        );
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(kycSignerPrivateKey, ethHash);
+        // KYC provider issues offchain signed non-US attestation bound to chainId, gate, user, nonce, expiry
+        uint256 expiry = block.timestamp + 1 days;
+        bytes32 digest = gate.getAttestationDigest(user1, 0, expiry);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(kycSignerPrivateKey, digest);
         bytes memory sig = abi.encodePacked(r, s, v);
+        bytes memory context = abi.encode(expiry, sig);
 
         // User is immediately eligible via attestation without any onchain transactions!
-        assertTrue(gate.isEligible(user1, sig));
+        assertTrue(gate.isEligible(user1, context));
+
+        // 1. User revocation rejects even with valid signature
+        vm.prank(owner);
+        gate.revokeUser(user1, true);
+        assertFalse(gate.isEligible(user1, context));
+
+        // Unrevoke restores eligibility
+        vm.prank(owner);
+        gate.revokeUser(user1, false);
+        assertTrue(gate.isEligible(user1, context));
+
+        // 2. User nonce bump invalidates old attestation
+        vm.prank(user1);
+        gate.bumpMyNonce();
+        assertFalse(gate.isEligible(user1, context));
+
+        // New attestation with bumped nonce succeeds
+        bytes32 newDigest = gate.getAttestationDigest(user1, 1, expiry);
+        (uint8 v2, bytes32 r2, bytes32 s2) = vm.sign(kycSignerPrivateKey, newDigest);
+        bytes memory newContext = abi.encode(expiry, abi.encodePacked(r2, s2, v2));
+        assertTrue(gate.isEligible(user1, newContext));
+
+        // 3. Expired attestation fails
+        vm.warp(expiry + 1);
+        assertFalse(gate.isEligible(user1, newContext));
     }
 }

@@ -2,7 +2,7 @@
 
 > Peer-to-peer, fixed-term repurchase (repo) market for tokenized stocks on Base (Chain ID: 8453).
 
-[![Foundry Tests](https://img.shields.io/badge/Foundry-52%2F52%20Tests%20Passing-brightgreen)](#smart-contracts)
+[![Foundry Tests](https://img.shields.io/badge/Foundry-61%2F61%20Tests%20Passing-brightgreen)](#smart-contracts)
 [![Network](https://img.shields.io/badge/Network-Base%20L2-blue)](#architecture)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -51,14 +51,14 @@ The protocol smart contracts are written in Solidity `^0.8.28` using Foundry wit
 ### Core Contracts (`contracts/src/`)
 * **`NostokTimelock.sol`**: 48-hour OpenZeppelin `TimelockController` governing all contract upgrades and `CollateralEscrow` authorizations.
 * **`CollateralEscrow.sol`**: Immutable singleton custody contract for tokenized equities. Zero upgradeability; core authorization moves strictly through the 48-hour timelock.
-* **`PositionNFT.sol`**: Immutable ERC-721 position claim representing bullet debt repayment entitlement. Features auction transfer locks and dynamic onchain SVG metadata.
-* **`LoanCore.sol`**: State machine managing loan origination, bullet repayment, dynamic `minInterestDays` early repay penalties, 24h grace window (+5% penalty spread), interest-accruing partial repayments, EIP-712 mutual consent extensions with expiration deadlines (capped at 40% APR / 90 days), repayment during auction, bad debt write-offs, and pull-based claims.
-* **`OrderSettlement.sol`**: EIP-712 typed structured data verification for `BorrowOrder` and `LendOffer`, nonce bump invalidation, maker-authenticated cancellations (`msg.sender == maker`), and partial fill execution.
-* **`LiquidationAuction.sol`**: Linear decaying Dutch auction over 30 minutes with a 50% partial liquidation close factor. Tracks debt per buy, rejects dust buys (<$10), follows debt waterfall (fees -> interest -> principal -> surplus refund to borrower). Unsold expired auctions can be restarted at fresh oracle prices or cancelled if price recovers; partial liquidation preserves remaining loan collateral and debt.
-* **`OracleRouter.sol`**: Validates Chainlink price feeds against Base Sequencer Uptime (1-hour grace), US equity market hours with Gregorian DST awareness, pre-loaded NYSE holiday calendar (including Thanksgiving), 24-hour closed-market staleness limits, and automatic B20 corporate action / split freezes with split-adjusted pricing math.
+* **`PositionNFT.sol`**: Immutable ERC-721 position claim representing bullet debt repayment entitlement. Features auction transfer locks, dynamic onchain SVG metadata, and `transferWithAttestation` compliance verification.
+* **`LoanCore.sol`**: State machine managing loan origination, bullet repayment, dynamic `minInterestDays` early repay penalties, 24h grace window (+5% penalty spread), interest-accruing partial repayments, EIP-712/ERC-1271 mutual consent extensions with expiration deadlines (strictly capped at 40% APR and cumulative 90 days from loan origination with prospective rate application), accrued-to timestamp tracking across partial liquidations/repayments, single-source leftover collateral release upon debt payoff, repayment during auction, bad debt write-offs, and pull-based claims.
+* **`OrderSettlement.sol`**: EIP-712 typed structured data verification for `BorrowOrder` and `LendOffer`, nonce bump invalidation, maker-authenticated cancellations (`msg.sender == maker`), partial fill execution, and compliance attestation verification.
+* **`LiquidationAuction.sol`**: Linear decaying Dutch auction over 30 minutes with a 50% partial liquidation close factor. Tracks debt per buy, rejects dust buys (<$10), follows debt waterfall (fees -> interest -> principal), and reverts on expired buys past duration (`AuctionExpired`) until keeper restart. Leftover collateral is safely released exclusively via `LoanCore.onAuctionSettlement`, preventing double-release vulnerabilities across multiple loans.
+* **`OracleRouter.sol`**: Validates Chainlink price feeds against Base Sequencer Uptime (1-hour grace), US equity market hours with Gregorian DST awareness, pre-loaded NYSE holiday calendar for 2024–2028 (including Thanksgiving, MLK, Christmas, July 3 half-days), 100-hour closed-market staleness threshold (accommodating weekend trading pauses), and Coinbase B20 token multiplier monitoring (initialized from token, tolerating dividend drift <5%, and auto-freezing on corporate action splits >= 5% jump without price double-multiplication).
 * **`AssetRegistry.sol`**: Configures Tier A/B LTV boundaries and verifies auction discount boundaries (100–3000 bps). Guardians can only tighten; only Governance can loosen.
 * **`FeeCollector.sol`**: Enforces strict immutable fee ceilings (Origination max 1%, Interest cut max 20%, Liquidation max 3%).
-* **`EligibilityGate.sol`**: Enforces Reg S non-US counterparty eligibility via allowlist, batch operator allowlisting, or signed ECDSA attestations (owned directly by Multisig for zero-delay onboarding).
+* **`EligibilityGate.sol`**: Enforces Reg S non-US counterparty eligibility via allowlist, batch operator allowlisting, or signed EIP-712/ERC-1271 attestations bound to `(chainid, contract, account, nonce, expiry)` with per-user nonce bumping and revocation (owned directly by Multisig with deployer operator permissions revoked).
 
 ### Running Contract Tests
 
@@ -67,17 +67,17 @@ cd contracts
 forge test
 ```
 
-**Results:** 10 test suites, **52 tests passing (100%)** + **1,024 invariant fuzzing calls (0 reverts)**:
+**Results:** 10 test suites, **61 tests passing (100%)** + **1,024 invariant fuzzing calls (0 reverts)**:
 * `CollateralEscrowTest`: 6 passing (including 48h Timelock governance)
-* `PositionNFTTest`: 3 passing
+* `PositionNFTTest`: 4 passing (including transferWithAttestation)
 * `AssetRegistryTest`: 4 passing (including discount parameter bounds)
-* `FeeCollectorTest`: 3 passing
-* `EligibilityGateTest`: 2 passing (including operator batch allowlisting & instant attestations)
-* `OracleRouterTest`: 11 passing (including DST, preloaded holidays, B20 split auto-freeze & scaled price, 24h closed staleness)
-* `LoanCoreTest`: 12 passing (including EIP-712 extensions with deadline, repay during auction, partial repay interest, grace window, min interest)
-* `LiquidationAuctionTest`: 6 passing (including multi-buy debt reduction, partial liquidation health restoration, bad debt clearance, dust buy rejection, auction restart/cancel, default settlement)
-* `OrderSettlementTest`: 4 passing (including maker-authenticated cancellation validation)
-* `InvariantsTest`: 3 invariants passing across 1,024 calls (Escrow Solvency, Outstanding Principal, Asset Outstanding Principal)
+* `FeeCollectorTest`: 3 passing (including hard caps)
+* `EligibilityGateTest`: 2 passing (including operator batch allowlisting & instant attestations with revocation/nonces)
+* `OracleRouterTest`: 12 passing (including DST, 2024-2028 holidays, B20 split auto-freeze & dividend tolerance, 100h closed staleness)
+* `LoanCoreTest`: 16 passing (including EIP-712/ERC-1271 smart wallet extensions, cumulative 90-day cap, prospective rate application, partial auction buy interest tracking, repay during auction, partial repay interest)
+* `LiquidationAuctionTest`: 8 passing (including multi-loan single-token collateral isolation, post-duration expiry revert, multi-buy debt reduction, partial liquidation health restoration, bad debt clearance, dust buy rejection, auction restart/cancel, default settlement)
+* `OrderSettlementTest`: 5 passing (including attestation verification and maker-authenticated cancellation)
+* `InvariantsTest`: 3 invariants passing across 1,024 calls (Escrow Solvency, Outstanding Principal, Asset Outstanding Principal under multi-borrower liquidations and partial buys)
 
 ---
 

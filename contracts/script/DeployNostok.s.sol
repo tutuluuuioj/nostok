@@ -58,8 +58,8 @@ contract DeployNostok is Script {
         console.log("Deployer:", deployer);
         console.log("Target Multisig Owner:", multisigOwner);
 
-        // 1. EligibilityGate (starts in permissioned mode with deployer operator and multisig ownership)
-        address attestationSigner = vm.envOr("ATTESTATION_SIGNER", address(0));
+        // 1. EligibilityGate (starts in permissioned mode; multisig is owner & operator, attestation signer set)
+        address attestationSigner = vm.envOr("ATTESTATION_SIGNER", multisigOwner);
         EligibilityGate gate = new EligibilityGate(deployer, attestationSigner, false);
         console.log("EligibilityGate deployed at:", address(gate));
 
@@ -161,6 +161,10 @@ contract DeployNostok is Script {
         core.transferOwnership(address(timelock));
         auction.transferOwnership(address(timelock));
         settlement.transferOwnership(address(timelock));
+
+        // Wire operator permissions on EligibilityGate: grant to multisig, revoke deployer
+        gate.setOperator(multisigOwner, true);
+        gate.setOperator(deployer, false);
 
         // EligibilityGate is owned directly by Multisig to allow immediate KYC / allowlisting without 48h timelock
         gate.transferOwnership(multisigOwner);

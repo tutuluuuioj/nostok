@@ -70,4 +70,46 @@ contract PositionNFTTest is Test {
         string memory uri = nft.tokenURI(103);
         assertTrue(bytes(uri).length > 0);
     }
+
+    function test_TransferWithAttestation() public {
+        uint256 kycPrivateKey = 0x8888;
+        address kycSigner = vm.addr(kycPrivateKey);
+
+        // Configure gate: permissioned mode with kycSigner
+        vm.startPrank(owner);
+        gate.setPermissionlessMode(false);
+        gate.setAttestationSigner(kycSigner);
+        vm.stopPrank();
+
+        vm.prank(core);
+        nft.mint(lender1, 104);
+
+        address recipient = address(0x7777);
+        // Direct transfer without attestation fails because recipient is not allowlisted
+        vm.prank(lender1);
+        vm.expectRevert(PositionNFT.IneligibleRecipient.selector);
+        nft.transferFrom(lender1, recipient, 104);
+
+        // Recipient obtains signed attestation
+        uint256 expiry = block.timestamp + 1 days;
+        bytes32 digest = gate.getAttestationDigest(recipient, 0, expiry);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(kycPrivateKey, digest);
+        bytes memory sig = abi.encodePacked(r, s, v);
+        bytes memory context = abi.encode(expiry, sig);
+
+        // Transfer with valid attestation succeeds!
+        vm.prank(lender1);
+        nft.transferWithAttestation(lender1, recipient, 104, context);
+        assertEq(nft.ownerOf(104), recipient);
+
+        // Another transfer to unauthorized recipient with expired attestation fails
+        address recipient2 = address(0x6666);
+        bytes32 digest2 = gate.getAttestationDigest(recipient2, 0, expiry);
+        (uint8 v2, bytes32 r2, bytes32 s2) = vm.sign(kycPrivateKey, digest2);
+        bytes memory expiredContext = abi.encode(block.timestamp - 1, abi.encodePacked(r2, s2, v2));
+
+        vm.prank(recipient);
+        vm.expectRevert(PositionNFT.IneligibleRecipient.selector);
+        nft.transferWithAttestation(recipient, recipient2, 104, expiredContext);
+    }
 }

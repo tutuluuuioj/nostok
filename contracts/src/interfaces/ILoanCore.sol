@@ -95,6 +95,8 @@ interface ILoanCore {
     function getLoan(uint256 loanId) external view returns (Loan memory);
     function getDueInterest(uint256 loanId) external view returns (uint128 interestOwed);
     function getClaimable(address account) external view returns (uint128 amount);
+    function loanLastInterestAccruedTime(uint256 loanId) external view returns (uint64);
+    function loanUnpaidInterest(uint256 loanId) external view returns (uint128);
     function oracleRouter() external view returns (address);
     function assetRegistry() external view returns (address);
 }

@@ -45,6 +45,7 @@ contract LiquidationAuction is
     error InvalidAuctionAmount();
     error SlippageExceeded();
     error BuyAmountTooSmall();
+    error AuctionExpired();
 
     modifier onlyLoanCore() {
         if (msg.sender != loanCore) revert UnauthorizedCaller();
@@ -177,6 +178,7 @@ contract LiquidationAuction is
     ) external override nonReentrant returns (uint128 usdcPaid) {
         Auction storage a = auctions[auctionId];
         if (a.status != AuctionStatus.Active) revert AuctionNotActive();
+        if (block.timestamp > a.startTime + a.duration) revert AuctionExpired();
         if (collateralAmount == 0 || collateralAmount > a.collateralRemaining) {
             revert InvalidAuctionAmount();
         }
@@ -237,11 +239,10 @@ contract LiquidationAuction is
         bool debtZero = (a.debtPrincipalRemaining == 0 && a.debtInterestRemaining == 0);
         bool isAuctionSettled = isAuctionCollateralDepleted || debtZero;
 
-        // If debt is fully paid and collateral remains, refund remaining collateral to borrower
+        // If debt is fully paid and collateral remains, clear remaining collateral in auction.
+        // Leftover collateral is released to borrower in LoanCore.onAuctionSettlement.
         if (debtZero && a.collateralRemaining > 0) {
-            uint128 leftoverCollateral = a.collateralRemaining;
             a.collateralRemaining = 0;
-            ICollateralEscrow(escrow).releaseCollateral(a.collateralToken, a.borrower, leftoverCollateral);
         }
 
         // Refund any surplus USDC directly to borrower

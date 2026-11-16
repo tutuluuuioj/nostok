@@ -18,6 +18,12 @@ interface IPositionNFT is IERC721 {
     function mint(address to, uint256 loanId) external;
     function burn(uint256 loanId) external;
     function setAuctionLock(uint256 loanId, bool locked) external;
+    function transferWithAttestation(
+        address from,
+        address to,
+        uint256 tokenId,
+        bytes calldata recipientAttestation
+    ) external;
     function isAuctionLocked(uint256 loanId) external view returns (bool);
     function isAuthorizedCore(address caller) external view returns (bool);
 }

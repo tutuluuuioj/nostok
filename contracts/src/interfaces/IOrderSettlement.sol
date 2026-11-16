@@ -52,12 +52,30 @@ interface IOrderSettlement {
         uint128 fillUsdc
     ) external returns (uint256 loanId);
 
+    function fillBorrowOrderWithAttestations(
+        BorrowOrder calldata order,
+        bytes calldata signature,
+        uint128 fillUsdc,
+        bytes calldata borrowerAttestation,
+        bytes calldata lenderAttestation
+    ) external returns (uint256 loanId);
+
     function fillLendOffer(
         LendOffer calldata offer,
         bytes calldata signature,
         address collateralToken,
         uint128 collateralAmount,
         uint128 fillUsdc
+    ) external returns (uint256 loanId);
+
+    function fillLendOfferWithAttestations(
+        LendOffer calldata offer,
+        bytes calldata signature,
+        address collateralToken,
+        uint128 collateralAmount,
+        uint128 fillUsdc,
+        bytes calldata lenderAttestation,
+        bytes calldata borrowerAttestation
     ) external returns (uint256 loanId);
 
     function cancelBorrowOrder(BorrowOrder calldata order) external;
