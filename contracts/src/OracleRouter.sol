@@ -163,7 +163,7 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
     /**
      * @notice Synchronizes recorded multiplier with current token uiMultiplier.
      * - If recordedMultiplier[token] == 0 (initial baseline) or diff < 5% (dividend drift):
-     *   Permissionless (callable by anyone or daily keeper to ratchet baseline).
+     *   Permissionless (callable by anyone or automated keeper to ratchet baseline).
      * - If diff >= 5% (corporate action split):
      *   Restricted to Owner or Protocol Guardian (post-split unfreeze).
      */
@@ -343,7 +343,7 @@ contract OracleRouter is Initializable, UUPSUpgradeable, OwnableUpgradeable, IOr
         bool marketOpen = isMarketOpen();
 
         if (marketOpen) {
-            uint32 maxStale = cfg.maxStaleOpenSecs > 0 ? cfg.maxStaleOpenSecs : 3600;
+            uint32 maxStale = cfg.maxStaleOpenSecs > 0 ? cfg.maxStaleOpenSecs : 21600;
             if (block.timestamp - updatedAt > maxStale) {
                 return (price, decimals, OracleState.STALE_FEED);
             }

@@ -14,6 +14,7 @@ import {ILoanCore} from "./interfaces/ILoanCore.sol";
 import {IFeeCollector} from "./interfaces/IFeeCollector.sol";
 import {IOracleRouter} from "./interfaces/IOracleRouter.sol";
 import {IAssetRegistry} from "./interfaces/IAssetRegistry.sol";
+import {AggregatorV3Interface} from "./interfaces/AggregatorV3Interface.sol";
 
 /**
  * @title LiquidationAuction
@@ -357,6 +358,19 @@ contract LiquidationAuction is
         }
         if (currentPrice == 0) return;
 
+        IAssetRegistry.AssetConfig memory cfg = IAssetRegistry(ILoanCore(loanCore).assetRegistry()).getAssetConfig(a.collateralToken);
+
+        // If oracle feed is stale, enforce maximum stale age limit (e.g. maxStaleOpenSecs * 2 or 86400s)
+        // to prevent restarting the auction at an excessively stale price.
+        if (oState == IOracleRouter.OracleState.STALE_FEED) {
+            (, , , uint256 updatedAt, ) = AggregatorV3Interface(cfg.feed).latestRoundData();
+            uint256 maxFeedAge = cfg.maxStaleOpenSecs > 0 ? uint256(cfg.maxStaleOpenSecs) * 2 : 86400;
+            if (maxFeedAge > 86400) maxFeedAge = 86400;
+            if (updatedAt == 0 || block.timestamp > updatedAt + maxFeedAge) {
+                return; // Stale feed is older than allowable limit; do not restart
+            }
+        }
+
         ILoanCore.Loan memory l = ILoanCore(loanCore).getLoan(a.loanId);
         (uint256 grossVal, , ) = IOracleRouter(router).getValue(a.collateralToken, l.collateralRaw);
         uint128 debtPrincipal = l.principal - l.principalRepaid;
@@ -371,7 +385,6 @@ contract LiquidationAuction is
             emit AuctionCancelled(auctionId, a.loanId);
         } else {
             // Still liquidatable; restart auction at fresh oracle price
-            IAssetRegistry.AssetConfig memory cfg = IAssetRegistry(ILoanCore(loanCore).assetRegistry()).getAssetConfig(a.collateralToken);
             a.startPrice = (currentPrice * 99) / 100;
             a.floorPrice = (currentPrice * (10000 - cfg.maxDiscountBps)) / 10000;
             a.startTime = uint64(block.timestamp);

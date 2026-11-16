@@ -77,10 +77,15 @@ contract AssetRegistry is Initializable, UUPSUpgradeable, OwnableUpgradeable, IA
             revert InvalidDiscountParameters();
         }
 
+        // maxStaleOpenSecs sanity check: between 1800s (30 mins) and 86400s (24 hours)
+        if (config.maxStaleOpenSecs < 1800 || config.maxStaleOpenSecs > 86400) {
+            revert InvalidStaleParameters();
+        }
+
         _configs[token] = config;
         _supported[token] = true;
 
-        if (oracleRouter != address(0)) {
+        if (oracleRouter != address(0) && oracleRouter.code.length > 0) {
             // Automatically attempt to record token baseline multiplier upon listing.
             // Try/catch ensures a pending corporate action split does not revert asset configuration.
             try IOracleRouter(oracleRouter).syncMultiplier(token) {} catch {}

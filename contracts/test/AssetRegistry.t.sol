@@ -171,4 +171,73 @@ contract AssetRegistryTest is Test {
         vm.prank(owner);
         registry.setAssetConfig(address(b20), cfg); // Must succeed without reverting!
     }
+
+    function test_InvalidStaleParameters_Reverts() public {
+        IAssetRegistry.AssetConfig memory cfg = IAssetRegistry.AssetConfig({
+            feed: feed,
+            feedDecimals: 8,
+            tier: uint8(IAssetRegistry.AssetTier.TierA),
+            maxInitLtvBps: 6000,
+            marginCallLtvBps: 7000,
+            liqLtvBps: 7800,
+            badDebtLtvBps: 9000,
+            maxDiscountBps: 600,
+            closedMarketHaircutBps: 500,
+            perLoanCap: 10_000e6,
+            assetCap: 250_000e6,
+            maxStaleOpenSecs: 1799, // Below 1800s (30 mins)
+            status: uint8(IAssetRegistry.AssetStatus.Active),
+            restricted: false
+        });
+
+        // Reverts when < 1800s
+        vm.prank(owner);
+        vm.expectRevert(IAssetRegistry.InvalidStaleParameters.selector);
+        registry.setAssetConfig(token, cfg);
+
+        // Reverts when > 86400s (24 hours)
+        cfg.maxStaleOpenSecs = 86401;
+        vm.prank(owner);
+        vm.expectRevert(IAssetRegistry.InvalidStaleParameters.selector);
+        registry.setAssetConfig(token, cfg);
+
+        // Valid boundaries: 1800s and 86400s succeed
+        cfg.maxStaleOpenSecs = 1800;
+        vm.prank(owner);
+        registry.setAssetConfig(token, cfg);
+
+        cfg.maxStaleOpenSecs = 86400;
+        vm.prank(owner);
+        registry.setAssetConfig(token, cfg);
+    }
+
+    function test_OracleRouter_EOA_DoesNotRevert() public {
+        address eoaRouter = address(0x9999);
+        assertEq(eoaRouter.code.length, 0);
+
+        vm.prank(owner);
+        registry.setOracleRouter(eoaRouter);
+
+        IAssetRegistry.AssetConfig memory cfg = IAssetRegistry.AssetConfig({
+            feed: feed,
+            feedDecimals: 8,
+            tier: uint8(IAssetRegistry.AssetTier.TierA),
+            maxInitLtvBps: 6000,
+            marginCallLtvBps: 7000,
+            liqLtvBps: 7800,
+            badDebtLtvBps: 9000,
+            maxDiscountBps: 600,
+            closedMarketHaircutBps: 500,
+            perLoanCap: 10_000e6,
+            assetCap: 250_000e6,
+            maxStaleOpenSecs: 21600,
+            status: uint8(IAssetRegistry.AssetStatus.Active),
+            restricted: false
+        });
+
+        // Should succeed without trying to call syncMultiplier on an EOA
+        vm.prank(owner);
+        registry.setAssetConfig(token, cfg);
+        assertTrue(registry.isAssetSupported(token));
+    }
 }

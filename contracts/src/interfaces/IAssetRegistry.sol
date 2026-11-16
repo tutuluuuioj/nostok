@@ -38,6 +38,8 @@ interface IAssetRegistry {
     event AssetConfigSet(address indexed token, AssetConfig config);
     event AssetStatusSet(address indexed token, AssetStatus status);
 
+    error InvalidStaleParameters();
+
     function getAssetConfig(address token) external view returns (AssetConfig memory);
     function getAssetStatus(address token) external view returns (AssetStatus);
     function isAssetSupported(address token) external view returns (bool);

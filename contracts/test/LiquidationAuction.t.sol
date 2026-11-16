@@ -793,4 +793,122 @@ contract LiquidationAuctionTest is Test {
         assertEq(uint8(a.status), uint8(ILiquidationAuction.AuctionStatus.Cancelled));
         assertFalse(nft.isAuctionLocked(loanId));
     }
+
+    function test_StaleFeed_RestartLimit() public {
+        vm.prank(owner);
+        router.setMarketSession(true, true);
+
+        // Configure asset with maxStaleOpenSecs = 21600 (6 hours)
+        IAssetRegistry.AssetConfig memory cfg = registry.getAssetConfig(address(stockToken));
+        cfg.maxStaleOpenSecs = 21600;
+        vm.prank(owner);
+        registry.setAssetConfig(address(stockToken), cfg);
+
+        // Open loan: 50 shares ($10,000 value), borrow $5,800
+        vm.prank(mockOrderSettlement);
+        uint256 loanId = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            50e6,
+            5800e6,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        // Trigger liquidation auction at price 145 ($7,250 collat, $5,800 debt -> 80% LTV > 78%)
+        feed.setUpdatedAt(block.timestamp);
+        feed.setPrice(145e8);
+        vm.prank(keeper);
+        uint256 auctionId = core.startLiquidation(loanId);
+        ILiquidationAuction.Auction memory a = auction.getAuction(auctionId);
+
+        // Warp past auction duration (30 mins = 1800s)
+        vm.warp(block.timestamp + 1801);
+
+        // Scenario 1: Feed is stale, but age <= maxStaleOpenSecs * 2 (e.g. 25000s > 21600s, but <= 43200s)
+        feed.setUpdatedAt(block.timestamp - 25000);
+        (, , IOracleRouter.OracleState oState1) = router.getPrice(address(stockToken));
+        assertEq(uint8(oState1), uint8(IOracleRouter.OracleState.STALE_FEED));
+
+        auction.restartOrCancelAuction(auctionId);
+        a = auction.getAuction(auctionId);
+        assertEq(a.startTime, uint64(block.timestamp), "Auction should restart when stale feed is within allowable age limit");
+        uint64 secondStartTime = a.startTime;
+
+        // Warp past second auction duration
+        vm.warp(secondStartTime + 1801);
+
+        // Scenario 2: Feed is excessively stale: age > maxStaleOpenSecs * 2 (e.g. 50000s > 43200s)
+        feed.setUpdatedAt(block.timestamp - 50000);
+        (, , IOracleRouter.OracleState oState2) = router.getPrice(address(stockToken));
+        assertEq(uint8(oState2), uint8(IOracleRouter.OracleState.STALE_FEED));
+
+        // Call restartOrCancelAuction: should return without restarting because feed is too stale!
+        auction.restartOrCancelAuction(auctionId);
+        a = auction.getAuction(auctionId);
+        assertEq(a.startTime, secondStartTime, "Auction MUST NOT restart when stale feed exceeds max age limit");
+        assertEq(uint8(a.status), uint8(ILiquidationAuction.AuctionStatus.Active));
+    }
+
+    function test_PausedToken_RevertsRepayAndAuctionBuy() public {
+        vm.prank(owner);
+        router.setMarketSession(true, true);
+
+        // Open loan: 50 NVDAc, borrow 4,000 USDC
+        vm.prank(mockOrderSettlement);
+        uint256 loanId = core.openLoan(
+            borrower,
+            lender,
+            address(stockToken),
+            50e6,
+            4000e6,
+            800,
+            30,
+            6000,
+            3,
+            0
+        );
+
+        // 1. Token issuer pauses B20 token transfers
+        stockToken.setPaused(true);
+
+        // A. Borrower attempts to repay loan:
+        // LoanCore pulls USDC, then CollateralEscrow attempts safeTransfer of collateral back to borrower.
+        // Reverts because token transfer is paused!
+        vm.startPrank(borrower);
+        usdc.mint(borrower, 5000e6);
+        usdc.approve(address(core), type(uint256).max);
+        vm.expectRevert("Token paused");
+        core.repay(loanId);
+        vm.stopPrank();
+
+        // 2. Start liquidation auction (stock price drops to 100)
+        feed.setUpdatedAt(block.timestamp);
+        feed.setPrice(100e8);
+        vm.prank(keeper);
+        uint256 auctionId = core.startLiquidation(loanId);
+
+        // B. Liquidator attempts to buy from auction:
+        // LiquidationAuction pulls USDC, then CollateralEscrow attempts safeTransfer of collateral to liquidator.
+        // Reverts because token transfer is paused!
+        vm.startPrank(liquidator);
+        usdc.mint(liquidator, 10000e6);
+        usdc.approve(address(auction), type(uint256).max);
+        vm.expectRevert("Token paused");
+        auction.buy(auctionId, 10e6, 2000e6);
+        vm.stopPrank();
+
+        // 3. Token issuer unpauses transfers
+        stockToken.setPaused(false);
+
+        // Now auction buy succeeds cleanly!
+        vm.prank(liquidator);
+        uint128 usdcPaid = auction.buy(auctionId, 10e6, 2000e6);
+        assertGt(usdcPaid, 0);
+        assertEq(stockToken.balanceOf(liquidator), 10e6);
+    }
 }

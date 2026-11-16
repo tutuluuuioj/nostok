@@ -757,5 +757,5 @@ contract LoanCore is
         return claimable[account];
     }
 
-    uint256[50] private __gap;
+    uint256[48] private __gap;
 }

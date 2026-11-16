@@ -29,9 +29,14 @@ contract DeployNostok is Script {
         address treasury = vm.envAddress("TREASURY_ADDRESS");
         address reserve = vm.envAddress("RESERVE_ADDRESS");
 
+        require(multisigOwner != address(0), "Owner cannot be zero");
         require(multisigOwner != deployer, "Deployer cannot be owner");
+        require(guardian != address(0), "Guardian cannot be zero");
         require(guardian != deployer, "Deployer cannot be guardian");
+        require(guardian.code.length > 0, "Guardian must be a contract or multisig");
+        require(treasury != address(0), "Treasury cannot be zero");
         require(treasury != deployer, "Deployer cannot be treasury");
+        require(reserve != address(0), "Reserve cannot be zero");
         require(reserve != deployer, "Deployer cannot be reserve");
 
         uint256 chainId = block.chainid;
@@ -65,6 +70,8 @@ contract DeployNostok is Script {
 
         // 1. EligibilityGate (starts in permissioned mode; multisig is owner & operator, required attestation signer set)
         address attestationSigner = vm.envAddress("ATTESTATION_SIGNER");
+        require(attestationSigner != address(0), "Attestation signer cannot be zero");
+        require(attestationSigner != deployer, "Deployer cannot be attestation signer");
         EligibilityGate gate = new EligibilityGate(deployer, attestationSigner, false);
         console.log("EligibilityGate deployed at:", address(gate));
 
