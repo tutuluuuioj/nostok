@@ -36,12 +36,15 @@ export interface IndexerContext {
   publicClient: PublicClient<Transport, Chain>;
   db: DatabaseAdapter;
   trackedAssets: Set<Address>;
+  consecutiveBlockHashAborts: number;
 }
 
 export interface IndexerSyncSummary {
   reorgDetected: boolean;
   rolledBackToBlock?: bigint;
   batchAborted?: boolean;
+  consecutiveBlockHashAborts?: number;
+  recommendedBackoffMs?: number;
   fromBlock?: bigint;
   toBlock?: bigint;
   blocksProcessed: number;
@@ -122,35 +125,47 @@ export function isContractRevertError(err: unknown): boolean {
     if (matched) return true;
   }
 
-  const { text, codes } = collectErrorInfo(err);
-  if (text.includes('contractfunctionrevertederror') || text.includes('executionrevertederror')) {
-    return true;
-  }
-  if (codes.includes(3)) return true;
-  if (
-    (text.includes('execution reverted') || text.includes('revert')) &&
-    !text.includes('missing trie') &&
-    !text.includes('header not found') &&
-    !text.includes('pruned') &&
-    !text.includes('historical state')
-  ) {
-    return true;
+  const visited = new Set<unknown>();
+  let cur: unknown = err;
+  while (cur && typeof cur === 'object' && !visited.has(cur)) {
+    visited.add(cur);
+    const obj = cur as { name?: unknown; code?: unknown; cause?: unknown };
+    if (
+      obj instanceof ContractFunctionRevertedError ||
+      obj instanceof ExecutionRevertedError ||
+      obj.name === 'ContractFunctionRevertedError' ||
+      obj.name === 'ExecutionRevertedError' ||
+      obj.code === 3
+    ) {
+      return true;
+    }
+    cur = obj.cause;
   }
   return false;
 }
 
 export function isRangeTooLargeError(err: unknown): boolean {
   const { text, codes } = collectErrorInfo(err);
+  if (
+    codes.includes(-32016) ||
+    text.includes('rate limit') ||
+    text.includes('ratelimit') ||
+    text.includes('too many requests') ||
+    /\b429\b/.test(text)
+  ) {
+    return false;
+  }
+
   const rangeKeywords = [
     'range is too large',
     'range too large',
     'block range',
     'too many results',
     'query returned more than',
-    'response size',
+    'log response size',
+    'response size exceeded',
     'max results',
     'exceeds max',
-    'limit exceeded',
     '10000 results',
     'try with this block range',
     'more than 10000',
@@ -165,6 +180,31 @@ export function isRangeTooLargeError(err: unknown): boolean {
     return true;
   }
   return false;
+}
+
+export async function getBlockWithRetry(
+  publicClient: PublicClient<Transport, Chain>,
+  blockNumber: bigint,
+  maxRetries = 3,
+  baseDelayMs = 100
+) {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await publicClient.getBlock({ blockNumber });
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxRetries) {
+        const delayMs = baseDelayMs * 2 ** attempt;
+        console.warn(
+          `[INDEXER_BLOCK] getBlock(${blockNumber}) failed (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${delayMs}ms...`
+        );
+        await sleep(delayMs);
+      }
+    }
+  }
+  const reason = lastErr instanceof Error ? lastErr.message : String(lastErr);
+  throw new Error(`getBlock(${blockNumber}) RPC failed after ${maxRetries + 1} attempts: ${reason}`);
 }
 
 export async function readAtBlock<T>(
@@ -230,10 +270,18 @@ export async function fetchLogsWithRetryAndSplit(
         console.warn(
           `[INDEXER_LOGS] getLogs range [${params.fromBlock}..${params.toBlock}] too large; splitting in half at ${mid}...`
         );
-        const [left, right] = await Promise.all([
-          fetchLogsWithRetryAndSplit(publicClient, { ...params, toBlock: mid }, maxRetries, baseDelayMs),
-          fetchLogsWithRetryAndSplit(publicClient, { ...params, fromBlock: mid + 1n }, maxRetries, baseDelayMs),
-        ]);
+        const left = await fetchLogsWithRetryAndSplit(
+          publicClient,
+          { ...params, toBlock: mid },
+          maxRetries,
+          baseDelayMs
+        );
+        const right = await fetchLogsWithRetryAndSplit(
+          publicClient,
+          { ...params, fromBlock: mid + 1n },
+          maxRetries,
+          baseDelayMs
+        );
         return [...left, ...right];
       }
 
@@ -289,6 +337,7 @@ export async function createIndexerContext(config: IndexerConfig): Promise<Index
     publicClient,
     db,
     trackedAssets,
+    consecutiveBlockHashAborts: 0,
   };
 }
 
@@ -851,8 +900,8 @@ export async function detectAndHandleReorg(
     for (let i = 0; i < stored.rows.length; i++) {
       const row = stored.rows[i];
       const bn = toBigInt(row.block_number);
-      const canonical = await publicClient.getBlock({ blockNumber: bn }).catch(() => null);
-      if (!canonical || canonical.hash.toLowerCase() !== row.block_hash.toLowerCase()) {
+      const canonical = await getBlockWithRetry(publicClient, bn);
+      if (!canonical.hash || canonical.hash.toLowerCase() !== row.block_hash.toLowerCase()) {
         reorgNeeded = true;
       } else {
         if (reorgNeeded) {
@@ -874,8 +923,8 @@ export async function detectAndHandleReorg(
       for (const row of page) {
         const bn = toBigInt(row.block_number);
         if (bn > headBlock) continue;
-        const canonical = await publicClient.getBlock({ blockNumber: bn }).catch(() => null);
-        if (canonical && canonical.hash.toLowerCase() === row.block_hash.toLowerCase()) {
+        const canonical = await getBlockWithRetry(publicClient, bn);
+        if (canonical.hash && canonical.hash.toLowerCase() === row.block_hash.toLowerCase()) {
           forkPoint = bn;
           break;
         }
@@ -1031,9 +1080,11 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
 
   if (safeTarget < 0n || lastIndexed >= safeTarget) {
     await pruneOldIndexedBlocks(db, chainHead);
+    ctx.consecutiveBlockHashAborts = 0;
     return {
       reorgDetected: reorgResult.reorgDetected,
       rolledBackToBlock: reorgResult.rolledBackToBlock,
+      consecutiveBlockHashAborts: 0,
       blocksProcessed: 0,
       eventsIndexed: 0,
     };
@@ -1110,7 +1161,7 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
   let blocksProcessed = 0;
 
   for (let bn = fromBlock; bn <= toBlock; bn++) {
-    const block = await publicClient.getBlock({ blockNumber: bn });
+    const block = await getBlockWithRetry(publicClient, bn);
     let blockLogs = logsByBlock.get(bn) ?? [];
 
     // Requirement 6: Check if AssetConfigSet introduced any untracked token mid-batch
@@ -1169,13 +1220,27 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
     const expectedBlockHash = block.hash.toLowerCase();
     for (const log of blockLogs) {
       if (!log.blockHash || log.blockHash.toLowerCase() !== expectedBlockHash) {
-        console.warn(
-          `[INDEXER_REORG] Log blockHash mismatch at block ${bn} (log.blockHash=${String(log.blockHash)}, block.hash=${block.hash}). Aborting batch to retry next poll.`
-        );
+        ctx.consecutiveBlockHashAborts += 1;
+        let recommendedBackoffMs: number | undefined;
+        if (ctx.consecutiveBlockHashAborts >= 5) {
+          recommendedBackoffMs = Math.min(
+            config.pollIntervalMs * 2 ** (ctx.consecutiveBlockHashAborts - 4),
+            60_000
+          );
+          console.error(
+            `[INDEXER_ERROR] ${ctx.consecutiveBlockHashAborts} consecutive log.blockHash mismatch aborts (latest at block ${bn}, log.blockHash=${String(log.blockHash)}, block.hash=${block.hash}). Backing off poll to ${recommendedBackoffMs}ms.`
+          );
+        } else {
+          console.warn(
+            `[INDEXER_REORG] Log blockHash mismatch at block ${bn} (log.blockHash=${String(log.blockHash)}, block.hash=${block.hash}). Aborting batch to retry next poll (consecutive=${ctx.consecutiveBlockHashAborts}).`
+          );
+        }
         return {
           reorgDetected: true,
           rolledBackToBlock: reorgResult.rolledBackToBlock,
           batchAborted: true,
+          consecutiveBlockHashAborts: ctx.consecutiveBlockHashAborts,
+          recommendedBackoffMs,
           fromBlock,
           toBlock: bn > fromBlock ? bn - 1n : undefined,
           blocksProcessed,
@@ -1840,10 +1905,12 @@ export async function runIndexerSync(ctx: IndexerContext): Promise<IndexerSyncSu
   }
 
   await pruneOldIndexedBlocks(db, chainHead);
+  ctx.consecutiveBlockHashAborts = 0;
 
   return {
     reorgDetected: reorgResult.reorgDetected,
     rolledBackToBlock: reorgResult.rolledBackToBlock,
+    consecutiveBlockHashAborts: 0,
     fromBlock,
     toBlock,
     blocksProcessed,

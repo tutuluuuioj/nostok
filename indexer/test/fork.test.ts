@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
 import { execSync, spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { PGlite } from '@electric-sql/pglite';
+import { PGLiteSocketServer } from '@electric-sql/pglite-socket';
 import {
   type Address,
   type Hex,
@@ -34,6 +37,8 @@ import { toBigInt } from '../src/db.js';
 import {
   createIndexerContext,
   fetchLogsWithRetryAndSplit,
+  isContractRevertError,
+  isRangeTooLargeError,
   readAtBlock,
   runIndexerSync,
 } from '../src/indexer.js';
@@ -1353,6 +1358,337 @@ async function runTests(): Promise<void> {
         }
       } finally {
         fs.rmSync(pgliteDir, { recursive: true, force: true });
+      }
+
+      // -----------------------------------------------------------------------
+      // STEP 15: getBlock RPC failure does NOT trigger reorg rollback or wipe DB
+      // -----------------------------------------------------------------------
+      console.log('\n=== STEP 15: getBlock RPC error preserves DB (never rolls back) ===');
+      const loansBeforeRpcErr = await ctx.db.query<{ cnt: number }>('SELECT COUNT(*)::INT AS cnt FROM loans');
+      const eventsBeforeRpcErr = await ctx.db.query<{ cnt: number }>('SELECT COUNT(*)::INT AS cnt FROM loan_events');
+      const blocksBeforeRpcErr = await ctx.db.query<{ cnt: number }>('SELECT COUNT(*)::INT AS cnt FROM indexed_blocks');
+
+      const getBlockFailClient = new Proxy(publicClient, {
+        get(target, prop, receiver) {
+          if (prop === 'getBlock') {
+            return async () => {
+              throw new Error('Upstream JSON-RPC timeout during getBlock');
+            };
+          }
+          const val = Reflect.get(target, prop, receiver);
+          return typeof val === 'function' ? val.bind(target) : val;
+        },
+      });
+
+      await assert.rejects(
+        () => runIndexerSync({ ...ctx, publicClient: getBlockFailClient }),
+        /getBlock\(.+\) RPC failed/i
+      );
+
+      const loansAfterRpcErr = await ctx.db.query<{ cnt: number }>('SELECT COUNT(*)::INT AS cnt FROM loans');
+      const eventsAfterRpcErr = await ctx.db.query<{ cnt: number }>('SELECT COUNT(*)::INT AS cnt FROM loan_events');
+      const blocksAfterRpcErr = await ctx.db.query<{ cnt: number }>('SELECT COUNT(*)::INT AS cnt FROM indexed_blocks');
+      assert.equal(Number(loansAfterRpcErr.rows[0].cnt), Number(loansBeforeRpcErr.rows[0].cnt));
+      assert.equal(Number(eventsAfterRpcErr.rows[0].cnt), Number(eventsBeforeRpcErr.rows[0].cnt));
+      assert.equal(Number(blocksAfterRpcErr.rows[0].cnt), Number(blocksBeforeRpcErr.rows[0].cnt));
+      console.log('PASS STEP 15: getBlock RPC failure retried and aborted poll cleanly with DB intact.');
+
+      // -----------------------------------------------------------------------
+      // STEP 16: Strict isRangeTooLargeError, sequential split, strict isContractRevertError
+      // -----------------------------------------------------------------------
+      console.log('\n=== STEP 16: Strict rate-limit / revert error classification & sequential split ===');
+      assert.equal(isRangeTooLargeError(new Error('HTTP 429 rate limit exceeded')), false);
+      assert.equal(isRangeTooLargeError(new Error('Too Many Requests: limit exceeded')), false);
+      assert.equal(isRangeTooLargeError({ code: -32016, message: 'limit exceeded' }), false);
+      assert.equal(isRangeTooLargeError(new Error('Query returned more than 10000 results')), true);
+
+      // Verify HTTP 429 rate-limit message retries cleanly with backoff and NEVER splits range
+      let rateLimitCalls = 0;
+      const rateLimitRanges: Array<{ fromBlock: bigint; toBlock: bigint }> = [];
+      const rateLimitClient = new Proxy(publicClient, {
+        get(target, prop, receiver) {
+          if (prop === 'getLogs') {
+            return async (args?: Parameters<typeof target.getLogs>[0]) => {
+              const fb = BigInt((args?.fromBlock ?? 0n) as bigint);
+              const tb = BigInt((args?.toBlock ?? 0n) as bigint);
+              rateLimitRanges.push({ fromBlock: fb, toBlock: tb });
+              rateLimitCalls++;
+              if (rateLimitCalls === 1) {
+                throw new Error('429 Too Many Requests: rate limit exceeded');
+              }
+              return target.getLogs(args);
+            };
+          }
+          const val = Reflect.get(target, prop, receiver);
+          return typeof val === 'function' ? val.bind(target) : val;
+        },
+      });
+      await fetchLogsWithRetryAndSplit(
+        rateLimitClient,
+        { address: [deployed.loanCore], fromBlock: startBlock, toBlock: await publicClient.getBlockNumber() },
+        2,
+        5
+      );
+      assert.equal(rateLimitCalls, 2);
+      assert.ok(
+        rateLimitRanges.every((r) => r.fromBlock === startBlock && r.toBlock === rateLimitRanges[0].toBlock),
+        'Rate-limit error must retry full range with backoff and never split'
+      );
+
+      // Verify sequential execution when splitting (max in-flight getLogs calls === 1)
+      let inFlightGetLogs = 0;
+      let maxInFlightGetLogs = 0;
+      const headSeq = await publicClient.getBlockNumber();
+      const seqSplitClient = new Proxy(publicClient, {
+        get(target, prop, receiver) {
+          if (prop === 'getLogs') {
+            return async (args?: Parameters<typeof target.getLogs>[0]) => {
+              inFlightGetLogs++;
+              maxInFlightGetLogs = Math.max(maxInFlightGetLogs, inFlightGetLogs);
+              try {
+                await new Promise((r) => setTimeout(r, 2));
+                const fb = BigInt((args?.fromBlock ?? 0n) as bigint);
+                const tb = BigInt((args?.toBlock ?? 0n) as bigint);
+                if (tb - fb >= 4n) {
+                  throw new Error('block range is too large (-32005)');
+                }
+                return await target.getLogs(args);
+              } finally {
+                inFlightGetLogs--;
+              }
+            };
+          }
+          const val = Reflect.get(target, prop, receiver);
+          return typeof val === 'function' ? val.bind(target) : val;
+        },
+      });
+      await fetchLogsWithRetryAndSplit(
+        seqSplitClient,
+        { address: [deployed.loanCore], fromBlock: startBlock, toBlock: headSeq },
+        2,
+        5
+      );
+      assert.equal(maxInFlightGetLogs, 1, 'Split halves must execute sequentially');
+
+      // Verify an RPC error containing the word "revert" is NOT treated as a contract revert / burned NFT
+      assert.equal(isContractRevertError(new Error('Upstream proxy failed to revert state: 502')), false);
+      assert.equal(isContractRevertError({ code: 3, message: 'execution reverted' }), true);
+
+      // Self-transfer active PositionNFT #2 to dirty Position #2, then fail ownerOf with RPC error containing "revert"
+      await publicClient.waitForTransactionReceipt({
+        hash: await lenderClient.writeContract({
+          address: deployed.positionNFT,
+          abi: parseAbi(['function transferFrom(address from, address to, uint256 tokenId)']),
+          functionName: 'transferFrom',
+          args: [ADDRESSES.lender, ADDRESSES.lender, 2n],
+        }),
+      });
+      const revertWordRpcClient = new Proxy(publicClient, {
+        get(target, prop, receiver) {
+          if (prop === 'readContract') {
+            return async (args: Parameters<typeof target.readContract>[0]) => {
+              if (
+                args.address &&
+                getAddress(args.address) === deployed.positionNFT &&
+                args.functionName === 'ownerOf'
+              ) {
+                throw new Error('Gateway failed to revert backend snapshot during eth_call');
+              }
+              return target.readContract(args);
+            };
+          }
+          const val = Reflect.get(target, prop, receiver);
+          return typeof val === 'function' ? val.bind(target) : val;
+        },
+      });
+      await assert.rejects(
+        () => runIndexerSync({ ...ctx, publicClient: revertWordRpcClient }),
+        /Archive-capable RPC required|failed to revert backend snapshot/i
+      );
+      const pos2StillActive = await ctx.db.query('SELECT * FROM positions WHERE loan_id = 2');
+      assert.equal(pos2StillActive.rows[0].is_burned, false, 'RPC error mentioning "revert" must NOT mark NFT burned');
+      await runIndexerSync(ctx);
+      console.log('PASS STEP 16: Rate-limit exclusion, sequential split, and strict revert check verified.');
+
+      // -----------------------------------------------------------------------
+      // STEP 17: Consecutive blockHash-mismatch aborts (5 -> ERROR + poll backoff)
+      // -----------------------------------------------------------------------
+      console.log('\n=== STEP 17: Consecutive blockHash mismatch abort counter & backoff ===');
+      const bumpReceipt2 = await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: deployed.orderSettlement,
+          abi: parseAbi(['function bumpNonce() returns (uint256)']),
+          functionName: 'bumpNonce',
+        }),
+      });
+      const abortBlock2 = bumpReceipt2.blockNumber;
+      const mismatchClient2 = new Proxy(publicClient, {
+        get(target, prop, receiver) {
+          if (prop === 'getLogs') {
+            return async (args?: Parameters<typeof target.getLogs>[0]) => {
+              const logs = await target.getLogs(args);
+              return logs.map((l) =>
+                l.blockNumber === abortBlock2
+                  ? { ...l, blockHash: ('0x' + 'de'.repeat(32)) as Hex }
+                  : l
+              );
+            };
+          }
+          const val = Reflect.get(target, prop, receiver);
+          return typeof val === 'function' ? val.bind(target) : val;
+        },
+      });
+
+      const loggedErrors: string[] = [];
+      const origConsoleError = console.error;
+      console.error = (...args: unknown[]) => {
+        loggedErrors.push(args.map(String).join(' '));
+        origConsoleError(...args);
+      };
+      const ctxMismatch = {
+        ...ctx,
+        publicClient: mismatchClient2,
+      };
+      try {
+        for (let i = 1; i <= 5; i++) {
+          const res = await runIndexerSync(ctxMismatch);
+          assert.equal(res.batchAborted, true);
+          assert.equal(res.consecutiveBlockHashAborts, i);
+          if (i < 5) {
+            assert.equal(res.recommendedBackoffMs, undefined);
+          } else {
+            assert.ok(
+              res.recommendedBackoffMs !== undefined &&
+                res.recommendedBackoffMs > ctx.config.pollIntervalMs,
+              '5th consecutive abort must trigger poll backoff'
+            );
+          }
+        }
+      } finally {
+        console.error = origConsoleError;
+      }
+      assert.ok(
+        loggedErrors.some((line) => line.includes('[INDEXER_ERROR]') && line.includes('5 consecutive')),
+        '5 consecutive blockHash aborts must log an ERROR line'
+      );
+      ctxMismatch.publicClient = publicClient;
+      const recoveredAbort2 = await runIndexerSync(ctxMismatch);
+      assert.equal(recoveredAbort2.consecutiveBlockHashAborts, 0);
+      assert.equal(ctxMismatch.consecutiveBlockHashAborts, 0);
+      console.log('PASS STEP 17: 5 consecutive blockHash aborts logged ERROR + backed off, then reset cleanly.');
+
+      // -----------------------------------------------------------------------
+      // STEP 18: Real postgres:// wire-protocol test (PostgresPoolAdapter via pglite-socket)
+      // -----------------------------------------------------------------------
+      console.log('\n=== STEP 18: Real postgres:// wire-protocol test (PostgresPoolAdapter) ===');
+      const freePort = await new Promise<number>((resolve, reject) => {
+        const srv = net.createServer();
+        srv.listen(0, '127.0.0.1', () => {
+          const addr = srv.address();
+          srv.close((err) => {
+            if (err) reject(err);
+            else if (addr && typeof addr === 'object') resolve(addr.port);
+            else reject(new Error('Failed to bind ephemeral TCP port'));
+          });
+        });
+        srv.on('error', reject);
+      });
+
+      const wirePglite = new PGlite();
+      await wirePglite.waitReady;
+      const pgServer = new PGLiteSocketServer({
+        db: wirePglite,
+        host: '127.0.0.1',
+        port: freePort,
+        maxConnections: 5,
+      });
+      await pgServer.start();
+      const pgConnUrl = `postgres://postgres:postgres@127.0.0.1:${freePort}/postgres`;
+
+      try {
+        // Verify FORK=false accepts postgres:// connection string cleanly
+        const prodCfgCheck = loadConfig({
+          rpcUrl: LOCAL_RPC_URL,
+          isFork: false,
+          databaseUrl: pgConnUrl,
+          loanCore: deployed.loanCore,
+          orderSettlement: deployed.orderSettlement,
+          liquidationAuction: deployed.liquidationAuction,
+          positionNft: deployed.positionNFT,
+          collateralEscrow: deployed.collateralEscrow,
+          assetRegistry: deployed.assetRegistry,
+          oracleRouter: deployed.oracleRouter,
+        });
+        assert.equal(prodCfgCheck.databaseUrl, pgConnUrl);
+
+        const cfgPg = loadConfig({
+          rpcUrl: LOCAL_RPC_URL,
+          isFork: true,
+          forkChainId: 8453,
+          databaseUrl: pgConnUrl,
+          startBlock,
+          confirmations: 0,
+          blockBatchSize: 200,
+          loanCore: deployed.loanCore,
+          orderSettlement: deployed.orderSettlement,
+          liquidationAuction: deployed.liquidationAuction,
+          positionNft: deployed.positionNFT,
+          collateralEscrow: deployed.collateralEscrow,
+          assetRegistry: deployed.assetRegistry,
+          oracleRouter: deployed.oracleRouter,
+          assets: [nvdac],
+        });
+        const ctxPg = await createIndexerContext(cfgPg);
+        try {
+          const pgSync = await runIndexerSync(ctxPg);
+          assert.ok(pgSync.blocksProcessed > 0);
+
+          // Verify PostgresPoolAdapter COUNT(*), COUNT(*)::INT, BIGINT & NUMERIC(78,0) columns
+          const countTypes = await ctxPg.db.query<{ raw_cnt: string; int_cnt: number }>(
+            'SELECT COUNT(*) AS raw_cnt, COUNT(*)::INT AS int_cnt FROM loan_events'
+          );
+          const refCount = await ctx.db.query<{ cnt: number }>('SELECT COUNT(*)::INT AS cnt FROM loan_events');
+          assert.equal(Number(countTypes.rows[0].int_cnt), Number(refCount.rows[0].cnt));
+          assert.equal(toBigInt(countTypes.rows[0].raw_cnt), BigInt(refCount.rows[0].cnt));
+
+          const pgLoan2 = await ctxPg.db.query('SELECT * FROM loans WHERE loan_id = 2');
+          assert.equal(pgLoan2.rows.length, 1);
+          assert.equal(typeof pgLoan2.rows[0].collateral_raw, 'string');
+          assert.equal(typeof pgLoan2.rows[0].opened_block, 'string');
+          await assertLoanMatchesOnchain(publicClient, deployed.loanCore, pgLoan2.rows[0], 2n);
+
+          // Verify PostgresPoolAdapter transaction rollback on error
+          await assert.rejects(
+            () =>
+              ctxPg.db.transaction(async (tx) => {
+                await tx.query(
+                  `INSERT INTO claims (recipient, amount, block_number, block_hash, tx_hash, log_index, block_timestamp)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                  [
+                    ADDRESSES.treasury,
+                    '999',
+                    '999999999',
+                    '0x' + 'aa'.repeat(32),
+                    '0x' + 'bb'.repeat(32),
+                    99,
+                    '1700000000',
+                  ]
+                );
+                throw new Error('Intentional PostgresPoolAdapter rollback test');
+              }),
+            /Intentional PostgresPoolAdapter rollback test/
+          );
+          const rolledBackClaim = await ctxPg.db.query(
+            'SELECT * FROM claims WHERE block_number = 999999999'
+          );
+          assert.equal(rolledBackClaim.rows.length, 0, 'Rolled-back Postgres transaction must leave no rows');
+          console.log('PASS STEP 18: PostgresPoolAdapter (postgres:// via pglite-socket) sync, types, and rollback verified.');
+        } finally {
+          await ctxPg.db.close();
+        }
+      } finally {
+        await pgServer.stop();
+        await wirePglite.close();
       }
 
       // Print compact summary of DB table counts

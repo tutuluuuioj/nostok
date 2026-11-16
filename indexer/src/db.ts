@@ -67,7 +67,9 @@ class PostgresPoolAdapter implements DatabaseAdapter {
   private readonly pool: pg.Pool;
 
   constructor(connectionString: string) {
-    this.pool = new Pool({ connectionString });
+    const rawMax = Number(process.env.PG_POOL_MAX ?? 1);
+    const max = Number.isInteger(rawMax) && rawMax > 0 ? rawMax : 1;
+    this.pool = new Pool({ connectionString, max });
   }
 
   async exec(sql: string): Promise<void> {

@@ -14,6 +14,11 @@ indexer/.env.*
 !indexer/.env.example
 indexer/node_modules
 indexer/dist
+api/.env
+api/.env.*
+!api/.env.example
+api/node_modules
+api/dist
 contracts/out
 contracts/cache
 contracts/broadcast

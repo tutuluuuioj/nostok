@@ -37,8 +37,12 @@ async function main(): Promise<void> {
 
   const loop = async () => {
     if (stopping) return;
+    let nextDelayMs = config.pollIntervalMs;
     try {
       const summary = await runIndexerSync(ctx);
+      if (summary.recommendedBackoffMs !== undefined) {
+        nextDelayMs = summary.recommendedBackoffMs;
+      }
       if (summary.reorgDetected || summary.blocksProcessed > 0) {
         console.log('[INDEXER_SYNC]', summary);
       }
@@ -48,7 +52,7 @@ async function main(): Promise<void> {
     if (!stopping) {
       timer = setTimeout(() => {
         void loop();
-      }, config.pollIntervalMs);
+      }, nextDelayMs);
     }
   };
 
