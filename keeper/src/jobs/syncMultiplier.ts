@@ -1,4 +1,9 @@
-import { type Address } from 'viem';
+import {
+  type Address,
+  BaseError,
+  ContractFunctionRevertedError,
+  ExecutionRevertedError,
+} from 'viem';
 import {
   OracleState,
   ORACLE_STATE_NAMES,
@@ -20,6 +25,19 @@ async function emitTokenAlertOnce(
   if (ctx.cycleAlertedKeys?.has(key)) return;
   ctx.cycleAlertedKeys?.add(key);
   await ctx.alerts.send(type, message, details);
+}
+
+function isContractRevertError(err: unknown): boolean {
+  if (!(err instanceof BaseError)) return false;
+  return Boolean(
+    err.walk(
+      (e) =>
+        e instanceof ContractFunctionRevertedError ||
+        e instanceof ExecutionRevertedError ||
+        (e instanceof Error &&
+          (e.name === 'ContractFunctionRevertedError' || e.name === 'ExecutionRevertedError'))
+    )
+  );
 }
 
 /**
@@ -70,9 +88,17 @@ export async function runSyncMultiplierJob(ctx: KeeperContext): Promise<TxExecut
           abi: b20TokenAbi,
           functionName: 'uiMultiplier',
         });
-      } catch {
-        console.log(`[SYNC_MULTIPLIER] Asset ${symbol} (${token}) does not expose uiMultiplier(); skipping.`);
-        continue;
+      } catch (err) {
+        if (isContractRevertError(err)) {
+          const code = await publicClient.getBytecode({ address: token });
+          if (code && code !== '0x') {
+            console.log(
+              `[SYNC_MULTIPLIER] Asset ${symbol} (${token}) reverted on uiMultiplier() (does not expose uiMultiplier); skipping.`
+            );
+            continue;
+          }
+        }
+        throw err;
       }
 
       if (currentMult === 0n) {
@@ -125,6 +151,7 @@ export async function runSyncMultiplierJob(ctx: KeeperContext): Promise<TxExecut
           maxGasPriceWei: config.maxGasPriceWei,
           txTimeoutMs: config.txTimeoutMs,
           txBumpBps: config.txBumpBps,
+          skipBecauseStuckNonce: ctx.skipTxBecauseStuckNonce,
         });
         results.push(res);
         continue;
@@ -187,6 +214,7 @@ export async function runSyncMultiplierJob(ctx: KeeperContext): Promise<TxExecut
         maxGasPriceWei: config.maxGasPriceWei,
         txTimeoutMs: config.txTimeoutMs,
         txBumpBps: config.txBumpBps,
+        skipBecauseStuckNonce: ctx.skipTxBecauseStuckNonce,
       });
       results.push(res);
     } catch (err) {

@@ -165,6 +165,7 @@ export async function runExpiredAuctionJob(ctx: KeeperContext): Promise<TxExecut
         maxGasPriceWei: config.maxGasPriceWei,
         txTimeoutMs: config.txTimeoutMs,
         txBumpBps: config.txBumpBps,
+        skipBecauseStuckNonce: ctx.skipTxBecauseStuckNonce,
       });
       results.push(res);
     } catch (err) {

@@ -10,6 +10,8 @@ export interface KeeperContext {
   alerts: AlertManager;
   /** Tracks alerted tokens within a single polling cycle to prevent duplicate alerts */
   cycleAlertedKeys?: Set<string>;
+  /** True when cycle pre-flight detected a stuck pending nonce older than txTimeoutMs */
+  skipTxBecauseStuckNonce?: boolean;
 }
 
 export interface KeeperCycleSummary {

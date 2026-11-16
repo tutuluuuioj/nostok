@@ -22,6 +22,7 @@ export interface TxExecutionResult {
   executed: boolean;
   skippedDryRun: boolean;
   skippedGasCap?: boolean;
+  skippedStuckNonce?: boolean;
   txHash?: Hash;
   replacedTxHash?: Hash;
   receipt?: TransactionReceipt;
@@ -45,6 +46,7 @@ export interface ExecuteTxParams<
   txTimeoutMs?: number;
   txBumpBps?: number;
   alertOnSimRevert?: boolean;
+  skipBecauseStuckNonce?: boolean;
 }
 
 export function extractErrorMessage(err: unknown): string {
@@ -67,9 +69,81 @@ function bumpWei(base: bigint, bumpBps: number): bigint {
   return (base * BigInt(10_000 + bumpBps)) / 10_000n + 1_000_000n;
 }
 
+interface PendingNonceRecord {
+  nonce: number;
+  firstSeenMs: number;
+  txHash?: Hash;
+}
+
+const stuckNonceTracker = new Map<string, PendingNonceRecord>();
+
+export function recordStuckPendingNonce(keeperAddress: Address, nonce: number, txTimeoutMs: number, txHash?: Hash): void {
+  stuckNonceTracker.set(keeperAddress.toLowerCase(), {
+    nonce,
+    firstSeenMs: Date.now() - txTimeoutMs - 1,
+    txHash,
+  });
+}
+
+export interface PendingNonceGuardResult {
+  blocked: boolean;
+  latestNonce: number;
+  pendingNonce: number;
+  ageMs?: number;
+}
+
+export async function checkPendingNonceGuard(
+  publicClient: PublicClient<Transport, Chain>,
+  keeperAddress: Address,
+  txTimeoutMs: number,
+  alerts?: AlertManager,
+  emitAlert = true
+): Promise<PendingNonceGuardResult> {
+  const key = keeperAddress.toLowerCase();
+  const [latestNonce, pendingNonce] = await Promise.all([
+    publicClient.getTransactionCount({ address: keeperAddress, blockTag: 'latest' }),
+    publicClient.getTransactionCount({ address: keeperAddress, blockTag: 'pending' }),
+  ]);
+
+  if (pendingNonce <= latestNonce) {
+    stuckNonceTracker.delete(key);
+    return { blocked: false, latestNonce, pendingNonce };
+  }
+
+  let existing = stuckNonceTracker.get(key);
+  if (!existing || existing.nonce < latestNonce) {
+    existing = { nonce: latestNonce, firstSeenMs: Date.now() };
+    stuckNonceTracker.set(key, existing);
+  }
+
+  const ageMs = Date.now() - existing.firstSeenMs;
+  if (ageMs >= txTimeoutMs) {
+    console.warn(
+      `[STUCK_NONCE_GUARD] Skipping new tx for ${keeperAddress}: pending nonce ${latestNonce}..${pendingNonce - 1} unconfirmed for ${ageMs}ms (>= ${txTimeoutMs}ms)`
+    );
+    if (emitAlert && alerts) {
+      await alerts.send(
+        'STUCK_TX',
+        `Keeper has pending nonce ${latestNonce} unconfirmed for ${ageMs}ms; skipping new transactions`,
+        {
+          keeperAddress,
+          latestNonce,
+          pendingNonce,
+          ageMs,
+          txTimeoutMs,
+          txHash: existing.txHash,
+        }
+      );
+    }
+    return { blocked: true, latestNonce, pendingNonce, ageMs };
+  }
+
+  return { blocked: false, latestNonce, pendingNonce, ageMs };
+}
+
 /**
- * Guards against excessive gas prices, simulates via eth_call, skips in DRY_RUN=true,
- * and handles stuck transactions via timeout + fee-bumped replacement or alert.
+ * Guards against stuck pending nonces and excessive gas prices, simulates via eth_call,
+ * skips in DRY_RUN=true, and handles stuck transactions via timeout + fee-bumped replacement or alert.
  */
 export async function executeContractAction<
   TAbi extends Abi,
@@ -89,7 +163,55 @@ export async function executeContractAction<
     txTimeoutMs = 30_000,
     txBumpBps = 2000,
     alertOnSimRevert = true,
+    skipBecauseStuckNonce = false,
   } = params;
+
+  if (!dryRun) {
+    if (skipBecauseStuckNonce) {
+      return {
+        action: label,
+        simulated: false,
+        executed: false,
+        skippedDryRun: false,
+        skippedStuckNonce: true,
+        revertReason: 'Skipped due to stuck pending nonce detected in pre-flight check',
+      };
+    }
+
+    try {
+      const nonceGuard = await checkPendingNonceGuard(
+        publicClient,
+        walletClient.account.address,
+        txTimeoutMs,
+        alerts,
+        true
+      );
+      if (nonceGuard.blocked) {
+        return {
+          action: label,
+          simulated: false,
+          executed: false,
+          skippedDryRun: false,
+          skippedStuckNonce: true,
+          revertReason: `Pending nonce ${nonceGuard.latestNonce} stuck for ${nonceGuard.ageMs}ms (>= ${txTimeoutMs}ms)`,
+        };
+      }
+    } catch (err) {
+      const reason = extractErrorMessage(err);
+      await alerts.send('RPC_ERROR', `Failed to check pending nonce guard before ${label}`, {
+        target: address,
+        functionName: String(functionName),
+        reason,
+      });
+      return {
+        action: label,
+        simulated: false,
+        executed: false,
+        skippedDryRun: false,
+        revertReason: reason,
+      };
+    }
+  }
 
   let currentGasPrice: bigint;
   try {
@@ -206,6 +328,7 @@ export async function executeContractAction<
       };
     }
 
+    stuckNonceTracker.delete(walletClient.account.address.toLowerCase());
     console.log(`[TX_CONFIRMED] ${label} | tx=${initialHash} | block=${receipt.blockNumber}`);
     return {
       action: label,
@@ -258,6 +381,7 @@ export async function executeContractAction<
     }
 
     if (maxGasPriceWei !== undefined && candidateCapWei > maxGasPriceWei) {
+      recordStuckPendingNonce(walletClient.account.address, nonce!, txTimeoutMs, initialHash);
       const candidateGwei = formatGwei(candidateCapWei);
       const capGwei = formatGwei(maxGasPriceWei);
       await alerts.send(
@@ -317,6 +441,7 @@ export async function executeContractAction<
         };
       }
 
+      stuckNonceTracker.delete(walletClient.account.address.toLowerCase());
       console.log(
         `[TX_REPLACED] ${label} | old=${initialHash} | new=${repHash} | block=${repReceipt.blockNumber}`
       );
@@ -333,6 +458,7 @@ export async function executeContractAction<
       // Check if original tx actually mined right before replacement landed
       const initialMined = await publicClient.getTransactionReceipt({ hash: initialHash }).catch(() => null);
       if (initialMined) {
+        stuckNonceTracker.delete(walletClient.account.address.toLowerCase());
         console.log(
           `[TX_CONFIRMED] ${label} original tx confirmed before replacement | tx=${initialHash} | block=${initialMined.blockNumber}`
         );
@@ -346,6 +472,7 @@ export async function executeContractAction<
         };
       }
 
+      recordStuckPendingNonce(walletClient.account.address, nonce!, txTimeoutMs, initialHash);
       const reason = extractErrorMessage(repErr);
       await alerts.send('STUCK_TX', `Stuck tx replacement failed or timed out for ${label}`, {
         label,

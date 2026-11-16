@@ -145,6 +145,7 @@ export async function runLiquidationJob(ctx: KeeperContext): Promise<TxExecution
           maxGasPriceWei: config.maxGasPriceWei,
           txTimeoutMs: config.txTimeoutMs,
           txBumpBps: config.txBumpBps,
+          skipBecauseStuckNonce: ctx.skipTxBecauseStuckNonce,
         });
         results.push(res);
         continue;
@@ -174,6 +175,7 @@ export async function runLiquidationJob(ctx: KeeperContext): Promise<TxExecution
           maxGasPriceWei: config.maxGasPriceWei,
           txTimeoutMs: config.txTimeoutMs,
           txBumpBps: config.txBumpBps,
+          skipBecauseStuckNonce: ctx.skipTxBecauseStuckNonce,
         });
         results.push(res);
       } else {

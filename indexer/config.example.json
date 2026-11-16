@@ -1,0 +1,18 @@
+{
+  "rpcUrl": "http://127.0.0.1:8545",
+  "fork": false,
+  "forkChainId": 8453,
+  "databaseUrl": "",
+  "startBlock": 0,
+  "confirmations": 12,
+  "pollIntervalMs": 4000,
+  "blockBatchSize": 200,
+  "loanCore": "0x0000000000000000000000000000000000000000",
+  "orderSettlement": "0x0000000000000000000000000000000000000000",
+  "liquidationAuction": "0x0000000000000000000000000000000000000000",
+  "positionNft": "0x0000000000000000000000000000000000000000",
+  "collateralEscrow": "0x0000000000000000000000000000000000000000",
+  "assetRegistry": "0x0000000000000000000000000000000000000000",
+  "oracleRouter": "0x0000000000000000000000000000000000000000",
+  "assets": []
+}

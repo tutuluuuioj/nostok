@@ -9,6 +9,11 @@ keeper/.env.*
 !keeper/.env.example
 keeper/node_modules
 keeper/dist
+indexer/.env
+indexer/.env.*
+!indexer/.env.example
+indexer/node_modules
+indexer/dist
 contracts/out
 contracts/cache
 contracts/broadcast

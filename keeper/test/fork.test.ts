@@ -1108,6 +1108,32 @@ async function runTests(): Promise<void> {
         liveCtx.alerts.history.slice(stuckAlertBefore).some((a) => a.type === 'STUCK_TX'),
         'Expected STUCK_TX alert when replacement also times out'
       );
+
+      // Part 4: Next cycle sees stuck pending nonce older than txTimeoutMs and skips queueing new txs
+      const pendingBeforeGuard = await publicClient.getTransactionCount({
+        address: ADDRESSES.keeper,
+        blockTag: 'pending',
+      });
+      const guardSummary = await runKeeperCycle({
+        ...liveCtx,
+        config: { ...liveConfig, assets: [metac], txTimeoutMs: 250 },
+      });
+      const pendingAfterGuard = await publicClient.getTransactionCount({
+        address: ADDRESSES.keeper,
+        blockTag: 'pending',
+      });
+      assert.equal(
+        pendingAfterGuard,
+        pendingBeforeGuard,
+        'Stuck pending nonce guard must prevent queueing additional txs behind stuck nonce'
+      );
+      assert.equal(guardSummary.syncMultiplierResults.length, 1);
+      assert.equal(guardSummary.syncMultiplierResults[0].skippedStuckNonce, true);
+      assert.equal(guardSummary.syncMultiplierResults[0].executed, false);
+      assert.ok(
+        guardSummary.alertsEmitted.some((a) => a.type === 'STUCK_TX'),
+        'Expected STUCK_TX alert from pending nonce guard'
+      );
     } finally {
       if (automineDisabled) {
         await rpcCall('anvil_setAutomine', [true]);
@@ -1303,6 +1329,67 @@ async function runTests(): Promise<void> {
     console.log(
       'PASS TEST (g): Faulty loan #3 logged + alerted RPC_ERROR while loan #4 was liquidated in the same round; faulty expiredAuction job did not crash round.'
     );
+
+    // -------------------------------------------------------------------------
+    // TEST (h): uiMultiplier() RPC error alerts RPC_ERROR vs real contract revert skips cleanly
+    // -------------------------------------------------------------------------
+    console.log('\n=== TEST (h): uiMultiplier() RPC error vs non-B20 contract revert ===');
+    // 1. Real contract without uiMultiplier() (Base Mainnet USDC): skips with zero RPC_ERROR alert
+    const usdcCfgHash = await timelockClient.sendTransaction({
+      account: deployed.nostokTimelock,
+      to: deployed.assetRegistry,
+      data: encodeFunctionData({
+        abi: setCfgAbi,
+        functionName: 'setAssetConfig',
+        args: [
+          BASE_USDC,
+          {
+            feed: nvdaFeed,
+            feedDecimals: 8,
+            tier: 0,
+            maxInitLtvBps: 6000,
+            marginCallLtvBps: 7000,
+            liqLtvBps: 7800,
+            badDebtLtvBps: 9000,
+            maxDiscountBps: 600,
+            closedMarketHaircutBps: 500,
+            perLoanCap: 50_000_000_000n,
+            assetCap: 100_000_000_000n,
+            maxStaleOpenSecs: 21600,
+            status: 0,
+            restricted: false,
+          },
+        ],
+      }),
+    });
+    await publicClient.waitForTransactionReceipt({ hash: usdcCfgHash });
+
+    const nonB20Ctx = { ...liveCtx, config: { ...liveConfig, assets: [BASE_USDC] } };
+    const nonB20Summary = await runKeeperCycle(nonB20Ctx);
+    assert.equal(
+      nonB20Summary.alertsEmitted.some((a) => a.type === 'RPC_ERROR'),
+      false,
+      'Contract reverting on missing uiMultiplier() must skip without RPC_ERROR'
+    );
+
+    // 2. Non-revert RPC failure on uiMultiplier() read MUST emit RPC_ERROR alert
+    const rpcErrMultClient = {
+      ...liveCtx.publicClient,
+      readContract: (async (parameters: Parameters<typeof liveCtx.publicClient.readContract>[0]) => {
+        if (parameters.functionName === 'uiMultiplier') {
+          throw new Error('HTTP 503 Service Unavailable from RPC');
+        }
+        return origReadContract(parameters);
+      }) as typeof liveCtx.publicClient.readContract,
+    };
+    const rpcErrMultSummary = await runKeeperCycle({ ...liveCtx, publicClient: rpcErrMultClient });
+    assert.ok(
+      rpcErrMultSummary.alertsEmitted.some(
+        (a) => a.type === 'RPC_ERROR' && a.details.job === 'syncMultiplier'
+      ),
+      'RPC failure reading uiMultiplier() must emit RPC_ERROR alert'
+    );
+    console.log('PASS TEST (h): uiMultiplier() contract revert skipped cleanly; RPC failure emitted RPC_ERROR.');
 
     console.log('\nALL KEEPER BASE MAINNET FORK INTEGRATION TESTS PASSED.');
   } finally {

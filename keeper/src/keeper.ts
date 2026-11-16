@@ -12,7 +12,7 @@ import type { KeeperConfig } from './config.js';
 import { runExpiredAuctionJob } from './jobs/expiredAuction.js';
 import { runLiquidationJob } from './jobs/liquidation.js';
 import { runSyncMultiplierJob } from './jobs/syncMultiplier.js';
-import { extractErrorMessage, type TxExecutionResult } from './tx.js';
+import { checkPendingNonceGuard, extractErrorMessage, type TxExecutionResult } from './tx.js';
 import type { KeeperContext, KeeperCycleSummary } from './types.js';
 
 export function validateChainId(
@@ -113,6 +113,28 @@ export async function runKeeperCycle(ctx: KeeperContext): Promise<KeeperCycleSum
       keeperAddress,
       reason,
     });
+  }
+
+  if (!cycleCtx.config.dryRun) {
+    try {
+      const nonceGuard = await checkPendingNonceGuard(
+        cycleCtx.publicClient,
+        keeperAddress,
+        cycleCtx.config.txTimeoutMs,
+        cycleCtx.alerts,
+        true
+      );
+      if (nonceGuard.blocked) {
+        cycleCtx.skipTxBecauseStuckNonce = true;
+      }
+    } catch (err) {
+      const reason = extractErrorMessage(err);
+      console.error(`[CYCLE_ERROR] Failed to check pending nonce guard: ${reason}`);
+      await cycleCtx.alerts.send('RPC_ERROR', 'Failed to check pending nonce guard', {
+        keeperAddress,
+        reason,
+      });
+    }
   }
 
   let syncMultiplierResults: TxExecutionResult[] = [];
