@@ -2185,12 +2185,37 @@ async function runTests(): Promise<void> {
                   return a0.startsWith('0x000000000000000000000000');
                 })
               ) {
+                const isSyntheticCall = (c: { functionName: string; args?: unknown[] }) => {
+                  if (
+                    c.functionName !== 'isOrderCancelled' &&
+                    c.functionName !== 'getOrderFilledAmount' &&
+                    c.functionName !== 'getMakerNonce' &&
+                    c.functionName !== 'balanceOf' &&
+                    c.functionName !== 'allowance'
+                  ) {
+                    return false;
+                  }
+                  const a0 = String(c?.args?.[0] ?? '').toLowerCase();
+                  return a0.startsWith('0x000000000000000000000000');
+                };
+                const realCalls = opts.contracts.filter((c) => !isSyntheticCall(c));
+                const realResults =
+                  realCalls.length > 0
+                    ? ((await (target.multicall as (...a: unknown[]) => Promise<unknown[]>)({
+                        ...opts,
+                        contracts: realCalls,
+                      })) as unknown[])
+                    : [];
+                let realIdx = 0;
                 return opts.contracts.map((c) => {
+                  if (!isSyntheticCall(c)) {
+                    return realResults[realIdx++];
+                  }
                   if (c.functionName === 'isOrderCancelled') return { status: 'success', result: false };
                   if (c.functionName === 'getOrderFilledAmount') return { status: 'success', result: 0n };
                   if (c.functionName === 'getMakerNonce') return { status: 'success', result: 0n };
                   if (c.functionName === 'balanceOf' || c.functionName === 'allowance') {
-                    return { status: 'success', result: 50n * 10n ** 18n };
+                    return { status: 'success', result: 500n * 10n ** 18n };
                   }
                   return { status: 'success', result: 0n };
                 });
@@ -2323,12 +2348,356 @@ async function runTests(): Promise<void> {
         const recoveredOrdersRes = await getJson<{ stale: boolean; relay_stale: boolean }>(`${spamUrl}/orders?limit=5`);
         assert.equal(recoveredOrdersRes.body.stale, false);
 
-        // Clean up revoked entries before cap tests
+        // Clean up revoked entries before cap & collateralization tests
         spamSignedMap.delete(fundedBorrowRes.body.order_hash.toLowerCase());
         spamSignedMap.delete(fundedLendRes.body.order_hash.toLowerCase());
 
-        // Same funded maker posting 25 valid orders across different IPs evicts ONLY its own oldest/soonest orders (capped at 20)
-        for (let i = 0; i < 25; i++) {
+        // Medium (a): 1-wei collateral order rejected at admission (400 ORDER_UNDERCOLLATERALIZED) even when funded & escrow-approved
+        const oneWeiAcct = privateKeyToAccount(generatePrivateKey());
+        const oneWeiWallet = createWalletClient({
+          account: oneWeiAcct,
+          chain: forkChain,
+          transport: viemHttp(LOCAL_RPC_URL),
+        });
+        await rpcCall('anvil_setBalance', [oneWeiAcct.address, '0x56bc75e2d63100000']);
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdac,
+            abi: mockB20Artifact.abi,
+            functionName: 'mint',
+            args: [oneWeiAcct.address, 1n],
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await oneWeiWallet.writeContract({
+            address: nvdac,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.collateralEscrow, 1n],
+          }),
+        });
+        const oneWeiBorrow = await signBorrowForTest(oneWeiAcct, {
+          collateralAmount: '1',
+          minUsdc: '800000000',
+          maxLtvBps: 6000,
+          expiry: sevenDaysExpStr,
+          nonce: '0',
+        });
+        const oneWeiRes = await postJson<{ error: { code: string } }>(`${spamUrl}/orders`, {
+          order_type: 'borrow',
+          order: oneWeiBorrow.ord,
+          signature: oneWeiBorrow.sig,
+        });
+        assert.equal(oneWeiRes.status, 400);
+        assert.equal(oneWeiRes.body.error.code, 'ORDER_UNDERCOLLATERALIZED');
+
+        // Medium (a) refresh: Oracle price drop marks open borrow order unfunded + undercollateralized on GET /orders
+        const dropAcct = privateKeyToAccount(generatePrivateKey());
+        const dropWallet = createWalletClient({
+          account: dropAcct,
+          chain: forkChain,
+          transport: viemHttp(LOCAL_RPC_URL),
+        });
+        await rpcCall('anvil_setBalance', [dropAcct.address, '0x56bc75e2d63100000']);
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdac,
+            abi: mockB20Artifact.abi,
+            functionName: 'mint',
+            args: [dropAcct.address, 20n * 10n ** 18n],
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await dropWallet.writeContract({
+            address: nvdac,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.collateralEscrow, 20n * 10n ** 18n],
+          }),
+        });
+        const borderlineBorrow = await signBorrowForTest(dropAcct, {
+          collateralAmount: (12n * 10n ** 18n).toString(),
+          minUsdc: '800000000',
+          maxLtvBps: 6000,
+          expiry: sevenDaysExpStr,
+          nonce: '0',
+        });
+        const borderlineRes = await postJson<{ order_hash: string }>(`${spamUrl}/orders`, {
+          order_type: 'borrow',
+          order: borderlineBorrow.ord,
+          signature: borderlineBorrow.sig,
+        });
+        assert.equal(borderlineRes.status, 201);
+        // Drop NVDA price from $140 -> $100 ($1200 collateral * 60% = $720 < $800 minUsdc)
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdaFeed,
+            abi: mockAggArtifact.abi,
+            functionName: 'setPrice',
+            args: [100_00000000n],
+          }),
+        });
+        const dropRec = spamSignedMap.get(borderlineRes.body.order_hash.toLowerCase())!;
+        dropRec.cachedBlockNumber = 0n;
+        dropRec.lastRefreshedAtMs = 0;
+        const afterDropDefault = await getJson<{ data: Array<{ order_hash: string }> }>(
+          `${spamUrl}/orders?maker=${dropAcct.address}`
+        );
+        assert.equal(
+          afterDropDefault.body.data.length,
+          0,
+          'Undercollateralized order must drop out of default open GET /orders'
+        );
+        const afterDropInactive = await getJson<{
+          data: Array<{ order_hash: string; status: string; unfunded: boolean; undercollateralized?: boolean }>;
+        }>(`${spamUrl}/orders?maker=${dropAcct.address}&include_inactive=true`);
+        assert.equal(afterDropInactive.body.data[0]?.status, 'unfunded');
+        assert.equal(afterDropInactive.body.data[0]?.unfunded, true);
+        assert.equal(afterDropInactive.body.data[0]?.undercollateralized, true);
+        // Restore NVDA feed back to $140 and clean up test record
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdaFeed,
+            abi: mockAggArtifact.abi,
+            functionName: 'setPrice',
+            args: [140_00000000n],
+          }),
+        });
+        spamSignedMap.delete(borderlineRes.body.order_hash.toLowerCase());
+
+        // Medium (b): Summed maker funding for LendOffers (USDC -> LoanCore) & refresh budget overflow
+        const lendSumAcct = privateKeyToAccount(generatePrivateKey());
+        const lendSumWallet = createWalletClient({
+          account: lendSumAcct,
+          chain: forkChain,
+          transport: viemHttp(LOCAL_RPC_URL),
+        });
+        await rpcCall('anvil_setBalance', [lendSumAcct.address, '0x56bc75e2d63100000']);
+        await publicClient.waitForTransactionReceipt({
+          hash: await rawWalletClient.sendTransaction({
+            account: BASE_USDC_WHALE,
+            to: BASE_USDC,
+            data: encodeFunctionData({
+              abi: transferUsdcAbi,
+              functionName: 'transfer',
+              args: [lendSumAcct.address, 1_500_000_000n],
+            }),
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await lendSumWallet.writeContract({
+            address: BASE_USDC,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.loanCore, 1_500_000_000n],
+          }),
+        });
+        const lendSum1 = await signLendForTest(lendSumAcct, {
+          usdcAmount: '1000000000',
+          minRateBps: 851,
+          expiry: sevenDaysExpStr,
+          nonce: '0',
+        });
+        const lendSum1Res = await postJson<{ order_hash: string }>(`${spamUrl}/orders`, {
+          order_type: 'lend',
+          order: lendSum1.ord,
+          signature: lendSum1.sig,
+        });
+        assert.equal(lendSum1Res.status, 201);
+        const lendSumExceed = await signLendForTest(lendSumAcct, {
+          usdcAmount: '600000000',
+          minRateBps: 852,
+          expiry: sevenDaysExpStr,
+          nonce: '0',
+        });
+        const lendSumExceedRes = await postJson<{ error: { code: string } }>(`${spamUrl}/orders`, {
+          order_type: 'lend',
+          order: lendSumExceed.ord,
+          signature: lendSumExceed.sig,
+        });
+        assert.equal(lendSumExceedRes.status, 400);
+        assert.equal(lendSumExceedRes.body.error.code, 'INSUFFICIENT_ORDER_FUNDING');
+        const lendSum2 = await signLendForTest(lendSumAcct, {
+          usdcAmount: '500000000',
+          minRateBps: 853,
+          expiry: sevenDaysExpStr,
+          nonce: '0',
+        });
+        const lendSum2Res = await postJson<{ order_hash: string }>(`${spamUrl}/orders`, {
+          order_type: 'lend',
+          order: lendSum2.ord,
+          signature: lendSum2.sig,
+        });
+        assert.equal(lendSum2Res.status, 201);
+        // Drain $400 USDC so balance = $1,100: covers order #1 ($1,000), NOT #1 + #2 ($1,500) -> #2 becomes unfunded on refresh
+        await publicClient.waitForTransactionReceipt({
+          hash: await lendSumWallet.writeContract({
+            address: BASE_USDC,
+            abi: transferUsdcAbi,
+            functionName: 'transfer',
+            args: [BASE_USDC_WHALE, 400_000_000n],
+          }),
+        });
+        spamSignedMap.get(lendSum1Res.body.order_hash.toLowerCase())!.cachedBlockNumber = 0n;
+        spamSignedMap.get(lendSum2Res.body.order_hash.toLowerCase())!.cachedBlockNumber = 0n;
+        const lendRefreshRes = await getJson<{
+          data: Array<{ order_hash: string; status: string; unfunded: boolean }>;
+        }>(`${spamUrl}/orders?maker=${lendSumAcct.address}&include_inactive=true`);
+        const rLend1 = lendRefreshRes.body.data.find((d) => d.order_hash.toLowerCase() === lendSum1Res.body.order_hash.toLowerCase());
+        const rLend2 = lendRefreshRes.body.data.find((d) => d.order_hash.toLowerCase() === lendSum2Res.body.order_hash.toLowerCase());
+        assert.equal(rLend1?.status, 'open');
+        assert.equal(rLend1?.unfunded, false);
+        assert.equal(rLend2?.status, 'unfunded');
+        assert.equal(rLend2?.unfunded, true);
+        spamSignedMap.delete(lendSum1Res.body.order_hash.toLowerCase());
+        spamSignedMap.delete(lendSum2Res.body.order_hash.toLowerCase());
+
+        // Medium (a)+(b) 2,000-slot fill attack test: 100 wallets x 1 wei NVDAc + 1 wei approval x 20 orders across 40 IPs -> all 2000 rejected; real users still post!
+        const spam2kWallets = Array.from({ length: 100 }, () => privateKeyToAccount(generatePrivateKey()));
+        await Promise.all(
+          spam2kWallets.map((w) => rpcCall('anvil_setBalance', [w.address, '0x1bc16d674ec80000']))
+        );
+        for (const w of spam2kWallets) {
+          await publicClient.waitForTransactionReceipt({
+            hash: await deployerClient.writeContract({
+              address: nvdac,
+              abi: mockB20Artifact.abi,
+              functionName: 'mint',
+              args: [w.address, 1n],
+            }),
+          });
+        }
+        await Promise.all(
+          spam2kWallets.map(async (w) => {
+            const wc = createWalletClient({
+              account: w,
+              chain: forkChain,
+              transport: viemHttp(LOCAL_RPC_URL),
+            });
+            const h = await wc.writeContract({
+              address: nvdac,
+              abi: approveAbi,
+              functionName: 'approve',
+              args: [deployed.collateralEscrow, 1n],
+            });
+            await publicClient.waitForTransactionReceipt({ hash: h });
+          })
+        );
+        const signed2kPayloads = await Promise.all(
+          spam2kWallets.flatMap((w, wIdx) =>
+            Array.from({ length: 20 }, async (_, oIdx) => {
+              const { ord, sig } = await signBorrowForTest(w, {
+                collateralAmount: '1',
+                minUsdc: (800_000_000 + oIdx).toString(),
+                maxLtvBps: 6000,
+                expiry: sevenDaysExpStr,
+                nonce: '0',
+              });
+              return { ord, sig, ip: `198.51.140.${(wIdx % 40) + 1}` };
+            })
+          )
+        );
+        let rejected2kCount = 0;
+        for (let b = 0; b < signed2kPayloads.length; b += 100) {
+          const chunk = signed2kPayloads.slice(b, b + 100);
+          const responses = await Promise.all(
+            chunk.map((item) =>
+              postJson<{ error?: { code: string } }>(
+                `${spamUrl}/orders`,
+                { order_type: 'borrow', order: item.ord, signature: item.sig },
+                { 'X-Forwarded-For': item.ip }
+              )
+            )
+          );
+          for (const resp of responses) {
+            assert.equal(resp.status, 400);
+            assert.equal(resp.body.error?.code, 'ORDER_UNDERCOLLATERALIZED');
+            rejected2kCount += 1;
+          }
+        }
+        assert.equal(rejected2kCount, 2000, 'All 2,000 1-wei fill-attack requests must be rejected with 400');
+        assert.equal(spamSignedMap.size, 1, 'Only the legit 7d order remains after 2,000 fill attack requests');
+
+        // Real funded borrower still posts cleanly after 2,000 attack attempts
+        const realAfter2kBorrow = await signBorrowForTest(dropAcct, {
+          collateralAmount: (12n * 10n ** 18n).toString(),
+          minUsdc: '801000000',
+          expiry: sevenDaysExpStr,
+          nonce: '0',
+        });
+        const realAfter2kRes = await postJson<{ order_hash: string }>(`${spamUrl}/orders`, {
+          order_type: 'borrow',
+          order: realAfter2kBorrow.ord,
+          signature: realAfter2kBorrow.sig,
+        });
+        assert.equal(realAfter2kRes.status, 201);
+        spamSignedMap.delete(realAfter2kRes.body.order_hash.toLowerCase());
+
+        // Medium (b): spamSigner1 holds exact 240 NVDAc (50 existing + 190 minted), covers exact 20 orders * 12 NVDAc -> #1..#20 accepted, #21 rejected 400 INSUFFICIENT_ORDER_FUNDING!
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdac,
+            abi: mockB20Artifact.abi,
+            functionName: 'mint',
+            args: [spamSigner1.address, 190n * 10n ** 18n],
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await spamSigner1Wallet.writeContract({
+            address: nvdac,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.collateralEscrow, 240n * 10n ** 18n],
+          }),
+        });
+        for (let i = 0; i < 20; i++) {
+          const { ord, sig } = await signBorrowForTest(spamSigner1, {
+            minUsdc: (600_000_000n + BigInt(i)).toString(),
+            expiry: sevenDaysExpStr,
+            nonce: '0',
+          });
+          const resMaker = await postJson<{ order_hash: string }>(`${spamUrl}/orders`, {
+            order_type: 'borrow',
+            order: ord,
+            signature: sig,
+          }, { 'X-Forwarded-For': `198.51.100.${i + 1}` });
+          assert.equal(resMaker.status, 201);
+        }
+        const order21Insufficient = await signBorrowForTest(spamSigner1, {
+          minUsdc: '600000020',
+          expiry: sevenDaysExpStr,
+          nonce: '0',
+        });
+        const resOrder21Insufficient = await postJson<{ error: { code: string } }>(`${spamUrl}/orders`, {
+          order_type: 'borrow',
+          order: order21Insufficient.ord,
+          signature: order21Insufficient.sig,
+        }, { 'X-Forwarded-For': '198.51.100.21' });
+        assert.equal(
+          resOrder21Insufficient.status,
+          400,
+          '21st order must be rejected when maker balance/allowance only covers 20'
+        );
+        assert.equal(resOrder21Insufficient.body.error.code, 'INSUFFICIENT_ORDER_FUNDING');
+
+        // Top up spamSigner1 to 300 NVDAc & allowance -> orders 21..25 succeed and evict oldest down to 20 per-maker cap!
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdac,
+            abi: mockB20Artifact.abi,
+            functionName: 'mint',
+            args: [spamSigner1.address, 60n * 10n ** 18n],
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await spamSigner1Wallet.writeContract({
+            address: nvdac,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.collateralEscrow, 300n * 10n ** 18n],
+          }),
+        });
+        for (let i = 20; i < 25; i++) {
           const { ord, sig } = await signBorrowForTest(spamSigner1, {
             minUsdc: (600_000_000n + BigInt(i)).toString(),
             expiry: sevenDaysExpStr,

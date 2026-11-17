@@ -401,6 +401,11 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
     3_600_000,
     ctx.config.rateLimitMaxBuckets
   );
+  const verifyTarget24hLimiter = new IpRateLimiter(
+    ctx.config.verifyEmailTargetPer24hMax,
+    86_400_000,
+    ctx.config.rateLimitMaxBuckets
+  );
   const sybilCostCache = new Map<string, SybilCostCacheEntry>();
   const confirmTargetResendLimiter = new IpRateLimiter(
     Math.max(1, Math.min(3, Math.floor(ctx.config.confirmTargetGlobalPerHourMax / 2))),
@@ -816,56 +821,61 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
 
         const created = resSub.rows[0];
         if (!isWebhook && verificationCode && codeHash) {
-          const confirmToken = signConfirmSubscriptionToken(
-            ctx.config.confirmSecret,
-            created.id,
-            wallet,
-            codeHash,
-            3600
-          );
-          const confirmUrl = `${ctx.config.publicBaseUrl}/subscriptions/confirm?token=${encodeURIComponent(confirmToken)}`;
-          const blockToken = signBlockSenderToken(
-            ctx.config.confirmSecret,
-            created.id,
-            wallet,
-            canonicalTargetHash,
-            86_400
-          );
-          const blockUrl = `${ctx.config.publicBaseUrl}/subscriptions/block?token=${encodeURIComponent(blockToken)}`;
-          const siweAppOrigin = ctx.config.siweUri ? ctx.config.siweUri.replace(/\/+$/, '') : ctx.config.publicBaseUrl;
-          const frontendConfirmUrl = `${siweAppOrigin}/subscriptions/confirm?token=${encodeURIComponent(confirmToken)}`;
-          const frontendBlockUrl = `${siweAppOrigin}/subscriptions/block?token=${encodeURIComponent(blockToken)}`;
-          const unsubToken = signUnsubscribeToken(
-            ctx.config.unsubscribeSecret,
-            created.id,
-            wallet
-          );
-          const unsubscribeUrl = `${ctx.config.publicBaseUrl}/unsubscribe?token=${encodeURIComponent(unsubToken)}`;
-          const verifyMsg = {
-            wallet,
-            subscriptionId: created.id,
-            channel: input.channel,
-            target: normalizedTarget,
-            alertType: 'subscription_verification',
-            severity: 'info' as const,
-            title: 'Confirm your NOSTOK alert subscription',
-            message: `Verification code: ${verificationCode}. Confirm link: ${confirmUrl}. Not me, block this address: ${blockUrl} (link valid 24h, single-use; stops new requests only, not existing verified subscriptions).`,
-            payload: {
-              subscription_id: created.id,
-              verification_code: verificationCode,
-              confirm_token: confirmToken,
-              confirm_url: confirmUrl,
-              frontend_confirm_url: frontendConfirmUrl,
-              block_token: blockToken,
-              block_url: blockUrl,
-              frontend_block_url: frontendBlockUrl,
-            },
-            unsubscribeUrl,
-          };
-          if (input.channel === 'email') {
-            await ctx.transports.sendEmail(verifyMsg);
-          } else {
-            await ctx.transports.sendTelegram(verifyMsg);
+          // Cross-wallet 24h cap per canonical target: stop sending verification emails past 5/24h
+          // while still returning generic 201 success (never 429) so the real owner is never locked out.
+          const target24hCheck = verifyTarget24hLimiter.check(canonicalTargetHash);
+          if (target24hCheck.allowed) {
+            const confirmToken = signConfirmSubscriptionToken(
+              ctx.config.confirmSecret,
+              created.id,
+              wallet,
+              codeHash,
+              3600
+            );
+            const confirmUrl = `${ctx.config.publicBaseUrl}/subscriptions/confirm?token=${encodeURIComponent(confirmToken)}`;
+            const blockToken = signBlockSenderToken(
+              ctx.config.confirmSecret,
+              created.id,
+              wallet,
+              canonicalTargetHash,
+              86_400
+            );
+            const blockUrl = `${ctx.config.publicBaseUrl}/subscriptions/block?token=${encodeURIComponent(blockToken)}`;
+            const siweAppOrigin = ctx.config.siweUri ? ctx.config.siweUri.replace(/\/+$/, '') : ctx.config.publicBaseUrl;
+            const frontendConfirmUrl = `${siweAppOrigin}/subscriptions/confirm?token=${encodeURIComponent(confirmToken)}`;
+            const frontendBlockUrl = `${siweAppOrigin}/subscriptions/block?token=${encodeURIComponent(blockToken)}`;
+            const unsubToken = signUnsubscribeToken(
+              ctx.config.unsubscribeSecret,
+              created.id,
+              wallet
+            );
+            const unsubscribeUrl = `${ctx.config.publicBaseUrl}/unsubscribe?token=${encodeURIComponent(unsubToken)}`;
+            const verifyMsg = {
+              wallet,
+              subscriptionId: created.id,
+              channel: input.channel,
+              target: normalizedTarget,
+              alertType: 'subscription_verification',
+              severity: 'info' as const,
+              title: 'Confirm your NOSTOK alert subscription',
+              message: `Verification code: ${verificationCode}. Confirm link: ${confirmUrl}. Not me, block this address: ${blockUrl} (link valid 24h, single-use; stops new requests only, not existing verified subscriptions).`,
+              payload: {
+                subscription_id: created.id,
+                verification_code: verificationCode,
+                confirm_token: confirmToken,
+                confirm_url: confirmUrl,
+                frontend_confirm_url: frontendConfirmUrl,
+                block_token: blockToken,
+                block_url: blockUrl,
+                frontend_block_url: frontendBlockUrl,
+              },
+              unsubscribeUrl,
+            };
+            if (input.channel === 'email') {
+              await ctx.transports.sendEmail(verifyMsg);
+            } else {
+              await ctx.transports.sendTelegram(verifyMsg);
+            }
           }
         }
 
@@ -1561,6 +1571,7 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
     confirmTargetWalletLimiter.close();
     confirmTargetIpLimiter.close();
     confirmTargetGlobalLimiter.close();
+    verifyTarget24hLimiter.close();
     confirmTargetResendLimiter.close();
     sybilCostCache.clear();
     clearInterval(pendingWalletsTimer);

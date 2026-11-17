@@ -104,6 +104,9 @@ export interface RelaySignedOrderRecord {
   cachedMakerBalance?: bigint;
   cachedMakerAllowance?: bigint;
   cachedFundingChecked?: boolean;
+  cachedFundingOverBudget?: boolean;
+  cachedCollateralCheck?: boolean;
+  cachedUndercollateralized?: boolean;
   cachedRpcStale?: boolean;
   cachedStatus: 'open' | 'partially_filled' | 'filled' | 'cancelled' | 'expired' | 'nonce_bumped' | 'unfunded';
   cachedBlockNumber: bigint;
@@ -625,10 +628,72 @@ interface LiveRelayOrderState {
   expired: boolean;
   nonceBumped: boolean;
   unfunded: boolean;
+  undercollateralized: boolean;
   stale: boolean;
   currentMakerNonce: bigint;
   status: 'open' | 'partially_filled' | 'filled' | 'cancelled' | 'expired' | 'nonce_bumped' | 'unfunded';
   blockNumber: bigint;
+}
+
+function computeCollateralValuationUsdc(params: {
+  collateralRaw: bigint;
+  tokenDecimals: number;
+  price: bigint;
+  feedDecimals: number;
+  oracleState: number;
+  closedMarketHaircutBps: number;
+}): bigint {
+  if (params.collateralRaw <= 0n || params.price <= 0n) return 0n;
+  if (
+    params.oracleState !== OracleState.VALID_OPEN &&
+    params.oracleState !== OracleState.VALID_CLOSED
+  ) {
+    return 0n;
+  }
+  const denom = 10n ** BigInt(params.tokenDecimals) * 10n ** BigInt(params.feedDecimals);
+  if (denom <= 0n) return 0n;
+  const grossUsdc = (params.collateralRaw * params.price * 1_000_000n) / denom;
+  if (params.oracleState === OracleState.VALID_CLOSED && params.closedMarketHaircutBps > 0) {
+    return grossUsdc - (grossUsdc * BigInt(params.closedMarketHaircutBps)) / 10_000n;
+  }
+  return grossUsdc;
+}
+
+function isBorrowOrderAdequatelyCollateralized(params: {
+  collateralRaw: bigint;
+  tokenDecimals: number;
+  minUsdc: bigint;
+  maxLtvBps: number;
+  assetMaxInitLtvBps: number;
+  assetStatus: number;
+  closedMarketHaircutBps: number;
+  price: bigint;
+  feedDecimals: number;
+  oracleState: number;
+}): { ok: boolean; effectiveUsdc: bigint; allowedLtvBps: number } {
+  if (params.assetStatus !== 0) {
+    return { ok: false, effectiveUsdc: 0n, allowedLtvBps: 0 };
+  }
+  if (
+    params.oracleState !== OracleState.VALID_OPEN &&
+    params.oracleState !== OracleState.VALID_CLOSED
+  ) {
+    return { ok: false, effectiveUsdc: 0n, allowedLtvBps: 0 };
+  }
+  const effectiveUsdc = computeCollateralValuationUsdc({
+    collateralRaw: params.collateralRaw,
+    tokenDecimals: params.tokenDecimals,
+    price: params.price,
+    feedDecimals: params.feedDecimals,
+    oracleState: params.oracleState,
+    closedMarketHaircutBps: params.closedMarketHaircutBps,
+  });
+  const allowedLtvBps = Math.min(params.maxLtvBps, params.assetMaxInitLtvBps);
+  const ok =
+    allowedLtvBps > 0 &&
+    params.price > 0n &&
+    effectiveUsdc * BigInt(allowedLtvBps) >= params.minUsdc * 10_000n;
+  return { ok, effectiveUsdc, allowedLtvBps };
 }
 
 function getRequiredFundingSpec(
@@ -639,10 +704,18 @@ function getRequiredFundingSpec(
     collateralAmount: string | null;
     totalUsdc: bigint;
     filled: bigint;
+    priorOpenRequiredRaw?: bigint;
   }
-): { token: Address; spender: Address; requiredRaw: bigint } | null {
+): {
+  token: Address;
+  spender: Address;
+  requiredRaw: bigint;
+  priorOpenRequiredRaw: bigint;
+  cumulativeRequiredRaw: bigint;
+} | null {
   const remaining = params.totalUsdc > params.filled ? params.totalUsdc - params.filled : 0n;
   if (remaining === 0n) return null;
+  const priorOpenRequiredRaw = params.priorOpenRequiredRaw ?? 0n;
   if (params.orderType === 'borrow') {
     if (!params.collateralToken || !params.collateralAmount) return null;
     const colBig = BigInt(params.collateralAmount);
@@ -651,17 +724,144 @@ function getRequiredFundingSpec(
       token: getAddress(params.collateralToken),
       spender: ctx.config.collateralEscrow,
       requiredRaw,
+      priorOpenRequiredRaw,
+      cumulativeRequiredRaw: requiredRaw + priorOpenRequiredRaw,
     };
   }
   return {
     token: ctx.config.usdc,
     spender: ctx.config.loanCore,
     requiredRaw: remaining,
+    priorOpenRequiredRaw,
+    cumulativeRequiredRaw: remaining + priorOpenRequiredRaw,
   };
 }
 
 function fundingPairKey(token: Address, maker: Address, spender: Address): string {
   return `${token.toLowerCase()}:${maker.toLowerCase()}:${spender.toLowerCase()}`;
+}
+
+function isRelayRecordDead(
+  rec: RelaySignedOrderRecord,
+  chainNowSec: bigint,
+  currentMakerNonceOverride?: bigint
+): boolean {
+  const filled = rec.cachedFilled ?? 0n;
+  const total = BigInt(rec.totalUsdc);
+  const currentNonce = currentMakerNonceOverride ?? rec.cachedMakerNonce ?? BigInt(rec.nonce);
+  return (
+    Boolean(rec.cachedCancelled) ||
+    currentNonce !== BigInt(rec.nonce) ||
+    filled >= total ||
+    BigInt(rec.expiry) <= chainNowSec
+  );
+}
+
+function getMakerPriorOpenRequiredRaw(
+  ctx: ApiContext,
+  signedMap: Map<string, RelaySignedOrderRecord>,
+  params: {
+    maker: Address;
+    token: Address;
+    spender: Address;
+    chainNowSec: bigint;
+    excludeOrderHashLower?: string;
+  }
+): bigint {
+  const targetMaker = params.maker.toLowerCase();
+  const targetToken = params.token.toLowerCase();
+  const targetSpender = params.spender.toLowerCase();
+  let totalPrior = 0n;
+  for (const [k, existing] of signedMap.entries()) {
+    if (params.excludeOrderHashLower && k === params.excludeOrderHashLower) continue;
+    if (existing.maker.toLowerCase() !== targetMaker) continue;
+    if (isRelayRecordDead(existing, params.chainNowSec)) continue;
+    if (existing.cachedStatus === 'unfunded') continue;
+    if (existing.orderType === 'borrow' && existing.cachedCollateralCheck && existing.cachedUndercollateralized) {
+      continue;
+    }
+    const existingSpec = getRequiredFundingSpec(ctx, {
+      orderType: existing.orderType,
+      collateralToken: existing.collateralToken,
+      collateralAmount: existing.collateralAmount,
+      totalUsdc: BigInt(existing.totalUsdc),
+      filled: existing.cachedFilled ?? 0n,
+    });
+    if (!existingSpec) continue;
+    if (
+      existingSpec.token.toLowerCase() === targetToken &&
+      existingSpec.spender.toLowerCase() === targetSpender
+    ) {
+      totalPrior += existingSpec.requiredRaw;
+    }
+  }
+  return totalPrior;
+}
+
+function reconcileMakerFundingBudgets(
+  ctx: ApiContext,
+  signedMap: Map<string, RelaySignedOrderRecord>,
+  fundingResultMap: Map<string, { balance: bigint; allowance: bigint; ok: boolean }>,
+  chainNowSec: bigint,
+  chainBlockNum: bigint
+): void {
+  const groups = new Map<string, Array<{ rec: RelaySignedOrderRecord; requiredRaw: bigint }>>();
+  for (const rec of signedMap.values()) {
+    const fSpec = getRequiredFundingSpec(ctx, {
+      orderType: rec.orderType,
+      collateralToken: rec.collateralToken,
+      collateralAmount: rec.collateralAmount,
+      totalUsdc: BigInt(rec.totalUsdc),
+      filled: rec.cachedFilled ?? 0n,
+    });
+    if (!fSpec) continue;
+    const fKey = fundingPairKey(fSpec.token, rec.maker, fSpec.spender);
+    const latest = fundingResultMap.get(fKey);
+    if (!latest?.ok) continue;
+
+    rec.cachedMakerBalance = latest.balance;
+    rec.cachedMakerAllowance = latest.allowance;
+    rec.cachedFundingChecked = true;
+
+    if (isRelayRecordDead(rec, chainNowSec)) {
+      rec.cachedFundingOverBudget = false;
+      deriveRelayLiveState(ctx, rec, chainNowSec, chainBlockNum);
+      continue;
+    }
+    if (rec.orderType === 'borrow' && rec.cachedCollateralCheck && rec.cachedUndercollateralized) {
+      rec.cachedFundingOverBudget = false;
+      deriveRelayLiveState(ctx, rec, chainNowSec, chainBlockNum);
+      continue;
+    }
+
+    const list = groups.get(fKey);
+    if (list) {
+      list.push({ rec, requiredRaw: fSpec.requiredRaw });
+    } else {
+      groups.set(fKey, [{ rec, requiredRaw: fSpec.requiredRaw }]);
+    }
+  }
+
+  for (const [fKey, entries] of groups.entries()) {
+    const latest = fundingResultMap.get(fKey);
+    if (!latest?.ok) continue;
+    entries.sort((a, b) => {
+      const dt = (a.rec.submittedAtMs ?? 0) - (b.rec.submittedAtMs ?? 0);
+      if (dt !== 0) return dt;
+      return a.rec.orderHash.toLowerCase().localeCompare(b.rec.orderHash.toLowerCase());
+    });
+    let runningSum = 0n;
+    for (const entry of entries) {
+      const nextSum = runningSum + entry.requiredRaw;
+      if (latest.balance >= nextSum && latest.allowance >= nextSum) {
+        entry.rec.cachedFundingOverBudget = false;
+        runningSum = nextSum;
+      } else {
+        entry.rec.cachedFundingOverBudget = true;
+      }
+      deriveRelayLiveState(ctx, entry.rec, chainNowSec, chainBlockNum);
+    }
+  }
 }
 
 function deriveRelayLiveState(
@@ -684,12 +884,15 @@ function deriveRelayLiveState(
     totalUsdc: total,
     filled,
   });
-  const unfunded = Boolean(
+  const undercollateralized =
+    rec.orderType === 'borrow' && Boolean(rec.cachedCollateralCheck && rec.cachedUndercollateralized);
+  const singleOrderUnfunded = Boolean(
     rec.cachedFundingChecked &&
       fundingSpec &&
       ((rec.cachedMakerBalance ?? 0n) < fundingSpec.requiredRaw ||
         (rec.cachedMakerAllowance ?? 0n) < fundingSpec.requiredRaw)
   );
+  const unfunded = undercollateralized || singleOrderUnfunded || Boolean(rec.cachedFundingOverBudget);
   const status: LiveRelayOrderState['status'] = cancelled
     ? 'cancelled'
     : nonceBumped
@@ -713,6 +916,7 @@ function deriveRelayLiveState(
     expired,
     nonceBumped,
     unfunded,
+    undercollateralized,
     stale: Boolean(rec.cachedRpcStale),
     currentMakerNonce,
     status,
@@ -775,11 +979,29 @@ async function batchRefreshRelayRecords(
       }
     }
     const uniqueFundingPairs = Array.from(fundingPairsMap.entries());
+    const uniqueCollateralTokens = Array.from(
+      new Set(
+        stale
+          .filter((r) => r.orderType === 'borrow' && r.collateralToken)
+          .map((r) => getAddress(r.collateralToken!))
+      )
+    );
 
     const calls: Array<{
       address: Address;
-      abi: typeof orderSettlementAbi | typeof erc20MetaAbi;
-      functionName: 'getOrderFilledAmount' | 'isOrderCancelled' | 'getMakerNonce' | 'balanceOf' | 'allowance';
+      abi:
+        | typeof orderSettlementAbi
+        | typeof erc20MetaAbi
+        | typeof oracleRouterAbi
+        | typeof assetRegistryAbi;
+      functionName:
+        | 'getOrderFilledAmount'
+        | 'isOrderCancelled'
+        | 'getMakerNonce'
+        | 'balanceOf'
+        | 'allowance'
+        | 'getPrice'
+        | 'getAssetConfig';
       args: readonly [Hex] | readonly [Address] | readonly [Address, Address];
     }> = [];
 
@@ -819,6 +1041,21 @@ async function batchRefreshRelayRecords(
         abi: erc20MetaAbi,
         functionName: 'allowance',
         args: [fp.maker, fp.spender],
+      });
+    }
+    const oracleStartIdx = calls.length;
+    for (const tok of uniqueCollateralTokens) {
+      calls.push({
+        address: ctx.config.oracleRouter,
+        abi: oracleRouterAbi,
+        functionName: 'getPrice',
+        args: [tok],
+      });
+      calls.push({
+        address: ctx.config.assetRegistry,
+        abi: assetRegistryAbi,
+        functionName: 'getAssetConfig',
+        args: [tok],
       });
     }
 
@@ -867,6 +1104,51 @@ async function batchRefreshRelayRecords(
       }
     }
 
+    const oracleAssetMap = new Map<
+      string,
+      {
+        price: bigint;
+        feedDecimals: number;
+        oracleState: number;
+        maxInitLtvBps: number;
+        closedMarketHaircutBps: number;
+        assetStatus: number;
+        ok: boolean;
+      }
+    >();
+    for (let tIdx = 0; tIdx < uniqueCollateralTokens.length; tIdx++) {
+      const tokLower = uniqueCollateralTokens[tIdx].toLowerCase();
+      const pRes = results[oracleStartIdx + tIdx * 2];
+      const cfgRes = results[oracleStartIdx + tIdx * 2 + 1];
+      if (pRes?.status === 'success' && cfgRes?.status === 'success') {
+        const priceTuple = pRes.result as readonly [bigint, number, number];
+        const cfg = cfgRes.result as {
+          maxInitLtvBps: number;
+          closedMarketHaircutBps: number;
+          status: number;
+        };
+        oracleAssetMap.set(tokLower, {
+          price: BigInt(priceTuple[0]),
+          feedDecimals: Number(priceTuple[1]),
+          oracleState: Number(priceTuple[2]),
+          maxInitLtvBps: Number(cfg.maxInitLtvBps),
+          closedMarketHaircutBps: Number(cfg.closedMarketHaircutBps ?? 0),
+          assetStatus: Number(cfg.status),
+          ok: true,
+        });
+      } else {
+        oracleAssetMap.set(tokLower, {
+          price: 0n,
+          feedDecimals: 8,
+          oracleState: 5,
+          maxInitLtvBps: 0,
+          closedMarketHaircutBps: 0,
+          assetStatus: 2,
+          ok: false,
+        });
+      }
+    }
+
     const doneAtMs = Date.now();
     let anyStale = batchRpcError;
     for (let idx = 0; idx < stale.length; idx++) {
@@ -892,11 +1174,35 @@ async function batchRefreshRelayRecords(
         rec.cachedFundingChecked = true;
       }
 
+      let collateralCheckOk = true;
+      if (rec.orderType === 'borrow' && rec.collateralToken && rec.collateralAmount) {
+        const oa = oracleAssetMap.get(rec.collateralToken.toLowerCase());
+        if (oa?.ok) {
+          const check = isBorrowOrderAdequatelyCollateralized({
+            collateralRaw: BigInt(rec.collateralAmount),
+            tokenDecimals: rec.collateralDecimals,
+            minUsdc: BigInt(rec.totalUsdc),
+            maxLtvBps: rec.maxLtvBps,
+            assetMaxInitLtvBps: oa.maxInitLtvBps,
+            assetStatus: oa.assetStatus,
+            closedMarketHaircutBps: oa.closedMarketHaircutBps,
+            price: oa.price,
+            feedDecimals: oa.feedDecimals,
+            oracleState: oa.oracleState,
+          });
+          rec.cachedCollateralCheck = true;
+          rec.cachedUndercollateralized = !check.ok;
+        } else {
+          collateralCheckOk = false;
+        }
+      }
+
       const recOk =
         fRes?.status === 'success' &&
         cRes?.status === 'success' &&
         nonceVal !== undefined &&
-        (!fKey || Boolean(fState?.ok));
+        (!fKey || Boolean(fState?.ok)) &&
+        collateralCheckOk;
 
       if (recOk) {
         rec.cachedRpcStale = false;
@@ -908,6 +1214,17 @@ async function batchRefreshRelayRecords(
       }
       deriveRelayLiveState(ctx, rec, chainNowSec, chainBlockNum);
     }
+
+    if (fundingResultMap.size > 0) {
+      reconcileMakerFundingBudgets(
+        ctx,
+        getSignedOrdersMap(ctx),
+        fundingResultMap,
+        chainNowSec,
+        chainBlockNum
+      );
+    }
+
     return anyStale;
   })().finally(() => {
     headState.inFlightRefresh.delete(batchKey);
@@ -928,6 +1245,7 @@ function formatRelayOrderEnvelope(live: LiveRelayOrderState, fills: unknown[] = 
     collateral_symbol: rec.collateralSymbol,
     status: live.status,
     unfunded: live.unfunded,
+    undercollateralized: live.undercollateralized,
     stale: live.stale,
     min_usdc: formatAmount(total, USDC_DECIMALS, 'USDC'),
     ...(rec.orderType === 'lend' ? { usdc_amount: formatAmount(total, USDC_DECIMALS, 'USDC') } : {}),
@@ -1121,7 +1439,12 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
   let collateralDecimals = 18;
   if (collateralToken) {
     let isSupported = false;
-    let assetCfg: { maxInitLtvBps: number; perLoanCap: bigint; status: number } | null = null;
+    let assetCfg: {
+      maxInitLtvBps: number;
+      closedMarketHaircutBps: number;
+      perLoanCap: bigint;
+      status: number;
+    } | null = null;
     try {
       isSupported = Boolean(
         await ctx.publicClient.readContract({
@@ -1137,7 +1460,12 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
           abi: assetRegistryAbi,
           functionName: 'getAssetConfig',
           args: [collateralToken],
-        })) as unknown as { maxInitLtvBps: number; perLoanCap: bigint; status: number };
+        })) as unknown as {
+          maxInitLtvBps: number;
+          closedMarketHaircutBps: number;
+          perLoanCap: bigint;
+          status: number;
+        };
       }
     } catch (err) {
       throw new RpcUnavailableError(err instanceof Error ? err.message : String(err));
@@ -1157,22 +1485,6 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
         `Collateral token ${collateralToken} is not Active in AssetRegistry`
       );
     }
-    if (input.order_type === 'borrow') {
-      if (maxLtvBps > Number(assetCfg.maxInitLtvBps)) {
-        throw new HttpError(
-          400,
-          'LTV_EXCEEDS_ASSET_MAX',
-          `Order maxLtvBps (${maxLtvBps}) exceeds asset maxInitLtvBps (${assetCfg.maxInitLtvBps})`
-        );
-      }
-      if (BigInt(assetCfg.perLoanCap) > 0n && totalUsdc > BigInt(assetCfg.perLoanCap)) {
-        throw new HttpError(
-          400,
-          'PER_LOAN_CAP_EXCEEDED',
-          `Order principal (${totalUsdc}) exceeds asset perLoanCap (${assetCfg.perLoanCap})`
-        );
-      }
-    }
 
     const assetRes = await ctx.db.query<{ symbol: string | null; decimals: number | null }>(
       'SELECT symbol, decimals FROM assets WHERE LOWER(token) = LOWER($1) LIMIT 1',
@@ -1191,6 +1503,58 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
         collateralDecimals = Number(dec);
       } catch {
         // leave null/18 fallback
+      }
+    }
+
+    if (input.order_type === 'borrow') {
+      if (maxLtvBps > Number(assetCfg.maxInitLtvBps)) {
+        throw new HttpError(
+          400,
+          'LTV_EXCEEDS_ASSET_MAX',
+          `Order maxLtvBps (${maxLtvBps}) exceeds asset maxInitLtvBps (${assetCfg.maxInitLtvBps})`
+        );
+      }
+      if (BigInt(assetCfg.perLoanCap) > 0n && totalUsdc > BigInt(assetCfg.perLoanCap)) {
+        throw new HttpError(
+          400,
+          'PER_LOAN_CAP_EXCEEDED',
+          `Order principal (${totalUsdc}) exceeds asset perLoanCap (${assetCfg.perLoanCap})`
+        );
+      }
+
+      let priceTuple: readonly [bigint, number, number];
+      try {
+        priceTuple = (await ctx.publicClient.readContract({
+          address: ctx.config.oracleRouter,
+          abi: oracleRouterAbi,
+          functionName: 'getPrice',
+          args: [collateralToken],
+        })) as unknown as readonly [bigint, number, number];
+      } catch (err) {
+        throw new RpcUnavailableError(err instanceof Error ? err.message : String(err));
+      }
+
+      const oraclePrice = BigInt(priceTuple[0]);
+      const feedDecimals = Number(priceTuple[1]);
+      const oracleState = Number(priceTuple[2]);
+      const colCheck = isBorrowOrderAdequatelyCollateralized({
+        collateralRaw: BigInt(collateralAmount ?? '0'),
+        tokenDecimals: collateralDecimals,
+        minUsdc: totalUsdc,
+        maxLtvBps,
+        assetMaxInitLtvBps: Number(assetCfg.maxInitLtvBps),
+        assetStatus: Number(assetCfg.status),
+        closedMarketHaircutBps: Number(assetCfg.closedMarketHaircutBps ?? 0),
+        price: oraclePrice,
+        feedDecimals,
+        oracleState,
+      });
+      if (!colCheck.ok) {
+        throw new HttpError(
+          400,
+          'ORDER_UNDERCOLLATERALIZED',
+          `Order collateral (${collateralAmount ?? '0'} raw, effective value ${colCheck.effectiveUsdc.toString()} USDC at oracle state ${oracleState}) does not satisfy minUsdc (${totalUsdc.toString()}) at LTV ${colCheck.allowedLtvBps} bps`
+        );
       }
     }
   }
@@ -1240,7 +1604,25 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
     throw new HttpError(400, 'ORDER_ALREADY_FILLED', 'Order has already been completely filled on-chain');
   }
 
-  const fundingSpec = getRequiredFundingSpec(ctx, {
+  const orderHashLower = orderHash.toLowerCase();
+  const makerLower = maker.toLowerCase();
+
+  const pruneDeadEntries = () => {
+    for (const [k, existing] of signedMap.entries()) {
+      if (
+        BigInt(existing.expiry) <= blk.timestamp ||
+        existing.cachedCancelled ||
+        existing.cachedStatus === 'filled' ||
+        (existing.maker.toLowerCase() === makerLower && BigInt(existing.nonce) !== currentMakerNonce)
+      ) {
+        signedMap.delete(k);
+      }
+    }
+  };
+
+  pruneDeadEntries();
+
+  const baseFundingSpec = getRequiredFundingSpec(ctx, {
     orderType: input.order_type,
     collateralToken,
     collateralAmount,
@@ -1249,7 +1631,46 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
   });
   let makerBalance = 0n;
   let makerAllowance = 0n;
-  if (fundingSpec) {
+  let hasFundingCheck = false;
+  if (baseFundingSpec) {
+    const sameScopeExisting = Array.from(signedMap.values()).filter((existing) => {
+      if (existing.orderHash.toLowerCase() === orderHashLower) return false;
+      if (existing.maker.toLowerCase() !== makerLower) return false;
+      const eSpec = getRequiredFundingSpec(ctx, {
+        orderType: existing.orderType,
+        collateralToken: existing.collateralToken,
+        collateralAmount: existing.collateralAmount,
+        totalUsdc: BigInt(existing.totalUsdc),
+        filled: existing.cachedFilled ?? 0n,
+      });
+      return Boolean(
+        eSpec &&
+          eSpec.token.toLowerCase() === baseFundingSpec.token.toLowerCase() &&
+          eSpec.spender.toLowerCase() === baseFundingSpec.spender.toLowerCase()
+      );
+    });
+    if (sameScopeExisting.length > 0) {
+      await batchRefreshRelayRecords(ctx, sameScopeExisting, blk.timestamp, blk.number, false);
+      pruneDeadEntries();
+    }
+
+    const priorOpenRequiredRaw = getMakerPriorOpenRequiredRaw(ctx, signedMap, {
+      maker,
+      token: baseFundingSpec.token,
+      spender: baseFundingSpec.spender,
+      chainNowSec: blk.timestamp,
+      excludeOrderHashLower: orderHashLower,
+    });
+    const fundingSpec = getRequiredFundingSpec(ctx, {
+      orderType: input.order_type,
+      collateralToken,
+      collateralAmount,
+      totalUsdc,
+      filled,
+      priorOpenRequiredRaw,
+    })!;
+    hasFundingCheck = true;
+
     try {
       const [balRes, allowRes] = await Promise.all([
         ctx.publicClient.readContract({
@@ -1272,39 +1693,21 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
     }
 
     const spenderLabel = input.order_type === 'borrow' ? 'CollateralEscrow' : 'LoanCore';
-    if (makerBalance < fundingSpec.requiredRaw) {
+    if (makerBalance < fundingSpec.cumulativeRequiredRaw) {
       throw new HttpError(
         400,
         'INSUFFICIENT_ORDER_FUNDING',
-        `Maker balance (${makerBalance.toString()}) is below required ${fundingSpec.requiredRaw.toString()} raw units for open order`
+        `Maker balance (${makerBalance.toString()}) is below cumulative required ${fundingSpec.cumulativeRequiredRaw.toString()} raw units (${fundingSpec.requiredRaw.toString()} new + ${fundingSpec.priorOpenRequiredRaw.toString()} open orders)`
       );
     }
-    if (makerAllowance < fundingSpec.requiredRaw) {
+    if (makerAllowance < fundingSpec.cumulativeRequiredRaw) {
       throw new HttpError(
         400,
         'INSUFFICIENT_ORDER_FUNDING',
-        `Maker ${spenderLabel} allowance (${makerAllowance.toString()}) is below required ${fundingSpec.requiredRaw.toString()} raw units`
+        `Maker ${spenderLabel} allowance (${makerAllowance.toString()}) is below cumulative required ${fundingSpec.cumulativeRequiredRaw.toString()} raw units (${fundingSpec.requiredRaw.toString()} new + ${fundingSpec.priorOpenRequiredRaw.toString()} open orders)`
       );
     }
   }
-
-  const orderHashLower = orderHash.toLowerCase();
-  const makerLower = maker.toLowerCase();
-
-  const pruneDeadEntries = () => {
-    for (const [k, existing] of signedMap.entries()) {
-      if (
-        BigInt(existing.expiry) <= blk.timestamp ||
-        existing.cachedCancelled ||
-        existing.cachedStatus === 'filled' ||
-        (existing.maker.toLowerCase() === makerLower && BigInt(existing.nonce) !== currentMakerNonce)
-      ) {
-        signedMap.delete(k);
-      }
-    }
-  };
-
-  pruneDeadEntries();
 
   // Enforce per-maker active cap (evict ONLY the same maker's unfunded/soonest/oldest order)
   const getSameMakerEntries = () =>
@@ -1436,7 +1839,10 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
     cachedMakerNonce: currentMakerNonce,
     cachedMakerBalance: makerBalance,
     cachedMakerAllowance: makerAllowance,
-    cachedFundingChecked: Boolean(fundingSpec),
+    cachedFundingChecked: hasFundingCheck,
+    cachedFundingOverBudget: false,
+    cachedCollateralCheck: input.order_type === 'borrow',
+    cachedUndercollateralized: false,
     cachedRpcStale: false,
     cachedStatus: initialStatus,
     cachedBlockNumber: blk.number,
@@ -1528,6 +1934,7 @@ function formatDbOrderRow(
     baseRow.signature = rec.signature;
     baseRow.submitted_at = rec.submittedAt;
     baseRow.unfunded = liveRelay.unfunded;
+    baseRow.undercollateralized = liveRelay.undercollateralized;
     baseRow.stale = liveRelay.stale;
   }
 

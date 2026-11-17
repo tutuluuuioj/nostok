@@ -1963,6 +1963,14 @@ async function runTests(): Promise<void> {
         cfg,
       });
       assert.ok(/^0x[0-9a-fA-F]{64}$/.test(cancelJsonRes.txHash));
+      // Also cancel M3 partially-filled bufferedOrderRes so subsequent single-order autoApprove covers all open relay commitments
+      await cancelSignedBorrowOrder({
+        address: ADDRESSES.borrower,
+        order: bufferedOrderRes.order,
+        storage: mockStorage,
+        provider: walletProvider,
+        cfg,
+      });
 
       const toBumpOrder = await prepareAndSignBorrowOrder({
         address: ADDRESSES.borrower,

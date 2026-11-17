@@ -2929,8 +2929,18 @@ async function runTests(): Promise<void> {
             signature: await gmailVictimAcct.signMessage({ message: gvSiwe }),
           })
         ).body.token;
+        const isBombedTarget = (t: string) => {
+          const low = t.toLowerCase();
+          return low.startsWith('bombed.target') || low.startsWith('bombedtarget');
+        };
+        const beforeBombedCount = deliveredEmails.filter((m) => isBombedTarget(m.target)).length;
+        assert.equal(
+          beforeBombedCount,
+          5,
+          `Expected 5 emails delivered to canonical bombed.target before funded victim retry, got ${beforeBombedCount}`
+        );
         for (const victimTarget of ['bombed.target@gmail.com', 'bombed.target+alerts@gmail.com']) {
-          const gvSubRes = await httpJson<{ id: string; verified: boolean }>(
+          const gvSubRes = await httpJson<{ id: string; verified: boolean; verification_required?: boolean }>(
             'POST',
             `${bombUrl}/subscriptions`,
             { channel: 'email', target: victimTarget },
@@ -2939,11 +2949,25 @@ async function runTests(): Promise<void> {
           assert.equal(
             gvSubRes.status,
             201,
-            `Wallet with sybil cost confirming ${victimTarget} must NOT be locked out by 15 zero-cost spam requests`
+            `Wallet with sybil cost confirming ${victimTarget} must NOT be locked out (returns 201)`
           );
+          assert.equal(gvSubRes.body.verification_required, true);
+        }
+        const afterBombedCount = deliveredEmails.filter((m) => isBombedTarget(m.target)).length;
+        assert.equal(afterBombedCount, 5, 'Cross-wallet 24h cap must bound bombed.target deliveries to 5');
+
+        // M2: GET with Accept: text/html returns interactive HTML <form method="POST"> confirm page (tested on unflooded targets)
+        for (const cleanTarget of ['m2.confirm.plain@gmail.com', 'm2.confirm.tag+alerts@gmail.com']) {
+          const gvSubRes = await httpJson<{ id: string; verified: boolean }>(
+            'POST',
+            `${bombUrl}/subscriptions`,
+            { channel: 'email', target: cleanTarget },
+            { Authorization: `Bearer ${gvTok}`, 'X-Forwarded-For': '203.0.114.99' }
+          );
+          assert.equal(gvSubRes.status, 201);
           const gvMsg = deliveredEmails.find((m) => m.subscriptionId === gvSubRes.body.id)!;
-          assert.ok(gvMsg, 'Verification email for victim must be delivered');
-          // M2: GET with Accept: text/html returns interactive HTML <form method="POST"> confirm page
+          assert.ok(gvMsg, 'Verification email for clean target must be delivered');
+          assert.ok(gvMsg.message.includes('Not me, block this address:'), 'Sent email must include block link');
           const htmlConfirmPage = await fetch(String(gvMsg.payload.confirm_url), {
             headers: { Accept: 'text/html', 'X-Forwarded-For': '203.0.114.99' },
           });
@@ -3151,7 +3175,8 @@ async function runTests(): Promise<void> {
         assert.equal(optedOutRetry.status, 403);
         assert.equal(optedOutRetry.body.error?.code, 'TARGET_OPTED_OUT');
 
-        // Legitimate funded victim STILL subscribes & confirms lockout.victim cleanly
+        // Legitimate funded victim STILL receives 201 (never 429) on lockout.victim after 5/24h cap,
+        // and no >5 emails are ever sent to lockout.victim; clean funded target confirms normally
         const pocVictimKey = generatePrivateKey();
         const pocVictimAcct = privateKeyToAccount(pocVictimKey);
         await fetch(LOCAL_RPC_URL, {
@@ -3180,14 +3205,26 @@ async function runTests(): Promise<void> {
             signature: await pocVictimAcct.signMessage({ message: pvSiwe }),
           })
         ).body.token;
-        const pvSub = await httpJson<{ id: string }>(
+        const pvSub = await httpJson<{ id: string; verification_required?: boolean }>(
           'POST',
           `${bombUrl}/subscriptions`,
           { channel: 'email', target: 'lockout.victim@nostok.xyz' },
           { Authorization: `Bearer ${pvTok}`, 'X-Forwarded-For': '203.0.114.125' }
         );
         assert.equal(pvSub.status, 201);
-        const pvMsg = deliveredEmails.find((m) => m.subscriptionId === pvSub.body.id)!;
+        assert.equal(pvSub.body.verification_required, true);
+        const lockoutDelivered = deliveredEmails.filter((m) =>
+          m.target.toLowerCase().startsWith('lockout.victim')
+        );
+        assert.ok(lockoutDelivered.length <= 5, `lockout.victim emails must be <= 5, got ${lockoutDelivered.length}`);
+        const pvCleanSub = await httpJson<{ id: string }>(
+          'POST',
+          `${bombUrl}/subscriptions`,
+          { channel: 'email', target: 'clean.funded.victim@nostok.xyz' },
+          { Authorization: `Bearer ${pvTok}`, 'X-Forwarded-For': '203.0.114.125' }
+        );
+        assert.equal(pvCleanSub.status, 201);
+        const pvMsg = deliveredEmails.find((m) => m.subscriptionId === pvCleanSub.body.id)!;
         const pvConfirm = await httpJson<{ confirmed: boolean; verified: boolean }>(
           'POST',
           `${bombUrl}/subscriptions/confirm`,
@@ -3351,8 +3388,11 @@ async function runTests(): Promise<void> {
         assert.equal(fundSub2.status, 201);
         assert.equal(sybilGetBalanceCalls, 1, 'Sybil ETH balance check must be cached across requests within TTL');
 
-        // Moving 0.01 ETH across 12 attacker wallets + IPs must NOT lock out an ETH-holding victim (owner path stays open)
-        for (let hop = 0; hop < 12; hop++) {
+        // Low fix: Moving 0.01 ETH across 30 wallets/IPs x 3 requests (90 sends total) against one victim:
+        // all 90 return generic 201 (never 429), strictly 5 emails delivered per 24h, every email retains block link,
+        // and a legitimate ETH-holding victim afterward still sees generic 201 (never locked out)!
+        const emailsBefore90 = deliveredEmails.length;
+        for (let hop = 0; hop < 30; hop++) {
           const hopAcct = privateKeyToAccount(generatePrivateKey());
           await fetch(LOCAL_RPC_URL, {
             method: 'POST',
@@ -3364,14 +3404,34 @@ async function runTests(): Promise<void> {
               params: [hopAcct.address, `0x${MIN_SYBIL_COST_ETH_WEI.toString(16)}`],
             }),
           });
-          const hopTok = await authAtSybil(hopAcct, `198.51.154.${hop + 1}`);
-          const hopRes = await httpJson(
-            'POST',
-            `${sybilUrl}/subscriptions`,
-            { channel: 'email', target: `hopping.victim+h${hop}@gmail.com` },
-            { Authorization: `Bearer ${hopTok}`, 'X-Forwarded-For': `198.51.154.${hop + 1}` }
+          const hopIp = `198.51.154.${hop + 1}`;
+          const hopTok = await authAtSybil(hopAcct, hopIp);
+          for (let shot = 0; shot < 3; shot++) {
+            const hopRes = await httpJson<{ verification_required?: boolean }>(
+              'POST',
+              `${sybilUrl}/subscriptions`,
+              {
+                channel: 'email',
+                target: shot === 0 ? 'bomb90.victim@gmail.com' : `bomb90.victim+w${hop}s${shot}@gmail.com`,
+              },
+              { Authorization: `Bearer ${hopTok}`, 'X-Forwarded-For': hopIp }
+            );
+            assert.equal(
+              hopRes.status,
+              201,
+              `0.01 ETH wallet #${hop} shot #${shot} must receive generic 201 (never 429)`
+            );
+            assert.equal(hopRes.body.verification_required, true);
+          }
+        }
+        const bomb90Emails = deliveredEmails.slice(emailsBefore90);
+        assert.equal(bomb90Emails.length, 5, '90 verification attempts across 30 0.01 ETH wallets must send strictly 5 emails');
+        for (const sent of bomb90Emails) {
+          assert.ok(
+            sent.message.includes('Not me, block this address:'),
+            'Every delivered verification email must contain "Not me, block this address:" block link'
           );
-          assert.equal(hopRes.status, 201);
+          assert.ok(String(sent.payload.block_url).includes('/subscriptions/block?token='));
         }
         const hopVictimAcct = privateKeyToAccount(generatePrivateKey());
         await fetch(LOCAL_RPC_URL, {
@@ -3385,17 +3445,18 @@ async function runTests(): Promise<void> {
           }),
         });
         const hopVictimTok = await authAtSybil(hopVictimAcct, '203.0.115.77');
-        const hopVictimRes = await httpJson(
+        const hopVictimRes = await httpJson<{ verification_required?: boolean }>(
           'POST',
           `${sybilUrl}/subscriptions`,
-          { channel: 'email', target: 'hopping.victim@gmail.com' },
+          { channel: 'email', target: 'bomb90.victim@gmail.com' },
           { Authorization: `Bearer ${hopVictimTok}`, 'X-Forwarded-For': '203.0.115.77' }
         );
         assert.equal(
           hopVictimRes.status,
           201,
-          'Legitimate ETH-holding victim must NEVER be locked out by 12 hopping 0.01 ETH attacker wallets'
+          'Legitimate ETH-holding victim must NEVER see 429 lockout even after 90 attacker sends'
         );
+        assert.equal(deliveredEmails.length - emailsBefore90, 5, 'No extra email past 5/24h cap');
 
         // When RPC is down, funded uncached wallet falls back strictly to 10/h global cap -> 429
         sybilForceRpcDown = true;
