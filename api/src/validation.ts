@@ -120,7 +120,20 @@ const positiveUintStringOrSafeIntSchema = uintStringOrSafeIntSchema.refine((val)
 }, 'Amount must be greater than zero');
 
 const MAX_UINT128 = (1n << 128n) - 1n;
+const MAX_UINT64 = (1n << 64n) - 1n;
 const MIN_PRINCIPAL_USDC = 500_000_000n;
+export const MAX_ORDER_EXPIRY_SECS = 30n * 86_400n;
+
+const orderExpiryStringSchema = positiveUintStringOrSafeIntSchema
+  .refine((val) => {
+    const parsed = safeParseBigInt(val);
+    return parsed !== null && parsed > 0n && parsed <= MAX_UINT64;
+  }, 'Order expiry exceeds uint64 bounds')
+  .refine((val) => {
+    const parsed = safeParseBigInt(val);
+    const maxWallClockExpiry = BigInt(Math.floor(Date.now() / 1000)) + 365n * 86_400n;
+    return parsed !== null && parsed <= maxWallClockExpiry;
+  }, 'Order expiry is too far in the future (max 30 days on-chain)');
 
 const positiveUint128StringOrSafeIntSchema = positiveUintStringOrSafeIntSchema.refine((val) => {
   const parsed = safeParseBigInt(val);
@@ -141,7 +154,7 @@ export const borrowOrderPayloadSchema = z.object({
   termDays: z.coerce.number().int().min(7, 'termDays must be between 7 and 90').max(90, 'termDays must be between 7 and 90'),
   maxLtvBps: z.coerce.number().int().min(100, 'maxLtvBps must be >= 100').max(9000, 'maxLtvBps cannot exceed 9000'),
   minFill: principalUsdcStringOrSafeIntSchema,
-  expiry: positiveUintStringOrSafeIntSchema,
+  expiry: orderExpiryStringSchema,
   nonce: uintStringOrSafeIntSchema,
   yieldMode: z.coerce.number().int().min(0).max(255).default(0),
   allowInKindSettlement: z.boolean().default(false),
@@ -155,7 +168,7 @@ export const lendOfferPayloadSchema = z.object({
   allowedCollateral: addressLikeSchema,
   maxLtvBps: z.coerce.number().int().min(100, 'maxLtvBps must be >= 100').max(9000, 'maxLtvBps cannot exceed 9000'),
   minFill: principalUsdcStringOrSafeIntSchema,
-  expiry: positiveUintStringOrSafeIntSchema,
+  expiry: orderExpiryStringSchema,
   nonce: uintStringOrSafeIntSchema,
   yieldMode: z.coerce.number().int().min(0).max(255).default(0),
 });

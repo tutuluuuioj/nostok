@@ -1709,6 +1709,38 @@ async function runTests(): Promise<void> {
         functionName: 'getMakerNonce',
         args: [ADDRESSES.lender],
       });
+      // Ensure borrower has ample NVDAc balance & CollateralEscrow allowance and lender has ample USDC & LoanCore allowance
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdac,
+          abi: mockB20Artifact.abi,
+          functionName: 'mint',
+          args: [ADDRESSES.borrower, 30n * 10n ** 18n],
+        }),
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: nvdac,
+          abi: approveAbi,
+          functionName: 'approve',
+          args: [deployed.collateralEscrow, 50n * 10n ** 18n],
+        }),
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await rawWalletClient.sendTransaction({
+          account: BASE_USDC_WHALE,
+          to: BASE_USDC,
+          data: encodeFunctionData({ abi: transferUsdcAbi, functionName: 'transfer', args: [ADDRESSES.lender, 5_000_000_000n] }),
+        }),
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await lenderClient.writeContract({
+          address: BASE_USDC,
+          abi: approveAbi,
+          functionName: 'approve',
+          args: [deployed.loanCore, 10_000_000_000n],
+        }),
+      });
 
       const borrowOrderRelay = {
         borrower: ADDRESSES.borrower,
@@ -1897,12 +1929,36 @@ async function runTests(): Promise<void> {
       };
 
       const spamSigner1 = privateKeyToAccount(generatePrivateKey());
-      // Validation bounds rejected (rate > 4000, term < 7 / > 90, minUsdc < $500)
+      const spamSigner1Wallet = createWalletClient({
+        account: spamSigner1,
+        chain: forkChain,
+        transport: viemHttp(LOCAL_RPC_URL),
+      });
+      await rpcCall('anvil_setBalance', [spamSigner1.address, '0x56bc75e2d63100000']);
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdac,
+          abi: mockB20Artifact.abi,
+          functionName: 'mint',
+          args: [spamSigner1.address, 50n * 10n ** 18n],
+        }),
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await spamSigner1Wallet.writeContract({
+          address: nvdac,
+          abi: approveAbi,
+          functionName: 'approve',
+          args: [deployed.collateralEscrow, 50n * 10n ** 18n],
+        }),
+      });
+
+      // Validation bounds rejected (rate > 4000, term < 7 / > 90, minUsdc < $500, >30d / 10-year expiry)
       for (const badField of [
         { maxRateBps: 100000 },
         { termDays: 3650 },
         { termDays: 3 },
         { minUsdc: '100000000', minFill: '100000000' },
+        { expiry: (latestBlkRelay.timestamp + 10n * 365n * 86_400n).toString() },
       ]) {
         const resBad = await postJson<{ error: { code: string } }>(`${baseUrl}/orders`, {
           order_type: 'borrow',
@@ -1912,6 +1968,167 @@ async function runTests(): Promise<void> {
         assert.equal(resBad.status, 400, `Out-of-range order payload ${JSON.stringify(badField)} must return 400`);
         assert.equal(resBad.body.error.code, 'VALIDATION_ERROR');
       }
+
+      // 31-day expiry exceeds on-chain 30-day cap for BOTH BorrowOrder and LendOffer (400 ORDER_EXPIRY_TOO_FAR)
+      const tooFarBorrow = await signBorrowForTest(spamSigner1, {
+        expiry: (latestBlkRelay.timestamp + 31n * 86_400n).toString(),
+        nonce: '0',
+      });
+      const tooFarBorrowRes = await postJson<{ error: { code: string } }>(`${baseUrl}/orders`, {
+        order_type: 'borrow',
+        order: tooFarBorrow.ord,
+        signature: tooFarBorrow.sig,
+      });
+      assert.equal(tooFarBorrowRes.status, 400);
+      assert.equal(tooFarBorrowRes.body.error.code, 'ORDER_EXPIRY_TOO_FAR');
+
+      const tooFarLendOrd = {
+        ...lendOfferRelay,
+        expiry: (latestBlkRelay.timestamp + 31n * 86_400n).toString(),
+      };
+      const tooFarLendSig = await signerLender.signTypedData({
+        domain: {
+          name: 'NOSTOK Order Settlement',
+          version: '1',
+          chainId: 8453,
+          verifyingContract: deployed.orderSettlement,
+        },
+        types: {
+          LendOffer: [
+            { name: 'lender', type: 'address' },
+            { name: 'usdcAmount', type: 'uint128' },
+            { name: 'minRateBps', type: 'uint32' },
+            { name: 'termDays', type: 'uint16' },
+            { name: 'allowedCollateral', type: 'address' },
+            { name: 'maxLtvBps', type: 'uint16' },
+            { name: 'minFill', type: 'uint128' },
+            { name: 'expiry', type: 'uint64' },
+            { name: 'nonce', type: 'uint256' },
+            { name: 'yieldMode', type: 'uint8' },
+          ],
+        },
+        primaryType: 'LendOffer',
+        message: {
+          ...tooFarLendOrd,
+          usdcAmount: BigInt(tooFarLendOrd.usdcAmount),
+          minFill: BigInt(tooFarLendOrd.minFill),
+          expiry: BigInt(tooFarLendOrd.expiry),
+          nonce: BigInt(tooFarLendOrd.nonce),
+        },
+      });
+      const tooFarLendRes = await postJson<{ error: { code: string } }>(`${baseUrl}/orders`, {
+        order_type: 'lend',
+        order: tooFarLendOrd,
+        signature: tooFarLendSig,
+      });
+      assert.equal(tooFarLendRes.status, 400);
+      assert.equal(tooFarLendRes.body.error.code, 'ORDER_EXPIRY_TOO_FAR');
+
+      // Item 1: Unfunded free-key BorrowOrders and LendOffers rejected (0 balance OR 0 spender allowance)
+      const unfundedKey = privateKeyToAccount(generatePrivateKey());
+      const unfundedBorrow = await signBorrowForTest(unfundedKey, { nonce: '0' });
+      const unfundedBorrowRes = await postJson<{ error: { code: string } }>(`${baseUrl}/orders`, {
+        order_type: 'borrow',
+        order: unfundedBorrow.ord,
+        signature: unfundedBorrow.sig,
+      });
+      assert.equal(unfundedBorrowRes.status, 400);
+      assert.equal(unfundedBorrowRes.body.error.code, 'INSUFFICIENT_ORDER_FUNDING');
+
+      // Collateral held cleanly on wallet, but CollateralEscrow allowance = 0 -> rejected!
+      const noAllowAcct = privateKeyToAccount(generatePrivateKey());
+      const noAllowWallet = createWalletClient({
+        account: noAllowAcct,
+        chain: forkChain,
+        transport: viemHttp(LOCAL_RPC_URL),
+      });
+      await rpcCall('anvil_setBalance', [noAllowAcct.address, '0x56bc75e2d63100000']);
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdac,
+          abi: mockB20Artifact.abi,
+          functionName: 'mint',
+          args: [noAllowAcct.address, 20n * 10n ** 18n],
+        }),
+      });
+      const noAllowBorrow = await signBorrowForTest(noAllowAcct, { nonce: '0' });
+      const noAllowBorrowRes = await postJson<{ error: { code: string } }>(`${baseUrl}/orders`, {
+        order_type: 'borrow',
+        order: noAllowBorrow.ord,
+        signature: noAllowBorrow.sig,
+      });
+      assert.equal(noAllowBorrowRes.status, 400);
+      assert.equal(noAllowBorrowRes.body.error.code, 'INSUFFICIENT_ORDER_FUNDING');
+
+      // Unfunded LendOffer (0 USDC / 0 LoanCore allowance) rejected
+      const noAllowLendAcct = privateKeyToAccount(generatePrivateKey());
+      const noAllowLendWallet = createWalletClient({
+        account: noAllowLendAcct,
+        chain: forkChain,
+        transport: viemHttp(LOCAL_RPC_URL),
+      });
+      await rpcCall('anvil_setBalance', [noAllowLendAcct.address, '0x56bc75e2d63100000']);
+      const signLendForTest = async (
+        acct: ReturnType<typeof privateKeyToAccount>,
+        overrides: Partial<typeof lendOfferRelay> = {}
+      ) => {
+        const ord = { ...lendOfferRelay, lender: acct.address, nonce: '0', ...overrides };
+        const sig = await acct.signTypedData({
+          domain: {
+            name: 'NOSTOK Order Settlement',
+            version: '1',
+            chainId: 8453,
+            verifyingContract: deployed.orderSettlement,
+          },
+          types: {
+            LendOffer: [
+              { name: 'lender', type: 'address' },
+              { name: 'usdcAmount', type: 'uint128' },
+              { name: 'minRateBps', type: 'uint32' },
+              { name: 'termDays', type: 'uint16' },
+              { name: 'allowedCollateral', type: 'address' },
+              { name: 'maxLtvBps', type: 'uint16' },
+              { name: 'minFill', type: 'uint128' },
+              { name: 'expiry', type: 'uint64' },
+              { name: 'nonce', type: 'uint256' },
+              { name: 'yieldMode', type: 'uint8' },
+            ],
+          },
+          primaryType: 'LendOffer',
+          message: {
+            ...ord,
+            usdcAmount: BigInt(ord.usdcAmount),
+            minFill: BigInt(ord.minFill),
+            expiry: BigInt(ord.expiry),
+            nonce: BigInt(ord.nonce),
+          },
+        });
+        return { ord, sig };
+      };
+      const zeroUsdcLend = await signLendForTest(noAllowLendAcct);
+      const zeroUsdcLendRes = await postJson<{ error: { code: string } }>(`${baseUrl}/orders`, {
+        order_type: 'lend',
+        order: zeroUsdcLend.ord,
+        signature: zeroUsdcLend.sig,
+      });
+      assert.equal(zeroUsdcLendRes.status, 400);
+      assert.equal(zeroUsdcLendRes.body.error.code, 'INSUFFICIENT_ORDER_FUNDING');
+
+      // Fund USDC balance but leave LoanCore allowance at 0 -> still rejected!
+      await publicClient.waitForTransactionReceipt({
+        hash: await rawWalletClient.sendTransaction({
+          account: BASE_USDC_WHALE,
+          to: BASE_USDC,
+          data: encodeFunctionData({ abi: transferUsdcAbi, functionName: 'transfer', args: [noAllowLendAcct.address, 2_000_000_000n] }),
+        }),
+      });
+      const noLoanAllowLendRes = await postJson<{ error: { code: string } }>(`${baseUrl}/orders`, {
+        order_type: 'lend',
+        order: zeroUsdcLend.ord,
+        signature: zeroUsdcLend.sig,
+      });
+      assert.equal(noLoanAllowLendRes.status, 400);
+      assert.equal(noLoanAllowLendRes.body.error.code, 'INSUFFICIENT_ORDER_FUNDING');
 
       // Unregistered collateral rejected before storing
       const badAsset = await signBorrowForTest(spamSigner1, { collateralToken: ADDRESSES.treasury, nonce: '0' });
@@ -1947,15 +2164,38 @@ async function runTests(): Promise<void> {
       assert.equal(sanitizeTokenSymbol('TOOLONGSYMBOLNAME17'), null);
       assert.equal(sanitizeTokenSymbol('NVDAc'), 'NVDAc');
 
-      // Anti-spam caps (20/maker, 50/IP, 2000 capacity) + 2000-order GET /orders?limit=5 multicall benchmark
+      // Anti-spam caps, refresh funding recheck, stale flag on RPC failure, unfunded/near-expiry eviction & 2000-order GET benchmark
       let multicallCount = 0;
       let directReadCount = 0;
+      let failRelayMulticall = false;
+      let mockSynthFunded = false;
       const instrumentedClient = new Proxy(apiCtx.publicClient, {
         get(target, prop, receiver) {
           if (prop === 'multicall') {
-            return (...args: unknown[]) => {
+            return async (opts: { contracts: Array<{ functionName: string; args?: unknown[] }> }) => {
               multicallCount += 1;
-              return (target.multicall as (...a: unknown[]) => unknown)(...args);
+              if (failRelayMulticall) {
+                throw new Error('Injected multicall RPC failure');
+              }
+              if (
+                mockSynthFunded &&
+                Array.isArray(opts?.contracts) &&
+                opts.contracts.some((c) => {
+                  const a0 = String(c?.args?.[0] ?? '').toLowerCase();
+                  return a0.startsWith('0x000000000000000000000000');
+                })
+              ) {
+                return opts.contracts.map((c) => {
+                  if (c.functionName === 'isOrderCancelled') return { status: 'success', result: false };
+                  if (c.functionName === 'getOrderFilledAmount') return { status: 'success', result: 0n };
+                  if (c.functionName === 'getMakerNonce') return { status: 'success', result: 0n };
+                  if (c.functionName === 'balanceOf' || c.functionName === 'allowance') {
+                    return { status: 'success', result: 50n * 10n ** 18n };
+                  }
+                  return { status: 'success', result: 0n };
+                });
+              }
+              return (target.multicall as (...a: unknown[]) => unknown)(opts);
             };
           }
           if (prop === 'readContract') {
@@ -1981,20 +2221,117 @@ async function runTests(): Promise<void> {
       const spamServer = createApiServer(spamCtx);
       await new Promise<void>((r) => spamServer.listen(0, '127.0.0.1', r));
       const spamUrl = `http://127.0.0.1:${(spamServer.address() as net.AddressInfo).port}`;
+      const sevenDaysExpStr = (latestBlkRelay.timestamp + 7n * 86_400n).toString();
       try {
-        // Post one legitimate order first from lender
+        // Post one legitimate long-lived 7-day order first from lender
+        const legitLend7d = await signLendForTest(signerLender, {
+          expiry: sevenDaysExpStr,
+          nonce: lenderNonceNow.toString(),
+        });
         const legitOrder = await postJson<{ order_hash: string }>(`${spamUrl}/orders`, {
           order_type: 'lend',
-          order: lendOfferRelay,
-          signature: lendRelaySig,
+          order: legitLend7d.ord,
+          signature: legitLend7d.sig,
         });
         assert.equal(legitOrder.status, 201);
         const legitHashLower = legitOrder.body.order_hash.toLowerCase();
 
-        // Same maker posting 25 valid orders across different IPs evicts ONLY its own oldest orders (capped at 20)
+        // Approve, relay, and then REVOKE allowance on both BorrowOrder & LendOffer -> GET /orders refresh hides from open & marks status='unfunded'
+        await publicClient.waitForTransactionReceipt({
+          hash: await noAllowWallet.writeContract({
+            address: nvdac,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.collateralEscrow, 20n * 10n ** 18n],
+          }),
+        });
+        const fundedBorrowRes = await postJson<{ order_hash: string }>(`${spamUrl}/orders`, {
+          order_type: 'borrow',
+          order: noAllowBorrow.ord,
+          signature: noAllowBorrow.sig,
+        });
+        assert.equal(fundedBorrowRes.status, 201);
+        await publicClient.waitForTransactionReceipt({
+          hash: await noAllowLendWallet.writeContract({
+            address: BASE_USDC,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.loanCore, 2_000_000_000n],
+          }),
+        });
+        const fundedLendRes = await postJson<{ order_hash: string }>(`${spamUrl}/orders`, {
+          order_type: 'lend',
+          order: zeroUsdcLend.ord,
+          signature: zeroUsdcLend.sig,
+        });
+        assert.equal(fundedLendRes.status, 201);
+
+        // Revoke CollateralEscrow & LoanCore allowances on-chain -> refresh drops both from open book & marks unfunded
+        await publicClient.waitForTransactionReceipt({
+          hash: await noAllowWallet.writeContract({
+            address: nvdac,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.collateralEscrow, 0n],
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await noAllowLendWallet.writeContract({
+            address: BASE_USDC,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.loanCore, 0n],
+          }),
+        });
+        const openAfterRevoke = await getJson<{
+          stale: boolean;
+          data: Array<{ order_hash: string }>;
+        }>(`${spamUrl}/orders?limit=20`);
+        assert.equal(openAfterRevoke.status, 200);
+        assert.equal(openAfterRevoke.body.stale, false);
+        assert.ok(!openAfterRevoke.body.data.some((o) => o.order_hash === fundedBorrowRes.body.order_hash));
+        assert.ok(!openAfterRevoke.body.data.some((o) => o.order_hash === fundedLendRes.body.order_hash));
+
+        const inactiveBorrowAfterRevoke = await getJson<{
+          data: Array<{ order_hash: string; status: string; unfunded: boolean; stale: boolean }>;
+        }>(`${spamUrl}/orders?maker=${noAllowAcct.address}&include_inactive=true`);
+        const revBorrowRow = inactiveBorrowAfterRevoke.body.data.find((o) => o.order_hash === fundedBorrowRes.body.order_hash);
+        assert.equal(revBorrowRow?.status, 'unfunded');
+        assert.equal(revBorrowRow?.unfunded, true);
+
+        const inactiveLendAfterRevoke = await getJson<{
+          data: Array<{ order_hash: string; status: string; unfunded: boolean }>;
+        }>(`${spamUrl}/orders?maker=${noAllowLendAcct.address}&include_inactive=true`);
+        const revLendRow = inactiveLendAfterRevoke.body.data.find((o) => o.order_hash === fundedLendRes.body.order_hash);
+        assert.equal(revLendRow?.status, 'unfunded');
+        assert.equal(revLendRow?.unfunded, true);
+
+        // Item 3 Low: When RPC refresh fails, GET /orders flags top-level stale=true, relay_stale=true & item stale=true
+        failRelayMulticall = true;
+        // Mine 1 block so cached blockNumber invalidates and triggers refresh attempt
+        await rpcCall('evm_mine', []);
+        const staleOrdersRes = await getJson<{
+          stale: boolean;
+          relay_stale: boolean;
+          data: Array<{ order_hash: string; stale?: boolean }>;
+        }>(`${spamUrl}/orders?limit=5`);
+        assert.equal(staleOrdersRes.status, 200);
+        assert.equal(staleOrdersRes.body.stale, true, 'GET /orders must flag stale=true when RPC refresh fails');
+        assert.equal(staleOrdersRes.body.relay_stale, true);
+        assert.equal(staleOrdersRes.body.data[0]?.stale, true);
+        failRelayMulticall = false;
+        const recoveredOrdersRes = await getJson<{ stale: boolean; relay_stale: boolean }>(`${spamUrl}/orders?limit=5`);
+        assert.equal(recoveredOrdersRes.body.stale, false);
+
+        // Clean up revoked entries before cap tests
+        spamSignedMap.delete(fundedBorrowRes.body.order_hash.toLowerCase());
+        spamSignedMap.delete(fundedLendRes.body.order_hash.toLowerCase());
+
+        // Same funded maker posting 25 valid orders across different IPs evicts ONLY its own oldest/soonest orders (capped at 20)
         for (let i = 0; i < 25; i++) {
           const { ord, sig } = await signBorrowForTest(spamSigner1, {
             minUsdc: (600_000_000n + BigInt(i)).toString(),
+            expiry: sevenDaysExpStr,
             nonce: '0',
           });
           const resMaker = await postJson<{ order_hash: string }>(`${spamUrl}/orders`, {
@@ -2010,36 +2347,60 @@ async function runTests(): Promise<void> {
         assert.equal(signer1Count, 20, 'Per-maker active relay cap must bound maker to 20 orders');
         assert.ok(spamSignedMap.has(legitHashLower), 'Maker eviction must NEVER evict another maker valid order');
 
-        // Same IP posting > 50 orders across fresh keys hits 429 on #51
+        // Per-IP cap: seed 50 active funded orders attributed to IP 198.51.110.1, then verify #51 returns 429
+        const curBlkCap = await publicClient.getBlock();
+        const nearExpStr = (curBlkCap.timestamp + 1800n).toString();
         for (let ipIdx = 0; ipIdx < 50; ipIdx++) {
-          const kAcct = privateKeyToAccount(generatePrivateKey());
-          const { ord, sig } = await signBorrowForTest(kAcct, {
-            minUsdc: (650_000_000n + BigInt(ipIdx)).toString(),
+          const ipHash = ('0x' + (9000 + ipIdx).toString(16).padStart(64, 'b')) as Hex;
+          const ipMaker = getAddress('0x' + (5000 + ipIdx).toString(16).padStart(40, '0'));
+          spamSignedMap.set(ipHash, {
+            orderHash: ipHash,
+            orderType: 'borrow',
+            maker: ipMaker,
+            collateralToken: nvdac,
+            collateralSymbol: 'NVDAc',
+            collateralDecimals: 18,
+            collateralAmount: borrowOrderRelay.collateralAmount,
+            totalUsdc: '700000000',
+            rateBps: 900,
+            termDays: 30,
+            maxLtvBps: 6000,
+            minFill: '500000000',
+            expiry: sevenDaysExpStr,
             nonce: '0',
+            yieldMode: 0,
+            signature: ('0x' + '22'.repeat(65)) as Hex,
+            signedOrder: { ...borrowOrderRelay, borrower: ipMaker, nonce: '0', expiry: sevenDaysExpStr },
+            submittedAt: new Date().toISOString(),
+            submittedAtMs: Date.now(),
+            submittedIp: '198.51.110.1',
+            cachedFilled: 0n,
+            cachedCancelled: false,
+            cachedMakerNonce: 0n,
+            cachedMakerBalance: 50n * 10n ** 18n,
+            cachedMakerAllowance: 50n * 10n ** 18n,
+            cachedFundingChecked: true,
+            cachedRpcStale: false,
+            cachedStatus: 'open',
+            cachedBlockNumber: curBlkCap.number,
+            lastRefreshedAtMs: Date.now(),
           });
-          const ipRes = await postJson(`${spamUrl}/orders`, {
-            order_type: 'borrow',
-            order: ord,
-            signature: sig,
-          }, { 'X-Forwarded-For': '198.51.110.1' });
-          assert.equal(ipRes.status, 201);
         }
-        const overflowIpAcct = privateKeyToAccount(generatePrivateKey());
-        const overflowIpOrder = await signBorrowForTest(overflowIpAcct, { minUsdc: '777000000', nonce: '0' });
+        const ipTestOrder = await signBorrowForTest(spamSigner1, { minUsdc: '777000000', nonce: '0' });
         const overflowIpRes = await postJson<{ error: { code: string } }>(`${spamUrl}/orders`, {
           order_type: 'borrow',
-          order: overflowIpOrder.ord,
-          signature: overflowIpOrder.sig,
+          order: ipTestOrder.ord,
+          signature: ipTestOrder.sig,
         }, { 'X-Forwarded-For': '198.51.110.1' });
         assert.equal(overflowIpRes.status, 429);
         assert.equal(overflowIpRes.body.error.code, 'RATE_LIMIT_EXCEEDED');
 
-        // Fill relay to 2000 active entries, verify #2001 gets 429 ORDERBOOK_CAPACITY_EXCEEDED without evicting legit order
-        const futureExpStr = (latestBlkRelay.timestamp + 3600n).toString();
+        // Fill relay to 2000 entries cleanly (1998 long-lived + 1 unfunded + 1 near-expiry):
+        // real funded maker MUST evict unfunded first, then near-expiry, before ever seeing 429!
         let fillIdx = 0;
-        while (spamSignedMap.size < 2000) {
+        while (spamSignedMap.size < 1999) {
           fillIdx += 1;
-          const synthHash = ('0x' + fillIdx.toString(16).padStart(64, 'a')) as Hex;
+          const synthHash = ('0xaa' + fillIdx.toString(16).padStart(62, '0')) as Hex;
           const synthMaker = getAddress('0x' + (1000 + fillIdx).toString(16).padStart(40, '0'));
           spamSignedMap.set(synthHash, {
             orderHash: synthHash,
@@ -2054,38 +2415,173 @@ async function runTests(): Promise<void> {
             termDays: 30,
             maxLtvBps: 6000,
             minFill: '500000000',
-            expiry: futureExpStr,
+            expiry: fillIdx === 1 ? nearExpStr : sevenDaysExpStr,
             nonce: '0',
             yieldMode: 0,
             signature: ('0x' + '22'.repeat(65)) as Hex,
-            signedOrder: { ...borrowOrderRelay, borrower: synthMaker, nonce: '0', expiry: futureExpStr },
+            signedOrder: { ...borrowOrderRelay, borrower: synthMaker, nonce: '0', expiry: fillIdx === 1 ? nearExpStr : sevenDaysExpStr },
             submittedAt: new Date().toISOString(),
             submittedAtMs: Date.now(),
             submittedIp: `10.0.${Math.floor(fillIdx / 250)}.${fillIdx % 250}`,
             cachedFilled: 0n,
             cachedCancelled: false,
             cachedMakerNonce: 0n,
+            cachedMakerBalance: 50n * 10n ** 18n,
+            cachedMakerAllowance: 50n * 10n ** 18n,
+            cachedFundingChecked: true,
+            cachedRpcStale: false,
             cachedStatus: 'open',
-            cachedBlockNumber: 0n,
-            lastRefreshedAtMs: 0,
+            cachedBlockNumber: curBlkCap.number,
+            lastRefreshedAtMs: Date.now(),
           });
         }
+        const nearExpHash = ('0xaa' + (1).toString(16).padStart(62, '0')) as Hex;
+        const unfundedEvictHash = ('0x' + 'ee'.repeat(32)) as Hex;
+        spamSignedMap.set(unfundedEvictHash, {
+          orderHash: unfundedEvictHash,
+          orderType: 'borrow',
+          maker: unfundedKey.address,
+          collateralToken: nvdac,
+          collateralSymbol: 'NVDAc',
+          collateralDecimals: 18,
+          collateralAmount: borrowOrderRelay.collateralAmount,
+          totalUsdc: '700000000',
+          rateBps: 900,
+          termDays: 30,
+          maxLtvBps: 6000,
+          minFill: '500000000',
+          expiry: sevenDaysExpStr,
+          nonce: '0',
+          yieldMode: 0,
+          signature: ('0x' + '22'.repeat(65)) as Hex,
+          signedOrder: { ...borrowOrderRelay, borrower: unfundedKey.address, nonce: '0', expiry: sevenDaysExpStr },
+          submittedAt: new Date().toISOString(),
+          submittedAtMs: Date.now(),
+          submittedIp: '10.99.99.1',
+          cachedFilled: 0n,
+          cachedCancelled: false,
+          cachedMakerNonce: 0n,
+          cachedMakerBalance: 0n,
+          cachedMakerAllowance: 0n,
+          cachedFundingChecked: true,
+          cachedRpcStale: false,
+          cachedStatus: 'unfunded',
+          cachedBlockNumber: curBlkCap.number,
+          lastRefreshedAtMs: Date.now(),
+        });
+        assert.equal(spamSignedMap.size, 2000);
+
+        // Give noAllowAcct approval again & post funded 7-day order #1 -> must evict unfundedEvictHash and return 201!
+        await publicClient.waitForTransactionReceipt({
+          hash: await noAllowWallet.writeContract({
+            address: nvdac,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.collateralEscrow, 20n * 10n ** 18n],
+          }),
+        });
+        const realEvictUnfunded = await signBorrowForTest(noAllowAcct, {
+          minUsdc: '711000000',
+          expiry: sevenDaysExpStr,
+          nonce: '0',
+        });
+        const evictUnfundedRes = await postJson<{ order_hash: string }>(`${spamUrl}/orders`, {
+          order_type: 'borrow',
+          order: realEvictUnfunded.ord,
+          signature: realEvictUnfunded.sig,
+        }, { 'X-Forwarded-For': '198.51.120.2' });
+        assert.equal(evictUnfundedRes.status, 201, 'Real funded borrower must evict unfunded entry instead of 429');
+        assert.ok(!spamSignedMap.has(unfundedEvictHash), 'Unfunded entry must be evicted first');
+        assert.ok(spamSignedMap.has(nearExpHash), 'Funded near-expiry entry must survive until unfunded entries are evicted');
+
+        // Post funded 7-day order #2 from a fresh foreign funded maker while map is at 2000 funded entries (with nearExpHash expiring in 30m) -> must evict nearExpHash and return 201!
+        mockSynthFunded = true;
+        const evictNearAcct = privateKeyToAccount(generatePrivateKey());
+        const evictNearWallet = createWalletClient({
+          account: evictNearAcct,
+          chain: forkChain,
+          transport: viemHttp(LOCAL_RPC_URL),
+        });
+        await rpcCall('anvil_setBalance', [evictNearAcct.address, '0x56bc75e2d63100000']);
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdac,
+            abi: mockB20Artifact.abi,
+            functionName: 'mint',
+            args: [evictNearAcct.address, 20n * 10n ** 18n],
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await evictNearWallet.writeContract({
+            address: nvdac,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.collateralEscrow, 20n * 10n ** 18n],
+          }),
+        });
+        const realEvictNearExp = await signBorrowForTest(evictNearAcct, {
+          minUsdc: '712000000',
+          expiry: sevenDaysExpStr,
+          nonce: '0',
+        });
+        const evictNearExpRes = await postJson<{ order_hash: string }>(`${spamUrl}/orders`, {
+          order_type: 'borrow',
+          order: realEvictNearExp.ord,
+          signature: realEvictNearExp.sig,
+        }, { 'X-Forwarded-For': '198.51.120.3' });
+        assert.equal(evictNearExpRes.status, 201, 'Real funded borrower must evict about-to-expire entry instead of 429');
+        assert.ok(!spamSignedMap.has(nearExpHash), 'About-to-expire entry must be evicted before returning 429');
+
+        // Now ALL 2000 entries are genuinely funded AND long-lived (7 days) -> another foreign wallet hits 429 ORDERBOOK_CAPACITY_EXCEEDED without evicting legit orders!
+        const overflowFundedAcct = privateKeyToAccount(generatePrivateKey());
+        const overflowFundedWallet = createWalletClient({
+          account: overflowFundedAcct,
+          chain: forkChain,
+          transport: viemHttp(LOCAL_RPC_URL),
+        });
+        await rpcCall('anvil_setBalance', [overflowFundedAcct.address, '0x56bc75e2d63100000']);
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdac,
+            abi: mockB20Artifact.abi,
+            functionName: 'mint',
+            args: [overflowFundedAcct.address, 20n * 10n ** 18n],
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await overflowFundedWallet.writeContract({
+            address: nvdac,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.collateralEscrow, 20n * 10n ** 18n],
+          }),
+        });
+        const overflowFundedOrder = await signBorrowForTest(overflowFundedAcct, {
+          minUsdc: '713000000',
+          expiry: sevenDaysExpStr,
+          nonce: '0',
+        });
         const capRes = await postJson<{ error: { code: string } }>(`${spamUrl}/orders`, {
           order_type: 'borrow',
-          order: overflowIpOrder.ord,
-          signature: overflowIpOrder.sig,
+          order: overflowFundedOrder.ord,
+          signature: overflowFundedOrder.sig,
         }, { 'X-Forwarded-For': '198.51.120.5' });
         assert.equal(capRes.status, 429);
         assert.equal(capRes.body.error.code, 'ORDERBOOK_CAPACITY_EXCEEDED');
-        assert.ok(spamSignedMap.has(legitHashLower), 'Global capacity limit must reject overflow rather than evicting valid orders');
+        assert.ok(spamSignedMap.has(legitHashLower), 'Global capacity limit must reject overflow rather than evicting valid long-lived funded orders');
 
         // 10 parallel GET /orders?limit=5&offset=75 over 2000 relayed orders: singleflight + 2s cache + multicall + SQL LIMIT/OFFSET
+        for (const rec of spamSignedMap.values()) {
+          rec.cachedBlockNumber = 0n;
+          rec.lastRefreshedAtMs = 0;
+        }
         multicallCount = 0;
         directReadCount = 0;
         const t0 = Date.now();
         const parallelGets = await Promise.all(
           Array.from({ length: 10 }, (_, k) =>
             getJson<{
+              stale: boolean;
               pagination: { total: number; limit: number; offset: number; has_more: boolean };
               data: Array<{ order_hash: string }>;
             }>(`${spamUrl}/orders?limit=5&offset=75`, { 'X-Forwarded-For': `198.51.130.${k + 1}` })
@@ -2094,6 +2590,7 @@ async function runTests(): Promise<void> {
         const elapsedMs = Date.now() - t0;
         for (const r of parallelGets) {
           assert.equal(r.status, 200);
+          assert.equal(r.body.stale, false);
           assert.equal(r.body.data.length, 5);
           assert.ok(r.body.pagination.total >= 2000);
           assert.equal(r.body.pagination.limit, 5);
@@ -2119,6 +2616,8 @@ async function runTests(): Promise<void> {
         assert.equal(page2.body.pagination.offset, 80);
         assert.notEqual(page2.body.data[0].order_hash, parallelGets[0].body.data[0].order_hash);
       } finally {
+        mockSynthFunded = false;
+        failRelayMulticall = false;
         await new Promise<void>((r) => spamServer.close(() => r()));
       }
 

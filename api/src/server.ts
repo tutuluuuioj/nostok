@@ -32,6 +32,7 @@ import { type ReadOnlyDatabase, openReadOnlyDatabase, toBigInt } from './db.js';
 import { formatAmount, formatRawString } from './format.js';
 import { RpcUnavailableError, computeLoanQuote } from './quote.js';
 import {
+  MAX_ORDER_EXPIRY_SECS,
   assetsQuerySchema,
   auctionsQuerySchema,
   buildPaginationSchema,
@@ -100,7 +101,11 @@ export interface RelaySignedOrderRecord {
   cachedFilled: bigint;
   cachedCancelled: boolean;
   cachedMakerNonce: bigint;
-  cachedStatus: 'open' | 'partially_filled' | 'filled' | 'cancelled' | 'expired' | 'nonce_bumped';
+  cachedMakerBalance?: bigint;
+  cachedMakerAllowance?: bigint;
+  cachedFundingChecked?: boolean;
+  cachedRpcStale?: boolean;
+  cachedStatus: 'open' | 'partially_filled' | 'filled' | 'cancelled' | 'expired' | 'nonce_bumped' | 'unfunded';
   cachedBlockNumber: bigint;
   lastRefreshedAtMs: number;
 }
@@ -538,6 +543,8 @@ async function handleHealth(ctx: ApiContext) {
 const MAX_SIGNED_ORDERS = 2000;
 const MAX_ORDERS_PER_MAKER = 20;
 const MAX_ORDERS_PER_IP = 50;
+const NEAR_EXPIRY_EVICTION_WINDOW_SECS = 86_400n;
+const EVICTION_REFRESH_SCAN_LIMIT = 60;
 const RELAY_STATE_CACHE_TTL_MS = 2000;
 const MAX_RELAY_REFRESH_PER_REQ = 100;
 const RELAY_MULTICALL_CHUNK = 150;
@@ -546,8 +553,8 @@ const FALLBACK_SIGNED_ORDERS = new WeakMap<ApiContext, Map<string, RelaySignedOr
 interface RelayHeadCacheState {
   blockNumber: bigint;
   timestamp: bigint;
-  inFlightBlock: Promise<{ number: bigint; timestamp: bigint }> | null;
-  inFlightRefresh: Map<string, Promise<void>>;
+  inFlightBlock: Promise<{ number: bigint; timestamp: bigint; rpcFailed: boolean }> | null;
+  inFlightRefresh: Map<string, Promise<boolean>>;
 }
 const RELAY_HEAD_CACHE = new WeakMap<ApiContext, RelayHeadCacheState>();
 
@@ -568,7 +575,7 @@ function getRelayHeadState(ctx: ApiContext): RelayHeadCacheState {
 async function getLatestBlockForRelay(
   ctx: ApiContext,
   fallbackBlock: bigint
-): Promise<{ number: bigint; timestamp: bigint }> {
+): Promise<{ number: bigint; timestamp: bigint; rpcFailed: boolean }> {
   const headState = getRelayHeadState(ctx);
   if (headState.inFlightBlock) {
     return headState.inFlightBlock;
@@ -578,11 +585,12 @@ async function getLatestBlockForRelay(
     .then((b) => {
       headState.blockNumber = b.number;
       headState.timestamp = b.timestamp;
-      return { number: b.number, timestamp: b.timestamp };
+      return { number: b.number, timestamp: b.timestamp, rpcFailed: false };
     })
     .catch(() => ({
       number: headState.blockNumber > 0n ? headState.blockNumber : fallbackBlock,
       timestamp: headState.timestamp > 0n ? headState.timestamp : BigInt(Math.floor(Date.now() / 1000)),
+      rpcFailed: true,
     }))
     .finally(() => {
       headState.inFlightBlock = null;
@@ -616,12 +624,48 @@ interface LiveRelayOrderState {
   cancelled: boolean;
   expired: boolean;
   nonceBumped: boolean;
+  unfunded: boolean;
+  stale: boolean;
   currentMakerNonce: bigint;
-  status: 'open' | 'partially_filled' | 'filled' | 'cancelled' | 'expired' | 'nonce_bumped';
+  status: 'open' | 'partially_filled' | 'filled' | 'cancelled' | 'expired' | 'nonce_bumped' | 'unfunded';
   blockNumber: bigint;
 }
 
+function getRequiredFundingSpec(
+  ctx: ApiContext,
+  params: {
+    orderType: 'borrow' | 'lend';
+    collateralToken: Address | null;
+    collateralAmount: string | null;
+    totalUsdc: bigint;
+    filled: bigint;
+  }
+): { token: Address; spender: Address; requiredRaw: bigint } | null {
+  const remaining = params.totalUsdc > params.filled ? params.totalUsdc - params.filled : 0n;
+  if (remaining === 0n) return null;
+  if (params.orderType === 'borrow') {
+    if (!params.collateralToken || !params.collateralAmount) return null;
+    const colBig = BigInt(params.collateralAmount);
+    const requiredRaw = (colBig * remaining + (params.totalUsdc - 1n)) / params.totalUsdc;
+    return {
+      token: getAddress(params.collateralToken),
+      spender: ctx.config.collateralEscrow,
+      requiredRaw,
+    };
+  }
+  return {
+    token: ctx.config.usdc,
+    spender: ctx.config.loanCore,
+    requiredRaw: remaining,
+  };
+}
+
+function fundingPairKey(token: Address, maker: Address, spender: Address): string {
+  return `${token.toLowerCase()}:${maker.toLowerCase()}:${spender.toLowerCase()}`;
+}
+
 function deriveRelayLiveState(
+  ctx: ApiContext,
   rec: RelaySignedOrderRecord,
   chainNowSec: bigint,
   chainBlockNum: bigint
@@ -633,6 +677,19 @@ function deriveRelayLiveState(
   const remaining = total > filled ? total - filled : 0n;
   const expired = BigInt(rec.expiry) <= chainNowSec;
   const nonceBumped = currentMakerNonce !== BigInt(rec.nonce);
+  const fundingSpec = getRequiredFundingSpec(ctx, {
+    orderType: rec.orderType,
+    collateralToken: rec.collateralToken,
+    collateralAmount: rec.collateralAmount,
+    totalUsdc: total,
+    filled,
+  });
+  const unfunded = Boolean(
+    rec.cachedFundingChecked &&
+      fundingSpec &&
+      ((rec.cachedMakerBalance ?? 0n) < fundingSpec.requiredRaw ||
+        (rec.cachedMakerAllowance ?? 0n) < fundingSpec.requiredRaw)
+  );
   const status: LiveRelayOrderState['status'] = cancelled
     ? 'cancelled'
     : nonceBumped
@@ -641,9 +698,11 @@ function deriveRelayLiveState(
         ? 'filled'
         : expired
           ? 'expired'
-          : filled > 0n
-            ? 'partially_filled'
-            : 'open';
+          : unfunded
+            ? 'unfunded'
+            : filled > 0n
+              ? 'partially_filled'
+              : 'open';
 
   rec.cachedStatus = status;
   return {
@@ -653,6 +712,8 @@ function deriveRelayLiveState(
     cancelled,
     expired,
     nonceBumped,
+    unfunded,
+    stale: Boolean(rec.cachedRpcStale),
     currentMakerNonce,
     status,
     blockNumber: rec.cachedBlockNumber > 0n ? rec.cachedBlockNumber : chainBlockNum,
@@ -663,33 +724,63 @@ async function batchRefreshRelayRecords(
   ctx: ApiContext,
   records: RelaySignedOrderRecord[],
   chainNowSec: bigint,
-  chainBlockNum: bigint
-): Promise<void> {
-  if (records.length === 0) return;
+  chainBlockNum: bigint,
+  chainRpcFailed = false
+): Promise<boolean> {
+  if (records.length === 0) return chainRpcFailed;
   const headState = getRelayHeadState(ctx);
   const nowMs = Date.now();
   const capped = records.slice(0, MAX_RELAY_REFRESH_PER_REQ);
+  if (chainRpcFailed) {
+    for (const r of capped) {
+      r.cachedRpcStale = true;
+    }
+    return true;
+  }
   const stale = capped.filter(
     (rec) =>
+      Boolean(rec.cachedRpcStale) ||
       rec.cachedBlockNumber !== chainBlockNum ||
       nowMs - rec.lastRefreshedAtMs > RELAY_STATE_CACHE_TTL_MS
   );
-  if (stale.length === 0) return;
+  if (stale.length === 0) {
+    return capped.some((r) => Boolean(r.cachedRpcStale));
+  }
 
   const batchKey = `${chainBlockNum.toString()}:${stale.map((r) => r.orderHash.toLowerCase()).join(',')}`;
   const inFlight = headState.inFlightRefresh.get(batchKey);
   if (inFlight) {
-    await inFlight;
-    return;
+    return inFlight;
   }
 
-  const runPromise = (async () => {
+  const runPromise = (async (): Promise<boolean> => {
     const uniqueMakers = Array.from(new Set(stale.map((r) => getAddress(r.maker))));
+    const fundingPairsMap = new Map<string, { token: Address; maker: Address; spender: Address }>();
+    const recFundingKey = new Map<string, string>();
+    for (const r of stale) {
+      const fSpec = getRequiredFundingSpec(ctx, {
+        orderType: r.orderType,
+        collateralToken: r.collateralToken,
+        collateralAmount: r.collateralAmount,
+        totalUsdc: BigInt(r.totalUsdc),
+        filled: r.cachedFilled ?? 0n,
+      });
+      if (fSpec) {
+        const mAddr = getAddress(r.maker);
+        const fKey = fundingPairKey(fSpec.token, mAddr, fSpec.spender);
+        recFundingKey.set(r.orderHash.toLowerCase(), fKey);
+        if (!fundingPairsMap.has(fKey)) {
+          fundingPairsMap.set(fKey, { token: fSpec.token, maker: mAddr, spender: fSpec.spender });
+        }
+      }
+    }
+    const uniqueFundingPairs = Array.from(fundingPairsMap.entries());
+
     const calls: Array<{
       address: Address;
-      abi: typeof orderSettlementAbi;
-      functionName: 'getOrderFilledAmount' | 'isOrderCancelled' | 'getMakerNonce';
-      args: readonly [Hex] | readonly [Address];
+      abi: typeof orderSettlementAbi | typeof erc20MetaAbi;
+      functionName: 'getOrderFilledAmount' | 'isOrderCancelled' | 'getMakerNonce' | 'balanceOf' | 'allowance';
+      args: readonly [Hex] | readonly [Address] | readonly [Address, Address];
     }> = [];
 
     for (const r of stale) {
@@ -715,9 +806,25 @@ async function batchRefreshRelayRecords(
         args: [m],
       });
     }
+    const fundingStartIdx = calls.length;
+    for (const [, fp] of uniqueFundingPairs) {
+      calls.push({
+        address: fp.token,
+        abi: erc20MetaAbi,
+        functionName: 'balanceOf',
+        args: [fp.maker],
+      });
+      calls.push({
+        address: fp.token,
+        abi: erc20MetaAbi,
+        functionName: 'allowance',
+        args: [fp.maker, fp.spender],
+      });
+    }
 
     type McResult = { status: 'success'; result: unknown } | { status: 'failure'; error: unknown };
     const results: McResult[] = [];
+    let batchRpcError = false;
 
     try {
       for (let i = 0; i < calls.length; i += RELAY_MULTICALL_CHUNK) {
@@ -729,18 +836,11 @@ async function batchRefreshRelayRecords(
         results.push(...(resChunk as unknown as McResult[]));
       }
     } catch {
-      // Fallback only if client/chain has no multicall; still bounded to capped slice
-      const fb = await Promise.all(
-        calls.map(async (c): Promise<McResult> => {
-          try {
-            const val = await ctx.publicClient.readContract(c as never);
-            return { status: 'success', result: val };
-          } catch (error) {
-            return { status: 'failure', error };
-          }
-        })
-      );
-      results.push(...fb);
+      batchRpcError = true;
+      for (const r of stale) {
+        r.cachedRpcStale = true;
+      }
+      return true;
     }
 
     const makerNonceMap = new Map<string, bigint>();
@@ -751,31 +851,70 @@ async function batchRefreshRelayRecords(
       }
     }
 
+    const fundingResultMap = new Map<string, { balance: bigint; allowance: bigint; ok: boolean }>();
+    for (let fIdx = 0; fIdx < uniqueFundingPairs.length; fIdx++) {
+      const [fKey] = uniqueFundingPairs[fIdx];
+      const balRes = results[fundingStartIdx + fIdx * 2];
+      const allowRes = results[fundingStartIdx + fIdx * 2 + 1];
+      if (balRes?.status === 'success' && allowRes?.status === 'success') {
+        fundingResultMap.set(fKey, {
+          balance: BigInt(balRes.result as bigint),
+          allowance: BigInt(allowRes.result as bigint),
+          ok: true,
+        });
+      } else {
+        fundingResultMap.set(fKey, { balance: 0n, allowance: 0n, ok: false });
+      }
+    }
+
     const doneAtMs = Date.now();
+    let anyStale = batchRpcError;
     for (let idx = 0; idx < stale.length; idx++) {
       const rec = stale[idx];
       const fRes = results[idx * 2];
       const cRes = results[idx * 2 + 1];
-      if (fRes && fRes.status === 'success') {
+      const nonceVal = makerNonceMap.get(rec.maker.toLowerCase());
+      const fKey = recFundingKey.get(rec.orderHash.toLowerCase());
+      const fState = fKey ? fundingResultMap.get(fKey) : undefined;
+
+      if (fRes?.status === 'success') {
         rec.cachedFilled = BigInt(fRes.result as bigint);
       }
-      if (cRes && cRes.status === 'success') {
+      if (cRes?.status === 'success') {
         rec.cachedCancelled = Boolean(cRes.result);
       }
-      const mNonce = makerNonceMap.get(rec.maker.toLowerCase());
-      if (mNonce !== undefined) {
-        rec.cachedMakerNonce = mNonce;
+      if (nonceVal !== undefined) {
+        rec.cachedMakerNonce = nonceVal;
       }
-      rec.cachedBlockNumber = chainBlockNum;
-      rec.lastRefreshedAtMs = doneAtMs;
-      deriveRelayLiveState(rec, chainNowSec, chainBlockNum);
+      if (fState?.ok) {
+        rec.cachedMakerBalance = fState.balance;
+        rec.cachedMakerAllowance = fState.allowance;
+        rec.cachedFundingChecked = true;
+      }
+
+      const recOk =
+        fRes?.status === 'success' &&
+        cRes?.status === 'success' &&
+        nonceVal !== undefined &&
+        (!fKey || Boolean(fState?.ok));
+
+      if (recOk) {
+        rec.cachedRpcStale = false;
+        rec.cachedBlockNumber = chainBlockNum;
+        rec.lastRefreshedAtMs = doneAtMs;
+      } else {
+        rec.cachedRpcStale = true;
+        anyStale = true;
+      }
+      deriveRelayLiveState(ctx, rec, chainNowSec, chainBlockNum);
     }
+    return anyStale;
   })().finally(() => {
     headState.inFlightRefresh.delete(batchKey);
   });
 
   headState.inFlightRefresh.set(batchKey, runPromise);
-  await runPromise;
+  return runPromise;
 }
 
 function formatRelayOrderEnvelope(live: LiveRelayOrderState, fills: unknown[] = []) {
@@ -788,6 +927,8 @@ function formatRelayOrderEnvelope(live: LiveRelayOrderState, fills: unknown[] = 
     collateral_token: rec.collateralToken,
     collateral_symbol: rec.collateralSymbol,
     status: live.status,
+    unfunded: live.unfunded,
+    stale: live.stale,
     min_usdc: formatAmount(total, USDC_DECIMALS, 'USDC'),
     ...(rec.orderType === 'lend' ? { usdc_amount: formatAmount(total, USDC_DECIMALS, 'USDC') } : {}),
     filled_usdc: formatAmount(live.filled, USDC_DECIMALS, 'USDC'),
@@ -967,6 +1108,13 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
   if (expiry <= blk.timestamp) {
     throw new HttpError(400, 'ORDER_EXPIRED', 'Order expiry timestamp is in the past');
   }
+  if (expiry > blk.timestamp + MAX_ORDER_EXPIRY_SECS) {
+    throw new HttpError(
+      400,
+      'ORDER_EXPIRY_TOO_FAR',
+      `Order expiry cannot exceed ${Number(MAX_ORDER_EXPIRY_SECS / 86_400n)} days from current block timestamp`
+    );
+  }
 
   // Validate collateral token against AssetRegistry & resolve indexed symbol before storing
   let collateralSymbol: string | null = null;
@@ -1092,34 +1240,99 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
     throw new HttpError(400, 'ORDER_ALREADY_FILLED', 'Order has already been completely filled on-chain');
   }
 
-  const orderHashLower = orderHash.toLowerCase();
-  const makerLower = maker.toLowerCase();
+  const fundingSpec = getRequiredFundingSpec(ctx, {
+    orderType: input.order_type,
+    collateralToken,
+    collateralAmount,
+    totalUsdc,
+    filled,
+  });
+  let makerBalance = 0n;
+  let makerAllowance = 0n;
+  if (fundingSpec) {
+    try {
+      const [balRes, allowRes] = await Promise.all([
+        ctx.publicClient.readContract({
+          address: fundingSpec.token,
+          abi: erc20MetaAbi,
+          functionName: 'balanceOf',
+          args: [maker],
+        }),
+        ctx.publicClient.readContract({
+          address: fundingSpec.token,
+          abi: erc20MetaAbi,
+          functionName: 'allowance',
+          args: [maker, fundingSpec.spender],
+        }),
+      ]);
+      makerBalance = BigInt(balRes);
+      makerAllowance = BigInt(allowRes);
+    } catch (err) {
+      throw new RpcUnavailableError(err instanceof Error ? err.message : String(err));
+    }
 
-  // Prune globally expired / finalized entries (and this maker's older bumped-nonce orders) first
-  for (const [k, existing] of signedMap.entries()) {
-    if (
-      BigInt(existing.expiry) <= blk.timestamp ||
-      existing.cachedCancelled ||
-      existing.cachedStatus === 'filled' ||
-      (existing.maker.toLowerCase() === makerLower && BigInt(existing.nonce) !== currentMakerNonce)
-    ) {
-      signedMap.delete(k);
+    const spenderLabel = input.order_type === 'borrow' ? 'CollateralEscrow' : 'LoanCore';
+    if (makerBalance < fundingSpec.requiredRaw) {
+      throw new HttpError(
+        400,
+        'INSUFFICIENT_ORDER_FUNDING',
+        `Maker balance (${makerBalance.toString()}) is below required ${fundingSpec.requiredRaw.toString()} raw units for open order`
+      );
+    }
+    if (makerAllowance < fundingSpec.requiredRaw) {
+      throw new HttpError(
+        400,
+        'INSUFFICIENT_ORDER_FUNDING',
+        `Maker ${spenderLabel} allowance (${makerAllowance.toString()}) is below required ${fundingSpec.requiredRaw.toString()} raw units`
+      );
     }
   }
 
-  // Enforce per-maker active cap (evict ONLY the same maker's oldest order, never another maker's)
-  const sameMakerEntries = Array.from(signedMap.entries())
-    .filter(([k, e]) => k !== orderHashLower && e.maker.toLowerCase() === makerLower)
-    .sort((a, b) => (a[1].submittedAtMs ?? 0) - (b[1].submittedAtMs ?? 0));
+  const orderHashLower = orderHash.toLowerCase();
+  const makerLower = maker.toLowerCase();
+
+  const pruneDeadEntries = () => {
+    for (const [k, existing] of signedMap.entries()) {
+      if (
+        BigInt(existing.expiry) <= blk.timestamp ||
+        existing.cachedCancelled ||
+        existing.cachedStatus === 'filled' ||
+        (existing.maker.toLowerCase() === makerLower && BigInt(existing.nonce) !== currentMakerNonce)
+      ) {
+        signedMap.delete(k);
+      }
+    }
+  };
+
+  pruneDeadEntries();
+
+  // Enforce per-maker active cap (evict ONLY the same maker's unfunded/soonest/oldest order)
+  const getSameMakerEntries = () =>
+    Array.from(signedMap.entries())
+      .filter(([k, e]) => k !== orderHashLower && e.maker.toLowerCase() === makerLower)
+      .sort((a, b) => {
+        const aUnf = a[1].cachedStatus === 'unfunded' ? 0 : 1;
+        const bUnf = b[1].cachedStatus === 'unfunded' ? 0 : 1;
+        if (aUnf !== bUnf) return aUnf - bUnf;
+        const aExp = BigInt(a[1].expiry);
+        const bExp = BigInt(b[1].expiry);
+        if (aExp !== bExp) return aExp < bExp ? -1 : 1;
+        return (a[1].submittedAtMs ?? 0) - (b[1].submittedAtMs ?? 0);
+      });
+
+  const sameMakerEntries = getSameMakerEntries();
   while (sameMakerEntries.length >= MAX_ORDERS_PER_MAKER) {
     const oldest = sameMakerEntries.shift();
     if (oldest) signedMap.delete(oldest[0]);
   }
 
-  // Enforce per-IP cap so one IP rotating wallets cannot exhaust the global relay
+  // Enforce per-IP cap over funded non-dead entries so one IP cannot flood 50+ orders
   if (!signedMap.has(orderHashLower)) {
     const ipEntries = Array.from(signedMap.entries()).filter(
-      ([k, e]) => k !== orderHashLower && e.submittedIp === clientIp
+      ([k, e]) =>
+        k !== orderHashLower &&
+        e.submittedIp === clientIp &&
+        e.cachedStatus !== 'unfunded'
     );
     if (ipEntries.length >= MAX_ORDERS_PER_IP) {
       throw new HttpError(
@@ -1130,17 +1343,68 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
     }
   }
 
-  // Never evict another maker's valid open order at global capacity
+  // At capacity, refresh oldest/soonest candidates to discover unfunded/dead entries and prefer
+  // evicting unfunded or about-to-expire entries before ever rejecting with 429 ORDERBOOK_CAPACITY_EXCEEDED
   if (!signedMap.has(orderHashLower) && signedMap.size >= MAX_SIGNED_ORDERS) {
-    if (sameMakerEntries.length > 0) {
+    const hasCachedUnfunded = Array.from(signedMap.values()).some(
+      (e) => e.cachedStatus === 'unfunded'
+    );
+    if (!hasCachedUnfunded) {
+      const probeCandidates = Array.from(signedMap.values())
+        .sort((a, b) => {
+          const aExp = BigInt(a.expiry);
+          const bExp = BigInt(b.expiry);
+          if (a.lastRefreshedAtMs !== b.lastRefreshedAtMs) {
+            return a.lastRefreshedAtMs - b.lastRefreshedAtMs;
+          }
+          return aExp < bExp ? -1 : aExp > bExp ? 1 : 0;
+        })
+        .slice(0, EVICTION_REFRESH_SCAN_LIMIT);
+      await batchRefreshRelayRecords(ctx, probeCandidates, blk.timestamp, blk.number, false);
+      pruneDeadEntries();
+    }
+  }
+
+  if (!signedMap.has(orderHashLower) && signedMap.size >= MAX_SIGNED_ORDERS) {
+    const unfundedCandidates = Array.from(signedMap.entries())
+      .filter(([, e]) => e.cachedStatus === 'unfunded')
+      .sort((a, b) => {
+        const aExp = BigInt(a[1].expiry);
+        const bExp = BigInt(b[1].expiry);
+        if (aExp !== bExp) return aExp < bExp ? -1 : 1;
+        return (a[1].submittedAtMs ?? 0) - (b[1].submittedAtMs ?? 0);
+      });
+
+    if (unfundedCandidates.length > 0) {
+      signedMap.delete(unfundedCandidates[0][0]);
+    } else if (sameMakerEntries.length > 0) {
       const oldest = sameMakerEntries.shift();
       if (oldest) signedMap.delete(oldest[0]);
     } else {
-      throw new HttpError(
-        429,
-        'ORDERBOOK_CAPACITY_EXCEEDED',
-        'Signed order relay has reached active capacity; retry after existing orders expire or fill.'
-      );
+      const nearExpiryCandidates = Array.from(signedMap.entries())
+        .filter(([, e]) => {
+          const eExp = BigInt(e.expiry);
+          return (
+            eExp <= blk.timestamp + NEAR_EXPIRY_EVICTION_WINDOW_SECS &&
+            (eExp < expiry || eExp <= blk.timestamp + 3600n)
+          );
+        })
+        .sort((a, b) => {
+          const aExp = BigInt(a[1].expiry);
+          const bExp = BigInt(b[1].expiry);
+          if (aExp !== bExp) return aExp < bExp ? -1 : 1;
+          return (a[1].submittedAtMs ?? 0) - (b[1].submittedAtMs ?? 0);
+        });
+
+      if (nearExpiryCandidates.length > 0) {
+        signedMap.delete(nearExpiryCandidates[0][0]);
+      } else {
+        throw new HttpError(
+          429,
+          'ORDERBOOK_CAPACITY_EXCEEDED',
+          'Signed order relay has reached active capacity; retry after existing orders expire or fill.'
+        );
+      }
     }
   }
 
@@ -1170,13 +1434,17 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
     cachedFilled: filled,
     cachedCancelled: false,
     cachedMakerNonce: currentMakerNonce,
+    cachedMakerBalance: makerBalance,
+    cachedMakerAllowance: makerAllowance,
+    cachedFundingChecked: Boolean(fundingSpec),
+    cachedRpcStale: false,
     cachedStatus: initialStatus,
     cachedBlockNumber: blk.number,
     lastRefreshedAtMs: nowMs,
   };
   signedMap.set(orderHashLower, record);
 
-  const liveState = deriveRelayLiveState(record, blk.timestamp, blk.number);
+  const liveState = deriveRelayLiveState(ctx, record, blk.timestamp, blk.number);
   return {
     statusCode: 201,
     body: formatRelayOrderEnvelope(liveState, []),
@@ -1211,11 +1479,13 @@ function formatDbOrderRow(
       ? 'nonce_bumped'
       : minUsdc === 0n
         ? 'unknown'
-        : filled < minUsdc
-          ? liveRelay && filled === 0n && !liveRelay.expired
-            ? 'open'
-            : 'partially_filled'
-          : 'filled';
+        : filled >= minUsdc
+          ? 'filled'
+          : liveRelay?.unfunded
+            ? 'unfunded'
+            : liveRelay && filled === 0n && !liveRelay.expired
+              ? 'open'
+              : 'partially_filled';
 
   const baseRow: Record<string, unknown> = {
     order_hash: r.order_hash,
@@ -1257,6 +1527,8 @@ function formatDbOrderRow(
     baseRow.signed_order = rec.signedOrder;
     baseRow.signature = rec.signature;
     baseRow.submitted_at = rec.submittedAt;
+    baseRow.unfunded = liveRelay.unfunded;
+    baseRow.stale = liveRelay.stale;
   }
 
   return baseRow;
@@ -1460,21 +1732,26 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
 
   // If the filtered candidate list is small (<= 100), refresh them all in one multicall so status filters & counts are exact.
   // If > 100 (e.g. 2000 relayed orders), only refresh the requested page slice (<= pag.limit) via multicall + TTL cache!
+  let relayRefreshStale = blk.rpcFailed;
   if (relayOnlyCandidates.length <= MAX_RELAY_REFRESH_PER_REQ) {
-    await batchRefreshRelayRecords(ctx, relayOnlyCandidates, blk.timestamp, blk.number);
+    if (await batchRefreshRelayRecords(ctx, relayOnlyCandidates, blk.timestamp, blk.number, blk.rpcFailed)) {
+      relayRefreshStale = true;
+    }
   } else {
     const tentativeActive = relayOnlyCandidates.filter((rec) => {
-      const st = deriveRelayLiveState(rec, blk.timestamp, blk.number);
+      const st = deriveRelayLiveState(ctx, rec, blk.timestamp, blk.number);
       if (filters.status) return st.status === filters.status;
       if (filters.include_inactive) return true;
       return st.status === 'open' || st.status === 'partially_filled';
     });
     const pageCandidates = tentativeActive.slice(pag.offset, pag.offset + pag.limit);
-    await batchRefreshRelayRecords(ctx, pageCandidates, blk.timestamp, blk.number);
+    if (await batchRefreshRelayRecords(ctx, pageCandidates, blk.timestamp, blk.number, blk.rpcFailed)) {
+      relayRefreshStale = true;
+    }
   }
 
   const relayOnlyStates = relayOnlyCandidates
-    .map((rec) => deriveRelayLiveState(rec, blk.timestamp, blk.number))
+    .map((rec) => deriveRelayLiveState(ctx, rec, blk.timestamp, blk.number))
     .filter((live) => {
       if (filters.status) return live.status === filters.status;
       if (filters.include_inactive) return true;
@@ -1518,11 +1795,13 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
     .map((r) => signedMap.get(r.order_hash.toLowerCase()))
     .filter((r): r is RelaySignedOrderRecord => Boolean(r));
   if (dbRelaysOnPage.length > 0) {
-    await batchRefreshRelayRecords(ctx, dbRelaysOnPage, blk.timestamp, blk.number);
+    if (await batchRefreshRelayRecords(ctx, dbRelaysOnPage, blk.timestamp, blk.number, blk.rpcFailed)) {
+      relayRefreshStale = true;
+    }
   }
   const dbRelayStates = new Map<string, LiveRelayOrderState>();
   for (const rec of dbRelaysOnPage) {
-    dbRelayStates.set(rec.orderHash.toLowerCase(), deriveRelayLiveState(rec, blk.timestamp, blk.number));
+    dbRelayStates.set(rec.orderHash.toLowerCase(), deriveRelayLiveState(ctx, rec, blk.timestamp, blk.number));
   }
 
   const fillsByOrder = await fetchFillsMap(dbRows.map((r) => r.order_hash));
@@ -1534,11 +1813,17 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
     ...relaySlice.map((live) => formatRelayOrderEnvelope(live, [])),
     ...dbFormatted,
   ];
+  const anyPageRelayStale =
+    relayRefreshStale ||
+    relaySlice.some((live) => live.stale) ||
+    Array.from(dbRelayStates.values()).some((live) => live.stale);
 
   return {
     statusCode: 200,
     body: {
       ...meta,
+      stale: anyPageRelayStale,
+      relay_stale: anyPageRelayStale,
       pagination: buildPaginationEnvelope(pag.limit, pag.offset, pageData.length, total),
       data: pageData,
     },

@@ -1113,6 +1113,29 @@ async function runTests(): Promise<void> {
       assert.equal(downMkt.assets.length, 0);
       assert.equal(downMkt.orders.length, 0);
       assert.match(downMkt.error, /Failed to fetch live market data/i);
+
+      // Market snapshot must also flag stale=true & degraded=true if GET /orders reports stale=true / relay_stale=true while /health is ok
+      const origFetchWs3 = globalThis.fetch;
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const resp = await origFetchWs3(input, init);
+        const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (urlStr.includes('/orders')) {
+          const data = await resp.json();
+          return new Response(JSON.stringify({ ...data, stale: true, relay_stale: true }), {
+            status: resp.status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return resp;
+      }) as typeof fetch;
+      try {
+        const staleOrdersMkt = await fetchMarketSnapshot({ cfg, requestId: 103 });
+        assert.equal(staleOrdersMkt.stale, true, 'fetchMarketSnapshot must flag stale=true when /orders returns stale=true');
+        assert.equal(staleOrdersMkt.degraded, true);
+        assert.match(staleOrdersMkt.error, /stale/i);
+      } finally {
+        globalThis.fetch = origFetchWs3;
+      }
       console.log('PASS WS3.2: Live assets, orders, book metrics, GET /quote, and degraded error states verified.');
 
       // Pre-WS3.3 Hardening Verification (Fixes #1, #2, #4, #5, Low Fees & CSP)

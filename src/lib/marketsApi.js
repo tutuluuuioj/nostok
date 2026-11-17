@@ -379,16 +379,20 @@ export async function fetchMarketSnapshot({
         : Promise.resolve({ rows: [], total: 0, truncated: false }),
     ]);
 
+    const ordersStale = Boolean(ordersRes?.stale);
     const degraded = Boolean(
       !healthRes ||
         healthRes.status !== 'ok' ||
         healthRes.db_ok === false ||
         healthRes.rpc_ok === false ||
-        healthRes.within_lag_threshold === false
+        healthRes.within_lag_threshold === false ||
+        ordersStale
     );
 
     const statusReason = degraded
-      ? `API health is ${healthRes?.status ?? 'unavailable'} (db_ok=${healthRes?.db_ok}, rpc_ok=${healthRes?.rpc_ok}, lag=${healthRes?.lag_blocks ?? '?'} blocks).`
+      ? ordersStale && healthRes?.status === 'ok'
+        ? 'Orderbook RPC refresh failed or returned stale relayed order states.'
+        : `API health is ${healthRes?.status ?? 'unavailable'} (db_ok=${healthRes?.db_ok}, rpc_ok=${healthRes?.rpc_ok}, lag=${healthRes?.lag_blocks ?? '?'} blocks).`
       : '';
 
     const bookSummary = buildBookSummary(

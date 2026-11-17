@@ -401,11 +401,6 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
     3_600_000,
     ctx.config.rateLimitMaxBuckets
   );
-  const confirmTargetSybilLimiter = new IpRateLimiter(
-    ctx.config.confirmTargetGlobalPerHourMax,
-    3_600_000,
-    ctx.config.rateLimitMaxBuckets
-  );
   const sybilCostCache = new Map<string, SybilCostCacheEntry>();
   const confirmTargetResendLimiter = new IpRateLimiter(
     Math.max(1, Math.min(3, Math.floor(ctx.config.confirmTargetGlobalPerHourMax / 2))),
@@ -736,14 +731,7 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
           );
 
           const walletHasSybilCost = await hasOnchainSybilCost(ctx, wallet, sybilCostCache);
-          if (walletHasSybilCost) {
-            enforceScopedRateLimit(
-              res,
-              confirmTargetSybilLimiter,
-              canonicalTargetHash,
-              `confirmation sends to ${input.channel} target`
-            );
-          } else {
+          if (!walletHasSybilCost) {
             const nowMs = Date.now();
             let seenEntry = pendingWalletsByTarget.get(canonicalTargetHash);
             if (seenEntry && seenEntry.resetAtMs <= nowMs) {
@@ -1034,7 +1022,6 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             for (const r of bulkDel.rows) deletedIds.push(r.id);
           }
           confirmTargetGlobalLimiter.refund(verified.canonicalTargetHash);
-          confirmTargetSybilLimiter.refund(verified.canonicalTargetHash);
           confirmTargetResendLimiter.refund(verified.canonicalTargetHash);
           pendingWalletsByTarget.delete(verified.canonicalTargetHash);
         } else if (delRes.rows.length > 0) {
@@ -1574,7 +1561,6 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
     confirmTargetWalletLimiter.close();
     confirmTargetIpLimiter.close();
     confirmTargetGlobalLimiter.close();
-    confirmTargetSybilLimiter.close();
     confirmTargetResendLimiter.close();
     sybilCostCache.clear();
     clearInterval(pendingWalletsTimer);

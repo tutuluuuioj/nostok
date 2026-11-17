@@ -3351,6 +3351,52 @@ async function runTests(): Promise<void> {
         assert.equal(fundSub2.status, 201);
         assert.equal(sybilGetBalanceCalls, 1, 'Sybil ETH balance check must be cached across requests within TTL');
 
+        // Moving 0.01 ETH across 12 attacker wallets + IPs must NOT lock out an ETH-holding victim (owner path stays open)
+        for (let hop = 0; hop < 12; hop++) {
+          const hopAcct = privateKeyToAccount(generatePrivateKey());
+          await fetch(LOCAL_RPC_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              jsonrpc: '2.0',
+              id: 270 + hop,
+              method: 'anvil_setBalance',
+              params: [hopAcct.address, `0x${MIN_SYBIL_COST_ETH_WEI.toString(16)}`],
+            }),
+          });
+          const hopTok = await authAtSybil(hopAcct, `198.51.154.${hop + 1}`);
+          const hopRes = await httpJson(
+            'POST',
+            `${sybilUrl}/subscriptions`,
+            { channel: 'email', target: `hopping.victim+h${hop}@gmail.com` },
+            { Authorization: `Bearer ${hopTok}`, 'X-Forwarded-For': `198.51.154.${hop + 1}` }
+          );
+          assert.equal(hopRes.status, 201);
+        }
+        const hopVictimAcct = privateKeyToAccount(generatePrivateKey());
+        await fetch(LOCAL_RPC_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 299,
+            method: 'anvil_setBalance',
+            params: [hopVictimAcct.address, '0xb1a2bc2ec50000'], // 0.05 ETH
+          }),
+        });
+        const hopVictimTok = await authAtSybil(hopVictimAcct, '203.0.115.77');
+        const hopVictimRes = await httpJson(
+          'POST',
+          `${sybilUrl}/subscriptions`,
+          { channel: 'email', target: 'hopping.victim@gmail.com' },
+          { Authorization: `Bearer ${hopVictimTok}`, 'X-Forwarded-For': '203.0.115.77' }
+        );
+        assert.equal(
+          hopVictimRes.status,
+          201,
+          'Legitimate ETH-holding victim must NEVER be locked out by 12 hopping 0.01 ETH attacker wallets'
+        );
+
         // When RPC is down, funded uncached wallet falls back strictly to 10/h global cap -> 429
         sybilForceRpcDown = true;
         const rpcDownFundedAcct = privateKeyToAccount(generatePrivateKey());

@@ -334,6 +334,7 @@ assert.equal(resolvedMulti.approvalSlackRaw, 4n);
 assert.equal(resolvedMulti.requiredApprovalRaw, resolvedMulti.collateralAmountRaw + 4n);
 assert.equal(computeBorrowApprovalAmountRaw('1000', '1500000000', '500000000').approvalSlackRaw, 3n);
 assert.equal(computeBorrowApprovalAmountRaw('1000', '1000000000', '500000000').approvalSlackRaw, 2n);
+assert.equal(computeBorrowApprovalAmountRaw('1000', '2000000000', '1000000').approvalSlackRaw, 4n);
 assert.throws(
   () => resolveExactBorrowAmounts(quoteSample, { userCollateralRaw: '8333333000000000000' }),
   /below API rounded-up minimum/i

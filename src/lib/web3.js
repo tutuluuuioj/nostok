@@ -518,12 +518,16 @@ export async function fetchPaginatedApiRows(
   let offset = 0;
   let total = null;
   let truncated = false;
+  let stale = false;
   let firstJson = null;
   for (let page = 0; page < maxPages; page++) {
     const sep = resolvedBase.includes('?') ? '&' : '?';
     const json = await fetchJsonStrict(`${resolvedBase}${sep}limit=${limit}&offset=${offset}`, {}, timeoutMs);
     if (!firstJson && json && typeof json === 'object') {
       firstJson = json;
+    }
+    if (json?.stale === true || json?.relay_stale === true) {
+      stale = true;
     }
     const pageData = Array.isArray(json?.data) ? json.data : [];
     rows.push(...pageData);
@@ -544,7 +548,7 @@ export async function fetchPaginatedApiRows(
         ? Number(json.pagination.next_cursor)
         : offset + pageData.length;
   }
-  return { rows, total: total ?? rows.length, truncated, fees: firstJson?.fees ?? null };
+  return { rows, total: total ?? rows.length, truncated, fees: firstJson?.fees ?? null, stale };
 }
 
 /**
@@ -828,13 +832,16 @@ export function computeBorrowApprovalAmountRaw(
   if (signedCollateralRaw <= 0n || totalUsdcRaw <= 0n) {
     throw new Error('Collateral and principal raw amounts must be positive.');
   }
+  const MIN_PROTOCOL_FILL_USDC = 500_000_000n;
   const hasMinFill =
     minFillRaw !== null && minFillRaw !== undefined && String(minFillRaw).trim() !== '';
-  const rawMinFill = hasMinFill ? BigInt(minFillRaw) : totalUsdcRaw;
-  if (rawMinFill <= 0n) {
+  const parsedMinFill = hasMinFill ? BigInt(minFillRaw) : totalUsdcRaw;
+  if (parsedMinFill <= 0n) {
     throw new Error('Minimum fill raw amount must be positive.');
   }
-  const effectiveMinFill = rawMinFill > totalUsdcRaw ? totalUsdcRaw : rawMinFill;
+  const flooredMinFill =
+    parsedMinFill < MIN_PROTOCOL_FILL_USDC ? MIN_PROTOCOL_FILL_USDC : parsedMinFill;
+  const effectiveMinFill = flooredMinFill > totalUsdcRaw ? totalUsdcRaw : flooredMinFill;
   const maxFills = (totalUsdcRaw + effectiveMinFill - 1n) / effectiveMinFill;
   const approvalSlackRaw = maxFills;
   return {
