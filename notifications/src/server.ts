@@ -19,6 +19,7 @@ import {
   verifyUnblockTargetToken,
   verifyUnsubscribeToken,
 } from './crypto.js';
+import type { NotifDatabase } from './db.js';
 import { type NotificationsContext, defaultPreferencesMap } from './engine.js';
 import { issueSiweNonce, verifySiweAuth } from './siwe.js';
 import {
@@ -306,12 +307,31 @@ const SYBIL_COST_CACHE_MAX_ENTRIES = 10_000;
 const BLOCK_EXISTING_SUBS_NOTE =
   'Blocking prevents new subscription requests and removes unverified pending requests, but does NOT stop existing verified subscriptions (use the alert email unsubscribe link or Wallet settings to disable those).';
 const MANAGE_REQUESTS_TOKEN_TTL_SECS = 30 * 86_400;
+const DIGEST_MAX_WALLETS = 20;
+const MANAGE_MAX_CONFIRMS_PER_TOKEN = 1;
+const MANAGE_MAX_BLOCKS_PER_TOKEN = 10;
+const PENDING_PURGE_INTERVAL_MS = 300_000;
 
 interface PendingTargetWalletEntry {
   id: string;
   wallet: string;
   verifyCodeHash: string;
   expiresAtSec: number | null;
+}
+
+export async function purgeExpiredPendingSubscriptions(
+  notifDb: NotifDatabase,
+  nowSec = Math.floor(Date.now() / 1000)
+): Promise<number> {
+  const res = await notifDb.query<{ id: string }>(
+    `DELETE FROM notif_subscriptions
+     WHERE verified = FALSE
+       AND verify_expires_at IS NOT NULL
+       AND verify_expires_at <= $1
+     RETURNING id`,
+    [nowSec.toString()]
+  );
+  return res.rows.length;
 }
 
 function buildManageRequestsLinks(
@@ -356,50 +376,62 @@ function subscriptionRowMatchesTarget(
   }
 }
 
-async function queryPendingUniqueWalletsForTarget(
+async function queryPendingUniqueWalletsPage(
   ctx: NotificationsContext,
   canonicalTargetHash: string,
   channel: 'email' | 'telegram',
-  nowSecBig: bigint
-): Promise<PendingTargetWalletEntry[]> {
-  const pendingRows = await ctx.notifDb.query<{
-    id: string;
-    wallet: string;
-    channel: 'email' | 'telegram' | 'webhook';
-    target_ciphertext: string;
-    key_id: string;
-    verify_code_hash: string | null;
-    verify_expires_at: string | null;
-    canonical_target_hash: string | null;
-  }>(
-    `SELECT id, wallet, channel, target_ciphertext, key_id, verify_code_hash,
-            verify_expires_at::TEXT AS verify_expires_at, canonical_target_hash
+  nowSecBig: bigint,
+  limit: number,
+  offset: number
+): Promise<{ total: number; items: PendingTargetWalletEntry[] }> {
+  const nowStr = nowSecBig.toString();
+  const countRes = await ctx.notifDb.query<{ total: number }>(
+    `SELECT COUNT(DISTINCT LOWER(wallet))::INT AS total
      FROM notif_subscriptions
      WHERE verified = FALSE
        AND channel = $1
        AND verify_code_hash IS NOT NULL
        AND (verify_expires_at IS NULL OR verify_expires_at > $2)
-       AND (canonical_target_hash = $3 OR canonical_target_hash IS NULL)
-     ORDER BY updated_at DESC, id ASC`,
-    [channel, nowSecBig.toString(), canonicalTargetHash]
+       AND canonical_target_hash = $3`,
+    [channel, nowStr, canonicalTargetHash]
+  );
+  const total = Number(countRes.rows[0]?.total ?? 0);
+  if (total === 0) {
+    return { total: 0, items: [] };
+  }
+
+  const pageRes = await ctx.notifDb.query<{
+    id: string;
+    wallet: string;
+    verify_code_hash: string;
+    verify_expires_at: string | null;
+  }>(
+    `WITH ranked AS (
+       SELECT id, wallet, verify_code_hash, verify_expires_at::TEXT AS verify_expires_at,
+              updated_at,
+              ROW_NUMBER() OVER (PARTITION BY LOWER(wallet) ORDER BY updated_at DESC, id ASC) AS rn
+       FROM notif_subscriptions
+       WHERE verified = FALSE
+         AND channel = $1
+         AND verify_code_hash IS NOT NULL
+         AND (verify_expires_at IS NULL OR verify_expires_at > $2)
+         AND canonical_target_hash = $3
+     )
+     SELECT id, wallet, verify_code_hash, verify_expires_at
+     FROM ranked
+     WHERE rn = 1
+     ORDER BY updated_at DESC, id ASC
+     LIMIT $4 OFFSET $5`,
+    [channel, nowStr, canonicalTargetHash, limit, offset]
   );
 
-  const seenWallets = new Set<string>();
-  const uniquePending: PendingTargetWalletEntry[] = [];
-  for (const row of pendingRows.rows) {
-    if (!row.verify_code_hash) continue;
-    if (!subscriptionRowMatchesTarget(ctx, row, canonicalTargetHash)) continue;
-    const walletLower = row.wallet.toLowerCase();
-    if (seenWallets.has(walletLower)) continue;
-    seenWallets.add(walletLower);
-    uniquePending.push({
-      id: row.id,
-      wallet: row.wallet,
-      verifyCodeHash: row.verify_code_hash,
-      expiresAtSec: row.verify_expires_at ? Number(row.verify_expires_at) : null,
-    });
-  }
-  return uniquePending;
+  const items: PendingTargetWalletEntry[] = pageRes.rows.map((row) => ({
+    id: row.id,
+    wallet: row.wallet,
+    verifyCodeHash: row.verify_code_hash,
+    expiresAtSec: row.verify_expires_at ? Number(row.verify_expires_at) : null,
+  }));
+  return { total, items };
 }
 
 type SybilCostCacheEntry = { qualified: boolean; expiresAtMs: number };
@@ -516,6 +548,21 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
     }
   }, 60_000);
   pendingWalletsTimer.unref();
+  const pendingPurgeMs = ctx.pendingPurgeIntervalMs ?? PENDING_PURGE_INTERVAL_MS;
+  let pendingPurgeInFlight = false;
+  const pendingPurgeTimer =
+    pendingPurgeMs > 0
+      ? setInterval(() => {
+          if (pendingPurgeInFlight) return;
+          pendingPurgeInFlight = true;
+          void purgeExpiredPendingSubscriptions(ctx.notifDb)
+            .catch(() => {})
+            .finally(() => {
+              pendingPurgeInFlight = false;
+            });
+        }, pendingPurgeMs)
+      : null;
+  pendingPurgeTimer?.unref();
   const confirmIpLimiter = new IpRateLimiter(
     ctx.config.confirmRateLimitMax,
     ctx.config.rateLimitWindowMs,
@@ -1006,7 +1053,7 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
               alertType: 'subscription_verification',
               severity: 'info' as const,
               title: 'Confirm your NOSTOK alert subscription',
-              message: `Verification code: ${verificationCode}. Confirm link: ${confirmUrl}. Manage all pending requests (valid 30d, single-use): ${manageLinks.manageUrl}. Not me, block this address: ${blockUrl} (link valid 24h, single-use; stops new requests only, not existing verified subscriptions).`,
+              message: `Verification code: ${verificationCode}. Confirm link: ${confirmUrl}. Manage pending requests (valid 30d; 1 confirm + up to 10 blocks): ${manageLinks.manageUrl}. Not me, block this address: ${blockUrl} (link valid 24h, single-use; stops new requests only, not existing verified subscriptions).`,
               payload: {
                 subscription_id: created.id,
                 verification_code: verificationCode,
@@ -1028,12 +1075,16 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
               await ctx.transports.sendTelegram(verifyMsg);
             }
           } else if (sendDecision === 'digest') {
-            const matchingPending = await queryPendingUniqueWalletsForTarget(
+            const { total: totalPendingDb, items: previewPending } = await queryPendingUniqueWalletsPage(
               ctx,
               canonicalTargetHash,
               input.channel as 'email' | 'telegram',
-              nowSecBig
+              nowSecBig,
+              DIGEST_MAX_WALLETS,
+              0
             );
+            const matchingPending = previewPending.slice();
+            let totalPendingCount = totalPendingDb;
             if (!matchingPending.some((e) => e.wallet.toLowerCase() === wallet.toLowerCase())) {
               matchingPending.unshift({
                 id: created.id,
@@ -1041,6 +1092,10 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
                 verifyCodeHash: codeHash,
                 expiresAtSec,
               });
+              if (matchingPending.length > DIGEST_MAX_WALLETS) {
+                matchingPending.length = DIGEST_MAX_WALLETS;
+              }
+              totalPendingCount = Math.max(totalPendingCount, matchingPending.length);
             }
 
             const nowNumSec = Number(nowSecBig);
@@ -1094,6 +1149,10 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
               wallet
             );
             const digestUnsubUrl = `${ctx.config.publicBaseUrl}/unsubscribe?token=${encodeURIComponent(digestUnsubToken)}`;
+            const previewNote =
+              totalPendingCount > digestEntries.length
+                ? `Showing latest ${digestEntries.length} of ${totalPendingCount} pending wallet requests (view/manage all ${totalPendingCount} at the link below):`
+                : `Listing all ${digestEntries.length} pending wallet request${digestEntries.length === 1 ? '' : 's'}:`;
             const digestMsg = {
               wallet,
               subscriptionId: created.id,
@@ -1101,12 +1160,13 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
               target: normalizedTarget,
               alertType: 'subscription_verification_digest',
               severity: 'info' as const,
-              title: `NOSTOK alert verification digest (${digestEntries.length} pending wallet request${digestEntries.length === 1 ? '' : 's'})`,
-              message: `More than ${ctx.config.verifyEmailTargetPer24hMax} wallets requested verification for this address in 24h. Digest summary (max once per 6h):\nManage all pending requests (valid 30d, single-use): ${manageLinks.manageUrl}\n${entryLines.join('\n')}`,
+              title: `NOSTOK alert verification digest (${totalPendingCount} pending wallet request${totalPendingCount === 1 ? '' : 's'})`,
+              message: `More than ${ctx.config.verifyEmailTargetPer24hMax} wallets requested verification for this address in 24h. Digest summary (max once per 6h):\n${previewNote}\nManage all pending requests (valid 30d; 1 confirm + up to 10 blocks): ${manageLinks.manageUrl}\n${entryLines.join('\n')}`,
               payload: {
                 digest: true,
                 subscription_id: created.id,
-                pending_count: digestEntries.length,
+                pending_count: totalPendingCount,
+                shown_count: digestEntries.length,
                 entries: digestEntries,
                 manage_token: manageLinks.manageToken,
                 manage_url: manageLinks.manageUrl,
@@ -1349,7 +1409,7 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
               alertType: 'target_block_confirmation',
               severity: 'info' as const,
               title: 'Your address is now blocked from new NOSTOK requests',
-              message: `Your address has been blocked from all new NOSTOK alert subscription requests (${deletedIds.length} unverified pending request(s) removed). ${BLOCK_EXISTING_SUBS_NOTE} Manage pending requests (valid 30d, single-use): ${manageLinks.manageUrl}. Changed your mind? Unblock this address: ${unblockUrl}`,
+              message: `Your address has been blocked from all new NOSTOK alert subscription requests (${deletedIds.length} unverified pending request(s) removed). ${BLOCK_EXISTING_SUBS_NOTE} Manage pending requests (valid 30d; 1 confirm + up to 10 blocks): ${manageLinks.manageUrl}. Changed your mind? Unblock this address: ${unblockUrl}`,
               payload: {
                 scope: 'target_all',
                 block_all: true,
@@ -1506,12 +1566,20 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
           throw new HttpError(400, 'VALIDATION_ERROR', err instanceof Error ? err.message : 'Invalid token');
         }
         const tokenJti = `mng_${verified.jti}`;
-        const usedRes = await ctx.notifDb.query<{ jti: string }>(
-          'SELECT jti FROM notif_revoked_sessions WHERE jti = $1 LIMIT 1',
+        const usageRes = await ctx.notifDb.query<{ confirm_count: number; block_count: number }>(
+          'SELECT confirm_count, block_count FROM notif_manage_token_usage WHERE jti = $1 LIMIT 1',
           [tokenJti]
         );
-        if (usedRes.rows.length > 0) {
-          throw new HttpError(400, 'MANAGE_TOKEN_ALREADY_USED', 'This single-use manage link has already been used.');
+        const confirmCount = Number(usageRes.rows[0]?.confirm_count ?? 0);
+        const blockCount = Number(usageRes.rows[0]?.block_count ?? 0);
+        const remainingConfirms = Math.max(0, MANAGE_MAX_CONFIRMS_PER_TOKEN - confirmCount);
+        const remainingBlocks = Math.max(0, MANAGE_MAX_BLOCKS_PER_TOKEN - blockCount);
+        if (remainingConfirms === 0 && remainingBlocks === 0) {
+          throw new HttpError(
+            400,
+            'MANAGE_TOKEN_ALREADY_USED',
+            'This manage link has already used all allowed actions (1 confirm and 10 blocks).'
+          );
         }
 
         const pag = parseOrThrow(buildPaginationSchema(ctx.config.maxPageLimit), {
@@ -1520,13 +1588,14 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
           cursor: queryObj.cursor,
         });
         const nowSecBig = BigInt(Math.floor(Date.now() / 1000));
-        const allPending = await queryPendingUniqueWalletsForTarget(
+        const { total, items: pageItems } = await queryPendingUniqueWalletsPage(
           ctx,
           verified.canonicalTargetHash,
           verified.channel,
-          nowSecBig
+          nowSecBig,
+          pag.limit,
+          pag.offset
         );
-        const pageItems = allPending.slice(pag.offset, pag.offset + pag.limit);
         const blockedRes = await ctx.notifDb.query<{ canonical_target_hash: string }>(
           `SELECT canonical_target_hash FROM notif_blocked_senders
            WHERE canonical_target_hash = $1 AND wallet = '*' LIMIT 1`,
@@ -1554,13 +1623,13 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
       <input type="hidden" name="token" value="${escToken}" />
       <input type="hidden" name="subscription_id" value="${escSubId}" />
       <input type="hidden" name="action" value="confirm" />
-      <button type="submit">Confirm</button>
+      <button type="submit"${remainingConfirms === 0 ? ' disabled' : ''}>Confirm</button>
     </form>
     <form method="POST" action="/subscriptions/manage">
       <input type="hidden" name="token" value="${escToken}" />
       <input type="hidden" name="subscription_id" value="${escSubId}" />
       <input type="hidden" name="action" value="block" />
-      <button type="submit" class="danger">Block wallet</button>
+      <button type="submit" class="danger"${remainingBlocks === 0 ? ' disabled' : ''}>Block wallet</button>
     </form>
   </div>
 </div>`;
@@ -1575,7 +1644,7 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
               `<a href="/subscriptions/manage?token=${encTok}&limit=${pag.limit}&offset=${prevOffset}">Previous</a>`
             );
           }
-          if (nextOffset < allPending.length) {
+          if (nextOffset < total) {
             navLinks.push(
               `<a href="/subscriptions/manage?token=${encTok}&limit=${pag.limit}&offset=${nextOffset}">Next</a>`
             );
@@ -1587,9 +1656,9 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             res,
             200,
             'Manage Pending NOSTOK Requests',
-            `<h1>Pending subscription requests (${allPending.length})</h1>
+            `<h1>Pending subscription requests (${total})</h1>
 ${blockedNote}
-<p>Showing ${pageItems.length} of ${allPending.length} unique pending wallet(s) (single-use approval link).</p>
+<p>Showing ${pageItems.length} of ${total} unique pending wallet(s). Remaining link actions: ${remainingConfirms} confirm, ${remainingBlocks} block(s).</p>
 ${rowsHtml}
 ${navLinks.length > 0 ? `<div class="actions">${navLinks.join(' ')}</div>` : ''}`
           );
@@ -1601,12 +1670,16 @@ ${navLinks.length > 0 ? `<div class="actions">${navLinks.join(' ')}</div>` : ''}
           method: 'POST',
           channel: verified.channel,
           target_blocked: targetBlocked,
+          remaining_actions: {
+            confirm: remainingConfirms,
+            block: remainingBlocks,
+          },
           pagination: {
             limit: pag.limit,
             offset: pag.offset,
             returned: pageItems.length,
-            total: allPending.length,
-            has_more: pag.offset + pageItems.length < allPending.length,
+            total,
+            has_more: pag.offset + pageItems.length < total,
           },
           data: pageItems.map((item) => ({
             subscription_id: item.id,
@@ -1636,15 +1709,24 @@ ${navLinks.length > 0 ? `<div class="actions">${navLinks.join(' ')}</div>` : ''}
         const tokenJti = `mng_${verified.jti}`;
 
         const txResult = await ctx.notifDb.transaction(async (tx) => {
-          const usedRes = await tx.query<{ jti: string }>(
-            'SELECT jti FROM notif_revoked_sessions WHERE jti = $1 LIMIT 1',
+          const preUsageRes = await tx.query<{ confirm_count: number; block_count: number }>(
+            'SELECT confirm_count, block_count FROM notif_manage_token_usage WHERE jti = $1 LIMIT 1',
             [tokenJti]
           );
-          if (usedRes.rows.length > 0) {
+          const preConf = Number(preUsageRes.rows[0]?.confirm_count ?? 0);
+          const preBlk = Number(preUsageRes.rows[0]?.block_count ?? 0);
+          if (input.action === 'confirm' && preConf >= MANAGE_MAX_CONFIRMS_PER_TOKEN) {
             throw new HttpError(
               400,
               'MANAGE_TOKEN_ALREADY_USED',
-              'This single-use manage link has already been used.'
+              'This manage link has already used its allowed confirm action.'
+            );
+          }
+          if (input.action === 'block' && preBlk >= MANAGE_MAX_BLOCKS_PER_TOKEN) {
+            throw new HttpError(
+              400,
+              'MANAGE_TOKEN_ALREADY_USED',
+              'This manage link has already reached its limit of 10 block actions.'
             );
           }
 
@@ -1690,21 +1772,38 @@ ${navLinks.length > 0 ? `<div class="actions">${navLinks.join(' ')}</div>` : ''}
             );
           }
 
-          const consumed = await tx.query<{ jti: string }>(
-            `INSERT INTO notif_revoked_sessions (jti, wallet, expires_at, revoked_at)
-             VALUES ($1, '*', $2, $3)
-             ON CONFLICT (jti) DO NOTHING
-             RETURNING jti`,
+          await tx.query(
+            `INSERT INTO notif_manage_token_usage (jti, confirm_count, block_count, expires_at, updated_at)
+             VALUES ($1, 0, 0, $2, $3)
+             ON CONFLICT (jti) DO NOTHING`,
             [tokenJti, verified.exp.toString(), nowSec.toString()]
           );
-          if (consumed.rows.length === 0) {
+          const usageUpd =
+            input.action === 'confirm'
+              ? await tx.query<{ confirm_count: number; block_count: number }>(
+                  `UPDATE notif_manage_token_usage
+                   SET confirm_count = confirm_count + 1, updated_at = $3
+                   WHERE jti = $1 AND confirm_count < $2
+                   RETURNING confirm_count, block_count`,
+                  [tokenJti, MANAGE_MAX_CONFIRMS_PER_TOKEN, nowSec.toString()]
+                )
+              : await tx.query<{ confirm_count: number; block_count: number }>(
+                  `UPDATE notif_manage_token_usage
+                   SET block_count = block_count + 1, updated_at = $3
+                   WHERE jti = $1 AND block_count < $2
+                   RETURNING confirm_count, block_count`,
+                  [tokenJti, MANAGE_MAX_BLOCKS_PER_TOKEN, nowSec.toString()]
+                );
+          if (usageUpd.rows.length === 0) {
             throw new HttpError(
               400,
               'MANAGE_TOKEN_ALREADY_USED',
-              'This single-use manage link has already been used.'
+              input.action === 'confirm'
+                ? 'This manage link has already used its allowed confirm action.'
+                : 'This manage link has already reached its limit of 10 block actions.'
             );
           }
-          await tx.query('DELETE FROM notif_revoked_sessions WHERE expires_at < $1', [
+          await tx.query('DELETE FROM notif_manage_token_usage WHERE expires_at < $1', [
             (nowSec - 3600).toString(),
           ]);
 
@@ -1728,7 +1827,17 @@ ${navLinks.length > 0 ? `<div class="actions">${navLinks.join(' ')}</div>` : ''}
               [row.id]
             );
           }
-          return row;
+          return {
+            row,
+            remainingConfirms: Math.max(
+              0,
+              MANAGE_MAX_CONFIRMS_PER_TOKEN - Number(usageUpd.rows[0].confirm_count)
+            ),
+            remainingBlocks: Math.max(
+              0,
+              MANAGE_MAX_BLOCKS_PER_TOKEN - Number(usageUpd.rows[0].block_count)
+            ),
+          };
         });
 
         if (input.action === 'block') {
@@ -1736,28 +1845,38 @@ ${navLinks.length > 0 ? `<div class="actions">${navLinks.join(' ')}</div>` : ''}
           confirmTargetResendLimiter.refund(verified.canonicalTargetHash);
           pendingWalletsByTarget
             .get(verified.canonicalTargetHash)
-            ?.wallets.delete(txResult.wallet.toLowerCase());
+            ?.wallets.delete(txResult.row.wallet.toLowerCase());
         }
 
-        const checksumWallet = getAddress(txResult.wallet);
+        const checksumWallet = getAddress(txResult.row.wallet);
+        const remainingActions = {
+          confirm: txResult.remainingConfirms,
+          block: txResult.remainingBlocks,
+        };
+        const backToManageHtml =
+          remainingActions.confirm > 0 || remainingActions.block > 0
+            ? `<p><a href="/subscriptions/manage?token=${encodeURIComponent(input.token)}">Back to pending requests</a> (remaining: ${remainingActions.confirm} confirm, ${remainingActions.block} block(s))</p>`
+            : '';
+
         if (input.action === 'confirm') {
           if (prefersHtmlResponse(req)) {
             sendHtmlPage(
               res,
               200,
               'Subscription Confirmed',
-              `<h1>Alert subscription confirmed</h1><p>Subscription <code>${escapeHtml(txResult.id)}</code> for wallet <code>${escapeHtml(checksumWallet)}</code> is now active.</p>`
+              `<h1>Alert subscription confirmed</h1><p>Subscription <code>${escapeHtml(txResult.row.id)}</code> for wallet <code>${escapeHtml(checksumWallet)}</code> is now active.</p>${backToManageHtml}`
             );
             return;
           }
           sendJson(res, 200, {
             confirmed: true,
             action: 'confirm',
-            id: txResult.id,
+            id: txResult.row.id,
             wallet_address: checksumWallet,
-            channel: txResult.channel,
+            channel: txResult.row.channel,
             enabled: true,
             verified: true,
+            remaining_actions: remainingActions,
           });
           return;
         }
@@ -1767,17 +1886,18 @@ ${navLinks.length > 0 ? `<div class="actions">${navLinks.join(' ')}</div>` : ''}
             res,
             200,
             'Sender Wallet Blocked',
-            `<h1>Sender wallet blocked</h1><p>Wallet <code>${escapeHtml(checksumWallet)}</code> has been blocked and its pending request was removed. ${escapeHtml(BLOCK_EXISTING_SUBS_NOTE)}</p>`
+            `<h1>Sender wallet blocked</h1><p>Wallet <code>${escapeHtml(checksumWallet)}</code> has been blocked and its pending request was removed. ${escapeHtml(BLOCK_EXISTING_SUBS_NOTE)}</p>${backToManageHtml}`
           );
           return;
         }
         sendJson(res, 200, {
           blocked: true,
           action: 'block',
-          subscription_id: txResult.id,
+          subscription_id: txResult.row.id,
           blocked_wallet: checksumWallet,
           stops_existing_verified_subscriptions: false,
           note: BLOCK_EXISTING_SUBS_NOTE,
+          remaining_actions: remainingActions,
         });
         return;
       }
@@ -2290,6 +2410,7 @@ ${navLinks.length > 0 ? `<div class="actions">${navLinks.join(' ')}</div>` : ''}
     confirmTargetResendLimiter.close();
     sybilCostCache.clear();
     clearInterval(pendingWalletsTimer);
+    if (pendingPurgeTimer) clearInterval(pendingPurgeTimer);
     confirmIpLimiter.close();
     confirmWalletLimiter.close();
     confirmSubLimiter.close();

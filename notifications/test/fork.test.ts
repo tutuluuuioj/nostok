@@ -58,7 +58,11 @@ import {
   processDeliveryQueue,
   runNotificationsCycle,
 } from '../src/engine.js';
-import { MIN_SYBIL_COST_ETH_WEI, createNotificationsServer } from '../src/server.js';
+import {
+  MIN_SYBIL_COST_ETH_WEI,
+  createNotificationsServer,
+  purgeExpiredPendingSubscriptions,
+} from '../src/server.js';
 import { formatSiweMessage } from '../src/siwe.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -3897,33 +3901,35 @@ async function runTests(): Promise<void> {
         assert.notEqual(earlySubOld.id, earlySubNew.id);
 
         // Now 55 funded wallets submit AFTER earlyOwner so earlyOwner sits at index 55 (outside any old LIMIT 50!)
+        const crowdSubIds: string[] = [];
         for (let i = 0; i < 55; i++) {
-          await createSubWithSiwe(
+          const cSub = await createSubWithSiwe(
             d1Url,
             crowdAccts[i],
             'reprod2.owner@gmail.com',
             `198.52.${Math.floor(i / 200) + 2}.${(i % 200) + 1}`
           );
+          crowdSubIds.push(cSub.id);
         }
-        // Expire digest cooldown on reprod2.owner@gmail.com so 56th funded wallet triggers digest containing ALL 57 unique wallets
+        // Expire digest cooldown on reprod2.owner@gmail.com so 56th funded wallet triggers digest:
+        // Low 1: digest caps inline wallet list at <= 20 while reporting total pending_count (57) and manage link!
         const cthD2 = notifCtx.cipher.computeGlobalTargetHash('email', 'reprod2.owner@gmail.com');
         await notifCtx.notifDb.query(
           'UPDATE notif_verify_target_state SET last_digest_sent_at = 1 WHERE canonical_target_hash = $1',
           [cthD2]
         );
         const emailsBeforeD2Digest = deliveredEmails.length;
-        await createSubWithSiwe(d1Url, crowdAccts[55], 'reprod2.owner@gmail.com', '198.52.9.9');
+        const c56Sub = await createSubWithSiwe(d1Url, crowdAccts[55], 'reprod2.owner@gmail.com', '198.52.9.9');
+        crowdSubIds.push(c56Sub.id);
         const d2Digest = deliveredEmails.slice(emailsBeforeD2Digest)[0];
         assert.equal(d2Digest?.alertType, 'subscription_verification_digest');
+        assert.equal(d2Digest.payload.pending_count, 57, 'Digest must report full total count (57)');
+        assert.equal(d2Digest.payload.shown_count, 20, 'Digest must cap inline wallet entries at 20');
         const d2Entries = d2Digest.payload.entries as Array<{ wallet: string; subscription_id: string }>;
-        assert.equal(d2Entries.length, 57, `Digest must list all 57 unique wallets (>50, no LIMIT 50 cap), got ${d2Entries.length}`);
-        assert.equal(
-          d2Entries.filter((e) => e.wallet.toLowerCase() === earlyOwner.address.toLowerCase()).length,
-          1,
-          'Early owner with alias submissions must be deduplicated to strictly 1 wallet entry in digest'
-        );
+        assert.equal(d2Entries.length, 20, `Digest must list at most 20 wallets inline, got ${d2Entries.length}`);
+        assert.ok(d2Digest.message.includes('57'), 'Digest text must include total pending count');
 
-        // Browse /subscriptions/manage across 3 pages (limit=20, offset=0,20,40) -> token NOT burned by GETs!
+        // Browse /subscriptions/manage via SQL LIMIT/OFFSET across 3 pages (limit=20, offset=0,20,40) -> full 57 live here!
         const d2ManageTok = String(d2Digest.payload.manage_token);
         const seenManageWallets = new Set<string>();
         let foundEarlyOwnerPage3: { subscription_id: string; wallet_address: string } | undefined;
@@ -3934,6 +3940,7 @@ async function runTests(): Promise<void> {
         ] as const) {
           const pRes = await httpJson<{
             confirmation_required: boolean;
+            remaining_actions: { confirm: number; block: number };
             pagination: { limit: number; offset: number; returned: number; total: number; has_more: boolean };
             data: Array<{ subscription_id: string; wallet_address: string }>;
           }>(
@@ -3943,6 +3950,8 @@ async function runTests(): Promise<void> {
             { 'X-Forwarded-For': `198.52.10.${offset + 1}` }
           );
           assert.equal(pRes.status, 200);
+          assert.equal(pRes.body.remaining_actions.confirm, 1);
+          assert.equal(pRes.body.remaining_actions.block, 10);
           assert.equal(pRes.body.pagination.total, 57);
           assert.equal(pRes.body.pagination.returned, expectedCount);
           assert.equal(pRes.body.pagination.has_more, expectedHasMore);
@@ -3953,16 +3962,21 @@ async function runTests(): Promise<void> {
             }
           }
         }
-        assert.equal(seenManageWallets.size, 57, 'All 57 unique pending wallets must appear across paginated manage pages');
+        assert.equal(seenManageWallets.size, 57, 'All 57 unique pending wallets must appear across SQL paginated manage pages');
         assert.ok(foundEarlyOwnerPage3, 'Early owner pushed past offset 50 must still be reachable on page 3');
         assert.equal(
           foundEarlyOwnerPage3.subscription_id,
           earlySubNew.id,
-          'Manage list deduplication must keep the newest pending request per unique wallet'
+          'Manage list SQL deduplication must keep the newest pending request per unique wallet'
         );
 
-        // Confirm early owner via single-use POST /subscriptions/manage, then verify single-use replay rejection!
-        const d2ConfirmRes = await httpJson<{ confirmed: boolean; id: string; verified: boolean }>(
+        // Low 4: Confirm early owner (uses the 1 confirm) AND allow up to 10 blocks with that same token; reject 2nd confirm and 11th block!
+        const d2ConfirmRes = await httpJson<{
+          confirmed: boolean;
+          id: string;
+          verified: boolean;
+          remaining_actions: { confirm: number; block: number };
+        }>(
           'POST',
           `${d1Url}/subscriptions/manage`,
           { token: d2ManageTok, subscription_id: earlySubNew.id, action: 'confirm' },
@@ -3972,24 +3986,91 @@ async function runTests(): Promise<void> {
         assert.equal(d2ConfirmRes.body.confirmed, true);
         assert.equal(d2ConfirmRes.body.verified, true);
         assert.equal(d2ConfirmRes.body.id, earlySubNew.id);
+        assert.equal(d2ConfirmRes.body.remaining_actions.confirm, 0);
+        assert.equal(d2ConfirmRes.body.remaining_actions.block, 10);
 
-        const d2ReplayPost = await httpJson<{ error?: { code?: string } }>(
+        const d2ReplayConfirm = await httpJson<{ error?: { code?: string } }>(
           'POST',
           `${d1Url}/subscriptions/manage`,
-          { token: d2ManageTok, subscription_id: earlySubNew.id, action: 'confirm' },
+          { token: d2ManageTok, subscription_id: crowdSubIds[0], action: 'confirm' },
           { 'X-Forwarded-For': '198.52.11.2' }
         );
-        assert.equal(d2ReplayPost.status, 400);
-        assert.equal(d2ReplayPost.body.error?.code, 'MANAGE_TOKEN_ALREADY_USED');
+        assert.equal(d2ReplayConfirm.status, 400);
+        assert.equal(d2ReplayConfirm.body.error?.code, 'MANAGE_TOKEN_ALREADY_USED');
+
+        // Remaining 10 blocks STILL work with the same manage token after confirm!
+        for (let blkIdx = 0; blkIdx < 10; blkIdx++) {
+          const blkRes = await httpJson<{
+            blocked: boolean;
+            remaining_actions: { confirm: number; block: number };
+          }>(
+            'POST',
+            `${d1Url}/subscriptions/manage`,
+            { token: d2ManageTok, subscription_id: crowdSubIds[blkIdx], action: 'block' },
+            { 'X-Forwarded-For': `198.52.12.${blkIdx + 1}` }
+          );
+          assert.equal(blkRes.status, 200, `Block #${blkIdx + 1} with same manage token must succeed`);
+          assert.equal(blkRes.body.blocked, true);
+          assert.equal(blkRes.body.remaining_actions.confirm, 0);
+          assert.equal(blkRes.body.remaining_actions.block, 9 - blkIdx);
+        }
+
+        // 11th block fails with MANAGE_TOKEN_ALREADY_USED and exhausted GET fails too
+        const eleventhBlock = await httpJson<{ error?: { code?: string } }>(
+          'POST',
+          `${d1Url}/subscriptions/manage`,
+          { token: d2ManageTok, subscription_id: crowdSubIds[10], action: 'block' },
+          { 'X-Forwarded-For': '198.52.13.1' }
+        );
+        assert.equal(eleventhBlock.status, 400);
+        assert.equal(eleventhBlock.body.error?.code, 'MANAGE_TOKEN_ALREADY_USED');
 
         const d2ReplayGet = await httpJson<{ error?: { code?: string } }>(
           'GET',
           `${d1Url}/subscriptions/manage?token=${encodeURIComponent(d2ManageTok)}`,
           undefined,
-          { 'X-Forwarded-For': '198.52.11.3' }
+          { 'X-Forwarded-For': '198.52.13.2' }
         );
         assert.equal(d2ReplayGet.status, 400);
         assert.equal(d2ReplayGet.body.error?.code, 'MANAGE_TOKEN_ALREADY_USED');
+
+        // Low 2: Timer-driven purge of expired unverified rows while keeping active pending & verified rows intact
+        const expiredTargetIds = [crowdSubIds[11], crowdSubIds[12]];
+        const pastExpSec = (Math.floor(Date.now() / 1000) - 10).toString();
+        await notifCtx.notifDb.query(
+          'UPDATE notif_subscriptions SET verify_expires_at = $2 WHERE id = ANY($1::TEXT[])',
+          [expiredTargetIds, pastExpSec]
+        );
+        const purgeSrv = createNotificationsServer({
+          ...notifCtx,
+          pendingPurgeIntervalMs: 40,
+        });
+        await new Promise<void>((r) => purgeSrv.listen(0, '127.0.0.1', r));
+        try {
+          const deadline = Date.now() + 3000;
+          let leftCount = 2;
+          while (leftCount > 0 && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 50));
+            const chk = await notifCtx.notifDb.query<{ cnt: number }>(
+              'SELECT COUNT(*)::INT AS cnt FROM notif_subscriptions WHERE id = ANY($1::TEXT[])',
+              [expiredTargetIds]
+            );
+            leftCount = Number(chk.rows[0]?.cnt ?? 0);
+          }
+          assert.equal(leftCount, 0, 'Background purge timer must delete expired unverified pending rows');
+          const stillAliveRes = await notifCtx.notifDb.query<{ cnt: number }>(
+            'SELECT COUNT(*)::INT AS cnt FROM notif_subscriptions WHERE id = ANY($1::TEXT[])',
+            [[earlySubNew.id, crowdSubIds[13]]]
+          );
+          assert.equal(
+            Number(stillAliveRes.rows[0]?.cnt ?? 0),
+            2,
+            'Purge must keep verified and non-expired pending rows intact'
+          );
+          assert.equal(await purgeExpiredPendingSubscriptions(notifCtx.notifDb), 0);
+        } finally {
+          await new Promise<void>((r) => purgeSrv.close(() => r()));
+        }
       } finally {
         await new Promise<void>((r) => d1Srv.close(() => r()));
       }

@@ -3603,29 +3603,29 @@ async function runTests(): Promise<void> {
               args: [140_00000000n],
             }),
           });
-          // Mark 150 entries with stale cachedClosedHaircutShortfall=true and run 2 background refresh passes (100 + 50)
-          const flaggedSubset = Array.from(spamSignedMap.values()).slice(0, 150);
+          // Mark 300 entries with stale cachedClosedHaircutShortfall=true and run 2 background refresh passes (250 + remaining)
+          const flaggedSubset = Array.from(spamSignedMap.values()).slice(0, 300);
           for (let f = 0; f < flaggedSubset.length; f++) {
             flaggedSubset[f].cachedClosedHaircutShortfall = true;
             flaggedSubset[f].lastRefreshedAtMs = 1000 + f;
           }
-          // Also ensure none of the remaining 1850 entries still have cachedClosedHaircutShortfall set so these 150 run first
-          for (const rec of Array.from(spamSignedMap.values()).slice(150)) {
+          // Also ensure none of the remaining 1700 entries still have cachedClosedHaircutShortfall set so these 300 run first
+          for (const rec of Array.from(spamSignedMap.values()).slice(300)) {
             rec.cachedClosedHaircutShortfall = false;
             rec.cachedStatus = 'open';
             rec.cachedOracleStale = false;
           }
           const refreshed1 = await runRelayBackgroundRefresh(spamCtx);
-          assert.equal(refreshed1, 100, 'First background refresh pass must handle 100 entries in 1 batch');
+          assert.equal(refreshed1, 250, 'First background refresh pass must handle 250 entries in 1 batch');
           const remainingAfter1 = flaggedSubset.filter((r) => r.cachedClosedHaircutShortfall).length;
           assert.ok(
             remainingAfter1 <= 50,
-            `First background refresh pass must clear at least 100 shortfall entries (remaining=${remainingAfter1})`
+            `First background refresh pass must clear at least 250 shortfall entries (remaining=${remainingAfter1})`
           );
           const refreshed2 = await runRelayBackgroundRefresh(spamCtx);
           assert.ok(refreshed2 >= remainingAfter1, 'Second background refresh pass must process remaining shortfall entries');
           const stillFlagged = flaggedSubset.filter((r) => r.cachedClosedHaircutShortfall);
-          assert.equal(stillFlagged.length, 0, 'Market reopen + background refresh must clear cachedClosedHaircutShortfall across all 150 entries');
+          assert.equal(stillFlagged.length, 0, 'Market reopen + background refresh must clear cachedClosedHaircutShortfall across all 300 entries');
 
           // Also verify timer-driven background refresh in createApiServer (relayBgRefreshIntervalMs)
           flaggedSubset[0].cachedClosedHaircutShortfall = true;

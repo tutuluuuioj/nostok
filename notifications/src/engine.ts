@@ -58,6 +58,7 @@ export interface NotificationsContext {
   cipher: PiiCipher;
   transports: ChannelTransports;
   dnsLookup: DnsLookupFn;
+  pendingPurgeIntervalMs?: number;
   state: {
     cycleCount: number;
     lastSyncTimestamp: string | null;

@@ -206,15 +206,33 @@ export function SubscriptionAction({ mode = 'confirm' }) {
                   <strong>Address unblocked.</strong> New NOSTOK alert subscription requests are enabled again for this address.
                 </>
               ) : isManage ? (
-                result.blocked ? (
-                  <>
-                    <strong>Sender wallet blocked.</strong> Wallet <code>{result.blocked_wallet}</code> is blocked and its pending request was removed.
-                  </>
-                ) : (
-                  <>
-                    <strong>Subscription confirmed.</strong> Channel {result.channel} ({result.id}) is now verified and active for {result.wallet_address}.
-                  </>
-                )
+                <>
+                  {result.blocked ? (
+                    <>
+                      <strong>Sender wallet blocked.</strong> Wallet <code>{result.blocked_wallet}</code> is blocked and its pending request was removed.
+                    </>
+                  ) : (
+                    <>
+                      <strong>Subscription confirmed.</strong> Channel {result.channel} ({result.id}) is now verified and active for {result.wallet_address}.
+                    </>
+                  )}
+                  {result.remaining_actions &&
+                  (result.remaining_actions.confirm > 0 || result.remaining_actions.block > 0) ? (
+                    <div className="actions" style={{ marginTop: '8px' }}>
+                      <button
+                        className="btn secondary"
+                        type="button"
+                        onClick={() => {
+                          setResult(null);
+                          void loadPreview(activeToken, manageOffset);
+                        }}
+                      >
+                        Review remaining pending requests ({result.remaining_actions.confirm} confirm,{' '}
+                        {result.remaining_actions.block} block(s) left)
+                      </button>
+                    </div>
+                  ) : null}
+                </>
               ) : (
                 <>
                   <strong>Subscription confirmed.</strong> Channel {result.channel} ({result.id}) is now verified and active for {result.wallet_address}.
@@ -226,7 +244,10 @@ export function SubscriptionAction({ mode = 'confirm' }) {
           {isManage && Array.isArray(previewData?.data) && !result ? (
             <div className="fields">
               <p className="hint">
-                Showing {previewData.data.length} of {previewData.pagination?.total ?? previewData.data.length} unique pending wallet(s).
+                Showing {previewData.data.length} of {previewData.pagination?.total ?? previewData.data.length} unique pending wallet(s)
+                {previewData.remaining_actions
+                  ? ` · Remaining link actions: ${previewData.remaining_actions.confirm} confirm, ${previewData.remaining_actions.block} block(s)`
+                  : ''}.
               </p>
               {previewData.data.length === 0 ? (
                 <p className="hint">No pending unverified requests waiting on this address.</p>
@@ -243,7 +264,11 @@ export function SubscriptionAction({ mode = 'confirm' }) {
                         onClick={() =>
                           void executePost(`confirm:${item.subscription_id}`, item.subscription_id, 'confirm')
                         }
-                        disabled={!activeToken || Boolean(submitting)}
+                        disabled={
+                          !activeToken ||
+                          Boolean(submitting) ||
+                          previewData?.remaining_actions?.confirm === 0
+                        }
                       >
                         Confirm
                       </button>
@@ -253,7 +278,11 @@ export function SubscriptionAction({ mode = 'confirm' }) {
                         onClick={() =>
                           void executePost(`block:${item.subscription_id}`, item.subscription_id, 'block')
                         }
-                        disabled={!activeToken || Boolean(submitting)}
+                        disabled={
+                          !activeToken ||
+                          Boolean(submitting) ||
+                          previewData?.remaining_actions?.block === 0
+                        }
                       >
                         Block wallet
                       </button>

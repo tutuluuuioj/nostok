@@ -555,7 +555,7 @@ const RELAY_STATE_CACHE_TTL_MS = 2000;
 const MAX_RELAY_REFRESH_PER_REQ = 120;
 const UNFUNDED_REFRESH_SLICE = 20;
 const BG_REFRESH_INTERVAL_MS = 30_000;
-const BG_REFRESH_BATCH_LIMIT = 100;
+const BG_REFRESH_BATCH_LIMIT = 250;
 const RELAY_MULTICALL_CHUNK = 250;
 const FALLBACK_SIGNED_ORDERS = new WeakMap<ApiContext, Map<string, RelaySignedOrderRecord>>();
 const MAKER_ORDER_LOCKS = new WeakMap<ApiContext, Map<string, Promise<void>>>();
@@ -1041,12 +1041,13 @@ async function batchRefreshRelayRecords(
   chainNowSec: bigint,
   chainBlockNum: bigint,
   chainRpcFailed = false,
-  forceRefresh = false
+  forceRefresh = false,
+  maxBatchSize = MAX_RELAY_REFRESH_PER_REQ
 ): Promise<boolean> {
   if (records.length === 0) return chainRpcFailed;
   const headState = getRelayHeadState(ctx);
   const nowMs = Date.now();
-  const capped = records.slice(0, MAX_RELAY_REFRESH_PER_REQ);
+  const capped = records.slice(0, maxBatchSize);
   if (chainRpcFailed) {
     for (const r of capped) {
       r.cachedRpcStale = true;
@@ -3166,30 +3167,56 @@ async function handleFees(ctx: ApiContext) {
 }
 
 /**
- * Refreshes up to BG_REFRESH_BATCH_LIMIT (100) cached unfunded, closed-haircut-shortfall,
- * or oracle-stale relay records per invocation so recovered or reopened orders update without
- * waiting for paginated GET /orders requests.
+ * Refreshes up to BG_REFRESH_BATCH_LIMIT (250) cached unfunded, closed-haircut-shortfall,
+ * or oracle-stale relay records per invocation so recovered or reopened orders update rapidly
+ * without waiting for paginated GET /orders requests. Prioritizes distinct makers oldest-first
+ * so maker-wide balance recovery reconciles sibling orders in the same pass.
  */
 export async function runRelayBackgroundRefresh(ctx: ApiContext): Promise<number> {
   const signedMap = getSignedOrdersMap(ctx);
   if (signedMap.size === 0) return 0;
 
-  const candidates = Array.from(signedMap.values())
+  const eligible = Array.from(signedMap.values())
     .filter(
       (r) =>
         r.cachedStatus === 'unfunded' ||
         r.cachedClosedHaircutShortfall ||
         r.cachedOracleStale
     )
-    .sort((a, b) => (a.lastRefreshedAtMs ?? 0) - (b.lastRefreshedAtMs ?? 0))
-    .slice(0, BG_REFRESH_BATCH_LIMIT);
+    .sort((a, b) => (a.lastRefreshedAtMs ?? 0) - (b.lastRefreshedAtMs ?? 0));
 
-  if (candidates.length === 0) return 0;
+  if (eligible.length === 0) return 0;
+
+  const candidates: RelaySignedOrderRecord[] = [];
+  const seenMakers = new Set<string>();
+  const deferred: RelaySignedOrderRecord[] = [];
+  for (const rec of eligible) {
+    const makerLower = rec.maker.toLowerCase();
+    if (!seenMakers.has(makerLower)) {
+      seenMakers.add(makerLower);
+      candidates.push(rec);
+      if (candidates.length >= BG_REFRESH_BATCH_LIMIT) break;
+    } else {
+      deferred.push(rec);
+    }
+  }
+  for (const rec of deferred) {
+    if (candidates.length >= BG_REFRESH_BATCH_LIMIT) break;
+    candidates.push(rec);
+  }
 
   const blk = await getLatestBlockForRelay(ctx, 0n);
   if (blk.rpcFailed) return 0;
 
-  await batchRefreshRelayRecords(ctx, candidates, blk.timestamp, blk.number, false, true);
+  await batchRefreshRelayRecords(
+    ctx,
+    candidates,
+    blk.timestamp,
+    blk.number,
+    false,
+    true,
+    BG_REFRESH_BATCH_LIMIT
+  );
   return candidates.length;
 }
 
