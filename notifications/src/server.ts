@@ -320,7 +320,7 @@ interface PendingTargetWalletEntry {
   wallet: string;
   verifyCodeHash: string;
   expiresAtSec: number | null;
-  updatedAtIso?: string;
+  createdAtIso?: string;
 }
 
 export async function purgeExpiredPendingSubscriptions(
@@ -435,15 +435,15 @@ async function queryPendingUniqueWalletsPage(
     wallet: string;
     verify_code_hash: string;
     verify_expires_at: string | null;
-    updated_at_iso: string;
+    created_at_iso: string;
   };
   const pageRes = keysetCursor
     ? await ctx.notifDb.query<PageRow>(
         `WITH ranked AS (
            SELECT id, wallet, verify_code_hash, verify_expires_at::TEXT AS verify_expires_at,
-                  updated_at,
-                  to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso,
-                  ROW_NUMBER() OVER (PARTITION BY LOWER(wallet) ORDER BY updated_at DESC, id ASC) AS rn
+                  created_at,
+                  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_iso,
+                  ROW_NUMBER() OVER (PARTITION BY LOWER(wallet) ORDER BY updated_at DESC, created_at DESC, id ASC) AS rn
            FROM notif_subscriptions
            WHERE verified = FALSE
              AND channel = $1
@@ -452,11 +452,11 @@ async function queryPendingUniqueWalletsPage(
              AND canonical_target_hash = $3
              AND created_at <= $4::TIMESTAMPTZ
          )
-         SELECT id, wallet, verify_code_hash, verify_expires_at, updated_at_iso
+         SELECT id, wallet, verify_code_hash, verify_expires_at, created_at_iso
          FROM ranked
          WHERE rn = 1
-           AND (updated_at < $5::TIMESTAMPTZ OR (updated_at = $5::TIMESTAMPTZ AND id > $6))
-         ORDER BY updated_at DESC, id ASC
+           AND (created_at < $5::TIMESTAMPTZ OR (created_at = $5::TIMESTAMPTZ AND id > $6))
+         ORDER BY created_at DESC, id ASC
          LIMIT $7`,
         [
           channel,
@@ -471,9 +471,9 @@ async function queryPendingUniqueWalletsPage(
     : await ctx.notifDb.query<PageRow>(
         `WITH ranked AS (
            SELECT id, wallet, verify_code_hash, verify_expires_at::TEXT AS verify_expires_at,
-                  updated_at,
-                  to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso,
-                  ROW_NUMBER() OVER (PARTITION BY LOWER(wallet) ORDER BY updated_at DESC, id ASC) AS rn
+                  created_at,
+                  to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_iso,
+                  ROW_NUMBER() OVER (PARTITION BY LOWER(wallet) ORDER BY updated_at DESC, created_at DESC, id ASC) AS rn
            FROM notif_subscriptions
            WHERE verified = FALSE
              AND channel = $1
@@ -482,10 +482,10 @@ async function queryPendingUniqueWalletsPage(
              AND canonical_target_hash = $3
              AND created_at <= $4::TIMESTAMPTZ
          )
-         SELECT id, wallet, verify_code_hash, verify_expires_at, updated_at_iso
+         SELECT id, wallet, verify_code_hash, verify_expires_at, created_at_iso
          FROM ranked
          WHERE rn = 1
-         ORDER BY updated_at DESC, id ASC
+         ORDER BY created_at DESC, id ASC
          LIMIT $5 OFFSET $6`,
         [channel, nowStr, canonicalTargetHash, effectiveAsOf, limitPlusOne, offset]
       );
@@ -497,12 +497,12 @@ async function queryPendingUniqueWalletsPage(
     wallet: row.wallet,
     verifyCodeHash: row.verify_code_hash,
     expiresAtSec: row.verify_expires_at ? Number(row.verify_expires_at) : null,
-    updatedAtIso: row.updated_at_iso,
+    createdAtIso: row.created_at_iso,
   }));
   const last = items.length > 0 ? items[items.length - 1] : null;
   const nextCursor =
-    hasMore && last?.updatedAtIso
-      ? encodeManageCursor({ ts: last.updatedAtIso, id: last.id })
+    hasMore && last?.createdAtIso
+      ? encodeManageCursor({ ts: last.createdAtIso, id: last.id })
       : null;
   return { total, items, asOfIso: effectiveAsOf, nextCursor, hasMore };
 }

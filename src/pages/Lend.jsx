@@ -57,7 +57,7 @@ function computeOpenLendOffersRawTotal(
   marketOrders = [],
   excludeHashes = null
 ) {
-  if (!walletAddress) return 0n;
+  if (!walletAddress) return { totalRaw: 0n, hasUnknown: false };
   const addrLower = walletAddress.toLowerCase();
   const seenHashes = new Set();
   if (excludeHashes) {
@@ -65,29 +65,37 @@ function computeOpenLendOffersRawTotal(
       if (h) seenHashes.add(String(h).toLowerCase());
     }
   }
-  let total = 0n;
+  let totalRaw = 0n;
+  let hasUnknown = false;
 
   for (const item of persistedList ?? []) {
-    const st = item?.onchainStatus;
-    if (st !== 'open' && st !== 'partially_filled') continue;
     const maker = String(item?.offerJson?.lender ?? '').toLowerCase();
     if (maker !== addrLower) continue;
     const h = String(item?.orderHash ?? '').toLowerCase();
+    const st = item?.onchainStatus;
+    if (st === 'unknown') hasUnknown = true;
+    if (st !== 'open' && st !== 'partially_filled' && st !== 'unknown') {
+      if (h) seenHashes.add(h);
+      continue;
+    }
     if (h && seenHashes.has(h)) continue;
     if (h) seenHashes.add(h);
-    total += BigInt(item.remainingRaw ?? item.offerJson?.usdcAmount ?? 0n);
+    totalRaw += BigInt(item.remainingRaw ?? item.offerJson?.usdcAmount ?? 0n);
   }
 
   for (const row of marketOrders ?? []) {
     if (row.order_type !== 'lend' && row.order_type !== 'LendOffer') continue;
-    if (row.status !== 'open' && row.status !== 'partially_filled') continue;
+    if (!row?.signed_order || !row?.signature) continue;
     if (String(row.maker ?? '').toLowerCase() !== addrLower) continue;
+    const st = row.status;
+    if (st === 'unknown') hasUnknown = true;
+    if (st !== 'open' && st !== 'partially_filled' && st !== 'unknown') continue;
     const h = String(row.order_hash ?? '').toLowerCase();
     if (h && seenHashes.has(h)) continue;
     if (h) seenHashes.add(h);
-    total += BigInt(row.remaining_usdc?.raw ?? row.min_usdc?.raw ?? 0n);
+    totalRaw += BigInt(row.remaining_usdc?.raw ?? row.min_usdc?.raw ?? 0n);
   }
-  return total;
+  return { totalRaw, hasUnknown };
 }
 
 export function Lend() {
@@ -134,6 +142,7 @@ export function Lend() {
   const [borrowMultiFillPlanStr, setBorrowMultiFillPlanStr] = useState('');
   const [borrowPreviewBusy, setBorrowPreviewBusy] = useState(false);
   const [borrowPreview, setBorrowPreview] = useState(null);
+  const borrowPreviewSeqRef = useRef(0);
   const [borrowFillBusy, setBorrowFillBusy] = useState(false);
   const [borrowFillResult, setBorrowFillResult] = useState(null);
   const [borrowFillError, setBorrowFillError] = useState('');
@@ -224,6 +233,7 @@ export function Lend() {
 
   useEffect(() => {
     quoteSeqRef.current += 1;
+    borrowPreviewSeqRef.current += 1;
     setQuoteLoading(false);
     setQuoteResult(null);
     setQuoteError('');
@@ -233,6 +243,7 @@ export function Lend() {
     setCancelError('');
     setCancelNotice('');
     setAllowanceReductionState(null);
+    setBorrowPreviewBusy(false);
     setBorrowPreview(null);
     setBorrowFillResult(null);
     setBorrowFillError('');
@@ -254,7 +265,7 @@ export function Lend() {
         web3?.address,
         persistedOffers,
         marketState.data?.orders
-      ),
+      ).totalRaw,
     [marketState.data?.orders, persistedOffers, web3?.address]
   );
 
@@ -389,11 +400,23 @@ export function Lend() {
     if (!prinRawStr || !minRawStr) return '';
     const prin = BigInt(prinRawStr);
     const minFill = BigInt(minRawStr);
+    const messages = [];
     if (prin > minFill && prin - minFill < 500_000_000n) {
-      return `Warning (PARTIAL_REMAINDER_BELOW_500): Filling $${formatTokenUnitsDisplay(minFill, USDC_DECIMALS, 2)} leaves $${formatTokenUnitsDisplay(prin - minFill, USDC_DECIMALS, 2)} (< $500), which cannot be partially filled afterward.`;
+      messages.push(
+        `Warning (PARTIAL_REMAINDER_BELOW_500): Filling $${formatTokenUnitsDisplay(minFill, USDC_DECIMALS, 2)} leaves $${formatTokenUnitsDisplay(prin - minFill, USDC_DECIMALS, 2)} (< $500.00), which is unfillable on-chain (LoanCore PRINCIPAL_BELOW_MINIMUM) and can only be cancelled or expire.`
+      );
     }
-    return '';
-  }, [exactOfferAmounts, minFillStr, usdcStr]);
+    const planParsed = parseRawListInput(partialPlanStr, USDC_DECIMALS, 'USDC partial fill');
+    if (!planParsed.error && planParsed.list?.length) {
+      const planSum = planParsed.list.reduce((acc, item) => acc + BigInt(item), 0n);
+      if (prin > planSum && prin - planSum < 500_000_000n) {
+        messages.push(
+          `Warning (PLAN_REMAINDER_BELOW_500): Planned fills leave $${formatTokenUnitsDisplay(prin - planSum, USDC_DECIMALS, 2)} (< $500.00), which is unfillable on-chain and can only be cancelled or expire.`
+        );
+      }
+    }
+    return messages.join(' ');
+  }, [exactOfferAmounts, minFillStr, partialPlanStr, usdcStr]);
 
   const eligibilityInfo = lendMeta.data?.eligibility ?? null;
   const eligibilityStatusText = eligibilityInfo
@@ -544,19 +567,26 @@ export function Lend() {
       setMarketState({ loading: false, data: freshMarkets });
     }
     const exclude = cancelledHash ? new Set([String(cancelledHash).toLowerCase()]) : null;
-    const remainingOpenRaw = allInvalidated
-      ? 0n
+    const remainingSummary = allInvalidated
+      ? { totalRaw: 0n, hasUnknown: false }
       : computeOpenLendOffersRawTotal(
           web3.address,
           freshPersisted,
           freshMarkets?.orders,
           exclude
         );
+    const blockedByUnknown =
+      !allInvalidated &&
+      (remainingSummary.hasUnknown || !freshMarkets || Boolean(freshMarkets?.stale));
     const liveAllowanceRaw = freshMeta ? BigInt(freshMeta.allowanceRaw) : allowanceRawBig;
-    if (liveAllowanceRaw > remainingOpenRaw) {
+    if (
+      liveAllowanceRaw > remainingSummary.totalRaw ||
+      (blockedByUnknown && liveAllowanceRaw > 0n)
+    ) {
       setAllowanceReductionState({
         currentAllowanceRaw: liveAllowanceRaw.toString(),
-        targetAllowanceRaw: remainingOpenRaw.toString(),
+        targetAllowanceRaw: remainingSummary.totalRaw.toString(),
+        blockedByUnknown,
       });
     } else {
       setAllowanceReductionState(null);
@@ -565,6 +595,12 @@ export function Lend() {
 
   async function handleReduceAllowanceAfterCancel() {
     if (txBusyRef.current || !web3?.address || !allowanceReductionState) return;
+    if (allowanceReductionState.blockedByUnknown) {
+      setCancelError(
+        'Cannot reduce LoanCore USDC allowance while an open LendOffer has unknown on-chain status or RPC is degraded; refresh offer status first.'
+      );
+      return;
+    }
     setCancelError('');
     txBusyRef.current = true;
     setTxBusy('reduce-allowance');
@@ -733,6 +769,7 @@ export function Lend() {
       return;
     }
 
+    const previewSeq = ++borrowPreviewSeqRef.current;
     setBorrowPreviewBusy(true);
     try {
       const preview = await verifyAndPreviewBorrowOrderFill({
@@ -745,14 +782,18 @@ export function Lend() {
         lenderAttestation: web3?.attestationHex ?? '0x',
         cfg: web3?.config,
       });
+      if (previewSeq !== borrowPreviewSeqRef.current) return;
       setBorrowPreview({
         ...preview,
         perFillUsdcRawList: multiPlan.list,
       });
     } catch (err) {
+      if (previewSeq !== borrowPreviewSeqRef.current) return;
       setBorrowFillError(formatWeb3Error(err));
     } finally {
-      setBorrowPreviewBusy(false);
+      if (previewSeq === borrowPreviewSeqRef.current) {
+        setBorrowPreviewBusy(false);
+      }
     }
   }
 
@@ -1084,22 +1125,26 @@ export function Lend() {
             <p>
               Warning: LoanCore USDC allowance is still $
               {formatTokenUnitsDisplay(allowanceReductionState.currentAllowanceRaw, USDC_DECIMALS, 2)}{' '}
-              ({allowanceReductionState.currentAllowanceRaw} raw), above your remaining open
+              ({allowanceReductionState.currentAllowanceRaw} raw), above your remaining known open
               LendOffers ($
               {formatTokenUnitsDisplay(allowanceReductionState.targetAllowanceRaw, USDC_DECIMALS, 2)}{' '}
-              / {allowanceReductionState.targetAllowanceRaw} raw). Reduce or revoke excess allowance
-              to limit contract exposure.
+              / {allowanceReductionState.targetAllowanceRaw} raw).{' '}
+              {allowanceReductionState.blockedByUnknown
+                ? 'One or more offers currently have unknown on-chain status; allowance reduction is blocked until "Refresh on-chain offer status" reads cleanly.'
+                : 'Reduce or revoke excess allowance to limit contract exposure.'}
             </p>
             <div className="actions" style={{ marginTop: 8 }}>
               <button
                 className="btn secondary"
                 type="button"
                 onClick={() => void handleReduceAllowanceAfterCancel()}
-                disabled={Boolean(txBusy)}
+                disabled={Boolean(txBusy) || Boolean(allowanceReductionState.blockedByUnknown)}
               >
-                {txBusy === 'reduce-allowance'
-                  ? 'Updating LoanCore USDC allowance…'
-                  : `Reduce LoanCore USDC allowance to $${formatTokenUnitsDisplay(allowanceReductionState.targetAllowanceRaw, USDC_DECIMALS, 2)}`}
+                {allowanceReductionState.blockedByUnknown
+                  ? 'Reduction blocked (unknown offer status)'
+                  : txBusy === 'reduce-allowance'
+                    ? 'Updating LoanCore USDC allowance…'
+                    : `Reduce LoanCore USDC allowance to $${formatTokenUnitsDisplay(allowanceReductionState.targetAllowanceRaw, USDC_DECIMALS, 2)}`}
               </button>
             </div>
           </div>
@@ -1271,8 +1316,8 @@ export function Lend() {
             </Field>
             <Field
               id="borrow-fill-plan"
-              label="Optional multi-fill USDC approval plan"
-              hint="Comma-separated per-fill amounts (e.g. 700, 700) so LoanCore approval covers sum(per-fill)."
+              label="Optional multi-fill USDC approval plan (includes current fill first)"
+              hint="Comma-separated per-fill sequence starting with the current fill (e.g. 700, 700 when current fill is 700) so LoanCore approval covers sum(plan). Every fill must be >= max(minFill, $500)."
             >
               {(props) => (
                 <TextInput

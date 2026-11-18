@@ -2296,7 +2296,8 @@ async function runTests(): Promise<void> {
         1_800_000_000n,
         'Partial-fill lend allowance must cover existing open offers plus validated per-fill chunks'
       );
-      // Item 3: Partial-fill plan validation rejects sums > offer/remaining or chunks below minFill/$500 other than final closing remainder
+      // Low 1 & 2: Partial-fill plan validation rejects sums > offer/remaining, ANY chunk < max(minFill, $500),
+      // and plans whose first entry is not the current fill; warns when a < $500 remainder is unfillable.
       assert.throws(
         () =>
           computeLendApprovalAmountRaw('1000000000', {
@@ -2314,31 +2315,38 @@ async function runTests(): Promise<void> {
       assert.throws(
         () =>
           computeLendApprovalAmountRaw('1000000000', {
-            perFillUsdcRawList: ['400000000', '600000000'],
+            perFillUsdcRawList: ['600000000', '400000000'],
           }),
-        /below minimum fill/
+        /PRINCIPAL_BELOW_MINIMUM/
       );
       assert.throws(
         () =>
           computeLendApprovalAmountRaw('1100000000', {
-            perFillUsdcRawList: ['500000000', '600000000'],
+            perFillUsdcRawList: ['600000000', '500000000'],
             minFillRaw: '600000000',
           }),
         /below minimum fill/
       );
       assert.throws(
         () =>
-          computeLendApprovalAmountRaw('1000000000', {
-            perFillUsdcRawList: ['600000000', '300000000'],
+          computeLendApprovalAmountRaw('700000000', {
+            perFillUsdcRawList: ['500000000', '500000000'],
+            maxAllowedTotalRaw: '1700000000',
           }),
-        /below minimum fill/
+        /first entry/
       );
-      const validClosingPlan = validateLendPartialFillPlan(
-        ['600000000', '500000000'],
-        '1100000000',
-        '600000000'
+      const unfillableRemPlan = computeLendApprovalAmountRaw('1000000000', {
+        perFillUsdcRawList: ['600000000'],
+        maxAllowedTotalRaw: '1000000000',
+      });
+      assert.equal(unfillableRemPlan.remainderAfterPlanRaw, 400_000_000n);
+      assert.match(unfillableRemPlan.remainderWarning, /unfillable/i);
+      assert.deepEqual(
+        validateLendPartialFillPlan(['700000000', '700000000'], '1400000000', '600000000', {
+          expectedFirstFillRaw: '700000000',
+        }),
+        [700_000_000n, 700_000_000n]
       );
-      assert.deepEqual(validClosingPlan, [600_000_000n, 500_000_000n]);
 
       assert.equal(
         computeBorrowCollateralForFill(10_000_000_000_000_000_001n, 1_400_000_000n, 700_000_000n),
@@ -2685,7 +2693,7 @@ async function runTests(): Promise<void> {
         /SelfLoanNotAllowed/
       );
 
-      // Item 3: Partial-fill plan exceeding remaining BorrowOrder must reject before any approval or fill
+      // Item 3 & Low 2: Partial-fill plan whose first entry != current fill OR whose sum exceeds remaining BorrowOrder must reject
       await assert.rejects(
         () =>
           fillBorrowOrderAsLender({
@@ -2693,7 +2701,20 @@ async function runTests(): Promise<void> {
             order: borrowOrder1400.order,
             signature: borrowOrder1400.signature,
             fillUsdcRaw: '700000000',
-            perFillUsdcRawList: ['900000000', '900000000'],
+            perFillUsdcRawList: ['500000000', '500000000'],
+            provider: walletProvider,
+            cfg,
+          }),
+        /first entry/
+      );
+      await assert.rejects(
+        () =>
+          fillBorrowOrderAsLender({
+            address: ADDRESSES.lender,
+            order: borrowOrder1400.order,
+            signature: borrowOrder1400.signature,
+            fillUsdcRaw: '700000000',
+            perFillUsdcRawList: ['700000000', '800000000'],
             provider: walletProvider,
             cfg,
           }),
@@ -2829,6 +2850,22 @@ async function runTests(): Promise<void> {
       });
 
       walletProvider.setAccount(KEYS.lender);
+      // Low 3: Even with storage = null AND existingOpenSumRaw omitted, resolveOpenLendOffersSumRaw MUST read relay open LendOffers!
+      const previewA1RelayOnly = await verifyAndPreviewBorrowOrderFill({
+        order: borrowOrderA1.order,
+        signature: borrowOrderA1.signature,
+        fillUsdcRaw: '600000000',
+        lenderAddress: ADDRESSES.lender,
+        storage: null,
+        cfg,
+      });
+      assert.equal(
+        previewA1RelayOnly.existingOpenSumRaw,
+        '1000000000',
+        'Relay-only open LendOffer ($1,000) must be included when storage & existingOpenSumRaw are omitted'
+      );
+      assert.equal(previewA1RelayOnly.requiredApprovalRaw, '1600000000');
+
       const previewA1 = await verifyAndPreviewBorrowOrderFill({
         order: borrowOrderA1.order,
         signature: borrowOrderA1.signature,
@@ -2847,7 +2884,7 @@ async function runTests(): Promise<void> {
         signature: borrowOrderA1.signature,
         fillUsdcRaw: '600000000',
         expectedPreview: previewA1,
-        storage: lendStorage,
+        storage: null,
         autoApprove: true,
         provider: walletProvider,
         cfg,
@@ -3024,6 +3061,72 @@ async function runTests(): Promise<void> {
         /PositionNFT owner mismatch/
       );
 
+      // Low 1 & Low 4: Remainder < $500 preview warning states unfillable, and unknown persisted offer state fails closed!
+      walletProvider.setAccount(KEYS.borrower);
+      const quote1000Rem = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '1000000000',
+        termDays: 30,
+        aprBps: 950,
+        maxLtvBps: 6000,
+        borrower: ADDRESSES.borrower,
+      });
+      const borrowOrder1000Rem = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '1000000000',
+        expectedQuote: quote1000Rem,
+        maxRateBps: 950,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '500000000',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: false,
+        provider: walletProvider,
+        cfg,
+      });
+      walletProvider.setAccount(KEYS.lender);
+      const remWarnPreview = await verifyAndPreviewBorrowOrderFill({
+        order: borrowOrder1000Rem.order,
+        signature: borrowOrder1000Rem.signature,
+        fillUsdcRaw: '600000000',
+        lenderAddress: ADDRESSES.lender,
+        existingOpenSumRaw: '0',
+        cfg,
+      });
+      const lowRemWarn = remWarnPreview.warnings.find((w) => w.code === 'PARTIAL_REMAINDER_BELOW_500');
+      assert.ok(lowRemWarn && /unfillable/i.test(lowRemWarn.message), 'Remainder < $500 preview warning must explain it is unfillable on-chain');
+
+      const rpcFailClient = new Proxy(publicClient, {
+        get(target, prop) {
+          if (prop === 'readContract') {
+            return async (args: { functionName?: string }) => {
+              if (args?.functionName === 'hashLendOffer') {
+                throw new Error('simulated RPC timeout');
+              }
+              return target.readContract(args as never);
+            };
+          }
+          const v = Reflect.get(target, prop);
+          return typeof v === 'function' ? v.bind(target) : v;
+        },
+      });
+      await assert.rejects(
+        () =>
+          verifyAndPreviewBorrowOrderFill({
+            order: borrowOrder1000Rem.order,
+            signature: borrowOrder1000Rem.signature,
+            fillUsdcRaw: '1000000000',
+            lenderAddress: ADDRESSES.lender,
+            storage: lendStorage,
+            publicClient: rpcFailClient as never,
+            cfg,
+          }),
+        /Cannot verify open LendOffer/
+      );
+
       // Verify indexer/API reflects new loans and lender's newly minted PositionNFT IDs
       await runIndexerSync(idxCtx);
       const ws34PosRes = await fetchPaginatedApiRows(`${cfg.apiUrl}/positions?owner=${ADDRESSES.lender}`, { cfg });
@@ -3069,14 +3172,19 @@ async function runTests(): Promise<void> {
         liveLendHtml,
         /<button[^>]*disabled=""[^>]*>3\. Sign &amp; publish LendOffer<\/button>/
       );
-      // Item 7 UI source guard check: account/chain switch useEffect resets preview/quote/action states
+      // Item 7 + Lows 2, 4, 5 UI source guard check: account/chain switch useEffect resets preview/quote/action states,
+      // BorrowOrder preview uses request sequence guard, unknown offer states block reduction & plan hint clarifies current fill first
       const lendSrc = fs.readFileSync(path.join(process.cwd(), 'src/pages/Lend.jsx'), 'utf8');
       assert.ok(
         lendSrc.includes('[web3?.address, web3?.chainId, web3?.wrongNetwork]') &&
+          lendSrc.includes('borrowPreviewSeqRef.current') &&
+          lendSrc.includes('blockedByUnknown') &&
+          lendSrc.includes("st !== 'unknown'") &&
+          lendSrc.includes('includes current fill first') &&
           lendSrc.includes('setBorrowPreview(null)') &&
           lendSrc.includes('setQuoteResult(null)') &&
           lendSrc.includes('setUsdcAllowanceForLend'),
-        'Lend.jsx must reset quote/preview state on account/network switch and support post-cancel allowance reduction'
+        'Lend.jsx must enforce account/network resets, BorrowOrder preview seq guard, conservative unknown-status handling, and clear fill-plan labels'
       );
       console.log('PASS WS3.4 Piece 2: Live Lend.jsx SSR, LoanCore approval, LendOffer sign/cancel, & BorrowOrder fill UI verified.');
 

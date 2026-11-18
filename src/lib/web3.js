@@ -972,14 +972,15 @@ export function sumRawBigints(values) {
 
 /**
  * Validates a planned sequence of partial-fill USDC amounts against an order/remaining total
- * and minimum fill rule (`max(minFill, $500)`). Rejects plans whose sum exceeds the total cap
- * or contain non-final fills below minimum (a final fill below minimum is valid only when it
- * closes out the exact remaining amount).
+ * and minimum fill rule (`max(minFill, $500)`). Rejects plans whose sum exceeds the total cap,
+ * plans with any chunk below `max(minFill, $500)` (`LoanCore` enforces `$500` minimum principal
+ * via `PRINCIPAL_BELOW_MINIMUM`), and fill plans whose first entry is not the current fill amount.
  */
 export function validateLendPartialFillPlan(
   perFillUsdcRawList,
   maxAllowedTotalRaw,
-  minFillRaw = null
+  minFillRaw = null,
+  { expectedFirstFillRaw = null } = {}
 ) {
   if (!Array.isArray(perFillUsdcRawList)) return [];
   const cleaned = perFillUsdcRawList
@@ -1002,6 +1003,16 @@ export function validateLendPartialFillPlan(
     }
     return v;
   });
+  if (
+    expectedFirstFillRaw !== null &&
+    expectedFirstFillRaw !== undefined &&
+    parsed[0] !== BigInt(expectedFirstFillRaw)
+  ) {
+    const expectedFirst = BigInt(expectedFirstFillRaw);
+    throw new Error(
+      `Partial-fill plan must include the current fill ($${formatTokenUnitsDisplay(expectedFirst, USDC_DECIMALS, 2)}) as its first entry (got $${formatTokenUnitsDisplay(parsed[0], USDC_DECIMALS, 2)}).`
+    );
+  }
   const sum = parsed.reduce((acc, v) => acc + v, 0n);
   if (sum > maxTotal) {
     throw new Error(
@@ -1010,10 +1021,9 @@ export function validateLendPartialFillPlan(
   }
   for (let i = 0; i < parsed.length; i += 1) {
     const v = parsed[i];
-    const isLast = i === parsed.length - 1;
-    if (v < effectiveMin && (!isLast || sum !== maxTotal)) {
+    if (v < effectiveMin) {
       throw new Error(
-        `Planned fill #${i + 1} ($${formatTokenUnitsDisplay(v, USDC_DECIMALS, 2)}) is below minimum fill ($${formatTokenUnitsDisplay(effectiveMin, USDC_DECIMALS, 2)}); only the final exact-remainder fill may be below minimum.`
+        `Planned fill #${i + 1} ($${formatTokenUnitsDisplay(v, USDC_DECIMALS, 2)}) is below minimum fill ($${formatTokenUnitsDisplay(effectiveMin, USDC_DECIMALS, 2)}); LoanCore requires every chunk >= max(minFill, $500.00) (PRINCIPAL_BELOW_MINIMUM).`
       );
     }
   }
@@ -1023,7 +1033,8 @@ export function validateLendPartialFillPlan(
 /**
  * Computes exact raw USDC allowance needed on LoanCore for signing a LendOffer
  * or executing partial/multi-fill lender transactions. Covers the fill/offer
- * requirement (or validated partial-fill plan sum) plus any open offer total.
+ * requirement (or validated partial-fill plan sum, which includes the current fill
+ * as its first entry when filling an order) plus any open offer total.
  */
 export function computeLendApprovalAmountRaw(
   usdcAmountRaw,
@@ -1032,6 +1043,7 @@ export function computeLendApprovalAmountRaw(
     existingOpenSumRaw = 0n,
     minFillRaw = null,
     maxAllowedTotalRaw = null,
+    matchCurrentFillFirst = false,
   } = {}
 ) {
   const orderUsdcRaw = BigInt(usdcAmountRaw);
@@ -1046,14 +1058,25 @@ export function computeLendApprovalAmountRaw(
   if (maxTotal < orderUsdcRaw) {
     throw new Error('Offer or remaining USDC cap cannot be below current fill/order amount.');
   }
-  validateLendPartialFillPlan(perFillUsdcRawList, maxTotal, minFillRaw);
-  const plannedFillsSum = sumRawBigints(perFillUsdcRawList);
+  const mustStartWithCurrentFill = matchCurrentFillFirst || maxTotal > orderUsdcRaw;
+  const parsedPlan = validateLendPartialFillPlan(perFillUsdcRawList, maxTotal, minFillRaw, {
+    expectedFirstFillRaw: mustStartWithCurrentFill ? orderUsdcRaw : null,
+  });
+  const plannedFillsSum = sumRawBigints(parsedPlan);
   const orderRequirement = plannedFillsSum > orderUsdcRaw ? plannedFillsSum : orderUsdcRaw;
+  const remainderAfterPlanRaw =
+    plannedFillsSum > 0n && maxTotal > plannedFillsSum ? maxTotal - plannedFillsSum : 0n;
+  const remainderWarning =
+    remainderAfterPlanRaw > 0n && remainderAfterPlanRaw < PROTOCOL_MIN_FILL_USDC_RAW
+      ? `Planned fills leave $${formatTokenUnitsDisplay(remainderAfterPlanRaw, USDC_DECIMALS, 2)} (< $500.00), which is unfillable on-chain (LoanCore PRINCIPAL_BELOW_MINIMUM) and can only be cancelled or expire.`
+      : '';
   return {
     orderUsdcRaw,
     plannedFillsSum,
     existingOpenSumRaw: existingSum,
     requiredApprovalRaw: existingSum + orderRequirement,
+    remainderAfterPlanRaw,
+    remainderWarning,
   };
 }
 
@@ -2350,10 +2373,10 @@ export async function verifyAndPreviewLendOfferFill({
 
   const warnings = [...(quote.warnings ?? [])];
   const remainderAfterFillRaw = remainingBig - fillUsdcBig;
-  if (remainderAfterFillRaw > 0n && remainderAfterFillRaw < 500_000_000n) {
+  if (remainderAfterFillRaw > 0n && remainderAfterFillRaw < PROTOCOL_MIN_FILL_USDC_RAW) {
     warnings.push({
       code: 'PARTIAL_REMAINDER_BELOW_500',
-      message: `Filling ${formatTokenUnitsDisplay(fillUsdcBig, USDC_DECIMALS, 2)} USDC leaves ${formatTokenUnitsDisplay(remainderAfterFillRaw, USDC_DECIMALS, 2)} USDC remaining (< $500); that remainder can only be filled in full or expired.`,
+      message: `Filling ${formatTokenUnitsDisplay(fillUsdcBig, USDC_DECIMALS, 2)} USDC leaves ${formatTokenUnitsDisplay(remainderAfterFillRaw, USDC_DECIMALS, 2)} USDC remaining (< $500.00), which is unfillable on-chain (LoanCore PRINCIPAL_BELOW_MINIMUM) and can only be cancelled or expire.`,
     });
   }
 
@@ -2697,21 +2720,32 @@ export function computeBorrowCollateralForFill(collateralAmountRaw, totalUsdcRaw
   return (collateral * fill + (total - 1n)) / total;
 }
 
-export function sumOpenSignedLendOffersRaw(offers, lenderAddress = null) {
+export function sumOpenSignedLendOffersRaw(offers, lenderAddress = null, { includeUnknown = true } = {}) {
   if (!Array.isArray(offers) || offers.length === 0) return 0n;
   const targetLender =
     lenderAddress && isAddress(lenderAddress) ? getAddress(lenderAddress).toLowerCase() : null;
   return offers.reduce((acc, item) => {
-    if (item?.onchainStatus !== 'open' && item?.onchainStatus !== 'partially_filled') {
+    const st = item?.onchainStatus ?? item?.status;
+    if (st !== 'open' && st !== 'partially_filled' && !(includeUnknown && st === 'unknown')) {
       return acc;
     }
     if (targetLender) {
       const maker = String(
-        item?.offer?.lender ?? item?.offerJson?.lender ?? item?.lender ?? ''
+        item?.offer?.lender ?? item?.offerJson?.lender ?? item?.lender ?? item?.maker ?? ''
       ).toLowerCase();
       if (maker && maker !== targetLender) return acc;
     }
-    return acc + BigInt(item?.remainingRaw ?? item?.offer?.usdcAmount ?? item?.offerJson?.usdcAmount ?? 0n);
+    return (
+      acc +
+      BigInt(
+        item?.remainingRaw ??
+          item?.remaining_usdc?.raw ??
+          item?.offer?.usdcAmount ??
+          item?.offerJson?.usdcAmount ??
+          item?.min_usdc?.raw ??
+          0n
+      )
+    );
   }, 0n);
 }
 
@@ -2725,18 +2759,54 @@ async function resolveOpenLendOffersSumRaw({
   if (existingOpenSumRaw !== null && existingOpenSumRaw !== undefined) {
     return BigInt(existingOpenSumRaw);
   }
+  if (!lenderAddress) return 0n;
+  const targetChecksum = getAddress(lenderAddress);
+  const targetLender = targetChecksum.toLowerCase();
+  const seenHashes = new Set();
+  let total = 0n;
+
   const persisted = loadPersistedSignedLendOffers(storage);
-  if (!lenderAddress || persisted.length === 0) return 0n;
-  const targetLender = getAddress(lenderAddress).toLowerCase();
   const mine = persisted.filter((item) => {
     const maker = String(
       item?.offer?.lender ?? item?.offerJson?.lender ?? item?.lender ?? ''
     ).toLowerCase();
     return !maker || maker === targetLender;
   });
-  if (mine.length === 0) return 0n;
-  const synced = await refreshSignedLendOffersState({ offers: mine, cfg, publicClient });
-  return sumOpenSignedLendOffersRaw(synced, targetLender);
+  if (mine.length > 0) {
+    const synced = await refreshSignedLendOffersState({ offers: mine, cfg, publicClient });
+    for (const item of synced) {
+      const h = String(item?.orderHash ?? '').toLowerCase();
+      if (h) seenHashes.add(h);
+      if (item?.onchainStatus === 'unknown') {
+        throw new Error(
+          `Cannot verify open LendOffer ${item.orderHash ?? ''} status on-chain (${item.stateError ?? 'unknown'}); supply existingOpenSumRaw or retry when RPC recovers.`
+        );
+      }
+      if (item?.onchainStatus === 'open' || item?.onchainStatus === 'partially_filled') {
+        total += BigInt(item?.remainingRaw ?? item?.offer?.usdcAmount ?? item?.offerJson?.usdcAmount ?? 0n);
+      }
+    }
+  }
+
+  if (cfg?.apiUrl) {
+    const relayRes = await fetchPaginatedApiRows(
+      `${cfg.apiUrl}/orders?order_type=lend&maker=${targetChecksum}`,
+      { cfg }
+    );
+    for (const row of relayRes.rows ?? []) {
+      if (String(row?.maker ?? '').toLowerCase() !== targetLender) continue;
+      if (row?.order_type !== 'lend' && row?.order_type !== 'LendOffer') continue;
+      if (!row?.signed_order || !row?.signature) continue;
+      const h = String(row?.order_hash ?? '').toLowerCase();
+      if (h && seenHashes.has(h)) continue;
+      if (h) seenHashes.add(h);
+      if (row?.status === 'open' || row?.status === 'partially_filled' || row?.status === 'unknown') {
+        total += BigInt(row?.remaining_usdc?.raw ?? row?.min_usdc?.raw ?? 0n);
+      }
+    }
+  }
+
+  return total;
 }
 
 async function resolveQuoteAssetForLendOffer({
@@ -3210,6 +3280,7 @@ export async function verifyAndPreviewBorrowOrderFill({
     existingOpenSumRaw: resolvedExistingOpenSumRaw,
     minFillRaw: normalizedOrder.minFill,
     maxAllowedTotalRaw: remainingBig,
+    matchCurrentFillFirst: true,
   });
   if (cfg.contracts.eligibilityGate) {
     const gateAddr = getAddress(cfg.contracts.eligibilityGate);
@@ -3258,10 +3329,16 @@ export async function verifyAndPreviewBorrowOrderFill({
   });
   const warnings = [...(quote.warnings ?? [])];
   const remainderAfterFillRaw = remainingBig - fillUsdcBig;
-  if (remainderAfterFillRaw > 0n && remainderAfterFillRaw < 500_000_000n) {
+  if (remainderAfterFillRaw > 0n && remainderAfterFillRaw < PROTOCOL_MIN_FILL_USDC_RAW) {
     warnings.push({
       code: 'PARTIAL_REMAINDER_BELOW_500',
-      message: `Filling ${formatTokenUnitsDisplay(fillUsdcBig, USDC_DECIMALS, 2)} USDC leaves ${formatTokenUnitsDisplay(remainderAfterFillRaw, USDC_DECIMALS, 2)} USDC remaining (< $500); that remainder can only be filled in full or expired.`,
+      message: `Filling ${formatTokenUnitsDisplay(fillUsdcBig, USDC_DECIMALS, 2)} USDC leaves ${formatTokenUnitsDisplay(remainderAfterFillRaw, USDC_DECIMALS, 2)} USDC remaining (< $500.00), which is unfillable on-chain (LoanCore PRINCIPAL_BELOW_MINIMUM) and can only be cancelled or expire.`,
+    });
+  }
+  if (approvalSizing.remainderWarning) {
+    warnings.push({
+      code: 'PLAN_REMAINDER_BELOW_500',
+      message: approvalSizing.remainderWarning,
     });
   }
 

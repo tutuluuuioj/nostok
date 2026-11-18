@@ -4008,7 +4008,8 @@ async function runTests(): Promise<void> {
         const p1Cursor = keysetP1.body.pagination.next_cursor!;
         const keysetSeen = new Set<string>(keysetP1.body.data.map((r) => r.wallet_address.toLowerCase()));
 
-        // Wait a few ms and submit BOTH 3 brand-new pending requests AND a re-request from a Page 1 wallet!
+        // Wait a few ms and submit 3 brand-new pending requests, a Page 1 wallet re-request,
+        // AND an unshown Page 3 wallet re-request (Low 6)!
         await new Promise((r) => setTimeout(r, 25));
         const shiftAccts = Array.from({ length: 3 }, () => privateKeyToAccount(generatePrivateKey()));
         await Promise.all(
@@ -4017,8 +4018,13 @@ async function runTests(): Promise<void> {
         for (let i = 0; i < shiftAccts.length; i++) {
           await createSubWithSiwe(d1Url, shiftAccts[i], 'reprod2.owner@gmail.com', `198.52.21.${i + 1}`);
         }
-        // Re-request from a Page 1 wallet updates its updated_at to NOW (> snapshotAsOf)
+        // Re-request from BOTH a Page 1 wallet (crowdAccts[55]) AND an unshown Page 3 wallet (crowdAccts[0])
         await createSubWithSiwe(d1Url, crowdAccts[55], 'reprod2.owner@gmail.com', '198.52.21.99');
+        await createSubWithSiwe(d1Url, crowdAccts[0], 'reprod2.owner@gmail.com', '198.52.21.98');
+        assert.ok(
+          !keysetSeen.has(crowdAccts[0].address.toLowerCase()),
+          'Test precondition: crowdAccts[0] must not be on Page 1 before re-requesting'
+        );
 
         const keysetP2 = await httpJson<{
           pagination: {
