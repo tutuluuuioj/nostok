@@ -44,6 +44,7 @@ export interface NotificationsConfig {
   confirmTargetPerHourMax: number;
   confirmTargetGlobalPerHourMax: number;
   verifyEmailTargetPer24hMax: number;
+  verifyDigestCooldownSecs: number;
   authNonceRateLimitMax: number;
   authVerifyRateLimitMax: number;
   subscriptionsRateLimitMax: number;
@@ -391,6 +392,13 @@ export function loadNotificationsConfig(
         process.env.VERIFY_EMAIL_TARGET_PER_24H_MAX,
         5,
         'VERIFY_EMAIL_TARGET_PER_24H_MAX'
+      ),
+    verifyDigestCooldownSecs:
+      overrides.verifyDigestCooldownSecs ??
+      parsePositiveInt(
+        process.env.VERIFY_DIGEST_COOLDOWN_SECS,
+        21_600,
+        'VERIFY_DIGEST_COOLDOWN_SECS'
       ),
     authNonceRateLimitMax:
       overrides.authNonceRateLimitMax ??

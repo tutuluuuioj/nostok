@@ -9,10 +9,12 @@ import {
   signBlockSenderToken,
   signConfirmSubscriptionToken,
   signSessionToken,
+  signUnblockTargetToken,
   signUnsubscribeToken,
   verifyBlockSenderToken,
   verifyConfirmSubscriptionToken,
   verifySessionTokenClaims,
+  verifyUnblockTargetToken,
   verifyUnsubscribeToken,
 } from './crypto.js';
 import { type NotificationsContext, defaultPreferencesMap } from './engine.js';
@@ -399,11 +401,6 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
   const confirmTargetGlobalLimiter = new IpRateLimiter(
     ctx.config.confirmTargetGlobalPerHourMax,
     3_600_000,
-    ctx.config.rateLimitMaxBuckets
-  );
-  const verifyTarget24hLimiter = new IpRateLimiter(
-    ctx.config.verifyEmailTargetPer24hMax,
-    86_400_000,
     ctx.config.rateLimitMaxBuckets
   );
   const sybilCostCache = new Map<string, SybilCostCacheEntry>();
@@ -793,12 +790,13 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
           verified: boolean;
         }>(
           `INSERT INTO notif_subscriptions (
-             id, wallet, channel, target_ciphertext, key_id, target_hash, enabled, verified,
+             id, wallet, channel, target_ciphertext, key_id, target_hash, canonical_target_hash, enabled, verified,
              verify_code_hash, verify_expires_at, verify_attempts, updated_at
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, 0, NOW())
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, 0, NOW())
            ON CONFLICT (wallet, channel, target_hash) DO UPDATE SET
              target_ciphertext = EXCLUDED.target_ciphertext,
              key_id = EXCLUDED.key_id,
+             canonical_target_hash = EXCLUDED.canonical_target_hash,
              enabled = EXCLUDED.enabled,
              verified = EXCLUDED.verified,
              verify_code_hash = EXCLUDED.verify_code_hash,
@@ -813,6 +811,7 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             encrypted.ciphertext,
             encrypted.keyId,
             targetHash,
+            canonicalTargetHash || null,
             isWebhook,
             codeHash,
             expiresAtSec !== null ? expiresAtSec.toString() : null,
@@ -821,10 +820,53 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
 
         const created = resSub.rows[0];
         if (!isWebhook && verificationCode && codeHash) {
-          // Cross-wallet 24h cap per canonical target: stop sending verification emails past 5/24h
-          // while still returning generic 201 success (never 429) so the real owner is never locked out.
-          const target24hCheck = verifyTarget24hLimiter.check(canonicalTargetHash);
-          if (target24hCheck.allowed) {
+          // DB-backed cross-wallet 5/24h cap + 1 digest/6h per canonical target (survives restarts/multi-instance).
+          const nowSecBig = BigInt(Math.floor(Date.now() / 1000));
+          const cutoff24hBig = nowSecBig - 86_400n;
+          const digestCooldownBig = BigInt(ctx.config.verifyDigestCooldownSecs);
+          const sendDecision = await ctx.notifDb.transaction(async (tx) => {
+            await tx.query(
+              `INSERT INTO notif_verify_target_state (canonical_target_hash, last_digest_sent_at, updated_at)
+               VALUES ($1, 0, $2)
+               ON CONFLICT (canonical_target_hash) DO UPDATE SET updated_at = EXCLUDED.updated_at`,
+              [canonicalTargetHash, nowSecBig.toString()]
+            );
+            await tx.query(
+              'DELETE FROM notif_verify_sends WHERE canonical_target_hash = $1 AND sent_at < $2',
+              [canonicalTargetHash, cutoff24hBig.toString()]
+            );
+            const cntRes = await tx.query<{ cnt: number }>(
+              'SELECT COUNT(*)::INT AS cnt FROM notif_verify_sends WHERE canonical_target_hash = $1 AND sent_at >= $2',
+              [canonicalTargetHash, cutoff24hBig.toString()]
+            );
+            const recentCount = Number(cntRes.rows[0]?.cnt ?? 0);
+            if (recentCount < ctx.config.verifyEmailTargetPer24hMax) {
+              await tx.query(
+                'INSERT INTO notif_verify_sends (id, canonical_target_hash, sent_at) VALUES ($1, $2, $3)',
+                [`vs_${crypto.randomUUID().replace(/-/g, '')}`, canonicalTargetHash, nowSecBig.toString()]
+              );
+              return 'direct' as const;
+            }
+            const stateRes = await tx.query<{ last_digest_sent_at: string }>(
+              'SELECT last_digest_sent_at::TEXT AS last_digest_sent_at FROM notif_verify_target_state WHERE canonical_target_hash = $1',
+              [canonicalTargetHash]
+            );
+            const lastDigestAt = BigInt(stateRes.rows[0]?.last_digest_sent_at ?? '0');
+            if (lastDigestAt === 0n || nowSecBig - lastDigestAt >= digestCooldownBig) {
+              await tx.query(
+                'UPDATE notif_verify_target_state SET last_digest_sent_at = $2, updated_at = $2 WHERE canonical_target_hash = $1',
+                [canonicalTargetHash, nowSecBig.toString()]
+              );
+              return 'digest' as const;
+            }
+            return 'suppressed' as const;
+          });
+
+          const siweAppOrigin = ctx.config.siweUri
+            ? ctx.config.siweUri.replace(/\/+$/, '')
+            : ctx.config.publicBaseUrl;
+
+          if (sendDecision === 'direct') {
             const confirmToken = signConfirmSubscriptionToken(
               ctx.config.confirmSecret,
               created.id,
@@ -841,7 +883,6 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
               86_400
             );
             const blockUrl = `${ctx.config.publicBaseUrl}/subscriptions/block?token=${encodeURIComponent(blockToken)}`;
-            const siweAppOrigin = ctx.config.siweUri ? ctx.config.siweUri.replace(/\/+$/, '') : ctx.config.publicBaseUrl;
             const frontendConfirmUrl = `${siweAppOrigin}/subscriptions/confirm?token=${encodeURIComponent(confirmToken)}`;
             const frontendBlockUrl = `${siweAppOrigin}/subscriptions/block?token=${encodeURIComponent(blockToken)}`;
             const unsubToken = signUnsubscribeToken(
@@ -875,6 +916,130 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
               await ctx.transports.sendEmail(verifyMsg);
             } else {
               await ctx.transports.sendTelegram(verifyMsg);
+            }
+          } else if (sendDecision === 'digest') {
+            const pendingRows = await ctx.notifDb.query<{
+              id: string;
+              wallet: string;
+              channel: 'email' | 'telegram' | 'webhook';
+              target_ciphertext: string;
+              key_id: string;
+              verify_code_hash: string | null;
+              verify_expires_at: string | null;
+              canonical_target_hash: string | null;
+            }>(
+              `SELECT id, wallet, channel, target_ciphertext, key_id, verify_code_hash,
+                      verify_expires_at::TEXT AS verify_expires_at, canonical_target_hash
+               FROM notif_subscriptions
+               WHERE verified = FALSE
+                 AND channel = $1
+                 AND verify_code_hash IS NOT NULL
+                 AND (verify_expires_at IS NULL OR verify_expires_at > $2)
+                 AND (canonical_target_hash = $3 OR canonical_target_hash IS NULL)
+               ORDER BY updated_at DESC
+               LIMIT 50`,
+              [input.channel, nowSecBig.toString(), canonicalTargetHash]
+            );
+            const matchingPending: Array<{
+              id: string;
+              wallet: string;
+              verifyCodeHash: string;
+              expiresAtSec: number | null;
+            }> = [];
+            for (const row of pendingRows.rows) {
+              if (!row.verify_code_hash) continue;
+              let matches = row.canonical_target_hash === canonicalTargetHash;
+              if (!matches && !row.canonical_target_hash) {
+                try {
+                  const plain = ctx.cipher.decrypt(row.target_ciphertext, row.key_id);
+                  matches = ctx.cipher.computeGlobalTargetHash(row.channel, plain) === canonicalTargetHash;
+                } catch {
+                  matches = false;
+                }
+              }
+              if (matches) {
+                matchingPending.push({
+                  id: row.id,
+                  wallet: row.wallet,
+                  verifyCodeHash: row.verify_code_hash,
+                  expiresAtSec: row.verify_expires_at ? Number(row.verify_expires_at) : null,
+                });
+              }
+            }
+            if (!matchingPending.some((e) => e.id === created.id)) {
+              matchingPending.unshift({
+                id: created.id,
+                wallet: wallet.toLowerCase(),
+                verifyCodeHash: codeHash,
+                expiresAtSec,
+              });
+            }
+
+            const nowNumSec = Number(nowSecBig);
+            const digestEntries = matchingPending.map((item) => {
+              const checksumWallet = getAddress(item.wallet);
+              const ttlSecs = item.expiresAtSec ? Math.max(60, item.expiresAtSec - nowNumSec) : 3600;
+              const cTok = signConfirmSubscriptionToken(
+                ctx.config.confirmSecret,
+                item.id,
+                item.wallet,
+                item.verifyCodeHash,
+                ttlSecs
+              );
+              const cUrl = `${ctx.config.publicBaseUrl}/subscriptions/confirm?token=${encodeURIComponent(cTok)}`;
+              const fcUrl = `${siweAppOrigin}/subscriptions/confirm?token=${encodeURIComponent(cTok)}`;
+              const bTok = signBlockSenderToken(
+                ctx.config.confirmSecret,
+                item.id,
+                item.wallet,
+                canonicalTargetHash,
+                86_400
+              );
+              const bUrl = `${ctx.config.publicBaseUrl}/subscriptions/block?token=${encodeURIComponent(bTok)}`;
+              const fbUrl = `${siweAppOrigin}/subscriptions/block?token=${encodeURIComponent(bTok)}`;
+              return {
+                wallet: checksumWallet,
+                subscription_id: item.id,
+                confirm_token: cTok,
+                confirm_url: cUrl,
+                frontend_confirm_url: fcUrl,
+                block_token: bTok,
+                block_url: bUrl,
+                frontend_block_url: fbUrl,
+              };
+            });
+
+            const entryLines = digestEntries.map(
+              (entry, idx) =>
+                `${idx + 1}. Wallet ${entry.wallet} — Confirm link: ${entry.confirm_url} | Not me, block this address: ${entry.block_url}`
+            );
+            const digestUnsubToken = signUnsubscribeToken(
+              ctx.config.unsubscribeSecret,
+              created.id,
+              wallet
+            );
+            const digestUnsubUrl = `${ctx.config.publicBaseUrl}/unsubscribe?token=${encodeURIComponent(digestUnsubToken)}`;
+            const digestMsg = {
+              wallet,
+              subscriptionId: created.id,
+              channel: input.channel,
+              target: normalizedTarget,
+              alertType: 'subscription_verification_digest',
+              severity: 'info' as const,
+              title: `NOSTOK alert verification digest (${digestEntries.length} pending wallet request${digestEntries.length === 1 ? '' : 's'})`,
+              message: `More than ${ctx.config.verifyEmailTargetPer24hMax} wallets requested verification for this address in 24h. Digest summary (max once per 6h):\n${entryLines.join('\n')}`,
+              payload: {
+                digest: true,
+                subscription_id: created.id,
+                pending_count: digestEntries.length,
+                entries: digestEntries,
+              },
+              unsubscribeUrl: digestUnsubUrl,
+            };
+            if (input.channel === 'email') {
+              await ctx.transports.sendEmail(digestMsg);
+            } else {
+              await ctx.transports.sendTelegram(digestMsg);
             }
           }
         }
@@ -979,12 +1144,40 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
           (nowSec - 3600).toString(),
         ]);
         const walletLower = verified.wallet.toLowerCase();
-        await ctx.notifDb.query(
-          `INSERT INTO notif_blocked_senders (wallet, canonical_target_hash)
-           VALUES ($1, $2)
-           ON CONFLICT (wallet, canonical_target_hash) DO NOTHING`,
-          [walletLower, verified.canonicalTargetHash]
-        );
+        // Decrypt recipient target BEFORE deleting pending rows so block-all can deliver an inbox confirmation with an unblock link.
+        let blockTargetChannel: 'email' | 'telegram' | null = null;
+        let blockTargetPlain: string | null = null;
+        if (blockAll) {
+          const targetLookup = await ctx.notifDb.query<{
+            channel: 'email' | 'telegram' | 'webhook';
+            target_ciphertext: string;
+            key_id: string;
+          }>(
+            `SELECT channel, target_ciphertext, key_id
+             FROM notif_subscriptions
+             WHERE (id = $1 OR canonical_target_hash = $2) AND channel IN ('email', 'telegram')
+             LIMIT 1`,
+            [verified.subId, verified.canonicalTargetHash]
+          );
+          const firstRow = targetLookup.rows[0];
+          if (firstRow && (firstRow.channel === 'email' || firstRow.channel === 'telegram')) {
+            try {
+              blockTargetPlain = ctx.cipher.decrypt(firstRow.target_ciphertext, firstRow.key_id);
+              blockTargetChannel = firstRow.channel;
+            } catch {
+              blockTargetPlain = null;
+            }
+          }
+        }
+
+        if (!blockAll) {
+          await ctx.notifDb.query(
+            `INSERT INTO notif_blocked_senders (wallet, canonical_target_hash)
+             VALUES ($1, $2)
+             ON CONFLICT (wallet, canonical_target_hash) DO NOTHING`,
+            [walletLower, verified.canonicalTargetHash]
+          );
+        }
         const deletedIds: string[] = [];
         const delRes = await ctx.notifDb.query<{ id: string }>(
           `DELETE FROM notif_subscriptions
@@ -1006,18 +1199,30 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             channel: 'email' | 'telegram' | 'webhook';
             target_ciphertext: string;
             key_id: string;
+            canonical_target_hash: string | null;
           }>(
-            `SELECT id, channel, target_ciphertext, key_id
+            `SELECT id, channel, target_ciphertext, key_id, canonical_target_hash
              FROM notif_subscriptions
-             WHERE verified = FALSE AND channel IN ('email', 'telegram')`
+             WHERE verified = FALSE
+               AND channel IN ('email', 'telegram')
+               AND (canonical_target_hash = $1 OR canonical_target_hash IS NULL)`,
+            [verified.canonicalTargetHash]
           );
           const matchingIds: string[] = [];
           for (const sub of pendingSubs.rows) {
+            if (sub.canonical_target_hash === verified.canonicalTargetHash) {
+              matchingIds.push(sub.id);
+              continue;
+            }
             try {
               const targetPlain = ctx.cipher.decrypt(sub.target_ciphertext, sub.key_id);
               const gHash = ctx.cipher.computeGlobalTargetHash(sub.channel, targetPlain);
               if (gHash === verified.canonicalTargetHash) {
                 matchingIds.push(sub.id);
+                if (!blockTargetPlain && (sub.channel === 'email' || sub.channel === 'telegram')) {
+                  blockTargetPlain = targetPlain;
+                  blockTargetChannel = sub.channel;
+                }
               }
             } catch {
               // ignore corrupted or unknown-key rows
@@ -1034,6 +1239,50 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
           confirmTargetGlobalLimiter.refund(verified.canonicalTargetHash);
           confirmTargetResendLimiter.refund(verified.canonicalTargetHash);
           pendingWalletsByTarget.delete(verified.canonicalTargetHash);
+
+          if (blockTargetPlain && blockTargetChannel) {
+            const unblockToken = signUnblockTargetToken(
+              ctx.config.confirmSecret,
+              verified.canonicalTargetHash,
+              blockTargetChannel,
+              30 * 86_400
+            );
+            const unblockUrl = `${ctx.config.publicBaseUrl}/subscriptions/unblock?token=${encodeURIComponent(unblockToken)}`;
+            const siweAppOrigin = ctx.config.siweUri
+              ? ctx.config.siweUri.replace(/\/+$/, '')
+              : ctx.config.publicBaseUrl;
+            const frontendUnblockUrl = `${siweAppOrigin}/subscriptions/unblock?token=${encodeURIComponent(unblockToken)}`;
+            const unsubToken = signUnsubscribeToken(
+              ctx.config.unsubscribeSecret,
+              verified.subId,
+              verified.wallet
+            );
+            const unsubscribeUrl = `${ctx.config.publicBaseUrl}/unsubscribe?token=${encodeURIComponent(unsubToken)}`;
+            const confirmBlockMsg = {
+              wallet: verified.wallet,
+              subscriptionId: verified.subId,
+              channel: blockTargetChannel,
+              target: blockTargetPlain,
+              alertType: 'target_block_confirmation',
+              severity: 'info' as const,
+              title: 'Your address is now blocked from new NOSTOK requests',
+              message: `Your address has been blocked from all new NOSTOK alert subscription requests (${deletedIds.length} unverified pending request(s) removed). ${BLOCK_EXISTING_SUBS_NOTE} Changed your mind? Unblock this address: ${unblockUrl}`,
+              payload: {
+                scope: 'target_all',
+                block_all: true,
+                deleted_pending_count: deletedIds.length,
+                unblock_token: unblockToken,
+                unblock_url: unblockUrl,
+                frontend_unblock_url: frontendUnblockUrl,
+              },
+              unsubscribeUrl,
+            };
+            if (blockTargetChannel === 'email') {
+              await ctx.transports.sendEmail(confirmBlockMsg);
+            } else {
+              await ctx.transports.sendTelegram(confirmBlockMsg);
+            }
+          }
         } else if (delRes.rows.length > 0) {
           confirmTargetGlobalLimiter.refund(verified.canonicalTargetHash);
           confirmTargetResendLimiter.refund(verified.canonicalTargetHash);
@@ -1048,7 +1297,7 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             200,
             blockAll ? 'Address Blocked From New Requests' : 'Sender Wallet Blocked',
             blockAll
-              ? `<h1>Address blocked from new alert requests</h1><p>No wallet can create new alert subscriptions or send confirmation emails to this address (${deletedIds.length} unverified pending request(s) removed). ${escapeHtml(BLOCK_EXISTING_SUBS_NOTE)}</p>`
+              ? `<h1>Address blocked from new alert requests</h1><p>No wallet can create new alert subscriptions or send confirmation emails to this address (${deletedIds.length} unverified pending request(s) removed). A confirmation email with a one-click unblock link was sent to your inbox. ${escapeHtml(BLOCK_EXISTING_SUBS_NOTE)}</p>`
               : `<h1>Sender wallet blocked</h1><p>Wallet <code>${escapeHtml(checksumWallet)}</code> can no longer send confirmation requests to this address. ${escapeHtml(BLOCK_EXISTING_SUBS_NOTE)}</p>`
           );
           return;
@@ -1062,6 +1311,101 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
           deleted_pending_count: deletedIds.length,
           stops_existing_verified_subscriptions: false,
           note: BLOCK_EXISTING_SUBS_NOTE,
+        });
+        return;
+      }
+
+      if (pathname === '/subscriptions/unblock' && req.method === 'GET') {
+        enforceScopedRateLimit(res, confirmIpLimiter, clientIp, '/subscriptions/unblock IP');
+        const rawToken = parseOrThrow(unsubscribeBodySchema, { token: queryObj.token }).token;
+        let verified: { canonicalTargetHash: string; channel: 'email' | 'telegram'; jti: string; exp: number };
+        try {
+          verified = verifyUnblockTargetToken(ctx.config.confirmSecret, rawToken);
+        } catch (err) {
+          throw new HttpError(400, 'VALIDATION_ERROR', err instanceof Error ? err.message : 'Invalid token');
+        }
+        const tokenJti = `ublk_${verified.jti}`;
+        const usedRes = await ctx.notifDb.query<{ jti: string }>(
+          'SELECT jti FROM notif_revoked_sessions WHERE jti = $1 LIMIT 1',
+          [tokenJti]
+        );
+        if (usedRes.rows.length > 0) {
+          throw new HttpError(400, 'UNBLOCK_TOKEN_ALREADY_USED', 'This single-use unblock link has already been used.');
+        }
+        if (prefersHtmlResponse(req)) {
+          const escToken = escapeHtml(rawToken);
+          sendHtmlPage(
+            res,
+            200,
+            'Unblock NOSTOK Address',
+            `<h1>Re-enable NOSTOK alert requests for this address?</h1>
+<p>You previously blocked this address from receiving new alert verification requests.</p>
+<div class="actions">
+  <form method="POST" action="/subscriptions/unblock">
+    <input type="hidden" name="token" value="${escToken}" />
+    <button type="submit">Unblock this address</button>
+  </form>
+</div>`
+          );
+          return;
+        }
+        sendJson(res, 200, {
+          confirmation_required: true,
+          method: 'POST',
+          scope: 'target_all',
+          action: 'unblock_target_all',
+          channel: verified.channel,
+        });
+        return;
+      }
+
+      if (pathname === '/subscriptions/unblock' && req.method === 'POST') {
+        enforceScopedRateLimit(res, confirmIpLimiter, clientIp, '/subscriptions/unblock IP');
+        const rawBody = await readJsonBody(req, ctx.config.maxBodyBytes);
+        const bodyObj =
+          rawBody && typeof rawBody === 'object' && 'token' in rawBody
+            ? rawBody
+            : { token: queryObj.token };
+        const rawToken = parseOrThrow(unsubscribeBodySchema, bodyObj).token;
+        let verified: { canonicalTargetHash: string; channel: 'email' | 'telegram'; jti: string; exp: number };
+        try {
+          verified = verifyUnblockTargetToken(ctx.config.confirmSecret, rawToken);
+        } catch (err) {
+          throw new HttpError(400, 'VALIDATION_ERROR', err instanceof Error ? err.message : 'Invalid token');
+        }
+        const nowSec = Math.floor(Date.now() / 1000);
+        const tokenJti = `ublk_${verified.jti}`;
+        const consumed = await ctx.notifDb.query<{ jti: string }>(
+          `INSERT INTO notif_revoked_sessions (jti, wallet, expires_at, revoked_at)
+           VALUES ($1, '*', $2, $3)
+           ON CONFLICT (jti) DO NOTHING
+           RETURNING jti`,
+          [tokenJti, verified.exp.toString(), nowSec.toString()]
+        );
+        if (consumed.rows.length === 0) {
+          throw new HttpError(400, 'UNBLOCK_TOKEN_ALREADY_USED', 'This single-use unblock link has already been used.');
+        }
+        await ctx.notifDb.query('DELETE FROM notif_revoked_sessions WHERE expires_at < $1', [
+          (nowSec - 3600).toString(),
+        ]);
+        await ctx.notifDb.query(
+          `DELETE FROM notif_blocked_senders
+           WHERE canonical_target_hash = $1 AND wallet = '*'`,
+          [verified.canonicalTargetHash]
+        );
+        if (prefersHtmlResponse(req)) {
+          sendHtmlPage(
+            res,
+            200,
+            'Address Unblocked',
+            `<h1>Address unblocked</h1><p>This address can now receive new NOSTOK alert subscription requests again. Any individual sender wallets you previously blocked remain blocked.</p>`
+          );
+          return;
+        }
+        sendJson(res, 200, {
+          unblocked: true,
+          scope: 'target_all',
+          channel: verified.channel,
         });
         return;
       }
@@ -1571,7 +1915,6 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
     confirmTargetWalletLimiter.close();
     confirmTargetIpLimiter.close();
     confirmTargetGlobalLimiter.close();
-    verifyTarget24hLimiter.close();
     confirmTargetResendLimiter.close();
     sybilCostCache.clear();
     clearInterval(pendingWalletsTimer);

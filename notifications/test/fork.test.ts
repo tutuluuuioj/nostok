@@ -2936,8 +2936,8 @@ async function runTests(): Promise<void> {
         const beforeBombedCount = deliveredEmails.filter((m) => isBombedTarget(m.target)).length;
         assert.equal(
           beforeBombedCount,
-          5,
-          `Expected 5 emails delivered to canonical bombed.target before funded victim retry, got ${beforeBombedCount}`
+          6,
+          `Expected 5 direct + 1 digest = 6 emails delivered to canonical bombed.target before funded victim retry, got ${beforeBombedCount}`
         );
         for (const victimTarget of ['bombed.target@gmail.com', 'bombed.target+alerts@gmail.com']) {
           const gvSubRes = await httpJson<{ id: string; verified: boolean; verification_required?: boolean }>(
@@ -2954,7 +2954,7 @@ async function runTests(): Promise<void> {
           assert.equal(gvSubRes.body.verification_required, true);
         }
         const afterBombedCount = deliveredEmails.filter((m) => isBombedTarget(m.target)).length;
-        assert.equal(afterBombedCount, 5, 'Cross-wallet 24h cap must bound bombed.target deliveries to 5');
+        assert.equal(afterBombedCount, 6, '5 direct/24h + 1 digest/6h must bound bombed.target deliveries to 6');
 
         // M2: GET with Accept: text/html returns interactive HTML <form method="POST"> confirm page (tested on unflooded targets)
         for (const cleanTarget of ['m2.confirm.plain@gmail.com', 'm2.confirm.tag+alerts@gmail.com']) {
@@ -3165,7 +3165,7 @@ async function runTests(): Promise<void> {
         assert.equal(blockAllExec.body.block_all, true);
         assert.ok(blockAllExec.body.deleted_pending_count >= 1);
 
-        // Even the funded sybil-cost wallet cannot subscribe to optout.victim@nostok.xyz or +plus variants now!
+        // Even the funded sybil-cost wallet cannot subscribe to optout.victim@nostok.xyz or +plus variants while blocked!
         const optedOutRetry = await httpJson<{ error?: { code: string } }>(
           'POST',
           `${bombUrl}/subscriptions`,
@@ -3174,6 +3174,44 @@ async function runTests(): Promise<void> {
         );
         assert.equal(optedOutRetry.status, 403);
         assert.equal(optedOutRetry.body.error?.code, 'TARGET_OPTED_OUT');
+
+        // Medium #2 (reversibility): block-all delivers an inbox confirmation email containing a single-use unblock link
+        const blockConfirmEmail = deliveredEmails.find(
+          (m) => m.target === 'optout.victim@nostok.xyz' && m.alertType === 'target_block_confirmation'
+        );
+        assert.ok(blockConfirmEmail, 'block-all must deliver confirmation email with unblock link to target inbox');
+        assert.ok(blockConfirmEmail.message.includes('/subscriptions/unblock?token='));
+        const unblockUrl = String(blockConfirmEmail.payload.unblock_url);
+        const unblockTok = String(blockConfirmEmail.payload.unblock_token);
+        const unblockHtmlPage = await fetch(unblockUrl, {
+          headers: { Accept: 'text/html', 'X-Forwarded-For': '203.0.114.143' },
+        });
+        assert.equal(unblockHtmlPage.status, 200);
+        assert.match(await unblockHtmlPage.text(), /<form[^>]*method="POST"[^>]*action="\/subscriptions\/unblock"/i);
+        const unblockExec = await httpJson<{ unblocked: boolean; scope: string }>(
+          'POST',
+          `${bombUrl}/subscriptions/unblock`,
+          { token: unblockTok },
+          { 'X-Forwarded-For': '203.0.114.144' }
+        );
+        assert.equal(unblockExec.status, 200);
+        assert.equal(unblockExec.body.unblocked, true);
+        assert.equal(unblockExec.body.scope, 'target_all');
+        const replayUnblock = await httpJson<{ error?: { code: string } }>(
+          'POST',
+          `${bombUrl}/subscriptions/unblock`,
+          { token: unblockTok },
+          { 'X-Forwarded-For': '203.0.114.144' }
+        );
+        assert.equal(replayUnblock.status, 400);
+        assert.equal(replayUnblock.body.error?.code, 'UNBLOCK_TOKEN_ALREADY_USED');
+        const unblockedSubRetry = await httpJson<{ id: string }>(
+          'POST',
+          `${bombUrl}/subscriptions`,
+          { channel: 'email', target: 'optout.victim+any@nostok.xyz' },
+          { Authorization: `Bearer ${gvTok}`, 'X-Forwarded-For': '203.0.114.145' }
+        );
+        assert.equal(unblockedSubRetry.status, 201, 'Owner must be able to subscribe again after unblocking from inbox');
 
         // Legitimate funded victim STILL receives 201 (never 429) on lockout.victim after 5/24h cap,
         // and no >5 emails are ever sent to lockout.victim; clean funded target confirms normally
@@ -3216,7 +3254,7 @@ async function runTests(): Promise<void> {
         const lockoutDelivered = deliveredEmails.filter((m) =>
           m.target.toLowerCase().startsWith('lockout.victim')
         );
-        assert.ok(lockoutDelivered.length <= 5, `lockout.victim emails must be <= 5, got ${lockoutDelivered.length}`);
+        assert.ok(lockoutDelivered.length <= 6, `lockout.victim emails (<=5 direct + <=1 digest) must be <= 6, got ${lockoutDelivered.length}`);
         const pvCleanSub = await httpJson<{ id: string }>(
           'POST',
           `${bombUrl}/subscriptions`,
@@ -3425,14 +3463,19 @@ async function runTests(): Promise<void> {
           }
         }
         const bomb90Emails = deliveredEmails.slice(emailsBefore90);
-        assert.equal(bomb90Emails.length, 5, '90 verification attempts across 30 0.01 ETH wallets must send strictly 5 emails');
-        for (const sent of bomb90Emails) {
+        assert.equal(bomb90Emails.length, 6, '90 verification attempts across 30 0.01 ETH wallets must send 5 direct + 1 digest = 6 emails');
+        const bomb90Direct = bomb90Emails.filter((m) => m.alertType === 'subscription_verification');
+        const bomb90Digest = bomb90Emails.filter((m) => m.alertType === 'subscription_verification_digest');
+        assert.equal(bomb90Direct.length, 5);
+        assert.equal(bomb90Digest.length, 1);
+        for (const sent of bomb90Direct) {
           assert.ok(
             sent.message.includes('Not me, block this address:'),
-            'Every delivered verification email must contain "Not me, block this address:" block link'
+            'Every delivered direct verification email must contain "Not me, block this address:" block link'
           );
           assert.ok(String(sent.payload.block_url).includes('/subscriptions/block?token='));
         }
+        assert.ok(Array.isArray(bomb90Digest[0].payload.entries) && bomb90Digest[0].payload.entries.length >= 2);
         const hopVictimAcct = privateKeyToAccount(generatePrivateKey());
         await fetch(LOCAL_RPC_URL, {
           method: 'POST',
@@ -3456,7 +3499,7 @@ async function runTests(): Promise<void> {
           201,
           'Legitimate ETH-holding victim must NEVER see 429 lockout even after 90 attacker sends'
         );
-        assert.equal(deliveredEmails.length - emailsBefore90, 5, 'No extra email past 5/24h cap');
+        assert.equal(deliveredEmails.length - emailsBefore90, 6, 'No extra email within 6h digest cooldown');
 
         // When RPC is down, funded uncached wallet falls back strictly to 10/h global cap -> 429
         sybilForceRpcDown = true;
@@ -3483,6 +3526,170 @@ async function runTests(): Promise<void> {
       } finally {
         sybilForceRpcDown = false;
         await new Promise<void>((r) => sybilSrv.close(() => r()));
+      }
+
+      // Medium #2 dedicated test: 5 zero-ETH wallets fill DB 5/24h cap -> server RESTARTS (instance B shares notifDb) ->
+      // 6th request from real owner triggers digest email listing every pending wallet w/ confirm & block links, AND owner confirms cleanly!
+      // 7th request on concurrent instance C within 6h cooldown is silenced by DB state.
+      const digestEmailsStart = deliveredEmails.length;
+      const digestSrvA = createNotificationsServer({
+        ...notifCtx,
+        config: { ...notifCtx.config, trustProxyHops: 1, rateLimitMax: 5000 },
+      });
+      await new Promise<void>((r) => digestSrvA.listen(0, '127.0.0.1', r));
+      const digestUrlA = `http://127.0.0.1:${(digestSrvA.address() as net.AddressInfo).port}`;
+      const zeroSpamWallets: Array<{ address: string; token: string }> = [];
+      try {
+        for (let z = 0; z < 5; z++) {
+          const zAcct = privateKeyToAccount(generatePrivateKey());
+          const nRes = await httpJson<{ nonce: string }>('POST', `${digestUrlA}/auth/nonce`, {
+            wallet_address: zAcct.address,
+          }, { 'X-Forwarded-For': `198.51.160.${z + 1}` });
+          const siweMsg = formatSiweMessage({
+            domain: 'app.nostok.xyz',
+            address: zAcct.address,
+            uri: 'https://app.nostok.xyz',
+            chainId: 8453,
+            nonce: nRes.body.nonce,
+            issuedAt: nowIso,
+            expirationTime: futureIso,
+          });
+          const vRes = await httpJson<{ token: string }>('POST', `${digestUrlA}/auth/verify`, {
+            message: siweMsg,
+            signature: await zAcct.signMessage({ message: siweMsg }),
+          }, { 'X-Forwarded-For': `198.51.160.${z + 1}` });
+          zeroSpamWallets.push({ address: zAcct.address, token: vRes.body.token });
+          const subRes = await httpJson<{ id: string; verification_required: boolean }>(
+            'POST',
+            `${digestUrlA}/subscriptions`,
+            { channel: 'email', target: 'capped.owner.digest@gmail.com' },
+            { Authorization: `Bearer ${vRes.body.token}`, 'X-Forwarded-For': `198.51.160.${z + 1}` }
+          );
+          assert.equal(subRes.status, 201);
+          assert.equal(subRes.body.verification_required, true);
+        }
+      } finally {
+        // Shut down instance A completely before starting fresh instance B (proves DB persistence across restarts)
+        await new Promise<void>((r) => digestSrvA.close(() => r()));
+      }
+      assert.equal(
+        deliveredEmails.slice(digestEmailsStart).length,
+        5,
+        'First 5 requests must deliver 5 direct verification emails'
+      );
+
+      const digestSrvB = createNotificationsServer({
+        ...notifCtx,
+        config: { ...notifCtx.config, trustProxyHops: 1, rateLimitMax: 5000 },
+      });
+      await new Promise<void>((r) => digestSrvB.listen(0, '127.0.0.1', r));
+      const digestUrlB = `http://127.0.0.1:${(digestSrvB.address() as net.AddressInfo).port}`;
+      try {
+        // 6th request from real owner after restart hits DB cap -> triggers 1 digest email containing owner's own confirm + block links!
+        const realOwnerAcct = privateKeyToAccount(generatePrivateKey());
+        const oNonceRes = await httpJson<{ nonce: string }>('POST', `${digestUrlB}/auth/nonce`, {
+          wallet_address: realOwnerAcct.address,
+        }, { 'X-Forwarded-For': '203.0.116.1' });
+        const oSiwe = formatSiweMessage({
+          domain: 'app.nostok.xyz',
+          address: realOwnerAcct.address,
+          uri: 'https://app.nostok.xyz',
+          chainId: 8453,
+          nonce: oNonceRes.body.nonce,
+          issuedAt: nowIso,
+          expirationTime: futureIso,
+        });
+        const oTok = (
+          await httpJson<{ token: string }>('POST', `${digestUrlB}/auth/verify`, {
+            message: oSiwe,
+            signature: await realOwnerAcct.signMessage({ message: oSiwe }),
+          }, { 'X-Forwarded-For': '203.0.116.1' })
+        ).body.token;
+        const owner6thSub = await httpJson<{ id: string; verification_required: boolean }>(
+          'POST',
+          `${digestUrlB}/subscriptions`,
+          { channel: 'email', target: 'capped.owner.digest@gmail.com' },
+          { Authorization: `Bearer ${oTok}`, 'X-Forwarded-For': '203.0.116.1' }
+        );
+        assert.equal(owner6thSub.status, 201);
+        assert.equal(owner6thSub.body.verification_required, true);
+
+        const after6th = deliveredEmails.slice(digestEmailsStart);
+        assert.equal(after6th.length, 6, '6th request across restart must trigger 1 digest email');
+        const digestMail = after6th[5];
+        assert.equal(digestMail.alertType, 'subscription_verification_digest');
+        const entries = digestMail.payload.entries as Array<{
+          wallet: string;
+          subscription_id: string;
+          confirm_token: string;
+          confirm_url: string;
+          block_token: string;
+          block_url: string;
+        }>;
+        assert.equal(entries.length, 6, 'Digest must list all 6 pending requesting wallets');
+        for (const zw of zeroSpamWallets) {
+          assert.ok(
+            entries.some((e) => e.wallet.toLowerCase() === zw.address.toLowerCase() && e.block_url.includes('/subscriptions/block?token=')),
+            `Digest must include block link for requesting wallet ${zw.address}`
+          );
+        }
+        const ownerEntry = entries.find(
+          (e) => e.wallet.toLowerCase() === realOwnerAcct.address.toLowerCase()
+        );
+        assert.ok(ownerEntry, 'Digest must include the 6th (owner) requesting wallet with confirm link');
+        const ownerConfirmRes = await httpJson<{ confirmed: boolean; verified: boolean }>(
+          'POST',
+          `${digestUrlB}/subscriptions/confirm`,
+          { token: ownerEntry.confirm_token },
+          { 'X-Forwarded-For': '203.0.116.2' }
+        );
+        assert.equal(ownerConfirmRes.status, 200);
+        assert.equal(ownerConfirmRes.body.verified, true, 'Owner must confirm successfully via 6th-request digest email');
+
+        // 7th request from another instance C within 6h cooldown must return 201 without sending another digest
+        const digestSrvC = createNotificationsServer({
+          ...notifCtx,
+          config: { ...notifCtx.config, trustProxyHops: 1, rateLimitMax: 5000 },
+        });
+        await new Promise<void>((r) => digestSrvC.listen(0, '127.0.0.1', r));
+        const digestUrlC = `http://127.0.0.1:${(digestSrvC.address() as net.AddressInfo).port}`;
+        try {
+          const w7Acct = privateKeyToAccount(generatePrivateKey());
+          const w7Nonce = await httpJson<{ nonce: string }>('POST', `${digestUrlC}/auth/nonce`, {
+            wallet_address: w7Acct.address,
+          }, { 'X-Forwarded-For': '198.51.161.7' });
+          const w7Siwe = formatSiweMessage({
+            domain: 'app.nostok.xyz',
+            address: w7Acct.address,
+            uri: 'https://app.nostok.xyz',
+            chainId: 8453,
+            nonce: w7Nonce.body.nonce,
+            issuedAt: nowIso,
+            expirationTime: futureIso,
+          });
+          const w7Tok = (
+            await httpJson<{ token: string }>('POST', `${digestUrlC}/auth/verify`, {
+              message: w7Siwe,
+              signature: await w7Acct.signMessage({ message: w7Siwe }),
+            }, { 'X-Forwarded-For': '198.51.161.7' })
+          ).body.token;
+          const w7Sub = await httpJson<{ id: string }>(
+            'POST',
+            `${digestUrlC}/subscriptions`,
+            { channel: 'email', target: 'capped.owner.digest@gmail.com' },
+            { Authorization: `Bearer ${w7Tok}`, 'X-Forwarded-For': '198.51.161.7' }
+          );
+          assert.equal(w7Sub.status, 201);
+          assert.equal(
+            deliveredEmails.slice(digestEmailsStart).length,
+            6,
+            'Separate instance C must share DB digest cooldown (no second digest within 6h)'
+          );
+        } finally {
+          await new Promise<void>((r) => digestSrvC.close(() => r()));
+        }
+      } finally {
+        await new Promise<void>((r) => digestSrvB.close(() => r()));
       }
 
       // 6.7 No pre-auth login lockout across IPs

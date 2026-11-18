@@ -107,6 +107,8 @@ export interface RelaySignedOrderRecord {
   cachedFundingOverBudget?: boolean;
   cachedCollateralCheck?: boolean;
   cachedUndercollateralized?: boolean;
+  cachedOracleStale?: boolean;
+  cachedClosedHaircutShortfall?: boolean;
   cachedRpcStale?: boolean;
   cachedStatus: 'open' | 'partially_filled' | 'filled' | 'cancelled' | 'expired' | 'nonce_bumped' | 'unfunded';
   cachedBlockNumber: bigint;
@@ -549,9 +551,40 @@ const MAX_ORDERS_PER_IP = 50;
 const NEAR_EXPIRY_EVICTION_WINDOW_SECS = 86_400n;
 const EVICTION_REFRESH_SCAN_LIMIT = 60;
 const RELAY_STATE_CACHE_TTL_MS = 2000;
-const MAX_RELAY_REFRESH_PER_REQ = 100;
-const RELAY_MULTICALL_CHUNK = 150;
+const MAX_RELAY_REFRESH_PER_REQ = 120;
+const UNFUNDED_REFRESH_SLICE = 20;
+const RELAY_MULTICALL_CHUNK = 250;
 const FALLBACK_SIGNED_ORDERS = new WeakMap<ApiContext, Map<string, RelaySignedOrderRecord>>();
+const MAKER_ORDER_LOCKS = new WeakMap<ApiContext, Map<string, Promise<void>>>();
+
+async function withMakerOrderLock<T>(
+  ctx: ApiContext,
+  maker: Address,
+  fn: () => Promise<T>
+): Promise<T> {
+  let locks = MAKER_ORDER_LOCKS.get(ctx);
+  if (!locks) {
+    locks = new Map();
+    MAKER_ORDER_LOCKS.set(ctx, locks);
+  }
+  const key = maker.toLowerCase();
+  const prev = locks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queued = prev.then(() => current);
+  locks.set(key, queued);
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (locks.get(key) === queued) {
+      locks.delete(key);
+    }
+  }
+}
 
 interface RelayHeadCacheState {
   blockNumber: bigint;
@@ -629,6 +662,7 @@ interface LiveRelayOrderState {
   nonceBumped: boolean;
   unfunded: boolean;
   undercollateralized: boolean;
+  fillableWhenMarketOpens: boolean;
   stale: boolean;
   currentMakerNonce: bigint;
   status: 'open' | 'partially_filled' | 'filled' | 'cancelled' | 'expired' | 'nonce_bumped' | 'unfunded';
@@ -670,15 +704,33 @@ function isBorrowOrderAdequatelyCollateralized(params: {
   price: bigint;
   feedDecimals: number;
   oracleState: number;
-}): { ok: boolean; effectiveUsdc: bigint; allowedLtvBps: number } {
+}): {
+  ok: boolean;
+  effectiveUsdc: bigint;
+  allowedLtvBps: number;
+  oracleNonTradable: boolean;
+  closedHaircutShortfall: boolean;
+} {
   if (params.assetStatus !== 0) {
-    return { ok: false, effectiveUsdc: 0n, allowedLtvBps: 0 };
+    return {
+      ok: false,
+      effectiveUsdc: 0n,
+      allowedLtvBps: 0,
+      oracleNonTradable: false,
+      closedHaircutShortfall: false,
+    };
   }
-  if (
+  const oracleNonTradable =
     params.oracleState !== OracleState.VALID_OPEN &&
-    params.oracleState !== OracleState.VALID_CLOSED
-  ) {
-    return { ok: false, effectiveUsdc: 0n, allowedLtvBps: 0 };
+    params.oracleState !== OracleState.VALID_CLOSED;
+  if (oracleNonTradable) {
+    return {
+      ok: false,
+      effectiveUsdc: 0n,
+      allowedLtvBps: 0,
+      oracleNonTradable: true,
+      closedHaircutShortfall: false,
+    };
   }
   const effectiveUsdc = computeCollateralValuationUsdc({
     collateralRaw: params.collateralRaw,
@@ -693,7 +745,38 @@ function isBorrowOrderAdequatelyCollateralized(params: {
     allowedLtvBps > 0 &&
     params.price > 0n &&
     effectiveUsdc * BigInt(allowedLtvBps) >= params.minUsdc * 10_000n;
-  return { ok, effectiveUsdc, allowedLtvBps };
+  if (
+    !ok &&
+    params.oracleState === OracleState.VALID_CLOSED &&
+    params.closedMarketHaircutBps > 0 &&
+    params.price > 0n &&
+    allowedLtvBps > 0
+  ) {
+    const openUsdc = computeCollateralValuationUsdc({
+      collateralRaw: params.collateralRaw,
+      tokenDecimals: params.tokenDecimals,
+      price: params.price,
+      feedDecimals: params.feedDecimals,
+      oracleState: OracleState.VALID_OPEN,
+      closedMarketHaircutBps: 0,
+    });
+    if (openUsdc * BigInt(allowedLtvBps) >= params.minUsdc * 10_000n) {
+      return {
+        ok: false,
+        effectiveUsdc,
+        allowedLtvBps,
+        oracleNonTradable: false,
+        closedHaircutShortfall: true,
+      };
+    }
+  }
+  return {
+    ok,
+    effectiveUsdc,
+    allowedLtvBps,
+    oracleNonTradable: false,
+    closedHaircutShortfall: false,
+  };
 }
 
 function getRequiredFundingSpec(
@@ -777,7 +860,12 @@ function getMakerPriorOpenRequiredRaw(
     if (existing.maker.toLowerCase() !== targetMaker) continue;
     if (isRelayRecordDead(existing, params.chainNowSec)) continue;
     if (existing.cachedStatus === 'unfunded') continue;
-    if (existing.orderType === 'borrow' && existing.cachedCollateralCheck && existing.cachedUndercollateralized) {
+    if (
+      existing.orderType === 'borrow' &&
+      existing.cachedCollateralCheck &&
+      existing.cachedUndercollateralized &&
+      !existing.cachedClosedHaircutShortfall
+    ) {
       continue;
     }
     const existingSpec = getRequiredFundingSpec(ctx, {
@@ -828,7 +916,12 @@ function reconcileMakerFundingBudgets(
       deriveRelayLiveState(ctx, rec, chainNowSec, chainBlockNum);
       continue;
     }
-    if (rec.orderType === 'borrow' && rec.cachedCollateralCheck && rec.cachedUndercollateralized) {
+    if (
+      rec.orderType === 'borrow' &&
+      rec.cachedCollateralCheck &&
+      rec.cachedUndercollateralized &&
+      !rec.cachedClosedHaircutShortfall
+    ) {
       rec.cachedFundingOverBudget = false;
       deriveRelayLiveState(ctx, rec, chainNowSec, chainBlockNum);
       continue;
@@ -885,7 +978,8 @@ function deriveRelayLiveState(
     filled,
   });
   const undercollateralized =
-    rec.orderType === 'borrow' && Boolean(rec.cachedCollateralCheck && rec.cachedUndercollateralized);
+    rec.orderType === 'borrow' &&
+    Boolean(rec.cachedCollateralCheck && rec.cachedUndercollateralized && !rec.cachedClosedHaircutShortfall);
   const singleOrderUnfunded = Boolean(
     rec.cachedFundingChecked &&
       fundingSpec &&
@@ -907,6 +1001,15 @@ function deriveRelayLiveState(
               ? 'partially_filled'
               : 'open';
 
+  const fillableWhenMarketOpens =
+    rec.orderType === 'borrow' &&
+    Boolean(rec.cachedClosedHaircutShortfall) &&
+    !unfunded &&
+    !cancelled &&
+    !nonceBumped &&
+    !expired &&
+    remaining > 0n;
+
   rec.cachedStatus = status;
   return {
     record: rec,
@@ -917,7 +1020,8 @@ function deriveRelayLiveState(
     nonceBumped,
     unfunded,
     undercollateralized,
-    stale: Boolean(rec.cachedRpcStale),
+    fillableWhenMarketOpens,
+    stale: Boolean(rec.cachedRpcStale || rec.cachedOracleStale),
     currentMakerNonce,
     status,
     blockNumber: rec.cachedBlockNumber > 0n ? rec.cachedBlockNumber : chainBlockNum,
@@ -929,7 +1033,8 @@ async function batchRefreshRelayRecords(
   records: RelaySignedOrderRecord[],
   chainNowSec: bigint,
   chainBlockNum: bigint,
-  chainRpcFailed = false
+  chainRpcFailed = false,
+  forceRefresh = false
 ): Promise<boolean> {
   if (records.length === 0) return chainRpcFailed;
   const headState = getRelayHeadState(ctx);
@@ -941,17 +1046,19 @@ async function batchRefreshRelayRecords(
     }
     return true;
   }
-  const stale = capped.filter(
-    (rec) =>
-      Boolean(rec.cachedRpcStale) ||
-      rec.cachedBlockNumber !== chainBlockNum ||
-      nowMs - rec.lastRefreshedAtMs > RELAY_STATE_CACHE_TTL_MS
-  );
+  const stale = forceRefresh
+    ? capped
+    : capped.filter(
+        (rec) =>
+          Boolean(rec.cachedRpcStale) ||
+          rec.cachedBlockNumber !== chainBlockNum ||
+          nowMs - rec.lastRefreshedAtMs > RELAY_STATE_CACHE_TTL_MS
+      );
   if (stale.length === 0) {
-    return capped.some((r) => Boolean(r.cachedRpcStale));
+    return capped.some((r) => Boolean(r.cachedRpcStale || r.cachedOracleStale));
   }
 
-  const batchKey = `${chainBlockNum.toString()}:${stale.map((r) => r.orderHash.toLowerCase()).join(',')}`;
+  const batchKey = `${forceRefresh ? 'force' : 'norm'}:${chainBlockNum.toString()}:${stale.map((r) => r.orderHash.toLowerCase()).join(',')}`;
   const inFlight = headState.inFlightRefresh.get(batchKey);
   if (inFlight) {
     return inFlight;
@@ -1190,8 +1297,21 @@ async function batchRefreshRelayRecords(
             feedDecimals: oa.feedDecimals,
             oracleState: oa.oracleState,
           });
-          rec.cachedCollateralCheck = true;
-          rec.cachedUndercollateralized = !check.ok;
+          if (check.oracleNonTradable) {
+            // Preserve last collateral/funding status and flag stale instead of marking unfunded
+            rec.cachedOracleStale = true;
+            anyStale = true;
+          } else {
+            rec.cachedOracleStale = false;
+            rec.cachedCollateralCheck = true;
+            if (check.closedHaircutShortfall) {
+              rec.cachedClosedHaircutShortfall = true;
+              rec.cachedUndercollateralized = false;
+            } else {
+              rec.cachedClosedHaircutShortfall = false;
+              rec.cachedUndercollateralized = !check.ok;
+            }
+          }
         } else {
           collateralCheckOk = false;
         }
@@ -1246,6 +1366,7 @@ function formatRelayOrderEnvelope(live: LiveRelayOrderState, fills: unknown[] = 
     status: live.status,
     unfunded: live.unfunded,
     undercollateralized: live.undercollateralized,
+    fillable_when_market_opens: live.fillableWhenMarketOpens,
     stale: live.stale,
     min_usdc: formatAmount(total, USDC_DECIMALS, 'USDC'),
     ...(rec.orderType === 'lend' ? { usdc_amount: formatAmount(total, USDC_DECIMALS, 'USDC') } : {}),
@@ -1279,6 +1400,10 @@ function formatRelayOrderEnvelope(live: LiveRelayOrderState, fills: unknown[] = 
 
 async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'unknown') {
   const input = parseOrThrow(postOrderSchema, rawBody);
+  const lockMaker =
+    input.order_type === 'borrow' ? getAddress(input.order.borrower) : getAddress(input.order.lender);
+
+  return withMakerOrderLock(ctx, lockMaker, async () => {
   const signedMap = getSignedOrdersMap(ctx);
 
   let blk: { number: bigint; timestamp: bigint };
@@ -1746,14 +1871,38 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
     }
   }
 
-  // At capacity, refresh oldest/soonest candidates to discover unfunded/dead entries and prefer
-  // evicting unfunded or about-to-expire entries before ever rejecting with 429 ORDERBOOK_CAPACITY_EXCEEDED
+  // At capacity, re-verify any cached-unfunded candidates via live multicall BEFORE evicting,
+  // and exclude closed-market haircut shortfalls (fillable when market opens) from eviction.
   if (!signedMap.has(orderHashLower) && signedMap.size >= MAX_SIGNED_ORDERS) {
-    const hasCachedUnfunded = Array.from(signedMap.values()).some(
-      (e) => e.cachedStatus === 'unfunded'
+    const cachedUnfundedToVerify = Array.from(signedMap.entries())
+      .filter(([, e]) => e.cachedStatus === 'unfunded' && !e.cachedClosedHaircutShortfall)
+      .sort((a, b) => {
+        const aExp = BigInt(a[1].expiry);
+        const bExp = BigInt(b[1].expiry);
+        if (aExp !== bExp) return aExp < bExp ? -1 : 1;
+        return (a[1].submittedAtMs ?? 0) - (b[1].submittedAtMs ?? 0);
+      })
+      .map(([, e]) => e)
+      .slice(0, EVICTION_REFRESH_SCAN_LIMIT);
+
+    if (cachedUnfundedToVerify.length > 0) {
+      await batchRefreshRelayRecords(
+        ctx,
+        cachedUnfundedToVerify,
+        blk.timestamp,
+        blk.number,
+        false,
+        true
+      );
+      pruneDeadEntries();
+    }
+
+    const stillCachedUnfunded = Array.from(signedMap.values()).some(
+      (e) => e.cachedStatus === 'unfunded' && !e.cachedClosedHaircutShortfall
     );
-    if (!hasCachedUnfunded) {
+    if (!stillCachedUnfunded && signedMap.size >= MAX_SIGNED_ORDERS) {
       const probeCandidates = Array.from(signedMap.values())
+        .filter((e) => !e.cachedClosedHaircutShortfall)
         .sort((a, b) => {
           const aExp = BigInt(a.expiry);
           const bExp = BigInt(b.expiry);
@@ -1763,14 +1912,14 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
           return aExp < bExp ? -1 : aExp > bExp ? 1 : 0;
         })
         .slice(0, EVICTION_REFRESH_SCAN_LIMIT);
-      await batchRefreshRelayRecords(ctx, probeCandidates, blk.timestamp, blk.number, false);
+      await batchRefreshRelayRecords(ctx, probeCandidates, blk.timestamp, blk.number, false, true);
       pruneDeadEntries();
     }
   }
 
   if (!signedMap.has(orderHashLower) && signedMap.size >= MAX_SIGNED_ORDERS) {
     const unfundedCandidates = Array.from(signedMap.entries())
-      .filter(([, e]) => e.cachedStatus === 'unfunded')
+      .filter(([, e]) => e.cachedStatus === 'unfunded' && !e.cachedClosedHaircutShortfall)
       .sort((a, b) => {
         const aExp = BigInt(a[1].expiry);
         const bExp = BigInt(b[1].expiry);
@@ -1786,6 +1935,7 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
     } else {
       const nearExpiryCandidates = Array.from(signedMap.entries())
         .filter(([, e]) => {
+          if (e.cachedClosedHaircutShortfall) return false;
           const eExp = BigInt(e.expiry);
           return (
             eExp <= blk.timestamp + NEAR_EXPIRY_EVICTION_WINDOW_SECS &&
@@ -1843,6 +1993,8 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
     cachedFundingOverBudget: false,
     cachedCollateralCheck: input.order_type === 'borrow',
     cachedUndercollateralized: false,
+    cachedOracleStale: false,
+    cachedClosedHaircutShortfall: false,
     cachedRpcStale: false,
     cachedStatus: initialStatus,
     cachedBlockNumber: blk.number,
@@ -1855,6 +2007,7 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
     statusCode: 201,
     body: formatRelayOrderEnvelope(liveState, []),
   };
+  });
 }
 
 function formatDbOrderRow(
@@ -1935,6 +2088,7 @@ function formatDbOrderRow(
     baseRow.submitted_at = rec.submittedAt;
     baseRow.unfunded = liveRelay.unfunded;
     baseRow.undercollateralized = liveRelay.undercollateralized;
+    baseRow.fillable_when_market_opens = liveRelay.fillableWhenMarketOpens;
     baseRow.stale = liveRelay.stale;
   }
 
@@ -2138,9 +2292,10 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
   );
 
   // If the filtered candidate list is small (<= 100), refresh them all in one multicall so status filters & counts are exact.
-  // If > 100 (e.g. 2000 relayed orders), only refresh the requested page slice (<= pag.limit) via multicall + TTL cache!
+  // If > 100 (e.g. 2000 relayed orders), refresh the requested page slice PLUS a capped oldest-refreshed slice
+  // of cached-unfunded records so recovered orders return to open automatically without unbounded RPC work.
   let relayRefreshStale = blk.rpcFailed;
-  if (relayOnlyCandidates.length <= MAX_RELAY_REFRESH_PER_REQ) {
+  if (relayOnlyCandidates.length <= 100) {
     if (await batchRefreshRelayRecords(ctx, relayOnlyCandidates, blk.timestamp, blk.number, blk.rpcFailed)) {
       relayRefreshStale = true;
     }
@@ -2152,7 +2307,13 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
       return st.status === 'open' || st.status === 'partially_filled';
     });
     const pageCandidates = tentativeActive.slice(pag.offset, pag.offset + pag.limit);
-    if (await batchRefreshRelayRecords(ctx, pageCandidates, blk.timestamp, blk.number, blk.rpcFailed)) {
+    const pageHashSet = new Set(pageCandidates.map((r) => r.orderHash.toLowerCase()));
+    const cachedUnfundedSlice = relayOnlyCandidates
+      .filter((r) => r.cachedStatus === 'unfunded' && !pageHashSet.has(r.orderHash.toLowerCase()))
+      .sort((a, b) => (a.lastRefreshedAtMs ?? 0) - (b.lastRefreshedAtMs ?? 0))
+      .slice(0, UNFUNDED_REFRESH_SLICE);
+    const refreshBatch = [...pageCandidates, ...cachedUnfundedSlice];
+    if (await batchRefreshRelayRecords(ctx, refreshBatch, blk.timestamp, blk.number, blk.rpcFailed)) {
       relayRefreshStale = true;
     }
   }

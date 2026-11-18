@@ -423,6 +423,67 @@ export function verifyBlockSenderToken(
   return { subId: parsed.subId, wallet: parsed.wallet, canonicalTargetHash: parsed.cth, exp: parsed.exp };
 }
 
+interface UnblockTargetPayload {
+  p: 'unblock_target';
+  cth: string;
+  ch: 'email' | 'telegram';
+  jti: string;
+  exp: number;
+}
+
+export function signUnblockTargetToken(
+  secret: string,
+  canonicalTargetHash: string,
+  channel: 'email' | 'telegram',
+  ttlSecs = 30 * 86_400,
+  nowMs = Date.now()
+): string {
+  const payload: UnblockTargetPayload = {
+    p: 'unblock_target',
+    cth: canonicalTargetHash,
+    ch: channel,
+    jti: crypto.randomUUID(),
+    exp: Math.floor(nowMs / 1000) + ttlSecs,
+  };
+  const body = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const sig = crypto.createHmac('sha256', secret).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+
+export function verifyUnblockTargetToken(
+  secret: string,
+  token: string,
+  nowMs = Date.now()
+): { canonicalTargetHash: string; channel: 'email' | 'telegram'; jti: string; exp: number } {
+  const parts = token.split('.');
+  if (parts.length !== 2) throw new Error('Invalid unblock token format');
+  const [body, sig] = parts;
+  const expected = crypto.createHmac('sha256', secret).update(body).digest('base64url');
+  const sigBuf = Buffer.from(sig, 'utf8');
+  const expBuf = Buffer.from(expected, 'utf8');
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    throw new Error('Invalid unblock token signature');
+  }
+  const parsed = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as Partial<UnblockTargetPayload>;
+  if (
+    parsed.p !== 'unblock_target' ||
+    typeof parsed.cth !== 'string' ||
+    (parsed.ch !== 'email' && parsed.ch !== 'telegram') ||
+    typeof parsed.jti !== 'string'
+  ) {
+    throw new Error('Invalid unblock token purpose');
+  }
+  if (typeof parsed.exp !== 'number' || Math.floor(nowMs / 1000) > parsed.exp) {
+    throw new Error('Unblock token expired');
+  }
+  return {
+    canonicalTargetHash: parsed.cth,
+    channel: parsed.ch,
+    jti: parsed.jti,
+    exp: parsed.exp,
+  };
+}
+
 export function signWebhookPayload(
   secret: string,
   timestampSec: number,

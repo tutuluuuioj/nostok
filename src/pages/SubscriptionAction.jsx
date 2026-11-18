@@ -29,7 +29,12 @@ export function SubscriptionAction({ mode = 'confirm' }) {
 
   const activeToken = tokenInput.trim();
   const cfg = web3?.config ?? getFrontendConfig();
-  const endpointPath = mode === 'block' ? '/subscriptions/block' : '/subscriptions/confirm';
+  const endpointPath =
+    mode === 'block'
+      ? '/subscriptions/block'
+      : mode === 'unblock'
+        ? '/subscriptions/unblock'
+        : '/subscriptions/confirm';
 
   const loadPreview = useCallback(
     async (tok) => {
@@ -98,26 +103,37 @@ export function SubscriptionAction({ mode = 'confirm' }) {
   }
 
   const isBlock = mode === 'block';
+  const isUnblock = mode === 'unblock';
 
   return (
     <Page
-      kicker={isBlock ? 'Notifications · Opt-out & Block' : 'Notifications · Confirm Subscription'}
+      kicker={
+        isBlock
+          ? 'Notifications · Opt-out & Block'
+          : isUnblock
+            ? 'Notifications · Re-enable Address'
+            : 'Notifications · Confirm Subscription'
+      }
       title={
         isBlock
           ? 'Stop unwanted alert verification emails.'
-          : 'Confirm your alert subscription.'
+          : isUnblock
+            ? 'Re-enable NOSTOK alert requests for this address.'
+            : 'Confirm your alert subscription.'
       }
       lede={
         isBlock
           ? 'Block the specific wallet that requested alerts for this address, or block your entire address across new NOSTOK requests. Note: blocking does not stop existing verified subscriptions — use the unsubscribe link in any alert email or Wallet settings to disable those.'
-          : 'Review the wallet and subscription ID below, then confirm via POST to activate delivery.'
+          : isUnblock
+            ? 'Reverse an address-wide block so you can create new alert subscriptions for this address again.'
+            : 'Review the wallet and subscription ID below, then confirm via POST to activate delivery.'
       }
     >
       <div className="form-layout">
         <div className="fields">
           <Field
             id="sub-action-token"
-            label={isBlock ? 'Block token' : 'Confirmation token'}
+            label={isBlock ? 'Block token' : isUnblock ? 'Unblock token' : 'Confirmation token'}
             hint="Pre-filled from your email link; never submitted on page load (POST only)."
           >
             {(props) => (
@@ -158,6 +174,10 @@ export function SubscriptionAction({ mode = 'confirm' }) {
                     <strong>Sender wallet blocked.</strong> Wallet <code>{result.blocked_wallet}</code> can no longer send requests to this address. Blocking does not stop existing verified subscriptions.
                   </>
                 )
+              ) : isUnblock ? (
+                <>
+                  <strong>Address unblocked.</strong> New NOSTOK alert subscription requests are enabled again for this address.
+                </>
               ) : (
                 <>
                   <strong>Subscription confirmed.</strong> Channel {result.channel} ({result.id}) is now verified and active for {result.wallet_address}.
@@ -201,6 +221,15 @@ export function SubscriptionAction({ mode = 'confirm' }) {
                     : 'Block this address entirely (all wallets)'}
                 </button>
               </>
+            ) : isUnblock ? (
+              <button
+                className="btn"
+                type="button"
+                onClick={() => void executePost('unblock')}
+                disabled={!activeToken || Boolean(submitting)}
+              >
+                {submitting ? 'Unblocking address…' : 'Unblock this address'}
+              </button>
             ) : (
               <button
                 className="btn"
@@ -219,7 +248,13 @@ export function SubscriptionAction({ mode = 'confirm' }) {
         </div>
 
         <Sheet
-          title={isBlock ? 'Block request details' : 'Subscription details'}
+          title={
+            isBlock
+              ? 'Block request details'
+              : isUnblock
+                ? 'Unblock request details'
+                : 'Subscription details'
+          }
           note="Tokens are verified via HMAC against notifications/ without exposing plaintext recipient addresses."
         >
           <Rows

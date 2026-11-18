@@ -47,6 +47,8 @@ const ALLOWED_NOTIF_TABLES = new Set([
   'notif_alert_episodes',
   'notif_revoked_sessions',
   'notif_blocked_senders',
+  'notif_verify_sends',
+  'notif_verify_target_state',
 ]);
 
 const INDEXER_TABLES = new Set([
@@ -799,7 +801,9 @@ export async function initNotifSchema(db: NotifDatabase): Promise<void> {
     ALTER TABLE notif_subscriptions ADD COLUMN IF NOT EXISTS verify_code_hash TEXT;
     ALTER TABLE notif_subscriptions ADD COLUMN IF NOT EXISTS verify_expires_at BIGINT;
     ALTER TABLE notif_subscriptions ADD COLUMN IF NOT EXISTS verify_attempts INT NOT NULL DEFAULT 0;
+    ALTER TABLE notif_subscriptions ADD COLUMN IF NOT EXISTS canonical_target_hash TEXT;
     CREATE INDEX IF NOT EXISTS idx_notif_subs_wallet ON notif_subscriptions (wallet);
+    CREATE INDEX IF NOT EXISTS idx_notif_subs_cth ON notif_subscriptions (canonical_target_hash, verified);
 
     CREATE TABLE IF NOT EXISTS notif_preferences (
       wallet TEXT PRIMARY KEY,
@@ -880,6 +884,19 @@ export async function initNotifSchema(db: NotifDatabase): Promise<void> {
       canonical_target_hash TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (wallet, canonical_target_hash)
+    );
+
+    CREATE TABLE IF NOT EXISTS notif_verify_sends (
+      id TEXT PRIMARY KEY,
+      canonical_target_hash TEXT NOT NULL,
+      sent_at BIGINT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_notif_verify_sends_target_time ON notif_verify_sends (canonical_target_hash, sent_at);
+
+    CREATE TABLE IF NOT EXISTS notif_verify_target_state (
+      canonical_target_hash TEXT PRIMARY KEY,
+      last_digest_sent_at BIGINT NOT NULL DEFAULT 0,
+      updated_at BIGINT NOT NULL
     );
   `);
 }

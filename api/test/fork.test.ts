@@ -21,7 +21,7 @@ import {
 } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { base } from 'viem/chains';
-import { loanCoreAbi } from '../src/abi.js';
+import { loanCoreAbi, orderSettlementAbi } from '../src/abi.js';
 import { loadApiConfig } from '../src/config.js';
 import { assertReadOnlySql, openReadOnlyDatabase, wrapQueryableAsReadOnly } from '../src/db.js';
 import { type QuoteResponse } from '../src/quote.js';
@@ -2984,6 +2984,390 @@ async function runTests(): Promise<void> {
         assert.equal(page2.body.data.length, 5);
         assert.equal(page2.body.pagination.offset, 80);
         assert.notEqual(page2.body.data[0].order_hash, parallelGets[0].body.data[0].order_hash);
+
+        // Item 1a: Oracle stale -> fresh with > 100 (2000) relay orders keeps last status & flags stale=true, then recovers to open (stale=false),
+        // AND cached-unfunded records are re-included in paginated GET refresh so funded recovery returns automatically to open.
+        const staleAcct = privateKeyToAccount(generatePrivateKey());
+        const staleWallet = createWalletClient({
+          account: staleAcct,
+          chain: forkChain,
+          transport: viemHttp(LOCAL_RPC_URL),
+        });
+        await rpcCall('anvil_setBalance', [staleAcct.address, '0x56bc75e2d63100000']);
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdac,
+            abi: mockB20Artifact.abi,
+            functionName: 'mint',
+            args: [staleAcct.address, 25n * 10n ** 18n],
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await staleWallet.writeContract({
+            address: nvdac,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.collateralEscrow, 25n * 10n ** 18n],
+          }),
+        });
+        const snapStale = await rpcCall<string>('evm_snapshot', []);
+        const removedSynthKey = '0xaa' + (5).toString(16).padStart(62, '0');
+        const removedSynthRec = spamSignedMap.get(removedSynthKey);
+        spamSignedMap.delete(removedSynthKey);
+        const staleOrder = await signBorrowForTest(staleAcct, {
+          collateralAmount: (12n * 10n ** 18n).toString(),
+          minUsdc: '800000000',
+          expiry: sevenDaysExpStr,
+          nonce: '0',
+        });
+        const stalePostRes = await postJson<{ order_hash: string }>(`${spamUrl}/orders`, {
+          order_type: 'borrow',
+          order: staleOrder.ord,
+          signature: staleOrder.sig,
+        });
+        assert.equal(stalePostRes.status, 201);
+        const staleHashLower = stalePostRes.body.order_hash.toLowerCase();
+        if (removedSynthRec) spamSignedMap.set(removedSynthKey, removedSynthRec);
+        spamSignedMap.delete('0xaa' + (6).toString(16).padStart(62, '0'));
+        // Re-verify total > 100 (2000 entries)
+        if (removedSynthRec) {
+          spamSignedMap.set('0xaa' + (6).toString(16).padStart(62, '0'), {
+            ...removedSynthRec,
+            orderHash: ('0xaa' + (6).toString(16).padStart(62, '0')) as Hex,
+          });
+        }
+        assert.ok(spamSignedMap.size > 100);
+
+        // Warp clock +25_000s (> maxStaleOpenSecs = 21_600s) -> NVDA feed becomes STALE_FEED
+        const preWarpBlk = await publicClient.getBlock();
+        await rpcCall('evm_setNextBlockTimestamp', [Number(preWarpBlk.timestamp + 25_000n)]);
+        await rpcCall('evm_mine', []);
+        const staleRec = spamSignedMap.get(staleHashLower)!;
+        staleRec.cachedBlockNumber = 0n;
+        staleRec.lastRefreshedAtMs = 0;
+
+        // While STALE_FEED, GET /orders?maker=... MUST keep last status ('open'), NOT mark 'unfunded', and flag stale=true
+        const duringStaleRes = await getJson<{
+          stale: boolean;
+          data: Array<{ order_hash: string; status: string; unfunded: boolean; stale: boolean }>;
+        }>(`${spamUrl}/orders?maker=${staleAcct.address}`);
+        assert.equal(duringStaleRes.status, 200);
+        assert.equal(duringStaleRes.body.stale, true);
+        assert.equal(duringStaleRes.body.data.length, 1);
+        assert.equal(duringStaleRes.body.data[0].status, 'open');
+        assert.equal(duringStaleRes.body.data[0].unfunded, false);
+        assert.equal(duringStaleRes.body.data[0].stale, true);
+
+        // Restore fresh NVDA feed price -> GET /orders clears stale=false and keeps status='open'
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdaFeed,
+            abi: mockAggArtifact.abi,
+            functionName: 'setPrice',
+            args: [140_00000000n],
+          }),
+        });
+        staleRec.cachedBlockNumber = 0n;
+        staleRec.lastRefreshedAtMs = 0;
+        const afterFreshRes = await getJson<{
+          stale: boolean;
+          data: Array<{ order_hash: string; status: string; unfunded: boolean; stale: boolean }>;
+        }>(`${spamUrl}/orders?maker=${staleAcct.address}`);
+        assert.equal(afterFreshRes.status, 200);
+        assert.equal(afterFreshRes.body.stale, false);
+        assert.equal(afterFreshRes.body.data[0].status, 'open');
+        assert.equal(afterFreshRes.body.data[0].stale, false);
+
+        // Re-include cached-unfunded recovery in unfiltered GET when > 100 relay orders:
+        // Drain collateral below 12 NVDAc -> marks unfunded; mint back -> unfiltered GET /orders?limit=5 brings it back to 'open'!
+        const drainTarget = privateKeyToAccount(generatePrivateKey()).address;
+        await publicClient.waitForTransactionReceipt({
+          hash: await staleWallet.writeContract({
+            address: nvdac,
+            abi: parseAbi(['function transfer(address,uint256) returns (bool)']),
+            functionName: 'transfer',
+            args: [drainTarget, 20n * 10n ** 18n],
+          }),
+        });
+        staleRec.cachedBlockNumber = 0n;
+        staleRec.lastRefreshedAtMs = 0;
+        const markedUnfundedGet = await getJson<{
+          data: Array<{ order_hash: string; status: string; unfunded: boolean }>;
+        }>(`${spamUrl}/orders?maker=${staleAcct.address}&include_inactive=true`);
+        assert.equal(markedUnfundedGet.body.data[0]?.status, 'unfunded');
+        assert.equal(markedUnfundedGet.body.data[0]?.unfunded, true);
+
+        // Restore balance on-chain; then call UNFILTERED GET /orders?limit=5 (>100 orders in map, staleRec not on page 0..5)
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdac,
+            abi: mockB20Artifact.abi,
+            functionName: 'mint',
+            args: [staleAcct.address, 20n * 10n ** 18n],
+          }),
+        });
+        staleRec.cachedBlockNumber = 0n;
+        staleRec.lastRefreshedAtMs = 0;
+        const unfilteredRecoveryTrigger = await getJson<{ data: Array<{ order_hash: string }> }>(
+          `${spamUrl}/orders?limit=5`,
+          { 'X-Forwarded-For': '198.51.135.1' }
+        );
+        assert.equal(unfilteredRecoveryTrigger.status, 200);
+        assert.equal(staleRec.cachedStatus, 'open', 'Unfiltered GET over >100 orders must refresh cached-unfunded slice and recover order to open');
+        await rpcCall('evm_revert', [snapStale]);
+        spamSignedMap.delete(staleHashLower);
+
+        // Item 1c + 1b: Closed-market haircut shortfall (1.05 * 0.95 = 0.9975) marked fillable_when_market_opens (NOT unfunded, NOT evictable)
+        // and capacity eviction re-verifies cached-unfunded candidate in multicall before evicting!
+        const snapClosed = await rpcCall<string>('evm_snapshot', []);
+        const closedAcct = privateKeyToAccount(generatePrivateKey());
+        const closedWallet = createWalletClient({
+          account: closedAcct,
+          chain: forkChain,
+          transport: viemHttp(LOCAL_RPC_URL),
+        });
+        await rpcCall('anvil_setBalance', [closedAcct.address, '0x56bc75e2d63100000']);
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdac,
+            abi: mockB20Artifact.abi,
+            functionName: 'mint',
+            args: [closedAcct.address, 30n * 10n ** 18n],
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await closedWallet.writeContract({
+            address: nvdac,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.collateralEscrow, 30n * 10n ** 18n],
+          }),
+        });
+        // UI default +5% buffer: 12.5 NVDAc ($1,750 * 60% = $1,050) for $1,000 minUsdc -> at 5% closed haircut: $997.50 < $1,000
+        const uiBufferedSlotKey = '0xaa' + (7).toString(16).padStart(62, '0');
+        const savedSlot7 = spamSignedMap.get(uiBufferedSlotKey);
+        spamSignedMap.delete(uiBufferedSlotKey);
+        const uiDefaultOrd = await signBorrowForTest(closedAcct, {
+          collateralAmount: (125n * 10n ** 17n).toString(),
+          minUsdc: '1000000000',
+          maxLtvBps: 6000,
+          expiry: sevenDaysExpStr,
+          nonce: '0',
+        });
+        const uiPostRes = await postJson<{ order_hash: string }>(`${spamUrl}/orders`, {
+          order_type: 'borrow',
+          order: uiDefaultOrd.ord,
+          signature: uiDefaultOrd.sig,
+        });
+        assert.equal(uiPostRes.status, 201);
+        const uiHashLower = uiPostRes.body.order_hash.toLowerCase();
+
+        // Switch market session to VALID_CLOSED (weekend / closed-market session with 5% haircut)
+        await publicClient.waitForTransactionReceipt({
+          hash: await rawWalletClient.sendTransaction({
+            account: deployed.nostokTimelock,
+            to: deployed.oracleRouter,
+            data: encodeFunctionData({
+              abi: parseAbi(['function setMarketSession(bool isOpen, bool isManual)']),
+              functionName: 'setMarketSession',
+              args: [false, true],
+            }),
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdaFeed,
+            abi: mockAggArtifact.abi,
+            functionName: 'setPrice',
+            args: [140_00000000n],
+          }),
+        });
+        const oracleCheckSat = (await publicClient.readContract({
+          address: deployed.oracleRouter,
+          abi: parseAbi(['function getPrice(address) view returns (uint256, uint8, uint8)']),
+          functionName: 'getPrice',
+          args: [nvdac],
+        })) as readonly [bigint, number, number];
+        assert.equal(Number(oracleCheckSat[2]), 1, 'Expected OracleState.VALID_CLOSED (1) during closed market session');
+
+        const uiRec = spamSignedMap.get(uiHashLower)!;
+        uiRec.cachedBlockNumber = 0n;
+        uiRec.lastRefreshedAtMs = 0;
+        const duringWeekendRes = await getJson<{
+          data: Array<{
+            order_hash: string;
+            status: string;
+            unfunded: boolean;
+            undercollateralized: boolean;
+            fillable_when_market_opens?: boolean;
+          }>;
+        }>(`${spamUrl}/orders?maker=${closedAcct.address}`);
+        assert.equal(duringWeekendRes.status, 200);
+        assert.equal(duringWeekendRes.body.data[0]?.status, 'open');
+        assert.equal(duringWeekendRes.body.data[0]?.unfunded, false);
+        assert.equal(duringWeekendRes.body.data[0]?.undercollateralized, false);
+        assert.equal(duringWeekendRes.body.data[0]?.fillable_when_market_opens, true);
+
+        // Even at 2000 capacity, closed-market haircut shortfall order must NOT be evictable
+        assert.equal(spamSignedMap.size, 2000);
+        const satCapRes = await postJson<{ error: { code: string } }>(`${spamUrl}/orders`, {
+          order_type: 'borrow',
+          order: overflowFundedOrder.ord,
+          signature: overflowFundedOrder.sig,
+        }, { 'X-Forwarded-For': '198.51.120.6' });
+        assert.equal(satCapRes.status, 429);
+        assert.ok(spamSignedMap.has(uiHashLower), 'Closed-market haircut shortfall order must NOT be evicted at capacity');
+
+        // Re-verify cached-unfunded candidate before evicting (Item 1b): mark staleRec's slot recovered BEFORE overflow POST
+        await rpcCall('evm_revert', [snapClosed]);
+        spamSignedMap.delete(uiHashLower);
+        if (savedSlot7) spamSignedMap.set(uiBufferedSlotKey, savedSlot7);
+
+        // Seed closedAcct with a valid order that WAS previously cachedStatus='unfunded' at capacity=2000,
+        // while closedAcct ALREADY holds full 30 NVDAc balance+allowance on-chain!
+        const snapEvictRecheck = await rpcCall<string>('evm_snapshot', []);
+        const savedSlot8 = spamSignedMap.get('0xaa' + (8).toString(16).padStart(62, '0'));
+        spamSignedMap.delete('0xaa' + (8).toString(16).padStart(62, '0'));
+        await rpcCall('anvil_setBalance', [closedAcct.address, '0x56bc75e2d63100000']);
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdac,
+            abi: mockB20Artifact.abi,
+            functionName: 'mint',
+            args: [closedAcct.address, 25n * 10n ** 18n],
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await closedWallet.writeContract({
+            address: nvdac,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.collateralEscrow, 25n * 10n ** 18n],
+          }),
+        });
+        const recheckOrd = await signBorrowForTest(closedAcct, {
+          collateralAmount: (12n * 10n ** 18n).toString(),
+          minUsdc: '800000000',
+          expiry: sevenDaysExpStr,
+          nonce: '0',
+        });
+        const recheckHash = await publicClient.readContract({
+          address: deployed.orderSettlement,
+          abi: orderSettlementAbi,
+          functionName: 'hashBorrowOrder',
+          args: [{
+            borrower: closedAcct.address,
+            collateralToken: nvdac,
+            collateralAmount: 12n * 10n ** 18n,
+            minUsdc: 800_000_000n,
+            maxRateBps: 900,
+            termDays: 30,
+            maxLtvBps: 6000,
+            minFill: 500_000_000n,
+            expiry: BigInt(sevenDaysExpStr),
+            nonce: 0n,
+            yieldMode: 0,
+            allowInKindSettlement: false,
+          }],
+        });
+        const recheckBlk = await publicClient.getBlock();
+        spamSignedMap.set(recheckHash.toLowerCase(), {
+          orderHash: recheckHash,
+          orderType: 'borrow',
+          maker: closedAcct.address,
+          collateralToken: nvdac,
+          collateralSymbol: 'NVDAc',
+          collateralDecimals: 18,
+          collateralAmount: (12n * 10n ** 18n).toString(),
+          totalUsdc: '800000000',
+          rateBps: 900,
+          termDays: 30,
+          maxLtvBps: 6000,
+          minFill: '500000000',
+          expiry: sevenDaysExpStr,
+          nonce: '0',
+          yieldMode: 0,
+          signedOrder: recheckOrd.ord as unknown as Record<string, unknown>,
+          signature: recheckOrd.sig,
+          submittedAt: new Date().toISOString(),
+          submittedIp: '198.51.142.1',
+          submittedAtMs: Date.now() - 10_000,
+          cachedFilled: 0n,
+          cachedCancelled: false,
+          cachedMakerNonce: 0n,
+          cachedMakerBalance: 0n,
+          cachedMakerAllowance: 0n,
+          cachedFundingChecked: true,
+          cachedUndercollateralized: false,
+          cachedRpcStale: false,
+          cachedStatus: 'unfunded',
+          cachedBlockNumber: recheckBlk.number,
+          lastRefreshedAtMs: Date.now(),
+        });
+        assert.equal(spamSignedMap.size, 2000);
+        const recheckOverflowRes = await postJson<{ error: { code: string } }>(`${spamUrl}/orders`, {
+          order_type: 'borrow',
+          order: overflowFundedOrder.ord,
+          signature: overflowFundedOrder.sig,
+        }, { 'X-Forwarded-For': '198.51.120.7' });
+        assert.equal(recheckOverflowRes.status, 429, 'Recovered candidate must NOT be evicted; capacity overflow returns 429');
+        assert.ok(spamSignedMap.has(recheckHash.toLowerCase()), 'Live recheck must save recovered cached-unfunded order from eviction');
+        assert.equal(spamSignedMap.get(recheckHash.toLowerCase())?.cachedStatus, 'open');
+        spamSignedMap.delete(recheckHash.toLowerCase());
+        if (savedSlot8) spamSignedMap.set('0xaa' + (8).toString(16).padStart(62, '0'), savedSlot8);
+        await rpcCall('evm_revert', [snapEvictRecheck]);
+
+        // Item 3 (Low): 20 parallel POSTs from one maker with funding for strictly ONE order -> ONLY 1 accepted, 19 rejected!
+        spamSignedMap.delete('0xaa' + (9).toString(16).padStart(62, '0'));
+        spamSignedMap.delete('0xaa' + (10).toString(16).padStart(62, '0'));
+        const raceAcct = privateKeyToAccount(generatePrivateKey());
+        const raceWallet = createWalletClient({
+          account: raceAcct,
+          chain: forkChain,
+          transport: viemHttp(LOCAL_RPC_URL),
+        });
+        await rpcCall('anvil_setBalance', [raceAcct.address, '0x56bc75e2d63100000']);
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdac,
+            abi: mockB20Artifact.abi,
+            functionName: 'mint',
+            args: [raceAcct.address, 12n * 10n ** 18n],
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await raceWallet.writeContract({
+            address: nvdac,
+            abi: approveAbi,
+            functionName: 'approve',
+            args: [deployed.collateralEscrow, 12n * 10n ** 18n],
+          }),
+        });
+        const raceOrders = await Promise.all(
+          Array.from({ length: 20 }, (_, idx) =>
+            signBorrowForTest(raceAcct, {
+              collateralAmount: (12n * 10n ** 18n).toString(),
+              minUsdc: (750_000_000 + idx).toString(),
+              expiry: sevenDaysExpStr,
+              nonce: '0',
+            })
+          )
+        );
+        const raceResponses = await Promise.all(
+          raceOrders.map((ro, idx) =>
+            postJson<{ order_hash?: string; error?: { code: string } }>(
+              `${spamUrl}/orders`,
+              { order_type: 'borrow', order: ro.ord, signature: ro.sig },
+              { 'X-Forwarded-For': `198.51.145.${idx + 1}` }
+            )
+          )
+        );
+        const raceAccepted = raceResponses.filter((r) => r.status === 201);
+        const raceRejected = raceResponses.filter(
+          (r) => r.status === 400 && r.body.error?.code === 'INSUFFICIENT_ORDER_FUNDING'
+        );
+        assert.equal(raceAccepted.length, 1, `20 parallel POSTs with single-order funding must accept strictly 1, got ${raceAccepted.length}`);
+        assert.equal(raceRejected.length, 19, `20 parallel POSTs must reject 19 with INSUFFICIENT_ORDER_FUNDING, got ${raceRejected.length}`);
       } finally {
         mockSynthFunded = false;
         failRelayMulticall = false;
