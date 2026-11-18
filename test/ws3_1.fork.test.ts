@@ -64,8 +64,10 @@ import {
   bumpMakerNonceOnChain,
   cancelSignedBorrowOrder,
   cancelSignedLendOffer,
+  computeBorrowApprovalAmountRaw,
   computeBorrowCollateralForFill,
   computeLendApprovalAmountRaw,
+  computeRemainingBorrowCollateralRequirement,
   connectWallet,
   decodeContractRevert,
   fetchNotificationsSessionState,
@@ -87,6 +89,7 @@ import {
   refreshSignedLendOffersState,
   resolveExactBorrowAmounts,
   resolveExactLendAmounts,
+  setCollateralAllowanceForBorrow,
   setInjectedProvider,
   setUsdcAllowanceForLend,
   signInWithSiwe,
@@ -3188,7 +3191,401 @@ async function runTests(): Promise<void> {
       );
       console.log('PASS WS3.4 Piece 2: Live Lend.jsx SSR, LoanCore approval, LendOffer sign/cancel, & BorrowOrder fill UI verified.');
 
-      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1 & PIECE 2 FORK TESTS PASSED.');
+      // 3.7 WS3.4 Piece 3: Borrower-side LendOffer fill parity, cumulative CollateralEscrow allowance, lossless raw pill math & guards
+      console.log('\n=== WS3.4 Piece 3: Borrower LendOffer fill & cumulative CollateralEscrow hardening ===');
+      const borrowCumSizing = computeBorrowApprovalAmountRaw('10000000000000000000', '1000000000', '500000000', {
+        existingOpenCollateralRaw: '5000000000000000000',
+        perFillUsdcRawList: ['500000000', '500000000'],
+      });
+      assert.equal(
+        borrowCumSizing.requiredApprovalRaw,
+        15_000_000_000_000_000_002n,
+        'Borrow approval sizing must add existing open BorrowOrders collateral + signed collateral + per-fill slack'
+      );
+      assert.equal(
+        computeRemainingBorrowCollateralRequirement('10000000000000000000', '1000000000', '500000000', '600000000'),
+        6_000_000_000_000_000_002n,
+        'Remaining collateral requirement for partially filled BorrowOrder must cover pro-rata ceil + remaining slack'
+      );
+
+      // Clean slate for borrower Piece 3 A1/A2 tests (top up NVDAc + bump old test BorrowOrders)
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdac,
+          abi: mockB20Artifact.abi,
+          functionName: 'mint',
+          args: [ADDRESSES.borrower, 50n * 10n ** 18n],
+        }),
+      });
+      walletProvider.setAccount(KEYS.borrower);
+      await bumpMakerNonceOnChain({ address: ADDRESSES.borrower, provider: walletProvider, cfg });
+      await runIndexerSync(idxCtx);
+
+      // Require expectedQuote when requireExpectedQuote: true
+      await assert.rejects(
+        () =>
+          prepareAndSignBorrowOrder({
+            address: ADDRESSES.borrower,
+            collateralToken: nvdac,
+            principalRaw: '600000000',
+            expectedQuote: null,
+            requireExpectedQuote: true,
+            maxRateBps: 900,
+            termDays: 30,
+            maxLtvBps: 6000,
+            minFillRaw: '600000000',
+            expiryDays: 7,
+            provider: walletProvider,
+            cfg,
+          }),
+        /No reviewed on-screen quote found/
+      );
+
+      // Lender creates two open LendOffers for Borrower Repro A1 ($600) and A2 ($900)
+      walletProvider.setAccount(KEYS.lender);
+      const p3LendQuote600 = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '600000000',
+        termDays: 30,
+        aprBps: 850,
+        maxLtvBps: 6000,
+        lender: ADDRESSES.lender,
+      });
+      const p3LendOffer600 = await prepareAndSignLendOffer({
+        address: ADDRESSES.lender,
+        principalRaw: '600000000',
+        allowedCollateral: nvdac,
+        expectedQuote: p3LendQuote600,
+        minRateBps: 850,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '600000000',
+        existingOpenUsdcSumRaw: '0',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: false,
+        provider: walletProvider,
+        cfg,
+      });
+      const p3LendQuote900 = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '900000000',
+        termDays: 30,
+        aprBps: 850,
+        maxLtvBps: 6000,
+        lender: ADDRESSES.lender,
+      });
+      const p3LendOffer900 = await prepareAndSignLendOffer({
+        address: ADDRESSES.lender,
+        principalRaw: '900000000',
+        allowedCollateral: nvdac,
+        expectedQuote: p3LendQuote900,
+        minRateBps: 850,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '900000000',
+        existingOpenUsdcSumRaw: '600000000',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: false,
+        provider: walletProvider,
+        cfg,
+      });
+
+      // Borrower Repro A1: open relayed $1,000 BorrowOrder (with exact CollateralEscrow allowance) -> fill $600 LendOffer
+      // with storage: null & existingOpenCollateralRaw omitted -> must detect relay BorrowOrder, approve cumulative
+      // open + fill600, so open $1,000 BorrowOrder STILL fills cleanly afterwards!
+      walletProvider.setAccount(KEYS.borrower);
+      await setCollateralAllowanceForBorrow({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        targetAllowanceRaw: '0',
+        provider: walletProvider,
+        cfg,
+      });
+      const p3BorrowStorage = new Map<string, string>();
+      const borrowStorageApi = {
+        getItem: (k: string) => p3BorrowStorage.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          p3BorrowStorage.set(k, v);
+        },
+      };
+      const p3BorrowQuote1000 = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '1000000000',
+        termDays: 30,
+        aprBps: 950,
+        maxLtvBps: 6000,
+        borrower: ADDRESSES.borrower,
+      });
+      const openBorrowP3A1 = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '1000000000',
+        expectedQuote: p3BorrowQuote1000,
+        requireExpectedQuote: true,
+        maxRateBps: 950,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '500000000',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: true,
+        storage: borrowStorageApi,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(openBorrowP3A1.publishedToApi, true);
+      const openBorrowReq1000 = BigInt(openBorrowP3A1.exactAmounts.requiredApprovalRaw);
+
+      // Preview filling $600 LendOffer WITHOUT passing storage or existingOpenCollateralRaw -> reads relay!
+      const previewBorrowP3A1 = await verifyAndPreviewLendOfferFill({
+        offer: p3LendOffer600.offer,
+        signature: p3LendOffer600.signature,
+        collateralToken: nvdac,
+        fillUsdcRaw: '600000000',
+        borrowerAddress: ADDRESSES.borrower,
+        storage: null,
+        cfg,
+      });
+      assert.equal(
+        previewBorrowP3A1.existingOpenCollateralRaw,
+        openBorrowReq1000.toString(),
+        'verifyAndPreviewLendOfferFill must automatically include relay-only open BorrowOrder collateral'
+      );
+      assert.equal(
+        previewBorrowP3A1.requiredApprovalRaw,
+        (openBorrowReq1000 + previewBorrowP3A1.exact.collateralAmountRaw).toString()
+      );
+      assert.equal(previewBorrowP3A1.needsApproval, true);
+
+      // Unknown BorrowOrder status fail-closed: RPC failure on persisted BorrowOrder must refuse preview cleanly
+      const rpcBorrowFailClient = new Proxy(publicClient, {
+        get(target, prop) {
+          if (prop === 'readContract') {
+            return async (args: { functionName?: string }) => {
+              if (args?.functionName === 'hashBorrowOrder') {
+                throw new Error('simulated RPC timeout');
+              }
+              return target.readContract(args as never);
+            };
+          }
+          const v = Reflect.get(target, prop);
+          return typeof v === 'function' ? v.bind(target) : v;
+        },
+      });
+      await assert.rejects(
+        () =>
+          verifyAndPreviewLendOfferFill({
+            offer: p3LendOffer600.offer,
+            signature: p3LendOffer600.signature,
+            collateralToken: nvdac,
+            fillUsdcRaw: '600000000',
+            borrowerAddress: ADDRESSES.borrower,
+            storage: borrowStorageApi,
+            publicClient: rpcBorrowFailClient as never,
+            cfg,
+          }),
+        /Cannot verify open BorrowOrder/
+      );
+
+      const fillBorrowP3A1 = await fillLendOfferAsBorrower({
+        address: ADDRESSES.borrower,
+        offer: p3LendOffer600.offer,
+        signature: p3LendOffer600.signature,
+        collateralToken: nvdac,
+        fillUsdcRaw: '600000000',
+        expectedPreview: previewBorrowP3A1,
+        storage: null,
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(fillBorrowP3A1.loanId);
+      assert.ok(fillBorrowP3A1.approvalTxHash, 'Borrower Repro A1 must raise CollateralEscrow allowance to open + fill');
+      const postA1BorrowAllow = BigInt((await readBorrowAllowanceAndNonce(ADDRESSES.borrower, nvdac, { cfg })).allowanceRaw);
+      assert.equal(
+        postA1BorrowAllow,
+        openBorrowReq1000,
+        'After $600 LendOffer fill, CollateralEscrow allowance must still preserve exact open $1,000 BorrowOrder requirement'
+      );
+
+      // Lender fills the open $1,000 BorrowOrder in two $500 fills -> succeeds cleanly without ERC20InsufficientAllowance!
+      walletProvider.setAccount(KEYS.lender);
+      await approveUsdcForLend({
+        address: ADDRESSES.lender,
+        requiredUsdcRaw: '2000000000',
+        provider: walletProvider,
+        cfg,
+      });
+      await fillBorrowOrderAsLender({
+        address: ADDRESSES.lender,
+        order: openBorrowP3A1.order,
+        signature: openBorrowP3A1.signature,
+        fillUsdcRaw: '500000000',
+        perFillUsdcRawList: ['500000000', '500000000'],
+        existingOpenSumRaw: '900000000',
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      await fillBorrowOrderAsLender({
+        address: ADDRESSES.lender,
+        order: openBorrowP3A1.order,
+        signature: openBorrowP3A1.signature,
+        fillUsdcRaw: '500000000',
+        existingOpenSumRaw: '900000000',
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+
+      // Borrower Repro A2: smaller open $600 BorrowOrder -> larger $900 LendOffer fill must approve (open600 + fill900), NOT overwrite to fill900!
+      walletProvider.setAccount(KEYS.borrower);
+      await setCollateralAllowanceForBorrow({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        targetAllowanceRaw: '0',
+        provider: walletProvider,
+        cfg,
+      });
+      const p3BorrowQuote600 = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '600000000',
+        termDays: 30,
+        aprBps: 950,
+        maxLtvBps: 6000,
+        borrower: ADDRESSES.borrower,
+      });
+      const openBorrowP3A2 = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '600000000',
+        expectedQuote: p3BorrowQuote600,
+        requireExpectedQuote: true,
+        maxRateBps: 950,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '600000000',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: true,
+        storage: borrowStorageApi,
+        provider: walletProvider,
+        cfg,
+      });
+      const openBorrowReq600 = BigInt(openBorrowP3A2.exactAmounts.requiredApprovalRaw);
+
+      const fillBorrowP3A2 = await fillLendOfferAsBorrower({
+        address: ADDRESSES.borrower,
+        offer: p3LendOffer900.offer,
+        signature: p3LendOffer900.signature,
+        collateralToken: nvdac,
+        fillUsdcRaw: '900000000',
+        existingOpenCollateralRaw: openBorrowReq600,
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(fillBorrowP3A2.loanId);
+      assert.equal(
+        (await readBorrowAllowanceAndNonce(ADDRESSES.borrower, nvdac, { cfg })).allowanceRaw,
+        openBorrowReq600.toString(),
+        'After $900 LendOffer fill, CollateralEscrow allowance must still equal open $600 BorrowOrder requirement'
+      );
+
+      // Lender fills open $600 BorrowOrder cleanly
+      walletProvider.setAccount(KEYS.lender);
+      await fillBorrowOrderAsLender({
+        address: ADDRESSES.lender,
+        order: openBorrowP3A2.order,
+        signature: openBorrowP3A2.signature,
+        fillUsdcRaw: '600000000',
+        existingOpenSumRaw: '0',
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+
+      // Post-cancel CollateralEscrow allowance reduction to 0
+      walletProvider.setAccount(KEYS.borrower);
+      await setCollateralAllowanceForBorrow({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        targetAllowanceRaw: '0',
+        provider: walletProvider,
+        cfg,
+      });
+      const borrowCancelP3 = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '600000000',
+        expectedQuote: p3BorrowQuote600,
+        requireExpectedQuote: true,
+        maxRateBps: 950,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '600000000',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: true,
+        storage: borrowStorageApi,
+        provider: walletProvider,
+        cfg,
+      });
+
+      await cancelSignedBorrowOrder({
+        address: ADDRESSES.borrower,
+        order: borrowCancelP3.order,
+        storage: borrowStorageApi,
+        provider: walletProvider,
+        cfg,
+      });
+      const reducedCollRes = await setCollateralAllowanceForBorrow({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        targetAllowanceRaw: '0',
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(reducedCollRes.allowanceRaw, '0');
+
+      // Borrow.jsx Piece 3 SSR & UI hardening checks
+      const liveBorrowHtml = renderToStaticMarkup(
+        createElement(
+          StoreProvider,
+          null,
+          createElement(MemoryRouter, { initialEntries: ['/borrow'] }, createElement(Shell, null, createElement(Borrow)))
+        )
+      );
+      assert.match(
+        liveBorrowHtml,
+        /<button[^>]*disabled=""[^>]*>2\. Approve \/ verify allowance<\/button>/
+      );
+      assert.match(
+        liveBorrowHtml,
+        /<button[^>]*disabled=""[^>]*>3\. Sign &amp; publish BorrowOrder<\/button>/
+      );
+      const borrowSrc = fs.readFileSync(path.join(process.cwd(), 'src/pages/Borrow.jsx'), 'utf8');
+      assert.ok(
+        borrowSrc.includes('selectedLendRemainingRaw') &&
+          borrowSrc.includes('formatUnits(BigInt(rawRemaining), USDC_DECIMALS)') &&
+          borrowSrc.includes('lendPreviewSeqRef.current') &&
+          borrowSrc.includes('[web3?.address, web3?.chainId, web3?.wrongNetwork]') &&
+          borrowSrc.includes('setLendPreview(null)') &&
+          borrowSrc.includes('setCollateralAllowanceForBorrow') &&
+          borrowSrc.includes('collateralReductionState') &&
+          borrowSrc.includes('blockedByUnknown') &&
+          borrowSrc.includes('requireExpectedQuote: true'),
+        'Borrow.jsx must enforce lossless raw pill fill, preview seq guard, account/network reset, quote requirement & collateral reduction guard'
+      );
+      console.log('PASS WS3.4 Piece 3: Borrower LendOffer fill parity, cumulative CollateralEscrow sizing, lossless pill fill & UI hardening verified.');
+
+      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1, PIECE 2 & PIECE 3 FORK TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
       await new Promise<void>((r) => apiServer.close(() => r()));

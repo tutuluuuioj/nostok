@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { formatUnits } from 'viem';
 import { Field, Page, Rows, Sheet, TextInput } from '../components/ui.jsx';
 import { USDC_DECIMALS } from '../lib/contracts.js';
 import {
@@ -15,6 +16,7 @@ import {
   approveCollateralForBorrow,
   bumpMakerNonceOnChain,
   cancelSignedBorrowOrder,
+  computeRemainingBorrowCollateralRequirement,
   fillLendOfferAsBorrower,
   formatTokenUnitsDisplay,
   formatWeb3Error,
@@ -24,10 +26,75 @@ import {
   readBorrowAllowanceAndNonce,
   refreshSignedBorrowOrdersState,
   resolveExactBorrowAmounts,
+  setCollateralAllowanceForBorrow,
   shortAddress,
   verifyAndPreviewLendOfferFill,
 } from '../lib/web3.js';
 import { useStore } from '../store.jsx';
+
+function computeOpenBorrowOrdersCollateralTotal(
+  walletAddress,
+  collateralToken,
+  persistedList = [],
+  marketOrders = [],
+  excludeHashes = null
+) {
+  if (!walletAddress || !collateralToken) return { totalRaw: 0n, hasUnknown: false };
+  const addrLower = walletAddress.toLowerCase();
+  const tokLower = collateralToken.toLowerCase();
+  const seenHashes = new Set();
+  if (excludeHashes) {
+    for (const h of excludeHashes) {
+      if (h) seenHashes.add(String(h).toLowerCase());
+    }
+  }
+  let totalRaw = 0n;
+  let hasUnknown = false;
+
+  for (const item of persistedList ?? []) {
+    const ord = item?.orderJson ?? item?.order ?? {};
+    const maker = String(ord?.borrower ?? '').toLowerCase();
+    const tok = String(ord?.collateralToken ?? '').toLowerCase();
+    if (maker !== addrLower || tok !== tokLower) continue;
+    const h = String(item?.orderHash ?? '').toLowerCase();
+    const st = item?.onchainStatus;
+    if (st === 'unknown') hasUnknown = true;
+    if (st !== 'open' && st !== 'partially_filled' && st !== 'unknown') {
+      if (h) seenHashes.add(h);
+      continue;
+    }
+    if (h && seenHashes.has(h)) continue;
+    if (h) seenHashes.add(h);
+    totalRaw += computeRemainingBorrowCollateralRequirement(
+      ord.collateralAmount,
+      ord.minUsdc,
+      ord.minFill,
+      item.remainingRaw ?? ord.minUsdc
+    );
+  }
+
+  for (const row of marketOrders ?? []) {
+    if (row.order_type !== 'borrow' && row.order_type !== 'BorrowOrder') continue;
+    if (!row?.signed_order || !row?.signature) continue;
+    if (String(row.maker ?? '').toLowerCase() !== addrLower) continue;
+    const ord = row.signed_order;
+    const tok = String(row.collateral_token ?? ord?.collateralToken ?? '').toLowerCase();
+    if (tok !== tokLower) continue;
+    const st = row.status;
+    if (st === 'unknown') hasUnknown = true;
+    if (st !== 'open' && st !== 'partially_filled' && st !== 'unknown') continue;
+    const h = String(row.order_hash ?? '').toLowerCase();
+    if (h && seenHashes.has(h)) continue;
+    if (h) seenHashes.add(h);
+    totalRaw += computeRemainingBorrowCollateralRequirement(
+      ord?.collateralAmount ?? row?.collateral_amount?.raw,
+      ord?.minUsdc ?? row?.min_usdc?.raw,
+      ord?.minFill ?? row?.min_fill?.raw,
+      row?.remaining_usdc?.raw ?? ord?.minUsdc ?? row?.min_usdc?.raw
+    );
+  }
+  return { totalRaw, hasUnknown };
+}
 
 export function Borrow() {
   const { web3 } = useStore();
@@ -66,12 +133,15 @@ export function Borrow() {
   const [pasteCancelJson, setPasteCancelJson] = useState('');
   const [cancelError, setCancelError] = useState('');
   const [cancelNotice, setCancelNotice] = useState('');
+  const [collateralReductionState, setCollateralReductionState] = useState(null);
 
   // LendOffer fill workflow (Step 1 verify & simulate -> review terms -> Step 2 confirm & fill)
   const [lendOfferJsonStr, setLendOfferJsonStr] = useState('');
+  const [selectedLendRemainingRaw, setSelectedLendRemainingRaw] = useState('');
   const [lendFillUsdcStr, setLendFillUsdcStr] = useState('500');
   const [lendPreviewBusy, setLendPreviewBusy] = useState(false);
   const [lendPreview, setLendPreview] = useState(null);
+  const lendPreviewSeqRef = useRef(0);
   const [lendFillBusy, setLendFillBusy] = useState(false);
   const [lendFillResult, setLendFillResult] = useState(null);
   const [lendFillError, setLendFillError] = useState('');
@@ -163,6 +233,39 @@ export function Borrow() {
   useEffect(() => {
     void loadAllowanceAndNonce();
   }, [loadAllowanceAndNonce]);
+
+  useEffect(() => {
+    quoteSeqRef.current += 1;
+    lendPreviewSeqRef.current += 1;
+    setQuoteLoading(false);
+    setQuoteResult(null);
+    setQuoteError('');
+    setActionError('');
+    setActionNotice('');
+    setLatestSignedOrder(null);
+    setCancelError('');
+    setCancelNotice('');
+    setCollateralReductionState(null);
+    setLendPreviewBusy(false);
+    setLendPreview(null);
+    setLendFillResult(null);
+    setLendFillError('');
+  }, [web3?.address, web3?.chainId, web3?.wrongNetwork]);
+
+  useEffect(() => {
+    setCollateralReductionState(null);
+  }, [assetObj?.token]);
+
+  const existingOpenBorrowCollateralSumRaw = useMemo(
+    () =>
+      computeOpenBorrowOrdersCollateralTotal(
+        web3?.address,
+        assetObj?.token,
+        persistedOrders,
+        marketState.data?.orders
+      ).totalRaw,
+    [assetObj?.token, marketState.data?.orders, persistedOrders, web3?.address]
+  );
 
   // Notice: field edits clear the stale quote preview & action banners,
   // but NEVER delete persisted signed orders from state/storage.
@@ -303,11 +406,12 @@ export function Borrow() {
         userCollateralRaw: userCol,
         bufferBps: parsedBufferBps ?? DEFAULT_COLLATERAL_BUFFER_BPS,
         minFillRaw: safeMinFillRaw,
+        existingOpenCollateralRaw: existingOpenBorrowCollateralSumRaw,
       });
     } catch {
       return null;
     }
-  }, [assetObj, collateralStr, minFillStr, parsedBufferBps, quoteResult]);
+  }, [assetObj, collateralStr, existingOpenBorrowCollateralSumRaw, minFillStr, parsedBufferBps, quoteResult]);
 
   const partialRemainderWarning = useMemo(() => {
     const prinRawStr = exactQuoteAmounts
@@ -320,7 +424,7 @@ export function Borrow() {
     const prin = BigInt(prinRawStr);
     const minFill = BigInt(minRawStr);
     if (prin > minFill && prin - minFill < 500_000_000n) {
-      return `Warning (PARTIAL_REMAINDER_BELOW_500): Filling $${formatTokenUnitsDisplay(minFill, USDC_DECIMALS, 2)} leaves $${formatTokenUnitsDisplay(prin - minFill, USDC_DECIMALS, 2)} (< $500), which cannot be partially filled afterward.`;
+      return `Warning (PARTIAL_REMAINDER_BELOW_500): Filling $${formatTokenUnitsDisplay(minFill, USDC_DECIMALS, 2)} leaves $${formatTokenUnitsDisplay(prin - minFill, USDC_DECIMALS, 2)} (< $500.00), which is unfillable on-chain (LoanCore PRINCIPAL_BELOW_MINIMUM) and can only be cancelled or expire.`;
     }
     return '';
   }, [exactQuoteAmounts, minFillStr, principalStr]);
@@ -355,6 +459,10 @@ export function Borrow() {
       setActionError('Connect your wallet on Base before approving collateral.');
       return;
     }
+    if (!quoteResult || !quoteResult.accepted) {
+      setActionError('Click "1. Simulate live quote" and obtain an accepted quote before approving collateral.');
+      return;
+    }
     const parsed = parseValidatedInputs();
     if (parsed.error) {
       setActionError(parsed.error);
@@ -363,17 +471,11 @@ export function Borrow() {
     txBusyRef.current = true;
     setTxBusy('approve');
     try {
-      let activeQuote = quoteResult;
-      if (!activeQuote) {
-        activeQuote = await handleQuote();
-      }
-      if (!activeQuote || !activeQuote.accepted) {
-        throw new Error('Obtain an accepted live quote before approving collateral.');
-      }
-      const exact = resolveExactBorrowAmounts(activeQuote, {
+      const exact = resolveExactBorrowAmounts(quoteResult, {
         userCollateralRaw: parsed.collateralRaw,
         bufferBps: parsed.bufferBps,
         minFillRaw: parsed.minFillRaw,
+        existingOpenCollateralRaw: existingOpenBorrowCollateralSumRaw,
       });
       const res = await approveCollateralForBorrow({
         address: web3.address,
@@ -385,7 +487,7 @@ export function Borrow() {
       setActionNotice(
         res.alreadyApproved
           ? `CollateralEscrow already approved for ${res.allowanceRaw} raw units.`
-          : `Approved CollateralEscrow for ${exact.requiredApprovalRaw.toString()} raw ${assetObj.symbol} units (signed ${exact.collateralAmountRaw.toString()} + ${exact.approvalSlackRaw.toString()} wei partial-fill slack, tx ${res.txHash}).`
+          : `Approved CollateralEscrow for ${exact.requiredApprovalRaw.toString()} raw ${assetObj.symbol} units (open ${existingOpenBorrowCollateralSumRaw.toString()} + signed ${exact.collateralAmountRaw.toString()} + ${exact.approvalSlackRaw.toString()} wei slack, tx ${res.txHash}).`
       );
     } catch (err) {
       setActionError(formatWeb3Error(err));
@@ -408,6 +510,10 @@ export function Borrow() {
       setActionError('IneligibleCounterparty: Wallet is not eligible in EligibilityGate on-chain.');
       return;
     }
+    if (!quoteResult || !quoteResult.accepted) {
+      setActionError('Click "1. Simulate live quote" and review an accepted quote before signing a BorrowOrder.');
+      return;
+    }
     const parsed = parseValidatedInputs();
     if (parsed.error) {
       setActionError(parsed.error);
@@ -423,10 +529,12 @@ export function Borrow() {
         collateralAmountRaw: parsed.collateralRaw,
         collateralBufferBps: parsed.bufferBps,
         expectedQuote: quoteResult,
+        requireExpectedQuote: true,
         maxRateBps: parsed.aprBps,
         termDays: parsed.termDays,
         maxLtvBps: parsed.maxLtvBps,
         minFillRaw: parsed.minFillRaw,
+        existingOpenCollateralRaw: existingOpenBorrowCollateralSumRaw,
         expiryDays: parsed.expiryDays,
         yieldMode: yieldOn ? 1 : 0,
         allowInKindSettlement: false,
@@ -436,6 +544,7 @@ export function Borrow() {
       });
       setQuoteResult(signed.quote);
       setLatestSignedOrder(signed);
+      setCollateralReductionState(null);
       await Promise.all([loadAllowanceAndNonce(), syncPersistedOrders(), loadMarkets()]);
       setActionNotice(
         `Signed EIP-712 BorrowOrder ${signed.orderHash} with ${signed.exactAmounts.collateralAmountRaw} raw ${assetObj.symbol} (${signed.exactAmounts.bufferBps / 100}% buffer)${signed.publishedToApi ? ' and published to api/ orderbook.' : '.'}`
@@ -448,10 +557,101 @@ export function Borrow() {
     }
   }
 
+  async function refreshPostCancelCollateralAllowance(cancelledHash = null, allInvalidated = false) {
+    if (!web3?.address || !assetObj?.token) return;
+    const stored = loadPersistedSignedOrders();
+    const [freshMeta, freshPersisted, freshMarkets] = await Promise.all([
+      loadAllowanceAndNonce(),
+      stored.length > 0
+        ? refreshSignedBorrowOrdersState({ orders: stored, cfg: web3?.config }).then((enriched) => {
+            setPersistedOrders(enriched);
+            return enriched;
+          })
+        : Promise.resolve([]).then(() => {
+            setPersistedOrders([]);
+            return [];
+          }),
+      fetchMarketSnapshot({
+        cfg: web3?.config,
+        includeLoans: false,
+        includeAuctions: false,
+      }),
+    ]);
+    if (freshMarkets) {
+      setMarketState({ loading: false, data: freshMarkets });
+    }
+    const exclude = cancelledHash ? new Set([String(cancelledHash).toLowerCase()]) : null;
+    const remainingSummary = allInvalidated
+      ? { totalRaw: 0n, hasUnknown: false }
+      : computeOpenBorrowOrdersCollateralTotal(
+          web3.address,
+          assetObj.token,
+          freshPersisted,
+          freshMarkets?.orders,
+          exclude
+        );
+    const blockedByUnknown =
+      !allInvalidated &&
+      (remainingSummary.hasUnknown || !freshMarkets || Boolean(freshMarkets?.stale));
+    const liveAllowanceRaw = freshMeta ? BigInt(freshMeta.allowanceRaw) : allowanceRawBig;
+    if (
+      liveAllowanceRaw > remainingSummary.totalRaw ||
+      (blockedByUnknown && liveAllowanceRaw > 0n)
+    ) {
+      setCollateralReductionState({
+        collateralToken: assetObj.token,
+        symbol: assetObj.symbol ?? 'collateral',
+        decimals: Number(assetObj.decimals ?? 18),
+        currentAllowanceRaw: liveAllowanceRaw.toString(),
+        targetAllowanceRaw: remainingSummary.totalRaw.toString(),
+        blockedByUnknown,
+      });
+    } else {
+      setCollateralReductionState(null);
+    }
+  }
+
+  async function handleReduceCollateralAfterCancel() {
+    if (txBusyRef.current || !web3?.address || !collateralReductionState) return;
+    if (collateralReductionState.blockedByUnknown) {
+      setCancelError(
+        'Cannot reduce CollateralEscrow allowance while an open BorrowOrder has unknown on-chain status or RPC is degraded; refresh order statuses first.'
+      );
+      return;
+    }
+    setCancelError('');
+    txBusyRef.current = true;
+    setTxBusy('reduce-collateral-allowance');
+    try {
+      const targetRaw = collateralReductionState.targetAllowanceRaw;
+      const res = await setCollateralAllowanceForBorrow({
+        address: web3.address,
+        collateralToken: collateralReductionState.collateralToken,
+        targetAllowanceRaw: targetRaw,
+        cfg: web3.config,
+      });
+      await loadAllowanceAndNonce();
+      const dec = collateralReductionState.decimals;
+      const sym = collateralReductionState.symbol;
+      setCollateralReductionState(null);
+      setCancelNotice(
+        res.unchanged
+          ? `CollateralEscrow ${sym} allowance is already ${formatTokenUnitsDisplay(targetRaw, dec, 6)} (${targetRaw} raw).`
+          : `Reduced CollateralEscrow ${sym} allowance to ${formatTokenUnitsDisplay(res.allowanceRaw, dec, 6)} (${res.allowanceRaw} raw) (tx ${res.txHash}).`
+      );
+    } catch (err) {
+      setCancelError(formatWeb3Error(err));
+    } finally {
+      txBusyRef.current = false;
+      setTxBusy('');
+    }
+  }
+
   async function handleCancelOrder(orderObj) {
     if (txBusyRef.current || !web3?.address) return;
     setCancelError('');
     setCancelNotice('');
+    setCollateralReductionState(null);
     txBusyRef.current = true;
     setTxBusy('cancel');
     try {
@@ -460,7 +660,7 @@ export function Borrow() {
         order: orderObj,
         cfg: web3.config,
       });
-      await Promise.all([syncPersistedOrders(), loadMarkets()]);
+      await refreshPostCancelCollateralAllowance(res.orderHash, false);
       setCancelNotice(`Cancelled order ${res.orderHash} on-chain (tx ${res.txHash}).`);
     } catch (err) {
       setCancelError(formatWeb3Error(err));
@@ -475,6 +675,7 @@ export function Borrow() {
     if (txBusyRef.current) return;
     setCancelError('');
     setCancelNotice('');
+    setCollateralReductionState(null);
     if (!web3?.connected || web3?.wrongNetwork || !web3?.address) {
       setCancelError('Connect your wallet on Base before cancelling an order.');
       return;
@@ -494,7 +695,7 @@ export function Borrow() {
         order: parsed.order,
         cfg: web3.config,
       });
-      await Promise.all([syncPersistedOrders(), loadMarkets()]);
+      await refreshPostCancelCollateralAllowance(res.orderHash, false);
       setCancelNotice(`Cancelled pasted BorrowOrder ${res.orderHash} on-chain (tx ${res.txHash}).`);
     } catch (err) {
       setCancelError(formatWeb3Error(err));
@@ -508,6 +709,7 @@ export function Borrow() {
     if (txBusyRef.current) return;
     setCancelError('');
     setCancelNotice('');
+    setCollateralReductionState(null);
     if (!web3?.connected || web3?.wrongNetwork || !web3?.address) {
       setCancelError('Connect your wallet on Base before bumping your maker nonce.');
       return;
@@ -519,7 +721,7 @@ export function Borrow() {
         address: web3.address,
         cfg: web3.config,
       });
-      await Promise.all([loadAllowanceAndNonce(), syncPersistedOrders(), loadMarkets()]);
+      await refreshPostCancelCollateralAllowance(null, true);
       setCancelNotice(
         `Called OrderSettlement.bumpNonce() (tx ${res.txHash}). Maker nonce is now ${res.newNonce}; all open orders signed at earlier nonces are invalidated on-chain.`
       );
@@ -565,6 +767,16 @@ export function Borrow() {
     return { offer, signature };
   }
 
+  function resolveLendFillUsdcRaw() {
+    if (
+      selectedLendRemainingRaw &&
+      lendFillUsdcStr.trim() === formatUnits(BigInt(selectedLendRemainingRaw), USDC_DECIMALS)
+    ) {
+      return selectedLendRemainingRaw;
+    }
+    return parseDecimalToRaw(lendFillUsdcStr, USDC_DECIMALS);
+  }
+
   async function handleVerifyLendOffer(event) {
     if (event) event.preventDefault();
     if (txBusyRef.current) return;
@@ -579,7 +791,7 @@ export function Borrow() {
       setLendFillError('Enter a valid collateral buffer percentage (0.00%–50.00%).');
       return;
     }
-    const fillUsdcRaw = parseDecimalToRaw(lendFillUsdcStr, USDC_DECIMALS);
+    const fillUsdcRaw = resolveLendFillUsdcRaw();
     if (!fillUsdcRaw) {
       setLendFillError('Enter a valid positive USDC fill amount (up to 6 decimals).');
       return;
@@ -592,6 +804,7 @@ export function Borrow() {
       return;
     }
 
+    const previewSeq = ++lendPreviewSeqRef.current;
     setLendPreviewBusy(true);
     try {
       const preview = await verifyAndPreviewLendOfferFill({
@@ -600,15 +813,20 @@ export function Borrow() {
         collateralToken: assetObj.token,
         fillUsdcRaw,
         collateralBufferBps: parsedBufferBps,
+        existingOpenCollateralRaw: existingOpenBorrowCollateralSumRaw,
         borrowerAddress: web3?.connected && !web3?.wrongNetwork ? web3.address : null,
         borrowerAttestation: web3?.attestationHex ?? '0x',
         cfg: web3?.config,
       });
+      if (previewSeq !== lendPreviewSeqRef.current) return;
       setLendPreview(preview);
     } catch (err) {
+      if (previewSeq !== lendPreviewSeqRef.current) return;
       setLendFillError(formatWeb3Error(err));
     } finally {
-      setLendPreviewBusy(false);
+      if (previewSeq === lendPreviewSeqRef.current) {
+        setLendPreviewBusy(false);
+      }
     }
   }
 
@@ -630,6 +848,7 @@ export function Borrow() {
         collateralToken: lendPreview.collateralToken,
         fillUsdcRaw: lendPreview.fillAmountRaw,
         collateralBufferBps: parsedBufferBps ?? DEFAULT_COLLATERAL_BUFFER_BPS,
+        existingOpenCollateralRaw: existingOpenBorrowCollateralSumRaw,
         expectedPreview: lendPreview,
         borrowerAttestation: web3.attestationHex,
         autoApprove: true,
@@ -855,7 +1074,15 @@ export function Borrow() {
               className="btn secondary"
               type="button"
               onClick={() => void handleApproveCollateral()}
-              disabled={!web3?.connected || web3?.wrongNetwork || Boolean(txBusy) || !assetObj}
+              disabled={
+                !web3?.connected ||
+                web3?.wrongNetwork ||
+                Boolean(txBusy) ||
+                !assetObj ||
+                quoteLoading ||
+                !quoteResult ||
+                !quoteResult.accepted
+              }
             >
               {txBusy === 'approve'
                 ? '2. Approving…'
@@ -871,6 +1098,9 @@ export function Borrow() {
                 web3?.wrongNetwork ||
                 Boolean(txBusy) ||
                 !assetObj ||
+                quoteLoading ||
+                !quoteResult ||
+                !quoteResult.accepted ||
                 Boolean(eligibilityInfo && !eligibilityInfo.isEligible)
               }
             >
@@ -940,9 +1170,15 @@ export function Borrow() {
                     value: `${formatTokenUnitsDisplay(exactQuoteAmounts.collateralAmountRaw, quoteResult.asset.decimals, 6)} ${quoteResult.asset.symbol} (${exactQuoteAmounts.collateralAmountRaw.toString()} raw)`,
                   }
                 : null,
+              tokenMeta.data
+                ? {
+                    label: 'Open BorrowOrders collateral reserve',
+                    value: `${formatTokenUnitsDisplay(existingOpenBorrowCollateralSumRaw, tokenMeta.data.decimals, 6)} ${tokenMeta.data.symbol} (${existingOpenBorrowCollateralSumRaw.toString()} raw)`,
+                  }
+                : null,
               exactQuoteAmounts
                 ? {
-                    label: `Approval required (+${exactQuoteAmounts.approvalSlackRaw.toString()} wei fill slack)`,
+                    label: `Approval required (open + signed + ${exactQuoteAmounts.approvalSlackRaw.toString()} wei slack)`,
                     value: `${exactQuoteAmounts.requiredApprovalRaw.toString()} raw (covers ${exactQuoteAmounts.maxFills.toString()} max fill(s))`,
                   }
                 : null,
@@ -1027,6 +1263,42 @@ export function Borrow() {
 
         {cancelError ? <p className="err block" role="alert">{cancelError}</p> : null}
         {cancelNotice ? <p className="note block" role="status">{cancelNotice}</p> : null}
+        {collateralReductionState ? (
+          <div className="err block" role="status" style={{ marginTop: 10 }}>
+            <p>
+              Warning: CollateralEscrow {collateralReductionState.symbol} allowance is still{' '}
+              {formatTokenUnitsDisplay(
+                collateralReductionState.currentAllowanceRaw,
+                collateralReductionState.decimals,
+                6
+              )}{' '}
+              ({collateralReductionState.currentAllowanceRaw} raw), above remaining open BorrowOrders (
+              {formatTokenUnitsDisplay(
+                collateralReductionState.targetAllowanceRaw,
+                collateralReductionState.decimals,
+                6
+              )}{' '}
+              / {collateralReductionState.targetAllowanceRaw} raw).{' '}
+              {collateralReductionState.blockedByUnknown
+                ? 'One or more BorrowOrders currently have unknown on-chain status; allowance reduction is blocked until "Refresh order statuses" reads cleanly.'
+                : 'Reduce or revoke excess allowance to limit contract exposure.'}
+            </p>
+            <div className="actions" style={{ marginTop: 8 }}>
+              <button
+                className="btn secondary"
+                type="button"
+                onClick={() => void handleReduceCollateralAfterCancel()}
+                disabled={Boolean(txBusy) || Boolean(collateralReductionState.blockedByUnknown)}
+              >
+                {collateralReductionState.blockedByUnknown
+                  ? 'Reduction blocked (unknown order status)'
+                  : txBusy === 'reduce-collateral-allowance'
+                    ? 'Updating CollateralEscrow allowance…'
+                    : `Reduce CollateralEscrow ${collateralReductionState.symbol} allowance to ${formatTokenUnitsDisplay(collateralReductionState.targetAllowanceRaw, collateralReductionState.decimals, 6)}`}
+              </button>
+            </div>
+          </div>
+        ) : null}
 
         {persistedOrders.length === 0 ? (
           <p className="hint block">No persisted BorrowOrders saved in this browser yet.</p>
@@ -1121,6 +1393,7 @@ export function Borrow() {
                 key={row.order_hash}
                 type="button"
                 onClick={() => {
+                  const rawRemaining = String(row.remaining_usdc?.raw ?? row.min_usdc?.raw ?? '500000000');
                   setLendOfferJsonStr(
                     JSON.stringify(
                       {
@@ -1132,9 +1405,8 @@ export function Borrow() {
                       2
                     )
                   );
-                  setLendFillUsdcStr(
-                    formatTokenUnitsDisplay(row.remaining_usdc?.raw ?? row.min_usdc?.raw ?? '500000000', USDC_DECIMALS, 2)
-                  );
+                  setSelectedLendRemainingRaw(rawRemaining);
+                  setLendFillUsdcStr(formatUnits(BigInt(rawRemaining), USDC_DECIMALS));
                   setLendPreview(null);
                   setLendFillError('');
                   setLendFillResult(null);
@@ -1176,6 +1448,7 @@ export function Borrow() {
                 value={lendFillUsdcStr}
                 onChange={(v) => {
                   setLendFillUsdcStr(v);
+                  setSelectedLendRemainingRaw('');
                   setLendPreview(null);
                   setLendFillError('');
                 }}
@@ -1245,10 +1518,14 @@ export function Borrow() {
                   value: `$${formatTokenUnitsDisplay(lendPreview.exact.totalRepaymentAtMaturityRaw, USDC_DECIMALS, 2)} (${lendPreview.exact.totalRepaymentAtMaturityRaw.toString()} raw)`,
                 },
                 {
+                  label: 'Open BorrowOrders collateral / Required CollateralEscrow allowance',
+                  value: `${formatTokenUnitsDisplay(lendPreview.existingOpenCollateralRaw ?? '0', lendPreview.collateralDecimals, 6)} ${lendPreview.collateralSymbol} (${lendPreview.existingOpenCollateralRaw ?? '0'} raw) · Need ${formatTokenUnitsDisplay(lendPreview.requiredApprovalRaw ?? lendPreview.exact.collateralAmountRaw, lendPreview.collateralDecimals, 6)} ${lendPreview.collateralSymbol} (${(lendPreview.requiredApprovalRaw ?? lendPreview.exact.collateralAmountRaw).toString()} raw)`,
+                },
+                {
                   label: 'Pre-approval eth_call simulation',
                   value: lendPreview.simulationVerified
                     ? lendPreview.needsApproval
-                      ? 'Verified (ERC-20 approval required before fill)'
+                      ? `Verified (ERC-20 approval required: ${formatTokenUnitsDisplay(lendPreview.requiredApprovalRaw ?? lendPreview.exact.collateralAmountRaw, lendPreview.collateralDecimals, 6)} ${lendPreview.collateralSymbol})`
                       : 'Verified (allowance sufficient)'
                     : 'Pending wallet connection',
                 },

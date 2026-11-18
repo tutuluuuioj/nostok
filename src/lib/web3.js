@@ -828,11 +828,13 @@ export async function fetchLoanQuote({
 export function computeBorrowApprovalAmountRaw(
   collateralAmountRaw,
   principalRaw,
-  minFillRaw = null
+  minFillRaw = null,
+  { existingOpenCollateralRaw = 0n, perFillUsdcRawList = null } = {}
 ) {
   const signedCollateralRaw = BigInt(collateralAmountRaw);
   const totalUsdcRaw = BigInt(principalRaw);
-  if (signedCollateralRaw <= 0n || totalUsdcRaw <= 0n) {
+  const existingOpen = BigInt(existingOpenCollateralRaw ?? 0n);
+  if (signedCollateralRaw <= 0n || totalUsdcRaw <= 0n || existingOpen < 0n) {
     throw new Error('Collateral and principal raw amounts must be positive.');
   }
   const MIN_PROTOCOL_FILL_USDC = 500_000_000n;
@@ -846,12 +848,33 @@ export function computeBorrowApprovalAmountRaw(
     parsedMinFill < MIN_PROTOCOL_FILL_USDC ? MIN_PROTOCOL_FILL_USDC : parsedMinFill;
   const effectiveMinFill = flooredMinFill > totalUsdcRaw ? totalUsdcRaw : flooredMinFill;
   const maxFills = (totalUsdcRaw + effectiveMinFill - 1n) / effectiveMinFill;
-  const approvalSlackRaw = maxFills;
+
+  let plannedPerFillCollateralSum = 0n;
+  if (Array.isArray(perFillUsdcRawList) && perFillUsdcRawList.length > 0) {
+    const validChunks = validateLendPartialFillPlan(perFillUsdcRawList, totalUsdcRaw, effectiveMinFill);
+    for (const chunk of validChunks) {
+      plannedPerFillCollateralSum += computeBorrowCollateralForFill(
+        signedCollateralRaw,
+        totalUsdcRaw,
+        chunk
+      );
+    }
+  }
+
+  const baseOrderRequirement = signedCollateralRaw + maxFills;
+  const orderRequirement =
+    plannedPerFillCollateralSum > baseOrderRequirement
+      ? plannedPerFillCollateralSum
+      : baseOrderRequirement;
+  const approvalSlackRaw = orderRequirement - signedCollateralRaw;
+
   return {
     signedCollateralRaw,
     maxFills,
     approvalSlackRaw,
-    requiredApprovalRaw: signedCollateralRaw + approvalSlackRaw,
+    plannedPerFillCollateralSum,
+    existingOpenCollateralRaw: existingOpen,
+    requiredApprovalRaw: existingOpen + orderRequirement,
   };
 }
 
@@ -861,6 +884,8 @@ export function resolveExactBorrowAmounts(
     userCollateralRaw = null,
     bufferBps = DEFAULT_COLLATERAL_BUFFER_BPS,
     minFillRaw = null,
+    existingOpenCollateralRaw = 0n,
+    perFillUsdcRawList = null,
   } = {}
 ) {
   if (!quote?.amounts?.principal?.raw || !quote?.amounts?.collateral_required?.raw) {
@@ -890,7 +915,8 @@ export function resolveExactBorrowAmounts(
   const approvalSizing = computeBorrowApprovalAmountRaw(
     collateralAmountRaw,
     principalRaw,
-    minFillRaw
+    minFillRaw,
+    { existingOpenCollateralRaw, perFillUsdcRawList }
   );
 
   return {
@@ -901,6 +927,7 @@ export function resolveExactBorrowAmounts(
     collateralAmountRaw,
     maxFills: approvalSizing.maxFills,
     approvalSlackRaw: approvalSizing.approvalSlackRaw,
+    existingOpenCollateralRaw: approvalSizing.existingOpenCollateralRaw,
     requiredApprovalRaw: approvalSizing.requiredApprovalRaw,
     originationFeeRaw: BigInt(quote.amounts.origination_fee?.raw ?? 0n),
     netProceedsRaw: BigInt(quote.amounts.net_proceeds?.raw ?? 0n),
@@ -1282,27 +1309,22 @@ export async function approveUsdcForLend({
   });
 }
 
-/**
- * Explicitly sets LoanCore USDC allowance to `targetAllowanceRaw` (including `0n`),
- * used after cancelling open LendOffers to revoke excess allowance.
- */
-export async function setUsdcAllowanceForLend({
+async function setErc20AllowanceExact({
   address,
+  tokenAddress,
+  spenderAddress,
   targetAllowanceRaw,
   provider = getInjectedProvider(),
   cfg = getFrontendConfig(),
   publicClient = createProtocolPublicClient(cfg),
 }) {
-  if (!cfg.usdcAddress || !cfg.contracts.loanCore) {
-    throw new Error('USDC or LoanCore contract address is not configured.');
-  }
   const target = BigInt(targetAllowanceRaw);
   if (target < 0n) {
-    throw new Error('Target USDC allowance raw amount cannot be negative.');
+    throw new Error('Target allowance raw amount cannot be negative.');
   }
   const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
-  const token = getAddress(cfg.usdcAddress);
-  const spender = getAddress(cfg.contracts.loanCore);
+  const token = getAddress(tokenAddress);
+  const spender = getAddress(spenderAddress);
 
   const currentAllowance = BigInt(
     await publicClient.readContract({
@@ -1352,6 +1374,60 @@ export async function setUsdcAllowanceForLend({
     txHash,
     allowanceRaw: postAllowance.toString(),
   };
+}
+
+/**
+ * Explicitly sets LoanCore USDC allowance to `targetAllowanceRaw` (including `0n`),
+ * used after cancelling open LendOffers to revoke excess allowance.
+ */
+export async function setUsdcAllowanceForLend({
+  address,
+  targetAllowanceRaw,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!cfg.usdcAddress || !cfg.contracts.loanCore) {
+    throw new Error('USDC or LoanCore contract address is not configured.');
+  }
+  return setErc20AllowanceExact({
+    address,
+    tokenAddress: cfg.usdcAddress,
+    spenderAddress: cfg.contracts.loanCore,
+    targetAllowanceRaw,
+    provider,
+    cfg,
+    publicClient,
+  });
+}
+
+/**
+ * Explicitly sets CollateralEscrow token allowance to `targetAllowanceRaw` (including `0n`),
+ * used after cancelling open BorrowOrders to revoke excess collateral allowance.
+ */
+export async function setCollateralAllowanceForBorrow({
+  address,
+  collateralToken,
+  targetAllowanceRaw,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!collateralToken || !isAddress(collateralToken)) {
+    throw new Error('Valid collateral token address required.');
+  }
+  if (!cfg.contracts.collateralEscrow) {
+    throw new Error('CollateralEscrow contract address is not configured.');
+  }
+  return setErc20AllowanceExact({
+    address,
+    tokenAddress: collateralToken,
+    spenderAddress: cfg.contracts.collateralEscrow,
+    targetAllowanceRaw,
+    provider,
+    cfg,
+    publicClient,
+  });
 }
 
 function normalizeAttestationHex(raw) {
@@ -1887,6 +1963,7 @@ export async function prepareAndSignBorrowOrder({
   termDays,
   maxLtvBps = null,
   minFillRaw = null,
+  existingOpenCollateralRaw = 0n,
   expiryDays = 2,
   expiryTimestamp = null,
   yieldMode = 0,
@@ -1939,6 +2016,7 @@ export async function prepareAndSignBorrowOrder({
     userCollateralRaw: collateralAmountRaw,
     bufferBps: collateralBufferBps,
     minFillRaw: minFillRaw ?? quote.amounts.principal.raw,
+    existingOpenCollateralRaw: existingOpenCollateralRaw ?? 0n,
   });
   const minFillBig = BigInt(minFillRaw ?? exact.principalRaw);
   if (minFillBig < 500_000_000n) {
@@ -2031,6 +2109,7 @@ export async function prepareAndSignBorrowOrder({
     collateralAmountRaw: exact.collateralAmountRaw.toString(),
     maxFills: exact.maxFills.toString(),
     approvalSlackRaw: exact.approvalSlackRaw.toString(),
+    existingOpenCollateralRaw: exact.existingOpenCollateralRaw.toString(),
     requiredApprovalRaw: exact.requiredApprovalRaw.toString(),
     originationFeeRaw: exact.originationFeeRaw.toString(),
     netProceedsRaw: exact.netProceedsRaw.toString(),
@@ -2177,6 +2256,106 @@ export async function bumpMakerNonceOnChain({
  * Catches expired, cancelled, wrong-nonce, invalid-sig, exceeded, minFill, lender funding,
  * eligibility, and LTV reverts BEFORE asking the user for an ERC-20 approve transaction.
  */
+export function computeRemainingBorrowCollateralRequirement(
+  totalCollRaw,
+  totalUsdcRaw,
+  minFillRaw,
+  remainingUsdcRaw = null
+) {
+  const totalColl = BigInt(totalCollRaw ?? 0n);
+  const totalUsdc = BigInt(totalUsdcRaw ?? 0n);
+  const remaining = BigInt(remainingUsdcRaw ?? totalUsdc);
+  if (totalColl <= 0n || totalUsdc <= 0n || remaining <= 0n) return 0n;
+  const effMinRaw = minFillRaw && BigInt(minFillRaw) > 500_000_000n ? BigInt(minFillRaw) : 500_000_000n;
+  if (remaining >= totalUsdc) {
+    return computeBorrowApprovalAmountRaw(totalColl, totalUsdc, effMinRaw).requiredApprovalRaw;
+  }
+  const remColl = computeBorrowCollateralForFill(totalColl, totalUsdc, remaining);
+  const clampedMin = effMinRaw > remaining ? remaining : effMinRaw;
+  const remFills = (remaining + clampedMin - 1n) / clampedMin;
+  return remColl + remFills;
+}
+
+async function resolveOpenBorrowOrdersCollateralSumRaw({
+  borrowerAddress,
+  collateralToken,
+  existingOpenCollateralRaw = null,
+  storage = null,
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (existingOpenCollateralRaw !== null && existingOpenCollateralRaw !== undefined) {
+    return BigInt(existingOpenCollateralRaw);
+  }
+  if (!borrowerAddress || !collateralToken) return 0n;
+  const targetChecksum = getAddress(borrowerAddress);
+  const targetBorrower = targetChecksum.toLowerCase();
+  const tokenChecksum = getAddress(collateralToken);
+  const tokenLower = tokenChecksum.toLowerCase();
+  const seenHashes = new Set();
+  let total = 0n;
+
+  const persisted = loadPersistedSignedOrders(storage);
+  const mine = persisted.filter((item) => {
+    const ord = item?.orderJson ?? item?.order;
+    const maker = String(ord?.borrower ?? '').toLowerCase();
+    const tok = String(ord?.collateralToken ?? '').toLowerCase();
+    return (!maker || maker === targetBorrower) && (!tok || tok === tokenLower);
+  });
+  if (mine.length > 0) {
+    const synced = await refreshSignedBorrowOrdersState({ orders: mine, cfg, publicClient });
+    for (const item of synced) {
+      const ord = item?.orderJson ?? item?.order ?? {};
+      const tok = String(ord?.collateralToken ?? '').toLowerCase();
+      const maker = String(ord?.borrower ?? '').toLowerCase();
+      if (tok !== tokenLower || (maker && maker !== targetBorrower)) continue;
+      const h = String(item?.orderHash ?? '').toLowerCase();
+      if (h) seenHashes.add(h);
+      if (item?.onchainStatus === 'unknown') {
+        throw new Error(
+          `Cannot verify open BorrowOrder ${item.orderHash ?? ''} status on-chain (${item.stateError ?? 'unknown'}); supply existingOpenCollateralRaw or retry when RPC recovers.`
+        );
+      }
+      if (item?.onchainStatus === 'open' || item?.onchainStatus === 'partially_filled') {
+        total += computeRemainingBorrowCollateralRequirement(
+          ord.collateralAmount,
+          ord.minUsdc,
+          ord.minFill,
+          item.remainingRaw ?? ord.minUsdc
+        );
+      }
+    }
+  }
+
+  if (cfg?.apiUrl) {
+    const relayRes = await fetchPaginatedApiRows(
+      `${cfg.apiUrl}/orders?order_type=borrow&maker=${targetChecksum}&asset=${tokenChecksum}`,
+      { cfg }
+    );
+    for (const row of relayRes.rows ?? []) {
+      if (String(row?.maker ?? '').toLowerCase() !== targetBorrower) continue;
+      if (row?.order_type !== 'borrow' && row?.order_type !== 'BorrowOrder') continue;
+      if (!row?.signed_order || !row?.signature) continue;
+      const ord = row.signed_order;
+      const rowTok = String(row?.collateral_token ?? ord?.collateralToken ?? '').toLowerCase();
+      if (rowTok !== tokenLower) continue;
+      const h = String(row?.order_hash ?? '').toLowerCase();
+      if (h && seenHashes.has(h)) continue;
+      if (h) seenHashes.add(h);
+      if (row?.status === 'open' || row?.status === 'partially_filled' || row?.status === 'unknown') {
+        total += computeRemainingBorrowCollateralRequirement(
+          ord?.collateralAmount ?? row?.collateral_amount?.raw,
+          ord?.minUsdc ?? row?.min_usdc?.raw,
+          ord?.minFill ?? row?.min_fill?.raw,
+          row?.remaining_usdc?.raw ?? ord?.minUsdc ?? row?.min_usdc?.raw
+        );
+      }
+    }
+  }
+
+  return total;
+}
+
 export async function verifyAndPreviewLendOfferFill({
   offer,
   signature,
@@ -2184,6 +2363,8 @@ export async function verifyAndPreviewLendOfferFill({
   fillUsdcRaw = null,
   collateralAmountRaw = null,
   collateralBufferBps = DEFAULT_COLLATERAL_BUFFER_BPS,
+  existingOpenCollateralRaw = null,
+  storage = null,
   borrowerAddress = null,
   borrowerAttestation = '0x',
   lenderAttestation = '0x',
@@ -2403,10 +2584,22 @@ export async function verifyAndPreviewLendOfferFill({
 
   let borrowerBalanceRaw = '0';
   let borrowerAllowanceRaw = '0';
+  let existingOpenCollRawBig = BigInt(existingOpenCollateralRaw ?? 0n);
+  let requiredApprovalRawBig = existingOpenCollRawBig + exact.collateralAmountRaw;
   let needsApproval = true;
   let simulationVerified = false;
 
   if (borrowerAddr) {
+    existingOpenCollRawBig = await resolveOpenBorrowOrdersCollateralSumRaw({
+      borrowerAddress: borrowerAddr,
+      collateralToken: token,
+      existingOpenCollateralRaw,
+      storage,
+      cfg,
+      publicClient,
+    });
+    requiredApprovalRawBig = existingOpenCollRawBig + exact.collateralAmountRaw;
+
     const walletMeta = await readBorrowAllowanceAndNonce(borrowerAddr, token, {
       cfg,
       publicClient,
@@ -2414,7 +2607,7 @@ export async function verifyAndPreviewLendOfferFill({
     });
     borrowerBalanceRaw = walletMeta.balanceRaw;
     borrowerAllowanceRaw = walletMeta.allowanceRaw;
-    needsApproval = BigInt(borrowerAllowanceRaw) < exact.collateralAmountRaw;
+    needsApproval = BigInt(borrowerAllowanceRaw) < requiredApprovalRawBig;
 
     if (BigInt(borrowerBalanceRaw) < exact.collateralAmountRaw) {
       throw new Error(
@@ -2465,6 +2658,8 @@ export async function verifyAndPreviewLendOfferFill({
     lenderUsdcAllowanceRaw: BigInt(lenderUsdcAllowance).toString(),
     borrowerBalanceRaw,
     borrowerAllowanceRaw,
+    existingOpenCollateralRaw: existingOpenCollRawBig.toString(),
+    requiredApprovalRaw: requiredApprovalRawBig.toString(),
     needsApproval,
     simulationVerified,
     warnings,
@@ -2483,6 +2678,8 @@ export async function verifyAndPreviewLendOfferFill({
  *   fillUsdcRaw: string | bigint,
  *   collateralAmountRaw?: string | bigint | null,
  *   collateralBufferBps?: number,
+ *   existingOpenCollateralRaw?: string | bigint | null,
+ *   storage?: any,
  *   expectedPreview?: any,
  *   borrowerAttestation?: string,
  *   lenderAttestation?: string,
@@ -2500,6 +2697,8 @@ export async function fillLendOfferAsBorrower({
   fillUsdcRaw,
   collateralAmountRaw = null,
   collateralBufferBps = DEFAULT_COLLATERAL_BUFFER_BPS,
+  existingOpenCollateralRaw = null,
+  storage = null,
   expectedPreview = null,
   borrowerAttestation = '0x',
   lenderAttestation = '0x',
@@ -2521,6 +2720,8 @@ export async function fillLendOfferAsBorrower({
     fillUsdcRaw,
     collateralAmountRaw,
     collateralBufferBps,
+    existingOpenCollateralRaw,
+    storage,
     borrowerAddress: wallet,
     borrowerAttestation,
     lenderAttestation,
@@ -2547,12 +2748,14 @@ export async function fillLendOfferAsBorrower({
   let approvalTxHash = null;
   if (preview.needsApproval) {
     if (!autoApprove) {
-      throw new Error('CollateralEscrow allowance is below required collateral; approve exact collateral first.');
+      throw new Error(
+        `CollateralEscrow allowance is below required ${preview.requiredApprovalRaw} raw units (covers open BorrowOrders + fill collateral); approve collateral first.`
+      );
     }
     const appRes = await approveCollateralForBorrow({
       address: wallet,
       collateralToken: preview.collateralToken,
-      requiredCollateralRaw: preview.exact.collateralAmountRaw,
+      requiredCollateralRaw: preview.requiredApprovalRaw,
       provider,
       cfg,
       publicClient,
@@ -2579,6 +2782,9 @@ export async function fillLendOfferAsBorrower({
   });
 
   const loanId = decodeOrderFilledLoanId(receipt, settlementAddr);
+  if (!loanId) {
+    throw new Error('OrderFilled event missing loanId after fillLendOffer transaction.');
+  }
 
   return {
     txHash,
@@ -2589,6 +2795,8 @@ export async function fillLendOfferAsBorrower({
     exact: preview.exact,
     preview,
     collateralAmountRaw: preview.exact.collateralAmountRaw.toString(),
+    existingOpenCollateralRaw: preview.existingOpenCollateralRaw,
+    requiredApprovalRaw: preview.requiredApprovalRaw,
     fillUsdcRaw: preview.fillAmountRaw,
   };
 }
