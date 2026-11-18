@@ -1166,7 +1166,6 @@ async function runTests(): Promise<void> {
           route: '/loan/L-1',
           el: createElement(Routes, null, createElement(Route, { path: '/loan/:id', element: createElement(Loan) })),
         },
-        { route: '/lend', el: createElement(Lend) },
         { route: '/builders', el: createElement(Builders) },
       ];
       for (const { route, el } of demoRoutes) {
@@ -2639,7 +2638,32 @@ async function runTests(): Promise<void> {
       walletProvider.setAccount(KEYS.borrower);
       console.log('PASS WS3.4 Piece 1: Lend primitives (exact raw bigints, LendOffer sign/cancel/multi-fill, BorrowOrder partial fills -> PositionNFT IDs) verified.');
 
-      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1 FORK TESTS PASSED.');
+      // 3.6 WS3.4 Piece 2: Live Lend.jsx UI verification (no PreviewBanner/mock assets, live LoanCore/Quote/BorrowOrder fill controls)
+      console.log('\n=== WS3.4 Piece 2: Live Lend.jsx UI verification ===');
+      const liveLendHtml = renderToStaticMarkup(
+        createElement(
+          StoreProvider,
+          null,
+          createElement(MemoryRouter, { initialEntries: ['/lend'] }, createElement(Shell, null, createElement(Lend)))
+        )
+      );
+      assert.ok(
+        !liveLendHtml.includes('Preview data, not your positions'),
+        'Live WS3.4 /lend page must no longer show static PreviewBanner'
+      );
+      assert.ok(!/in-kind|inkind/i.test(liveLendHtml), 'Unused in-kind checkbox must remain absent on Lend.jsx');
+      assert.match(liveLendHtml, /LoanCore \(USDC spender\)/);
+      assert.match(liveLendHtml, /EligibilityGate \(on-chain\)/);
+      assert.match(liveLendHtml, /Planned partial-fill chunks/);
+      assert.match(liveLendHtml, /1\. Simulate live quote/);
+      assert.match(liveLendHtml, /2\. Approve \/ verify LoanCore allowance/);
+      assert.match(liveLendHtml, /3\. Sign &amp; publish LendOffer/);
+      assert.match(liveLendHtml, /Bump maker nonce/);
+      assert.match(liveLendHtml, /Fill open BorrowOrders \(mint PositionNFT\)/);
+      assert.match(liveLendHtml, /1\. Verify &amp; preview BorrowOrder fill/);
+      console.log('PASS WS3.4 Piece 2: Live Lend.jsx SSR, LoanCore approval, LendOffer sign/cancel, & BorrowOrder fill UI verified.');
+
+      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1 & PIECE 2 FORK TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
       await new Promise<void>((r) => apiServer.close(() => r()));
