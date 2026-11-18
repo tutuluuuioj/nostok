@@ -60,6 +60,8 @@ import {
 } from '../src/lib/marketsApi.js';
 import {
   DEFAULT_COLLATERAL_BUFFER_BPS,
+  SIGNED_BORROW_ORDERS_STORAGE_KEY,
+  SIGNED_LEND_OFFERS_STORAGE_KEY,
   approveUsdcForLend,
   bumpMakerNonceOnChain,
   cancelSignedBorrowOrder,
@@ -77,6 +79,7 @@ import {
   fillLendOfferAsBorrower,
   formatTokenUnitsDisplay,
   formatWeb3Error,
+  isNonFinalOrderStatus,
   loadPersistedSignedLendOffers,
   loadPersistedSignedOrders,
   parseBorrowOrderFromJson,
@@ -87,8 +90,12 @@ import {
   readLendAllowanceAndNonce,
   refreshSignedBorrowOrdersState,
   refreshSignedLendOffersState,
+  removeSignedBorrowOrder,
+  removeSignedLendOffer,
   resolveExactBorrowAmounts,
   resolveExactLendAmounts,
+  resolveOpenBorrowOrdersCollateralSumRaw,
+  resolveOpenLendOffersSumRaw,
   setCollateralAllowanceForBorrow,
   setInjectedProvider,
   setUsdcAllowanceForLend,
@@ -3182,7 +3189,8 @@ async function runTests(): Promise<void> {
         lendSrc.includes('[web3?.address, web3?.chainId, web3?.wrongNetwork]') &&
           lendSrc.includes('borrowPreviewSeqRef.current') &&
           lendSrc.includes('blockedByUnknown') &&
-          lendSrc.includes("st !== 'unknown'") &&
+          lendSrc.includes('isNonFinalOrderStatus(st)') &&
+          lendSrc.includes("st === 'unknown'") &&
           lendSrc.includes('includes current fill first') &&
           lendSrc.includes('setBorrowPreview(null)') &&
           lendSrc.includes('setQuoteResult(null)') &&
@@ -3571,6 +3579,7 @@ async function runTests(): Promise<void> {
         /<button[^>]*disabled=""[^>]*>3\. Sign &amp; publish BorrowOrder<\/button>/
       );
       const borrowSrc = fs.readFileSync(path.join(process.cwd(), 'src/pages/Borrow.jsx'), 'utf8');
+      const p3LendSrc = fs.readFileSync(path.join(process.cwd(), 'src/pages/Lend.jsx'), 'utf8');
       assert.ok(
         borrowSrc.includes('selectedLendRemainingRaw') &&
           borrowSrc.includes('formatUnits(BigInt(rawRemaining), USDC_DECIMALS)') &&
@@ -3580,10 +3589,809 @@ async function runTests(): Promise<void> {
           borrowSrc.includes('setCollateralAllowanceForBorrow') &&
           borrowSrc.includes('collateralReductionState') &&
           borrowSrc.includes('blockedByUnknown') &&
-          borrowSrc.includes('requireExpectedQuote: true'),
-        'Borrow.jsx must enforce lossless raw pill fill, preview seq guard, account/network reset, quote requirement & collateral reduction guard'
+          borrowSrc.includes('requireExpectedQuote: true') &&
+          borrowSrc.includes('existingOpenCollateralRaw: null') &&
+          borrowSrc.includes('ordersTruncated') &&
+          borrowSrc.includes('removeSignedBorrowOrder') &&
+          p3LendSrc.includes('existingOpenUsdcSumRaw: null') &&
+          p3LendSrc.includes('existingOpenSumRaw: null') &&
+          p3LendSrc.includes('ordersTruncated') &&
+          p3LendSrc.includes('removeSignedLendOffer'),
+        'Borrow.jsx and Lend.jsx must enforce lossless raw pill fill, preview seq guard, account/network reset, quote requirement, maker-scoped open sums, truncated guard & corrupt order removal'
       );
-      console.log('PASS WS3.4 Piece 3: Borrower LendOffer fill parity, cumulative CollateralEscrow sizing, lossless pill fill & UI hardening verified.');
+
+      // Raise globalCap & NVDAc assetCap so M1 Borrow+Lend fork suites have ample headroom
+      await publicClient.waitForTransactionReceipt({
+        hash: await rawWalletClient.sendTransaction({
+          account: deployed.nostokTimelock,
+          to: deployed.loanCore,
+          data: encodeFunctionData({
+            abi: parseAbi(['function setGlobalCap(uint128 newCap)']),
+            functionName: 'setGlobalCap',
+            args: [50_000_000_000n],
+          }),
+        }),
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await rawWalletClient.sendTransaction({
+          account: deployed.nostokTimelock,
+          to: deployed.assetRegistry,
+          data: encodeFunctionData({
+            abi: [
+              {
+                type: 'function',
+                name: 'setAssetConfig',
+                stateMutability: 'nonpayable',
+                inputs: [
+                  { name: 'token', type: 'address' },
+                  {
+                    name: 'config',
+                    type: 'tuple',
+                    components: [
+                      { name: 'feed', type: 'address' },
+                      { name: 'feedDecimals', type: 'uint8' },
+                      { name: 'tier', type: 'uint8' },
+                      { name: 'maxInitLtvBps', type: 'uint16' },
+                      { name: 'marginCallLtvBps', type: 'uint16' },
+                      { name: 'liqLtvBps', type: 'uint16' },
+                      { name: 'badDebtLtvBps', type: 'uint16' },
+                      { name: 'maxDiscountBps', type: 'uint16' },
+                      { name: 'closedMarketHaircutBps', type: 'uint16' },
+                      { name: 'perLoanCap', type: 'uint128' },
+                      { name: 'assetCap', type: 'uint128' },
+                      { name: 'maxStaleOpenSecs', type: 'uint32' },
+                      { name: 'status', type: 'uint8' },
+                      { name: 'restricted', type: 'bool' },
+                    ],
+                  },
+                ],
+                outputs: [],
+              },
+            ],
+            functionName: 'setAssetConfig',
+            args: [
+              nvdac,
+              {
+                feed: nvdaFeed,
+                feedDecimals: 8,
+                tier: 0,
+                maxInitLtvBps: 6000,
+                marginCallLtvBps: 7000,
+                liqLtvBps: 7800,
+                badDebtLtvBps: 9000,
+                maxDiscountBps: 600,
+                closedMarketHaircutBps: 500,
+                perLoanCap: 3_000_000_000n,
+                assetCap: 40_000_000_000n,
+                maxStaleOpenSecs: 21600,
+                status: 0,
+                restricted: false,
+              },
+            ],
+          }),
+        }),
+      });
+
+      // M1 (Borrow & Lend): Unfunded open orders hidden from default /orders MUST remain in allowance sums & post-cancel targets
+      const erc20TestAbi = parseAbi([
+        'function balanceOf(address owner) view returns (uint256)',
+        'function transfer(address to, uint256 value) returns (bool)',
+      ]);
+      const clearStorage = (storageMap: Map<string, string>) => storageMap.clear();
+      clearStorage(p3BorrowStorage);
+
+      // --- M1 Borrow side ---
+      walletProvider.setAccount(KEYS.borrower);
+      await setCollateralAllowanceForBorrow({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        targetAllowanceRaw: '0',
+        provider: walletProvider,
+        cfg,
+      });
+      const m1BorrowQuote1000 = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '1000000000',
+        termDays: 30,
+        aprBps: 950,
+        maxLtvBps: 6000,
+        borrower: ADDRESSES.borrower,
+      });
+      const m1OpenBorrow = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '1000000000',
+        expectedQuote: m1BorrowQuote1000,
+        requireExpectedQuote: true,
+        maxRateBps: 950,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '1000000000',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: true,
+        storage: borrowStorageApi,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(m1OpenBorrow.publishedToApi, true);
+      const m1OpenBorrowColl = BigInt(m1OpenBorrow.exactAmounts.requiredApprovalRaw);
+
+      walletProvider.setAccount(KEYS.lender);
+      const m1LendQuote500 = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '500000000',
+        termDays: 30,
+        aprBps: 850,
+        maxLtvBps: 6000,
+      });
+      const m1Lend500 = await prepareAndSignLendOffer({
+        address: ADDRESSES.lender,
+        principalRaw: '500000000',
+        allowedCollateral: nvdac,
+        expectedQuote: m1LendQuote500,
+        minRateBps: 850,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '500000000',
+        existingOpenUsdcSumRaw: '0',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: false,
+        provider: walletProvider,
+        cfg,
+      });
+      const tmpM1BorrowPreview = await verifyAndPreviewLendOfferFill({
+        offer: m1Lend500.offer,
+        signature: m1Lend500.signature,
+        collateralToken: nvdac,
+        fillUsdcRaw: '500000000',
+        cfg,
+      });
+      const m1Fill500Coll = tmpM1BorrowPreview.exact.collateralAmountRaw;
+      assert.ok(m1Fill500Coll < m1OpenBorrowColl);
+
+      // Dip borrower's NVDAc balance to JUST m1Fill500Coll -> $1,000 BorrowOrder becomes 'unfunded' and hidden from default GET /orders
+      const borNvdacInit = await publicClient.readContract({
+        address: nvdac,
+        abi: erc20TestAbi,
+        functionName: 'balanceOf',
+        args: [ADDRESSES.borrower],
+      });
+      const nvdacParked = borNvdacInit - m1Fill500Coll;
+      await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: nvdac,
+          abi: erc20TestAbi,
+          functionName: 'transfer',
+          args: [ADDRESSES.lender, nvdacParked],
+        }),
+      });
+      await rpcCall('evm_mine', []);
+
+      const m1BorDef = (await fetch(`${cfg.apiUrl}/orders?order_type=borrow&maker=${ADDRESSES.borrower}`).then((r) =>
+        r.json()
+      )) as { data: Array<{ order_hash: string; status: string }> };
+      assert.ok(
+        !m1BorDef.data.some((r) => r.order_hash.toLowerCase() === m1OpenBorrow.orderHash.toLowerCase()),
+        'Unfunded BorrowOrder must be hidden from default GET /orders'
+      );
+      const m1BorAll = (await fetch(
+        `${cfg.apiUrl}/orders?order_type=borrow&maker=${ADDRESSES.borrower}&include_inactive=true`
+      ).then((r) => r.json())) as { data: Array<{ order_hash: string; status: string }> };
+      assert.equal(
+        m1BorAll.data.find((r) => r.order_hash.toLowerCase() === m1OpenBorrow.orderHash.toLowerCase())?.status,
+        'unfunded'
+      );
+
+      // While unfunded & hidden: post-cancel target and fill preview BOTH still reserve m1OpenBorrowColl!
+      assert.equal(
+        await resolveOpenBorrowOrdersCollateralSumRaw({
+          borrowerAddress: ADDRESSES.borrower,
+          collateralToken: nvdac,
+          existingOpenCollateralRaw: null,
+          excludeHashes: new Set(['0x' + '11'.repeat(32)]),
+          storage: null,
+          cfg,
+        }),
+        m1OpenBorrowColl,
+        'Borrow post-cancel target must count unfunded non-final BorrowOrders'
+      );
+      const m1BorPrev = await verifyAndPreviewLendOfferFill({
+        offer: m1Lend500.offer,
+        signature: m1Lend500.signature,
+        collateralToken: nvdac,
+        fillUsdcRaw: '500000000',
+        borrowerAddress: ADDRESSES.borrower,
+        storage: null,
+        cfg,
+      });
+      assert.equal(m1BorPrev.existingOpenCollateralRaw, m1OpenBorrowColl.toString());
+      assert.equal(m1BorPrev.needsApproval, true);
+      assert.equal(m1BorPrev.requiredApprovalRaw, (m1OpenBorrowColl + m1Fill500Coll).toString());
+
+      walletProvider.setAccount(KEYS.borrower);
+      const m1BorFill500 = await fillLendOfferAsBorrower({
+        address: ADDRESSES.borrower,
+        offer: m1Lend500.offer,
+        signature: m1Lend500.signature,
+        collateralToken: nvdac,
+        fillUsdcRaw: '500000000',
+        expectedPreview: m1BorPrev,
+        storage: null,
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(m1BorFill500.approvalTxHash);
+      assert.equal(
+        (await readBorrowAllowanceAndNonce(ADDRESSES.borrower, nvdac, { cfg })).allowanceRaw,
+        m1OpenBorrowColl.toString(),
+        'CollateralEscrow allowance after filling while BorrowOrder was unfunded must still cover m1OpenBorrow'
+      );
+
+      // Restore borrower NVDAc balance -> m1OpenBorrow recovers and fills in full on-chain!
+      await publicClient.waitForTransactionReceipt({
+        hash: await lenderClient.writeContract({
+          address: nvdac,
+          abi: erc20TestAbi,
+          functionName: 'transfer',
+          args: [ADDRESSES.borrower, nvdacParked],
+        }),
+      });
+      await rpcCall('evm_mine', []);
+      walletProvider.setAccount(KEYS.lender);
+      const m1RecoveredBorrowFill = await fillBorrowOrderAsLender({
+        address: ADDRESSES.lender,
+        order: m1OpenBorrow.order,
+        signature: m1OpenBorrow.signature,
+        fillUsdcRaw: '1000000000',
+        existingOpenSumRaw: '0',
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(m1RecoveredBorrowFill.loanId, 'Recovered previously-unfunded BorrowOrder must fill cleanly');
+
+      // --- M1 Lend side (exact prompt repro) ---
+      const m1LendStore = new Map<string, string>();
+      const m1LendStorage = {
+        getItem: (k: string) => m1LendStore.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          m1LendStore.set(k, v);
+        },
+        removeItem: (k: string) => {
+          m1LendStore.delete(k);
+        },
+      };
+      walletProvider.setAccount(KEYS.lender);
+      await setUsdcAllowanceForLend({
+        address: ADDRESSES.lender,
+        targetAllowanceRaw: '0',
+        provider: walletProvider,
+        cfg,
+      });
+      const m1LendQuote1000 = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '1000000000',
+        termDays: 30,
+        aprBps: 850,
+        maxLtvBps: 6000,
+      });
+      const m1OpenLend = await prepareAndSignLendOffer({
+        address: ADDRESSES.lender,
+        principalRaw: '1000000000',
+        allowedCollateral: nvdac,
+        expectedQuote: m1LendQuote1000,
+        minRateBps: 850,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '1000000000',
+        existingOpenUsdcSumRaw: '0',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: true,
+        storage: m1LendStorage,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(m1OpenLend.publishedToApi, true);
+      assert.equal((await readLendAllowanceAndNonce(ADDRESSES.lender, { cfg })).allowanceRaw, '1000000000');
+
+      walletProvider.setAccount(KEYS.borrower);
+      const m1BorrowQuote500 = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '500000000',
+        termDays: 30,
+        aprBps: 950,
+        maxLtvBps: 6000,
+        borrower: ADDRESSES.borrower,
+      });
+      const m1Borrow500 = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '500000000',
+        expectedQuote: m1BorrowQuote500,
+        requireExpectedQuote: true,
+        maxRateBps: 950,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '500000000',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: false,
+        storage: borrowStorageApi,
+        provider: walletProvider,
+        cfg,
+      });
+
+      // Dip lender's USDC balance to $500 -> $1,000 LendOffer becomes 'unfunded' & hidden on default GET /orders
+      const lenUsdcInit = await publicClient.readContract({
+        address: BASE_USDC,
+        abi: erc20TestAbi,
+        functionName: 'balanceOf',
+        args: [ADDRESSES.lender],
+      });
+      const usdcParked = lenUsdcInit - 500_000_000n;
+      await publicClient.waitForTransactionReceipt({
+        hash: await lenderClient.writeContract({
+          address: BASE_USDC,
+          abi: erc20TestAbi,
+          functionName: 'transfer',
+          args: [ADDRESSES.borrower, usdcParked],
+        }),
+      });
+      await rpcCall('evm_mine', []);
+
+      const m1LenDef = (await fetch(`${cfg.apiUrl}/orders?order_type=lend&maker=${ADDRESSES.lender}`).then((r) =>
+        r.json()
+      )) as { data: Array<{ order_hash: string; status: string }> };
+      assert.ok(
+        !m1LenDef.data.some((r) => r.order_hash.toLowerCase() === m1OpenLend.orderHash.toLowerCase()),
+        'Unfunded LendOffer must be hidden from default GET /orders'
+      );
+      const m1LenAll = (await fetch(
+        `${cfg.apiUrl}/orders?order_type=lend&maker=${ADDRESSES.lender}&include_inactive=true`
+      ).then((r) => r.json())) as { data: Array<{ order_hash: string; status: string }> };
+      assert.equal(
+        m1LenAll.data.find((r) => r.order_hash.toLowerCase() === m1OpenLend.orderHash.toLowerCase())?.status,
+        'unfunded'
+      );
+
+      assert.equal(
+        await resolveOpenLendOffersSumRaw({
+          lenderAddress: ADDRESSES.lender,
+          existingOpenSumRaw: null,
+          excludeHashes: new Set(['0x' + '22'.repeat(32)]),
+          storage: null,
+          cfg,
+        }),
+        1_000_000_000n,
+        'Lend post-cancel target must count unfunded non-final LendOffers'
+      );
+      const m1LenPrev = await verifyAndPreviewBorrowOrderFill({
+        order: m1Borrow500.order,
+        signature: m1Borrow500.signature,
+        fillUsdcRaw: '500000000',
+        existingOpenSumRaw: null,
+        lenderAddress: ADDRESSES.lender,
+        cfg,
+      });
+      assert.equal(m1LenPrev.existingOpenSumRaw, '1000000000');
+      assert.equal(m1LenPrev.needsApproval, true);
+      assert.equal(m1LenPrev.requiredApprovalRaw, '1500000000');
+
+      walletProvider.setAccount(KEYS.lender);
+      const m1LenFill500 = await fillBorrowOrderAsLender({
+        address: ADDRESSES.lender,
+        order: m1Borrow500.order,
+        signature: m1Borrow500.signature,
+        fillUsdcRaw: '500000000',
+        existingOpenSumRaw: null,
+        expectedPreview: m1LenPrev,
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(m1LenFill500.approvalTxHash);
+      assert.equal(
+        (await readLendAllowanceAndNonce(ADDRESSES.lender, { cfg })).allowanceRaw,
+        '1000000000',
+        'LoanCore allowance after filling $500 while $1,000 LendOffer was unfunded must stay 1000000000'
+      );
+
+      // Restore lender USDC -> previously-unfunded $1,000 LendOffer recovers and fills in full on-chain!
+      await publicClient.waitForTransactionReceipt({
+        hash: await borrowerClient.writeContract({
+          address: BASE_USDC,
+          abi: erc20TestAbi,
+          functionName: 'transfer',
+          args: [ADDRESSES.lender, usdcParked],
+        }),
+      });
+      await rpcCall('evm_mine', []);
+      walletProvider.setAccount(KEYS.borrower);
+      const m1RecoveredLendFill = await fillLendOfferAsBorrower({
+        address: ADDRESSES.borrower,
+        offer: m1OpenLend.offer,
+        signature: m1OpenLend.signature,
+        collateralToken: nvdac,
+        fillUsdcRaw: '1000000000',
+        existingOpenCollateralRaw: null,
+        storage: null,
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(m1RecoveredLendFill.loanId, 'Recovered previously-unfunded LendOffer must fill cleanly');
+
+      // Ensure status helper keeps all non-final statuses and drops all 4 terminal statuses
+      for (const nonFinal of ['open', 'partially_filled', 'unfunded', 'unknown']) {
+        assert.equal(isNonFinalOrderStatus(nonFinal), true);
+      }
+      for (const terminal of ['filled', 'cancelled', 'expired', 'nonce_bumped']) {
+        assert.equal(isNonFinalOrderStatus(terminal), false);
+      }
+
+      // Info checks: bad-checksum counterparty throws (never treated as null); corrupt saved entry blocks until removed
+      walletProvider.setAccount(KEYS.lender);
+      const infoLend500 = await prepareAndSignLendOffer({
+        address: ADDRESSES.lender,
+        principalRaw: '500000000',
+        allowedCollateral: nvdac,
+        expectedQuote: m1LendQuote500,
+        minRateBps: 850,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '500000000',
+        existingOpenUsdcSumRaw: '0',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: false,
+        provider: walletProvider,
+        cfg,
+      });
+      walletProvider.setAccount(KEYS.borrower);
+      const infoBorrow500 = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '500000000',
+        expectedQuote: m1BorrowQuote500,
+        requireExpectedQuote: true,
+        maxRateBps: 950,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '500000000',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: false,
+        provider: walletProvider,
+        cfg,
+      });
+      const invertChecksumHex = (addr: string) =>
+        addr.slice(0, 2) +
+        addr
+          .slice(2)
+          .replace(/[a-fA-F]/g, (c) => (c >= 'a' ? c.toUpperCase() : c.toLowerCase()));
+      const badChecksumBor = invertChecksumHex(ADDRESSES.borrower);
+      const badChecksumLen = invertChecksumHex(ADDRESSES.lender);
+      for (const badBor of [badChecksumBor, 'not-an-address']) {
+        await assert.rejects(
+          () =>
+            verifyAndPreviewLendOfferFill({
+              offer: infoLend500.offer,
+              signature: infoLend500.signature,
+              collateralToken: nvdac,
+              fillUsdcRaw: '500000000',
+              borrowerAddress: badBor,
+              cfg,
+            }),
+          /Invalid borrower address/
+        );
+      }
+      for (const badLen of [badChecksumLen, 'not-an-address']) {
+        await assert.rejects(
+          () =>
+            verifyAndPreviewBorrowOrderFill({
+              order: infoBorrow500.order,
+              signature: infoBorrow500.signature,
+              fillUsdcRaw: '500000000',
+              lenderAddress: badLen,
+              cfg,
+            }),
+          /Invalid lender address/
+        );
+      }
+
+      // Corrupt saved BorrowOrder blocks fill preview cleanly until removed via removeSignedBorrowOrder
+      const infoBorrowMap = new Map<string, string>();
+      const infoBorrowStorage = {
+        getItem: (k: string) => infoBorrowMap.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          infoBorrowMap.set(k, v);
+        },
+        removeItem: (k: string) => {
+          infoBorrowMap.delete(k);
+        },
+      };
+      infoBorrowStorage.setItem(
+        SIGNED_BORROW_ORDERS_STORAGE_KEY,
+        JSON.stringify([
+          {
+            orderHash: '0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+            orderJson: {
+              borrower: ADDRESSES.borrower,
+              collateralToken: nvdac,
+              collateralAmount: 'not-a-bigint',
+              minUsdc: '500000000',
+            },
+            signature: '0x1234',
+          },
+        ])
+      );
+      await assert.rejects(
+        () =>
+          verifyAndPreviewLendOfferFill({
+            offer: infoLend500.offer,
+            signature: infoLend500.signature,
+            collateralToken: nvdac,
+            fillUsdcRaw: '500000000',
+            borrowerAddress: ADDRESSES.borrower,
+            storage: infoBorrowStorage,
+            cfg,
+          }),
+        /Cannot verify open BorrowOrder/
+      );
+      removeSignedBorrowOrder(
+        '0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+        infoBorrowStorage
+      );
+      assert.equal(loadPersistedSignedOrders(infoBorrowStorage).length, 0);
+      const unblockedBorPreview = await verifyAndPreviewLendOfferFill({
+        offer: infoLend500.offer,
+        signature: infoLend500.signature,
+        collateralToken: nvdac,
+        fillUsdcRaw: '500000000',
+        borrowerAddress: ADDRESSES.borrower,
+        storage: infoBorrowStorage,
+        cfg,
+      });
+      assert.ok(BigInt(unblockedBorPreview.exact.collateralAmountRaw) > 0n);
+
+      // Same clean removal for corrupt persisted LendOffer
+      m1LendStorage.setItem(
+        SIGNED_LEND_OFFERS_STORAGE_KEY,
+        JSON.stringify([
+          {
+            orderHash: '0xfeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface',
+            offerJson: {
+              lender: ADDRESSES.lender,
+              allowedCollateral: nvdac,
+              usdcAmount: 'not-a-bigint',
+            },
+            signature: '0x1234',
+          },
+        ])
+      );
+      await assert.rejects(
+        () =>
+          verifyAndPreviewBorrowOrderFill({
+            order: infoBorrow500.order,
+            signature: infoBorrow500.signature,
+            fillUsdcRaw: '500000000',
+            lenderAddress: ADDRESSES.lender,
+            storage: m1LendStorage,
+            cfg,
+          }),
+        /Cannot verify open LendOffer/
+      );
+      removeSignedLendOffer(
+        '0xfeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface',
+        m1LendStorage
+      );
+      assert.equal(loadPersistedSignedLendOffers(m1LendStorage).length, 0);
+      const unblockedLenPreview = await verifyAndPreviewBorrowOrderFill({
+        order: infoBorrow500.order,
+        signature: infoBorrow500.signature,
+        fillUsdcRaw: '500000000',
+        lenderAddress: ADDRESSES.lender,
+        storage: m1LendStorage,
+        cfg,
+      });
+      assert.equal(unblockedLenPreview.fillAmountRaw, '500000000');
+
+      // M2: 1101-order truncated global book (ordersTruncated=true, stale=false) vs maker-scoped query + throw on maker truncation
+      const m2ApiUrl = 'http://127.0.0.1:49999';
+      const m2Cfg = { ...cfg, apiUrl: m2ApiUrl };
+      const origGlobalFetch = globalThis.fetch;
+      let simulateMakerTruncated = false;
+      try {
+        globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+          const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+          if (urlStr.startsWith(`${m2ApiUrl}/health`)) {
+            return new Response(
+              JSON.stringify({ status: 'ok', db_ok: true, rpc_ok: true, last_indexed_block: 1, chain_head_block: 1, lag_blocks: 0 }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+          }
+          if (urlStr.startsWith(`${m2ApiUrl}/assets`)) {
+            return new Response(
+              JSON.stringify({ data: [], pagination: { limit: 100, offset: 0, total: 0, has_more: false }, fees: null }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+          }
+          if (urlStr.startsWith(`${m2ApiUrl}/orders`)) {
+            const parsedUrl = new URL(urlStr);
+            const makerParam = parsedUrl.searchParams.get('maker');
+            const orderTypeParam = parsedUrl.searchParams.get('order_type');
+            const offsetParam = Number(parsedUrl.searchParams.get('offset') ?? '0');
+            if (!makerParam) {
+              // Global book: 1,101 dummy orders of other makers -> hits maxPages=10 -> ordersTruncated: true, stale: false!
+              const dummyRows = Array.from({ length: 100 }, (_, idx) => ({
+                order_hash: `0x${(offsetParam + idx + 1).toString(16).padStart(64, '0')}`,
+                order_type: idx % 2 === 0 ? 'borrow' : 'lend',
+                maker: '0x000000000000000000000000000000000000dead',
+                status: 'open',
+                collateral_token: nvdac,
+                signed_order: { minUsdc: '500000000', usdcAmount: '500000000' },
+                signature: '0x01',
+              }));
+              return new Response(
+                JSON.stringify({
+                  data: dummyRows,
+                  pagination: { limit: 100, offset: offsetParam, total: 1101, has_more: offsetParam < 1000 },
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+              );
+            }
+            if (simulateMakerTruncated) {
+              const overLimitRows = Array.from({ length: 100 }, (_, idx) => ({
+                order_hash: `0x${(offsetParam + idx + 5000).toString(16).padStart(64, '0')}`,
+                order_type: orderTypeParam ?? 'borrow',
+                maker: makerParam,
+                status: 'open',
+                collateral_token: nvdac,
+                collateral_amount: { raw: '1000000000000000000' },
+                min_usdc: { raw: '500000000' },
+                min_fill: { raw: '500000000' },
+                remaining_usdc: { raw: '500000000' },
+                signed_order: {
+                  borrower: makerParam,
+                  lender: makerParam,
+                  collateralToken: nvdac,
+                  collateralAmount: '1000000000000000000',
+                  minUsdc: '500000000',
+                  minFill: '500000000',
+                  usdcAmount: '500000000',
+                },
+                signature: '0x01',
+              }));
+              return new Response(
+                JSON.stringify({
+                  data: overLimitRows,
+                  pagination: { limit: 100, offset: offsetParam, total: 1101, has_more: true },
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+              );
+            }
+            // Maker-scoped query finds maker's own unfunded order even though global book was 1,101 rows!
+            if (orderTypeParam === 'borrow') {
+              return new Response(
+                JSON.stringify({
+                  data: [
+                    {
+                      order_hash: '0x' + 'aa'.repeat(32),
+                      order_type: 'borrow',
+                      maker: makerParam,
+                      status: 'unfunded',
+                      collateral_token: nvdac,
+                      collateral_amount: { raw: '4200000000000000000' },
+                      min_usdc: { raw: '500000000' },
+                      min_fill: { raw: '500000000' },
+                      remaining_usdc: { raw: '500000000' },
+                      signed_order: {
+                        borrower: makerParam,
+                        collateralToken: nvdac,
+                        collateralAmount: '4200000000000000000',
+                        minUsdc: '500000000',
+                        minFill: '500000000',
+                      },
+                      signature: '0x01',
+                    },
+                  ],
+                  pagination: { limit: 100, offset: 0, total: 1, has_more: false },
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+              );
+            }
+            return new Response(
+              JSON.stringify({
+                data: [
+                  {
+                    order_hash: '0x' + 'bb'.repeat(32),
+                    order_type: 'lend',
+                    maker: makerParam,
+                    status: 'unfunded',
+                    collateral_token: nvdac,
+                    min_usdc: { raw: '750000000' },
+                    remaining_usdc: { raw: '750000000' },
+                    signed_order: { lender: makerParam, usdcAmount: '750000000' },
+                    signature: '0x01',
+                  },
+                ],
+                pagination: { limit: 100, offset: 0, total: 1, has_more: false },
+              }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+          }
+          return origGlobalFetch(input, init);
+        }) as typeof globalThis.fetch;
+
+        const m2Snap = await fetchMarketSnapshot({ cfg: m2Cfg, includeLoans: false, includeAuctions: false });
+        assert.equal(m2Snap.orders.length, 1000, `Expected 1000 truncated rows (error=${m2Snap.error})`);
+        assert.equal(m2Snap.ordersTruncated, true);
+        assert.equal(m2Snap.stale, false);
+
+        assert.equal(
+          await resolveOpenBorrowOrdersCollateralSumRaw({
+            borrowerAddress: ADDRESSES.borrower,
+            collateralToken: nvdac,
+            existingOpenCollateralRaw: null,
+            storage: null,
+            cfg: m2Cfg,
+          }),
+          computeRemainingBorrowCollateralRequirement(
+            '4200000000000000000',
+            '500000000',
+            '500000000',
+            '500000000'
+          ),
+          'Maker-scoped borrow query must find maker order despite 1101-row global book truncation'
+        );
+        assert.equal(
+          await resolveOpenLendOffersSumRaw({
+            lenderAddress: ADDRESSES.lender,
+            existingOpenSumRaw: null,
+            storage: null,
+            cfg: m2Cfg,
+          }),
+          750000000n,
+          'Maker-scoped lend query must find maker order despite 1101-row global book truncation'
+        );
+
+        simulateMakerTruncated = true;
+        await assert.rejects(
+          () =>
+            resolveOpenBorrowOrdersCollateralSumRaw({
+              borrowerAddress: ADDRESSES.borrower,
+              collateralToken: nvdac,
+              existingOpenCollateralRaw: null,
+              storage: null,
+              cfg: m2Cfg,
+            }),
+          /truncated/i
+        );
+        await assert.rejects(
+          () =>
+            resolveOpenLendOffersSumRaw({
+              lenderAddress: ADDRESSES.lender,
+              existingOpenSumRaw: null,
+              storage: null,
+              cfg: m2Cfg,
+            }),
+          /truncated/i
+        );
+      } finally {
+        globalThis.fetch = origGlobalFetch;
+      }
+
+      console.log(
+        'PASS WS3.4 Piece 3 + M1 + M2 + Info: Borrower/Lender unfunded allowance retention, 1101-row global truncation safety, bad checksum fail-closed & corrupt storage removal verified.'
+      );
 
       console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1, PIECE 2 & PIECE 3 FORK TESTS PASSED.');
     } finally {

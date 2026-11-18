@@ -35,6 +35,27 @@ export const DEFAULT_COLLATERAL_BUFFER_BPS = 500; // +5.00% default buffer for p
 export const MAX_COLLATERAL_BUFFER_BPS = 5000;
 export const SIGNED_BORROW_ORDERS_STORAGE_KEY = 'nostok-signed-borrow-orders-v1';
 export const SIGNED_LEND_OFFERS_STORAGE_KEY = 'nostok-signed-lend-offers-v1';
+export const FINAL_ORDER_STATUSES = new Set([
+  'filled',
+  'cancelled',
+  'expired',
+  'nonce_bumped',
+]);
+
+export function isNonFinalOrderStatus(status) {
+  if (!status) return true;
+  return !FINAL_ORDER_STATUSES.has(String(status));
+}
+
+function parseOptionalCounterpartyAddress(rawAddr, label) {
+  if (rawAddr === null || rawAddr === undefined) return null;
+  const trimmed = String(rawAddr).trim();
+  if (!trimmed) return null;
+  if (!isAddress(trimmed)) {
+    throw new Error(`Invalid ${label} address or EIP-55 checksum: ${trimmed}`);
+  }
+  return getAddress(trimmed);
+}
 
 const REVERT_EXPLANATIONS = {
   Unauthorized: 'Caller is not authorized to perform this order action.',
@@ -1638,6 +1659,36 @@ function savePersistedOrderRecord(storageKey, record, storage = null) {
   return nextList;
 }
 
+function removePersistedOrderRecord(storageKey, match, storage = null) {
+  const store = resolveStorage(storage);
+  const existing = store ? loadPersistedOrderList(storageKey, store) : [];
+  const targetHash =
+    typeof match === 'string'
+      ? match.trim().toLowerCase()
+      : typeof match?.orderHash === 'string' && match.orderHash.trim()
+        ? match.orderHash.trim().toLowerCase()
+        : null;
+  const targetIndex =
+    typeof match === 'number'
+      ? match
+      : typeof match?.index === 'number'
+        ? match.index
+        : null;
+  const nextList = existing.filter((item, idx) => {
+    if (targetIndex !== null && idx === targetIndex) return false;
+    if (targetHash && String(item?.orderHash ?? '').toLowerCase() === targetHash) return false;
+    return true;
+  });
+  if (store) {
+    try {
+      store.setItem(storageKey, JSON.stringify(nextList));
+    } catch {
+      // ignore storage errors
+    }
+  }
+  return nextList;
+}
+
 export function loadPersistedSignedOrders(storage = null) {
   return loadPersistedOrderList(SIGNED_BORROW_ORDERS_STORAGE_KEY, storage);
 }
@@ -1646,12 +1697,20 @@ export function saveSignedBorrowOrder(record, storage = null) {
   return savePersistedOrderRecord(SIGNED_BORROW_ORDERS_STORAGE_KEY, record, storage);
 }
 
+export function removeSignedBorrowOrder(orderHashOrIndex, storage = null) {
+  return removePersistedOrderRecord(SIGNED_BORROW_ORDERS_STORAGE_KEY, orderHashOrIndex, storage);
+}
+
 export function loadPersistedSignedLendOffers(storage = null) {
   return loadPersistedOrderList(SIGNED_LEND_OFFERS_STORAGE_KEY, storage);
 }
 
 export function saveSignedLendOffer(record, storage = null) {
   return savePersistedOrderRecord(SIGNED_LEND_OFFERS_STORAGE_KEY, record, storage);
+}
+
+export function removeSignedLendOffer(orderHashOrIndex, storage = null) {
+  return removePersistedOrderRecord(SIGNED_LEND_OFFERS_STORAGE_KEY, orderHashOrIndex, storage);
 }
 
 export function buildLendOfferTypedData({ offer, cfg = getFrontendConfig() }) {
@@ -2012,11 +2071,23 @@ export async function prepareAndSignBorrowOrder({
   }
   assertExpectedQuoteUnchanged(expectedQuote, quote, { requireExpectedQuote });
 
+  const resolvedExistingOpenCollateralRaw =
+    existingOpenCollateralRaw === null
+      ? await resolveOpenBorrowOrdersCollateralSumRaw({
+          borrowerAddress: wallet,
+          collateralToken: token,
+          existingOpenCollateralRaw: null,
+          storage,
+          cfg,
+          publicClient,
+        })
+      : BigInt(existingOpenCollateralRaw ?? 0n);
+
   const exact = resolveExactBorrowAmounts(quote, {
     userCollateralRaw: collateralAmountRaw,
     bufferBps: collateralBufferBps,
     minFillRaw: minFillRaw ?? quote.amounts.principal.raw,
-    existingOpenCollateralRaw: existingOpenCollateralRaw ?? 0n,
+    existingOpenCollateralRaw: resolvedExistingOpenCollateralRaw,
   });
   const minFillBig = BigInt(minFillRaw ?? exact.principalRaw);
   if (minFillBig < 500_000_000n) {
@@ -2276,11 +2347,12 @@ export function computeRemainingBorrowCollateralRequirement(
   return remColl + remFills;
 }
 
-async function resolveOpenBorrowOrdersCollateralSumRaw({
+export async function resolveOpenBorrowOrdersCollateralSumRaw({
   borrowerAddress,
   collateralToken,
   existingOpenCollateralRaw = null,
   storage = null,
+  excludeHashes = null,
   cfg = getFrontendConfig(),
   publicClient = createProtocolPublicClient(cfg),
 }) {
@@ -2293,6 +2365,11 @@ async function resolveOpenBorrowOrdersCollateralSumRaw({
   const tokenChecksum = getAddress(collateralToken);
   const tokenLower = tokenChecksum.toLowerCase();
   const seenHashes = new Set();
+  if (excludeHashes) {
+    for (const h of excludeHashes) {
+      if (h) seenHashes.add(String(h).toLowerCase());
+    }
+  }
   let total = 0n;
 
   const persisted = loadPersistedSignedOrders(storage);
@@ -2308,15 +2385,16 @@ async function resolveOpenBorrowOrdersCollateralSumRaw({
       const ord = item?.orderJson ?? item?.order ?? {};
       const tok = String(ord?.collateralToken ?? '').toLowerCase();
       const maker = String(ord?.borrower ?? '').toLowerCase();
-      if (tok !== tokenLower || (maker && maker !== targetBorrower)) continue;
       const h = String(item?.orderHash ?? '').toLowerCase();
-      if (h) seenHashes.add(h);
       if (item?.onchainStatus === 'unknown') {
         throw new Error(
-          `Cannot verify open BorrowOrder ${item.orderHash ?? ''} status on-chain (${item.stateError ?? 'unknown'}); supply existingOpenCollateralRaw or retry when RPC recovers.`
+          `Cannot verify open BorrowOrder ${item.orderHash ?? '(corrupt entry)'} status (${item.stateError ?? 'unknown'}); remove corrupt saved entry or retry when RPC recovers.`
         );
       }
-      if (item?.onchainStatus === 'open' || item?.onchainStatus === 'partially_filled') {
+      if (tok !== tokenLower || (maker && maker !== targetBorrower)) continue;
+      if (h && seenHashes.has(h)) continue;
+      if (h) seenHashes.add(h);
+      if (isNonFinalOrderStatus(item?.onchainStatus)) {
         total += computeRemainingBorrowCollateralRequirement(
           ord.collateralAmount,
           ord.minUsdc,
@@ -2329,9 +2407,14 @@ async function resolveOpenBorrowOrdersCollateralSumRaw({
 
   if (cfg?.apiUrl) {
     const relayRes = await fetchPaginatedApiRows(
-      `${cfg.apiUrl}/orders?order_type=borrow&maker=${targetChecksum}&asset=${tokenChecksum}`,
+      `${cfg.apiUrl}/orders?order_type=borrow&maker=${targetChecksum}&asset=${tokenChecksum}&include_inactive=true`,
       { cfg }
     );
+    if (relayRes.truncated) {
+      throw new Error(
+        'Maker-scoped /orders query was truncated (> 1000 orders); cannot safely compute cumulative CollateralEscrow allowance.'
+      );
+    }
     for (const row of relayRes.rows ?? []) {
       if (String(row?.maker ?? '').toLowerCase() !== targetBorrower) continue;
       if (row?.order_type !== 'borrow' && row?.order_type !== 'BorrowOrder') continue;
@@ -2342,7 +2425,7 @@ async function resolveOpenBorrowOrdersCollateralSumRaw({
       const h = String(row?.order_hash ?? '').toLowerCase();
       if (h && seenHashes.has(h)) continue;
       if (h) seenHashes.add(h);
-      if (row?.status === 'open' || row?.status === 'partially_filled' || row?.status === 'unknown') {
+      if (isNonFinalOrderStatus(row?.status)) {
         total += computeRemainingBorrowCollateralRequirement(
           ord?.collateralAmount ?? row?.collateral_amount?.raw,
           ord?.minUsdc ?? row?.min_usdc?.raw,
@@ -2501,7 +2584,7 @@ export async function verifyAndPreviewLendOfferFill({
     );
   }
 
-  const borrowerAddr = borrowerAddress && isAddress(borrowerAddress) ? getAddress(borrowerAddress) : null;
+  const borrowerAddr = parseOptionalCounterpartyAddress(borrowerAddress, 'borrower');
   if (borrowerAddr && normalizedOffer.lender.toLowerCase() === borrowerAddr.toLowerCase()) {
     throw new Error('SelfLoanNotAllowed: Lender and borrower cannot be the same wallet address.');
   }
@@ -2934,7 +3017,7 @@ export function sumOpenSignedLendOffersRaw(offers, lenderAddress = null, { inclu
     lenderAddress && isAddress(lenderAddress) ? getAddress(lenderAddress).toLowerCase() : null;
   return offers.reduce((acc, item) => {
     const st = item?.onchainStatus ?? item?.status;
-    if (st !== 'open' && st !== 'partially_filled' && !(includeUnknown && st === 'unknown')) {
+    if (!isNonFinalOrderStatus(st) || (!includeUnknown && st === 'unknown')) {
       return acc;
     }
     if (targetLender) {
@@ -2957,10 +3040,11 @@ export function sumOpenSignedLendOffersRaw(offers, lenderAddress = null, { inclu
   }, 0n);
 }
 
-async function resolveOpenLendOffersSumRaw({
+export async function resolveOpenLendOffersSumRaw({
   lenderAddress,
   existingOpenSumRaw = null,
   storage = null,
+  excludeHashes = null,
   cfg = getFrontendConfig(),
   publicClient = createProtocolPublicClient(cfg),
 }) {
@@ -2971,6 +3055,11 @@ async function resolveOpenLendOffersSumRaw({
   const targetChecksum = getAddress(lenderAddress);
   const targetLender = targetChecksum.toLowerCase();
   const seenHashes = new Set();
+  if (excludeHashes) {
+    for (const h of excludeHashes) {
+      if (h) seenHashes.add(String(h).toLowerCase());
+    }
+  }
   let total = 0n;
 
   const persisted = loadPersistedSignedLendOffers(storage);
@@ -2984,13 +3073,14 @@ async function resolveOpenLendOffersSumRaw({
     const synced = await refreshSignedLendOffersState({ offers: mine, cfg, publicClient });
     for (const item of synced) {
       const h = String(item?.orderHash ?? '').toLowerCase();
-      if (h) seenHashes.add(h);
       if (item?.onchainStatus === 'unknown') {
         throw new Error(
-          `Cannot verify open LendOffer ${item.orderHash ?? ''} status on-chain (${item.stateError ?? 'unknown'}); supply existingOpenSumRaw or retry when RPC recovers.`
+          `Cannot verify open LendOffer ${item.orderHash ?? '(corrupt entry)'} status (${item.stateError ?? 'unknown'}); remove corrupt saved entry or retry when RPC recovers.`
         );
       }
-      if (item?.onchainStatus === 'open' || item?.onchainStatus === 'partially_filled') {
+      if (h && seenHashes.has(h)) continue;
+      if (h) seenHashes.add(h);
+      if (isNonFinalOrderStatus(item?.onchainStatus)) {
         total += BigInt(item?.remainingRaw ?? item?.offer?.usdcAmount ?? item?.offerJson?.usdcAmount ?? 0n);
       }
     }
@@ -2998,9 +3088,14 @@ async function resolveOpenLendOffersSumRaw({
 
   if (cfg?.apiUrl) {
     const relayRes = await fetchPaginatedApiRows(
-      `${cfg.apiUrl}/orders?order_type=lend&maker=${targetChecksum}`,
+      `${cfg.apiUrl}/orders?order_type=lend&maker=${targetChecksum}&include_inactive=true`,
       { cfg }
     );
+    if (relayRes.truncated) {
+      throw new Error(
+        'Maker-scoped /orders query was truncated (> 1000 orders); cannot safely compute cumulative LoanCore allowance.'
+      );
+    }
     for (const row of relayRes.rows ?? []) {
       if (String(row?.maker ?? '').toLowerCase() !== targetLender) continue;
       if (row?.order_type !== 'lend' && row?.order_type !== 'LendOffer') continue;
@@ -3008,7 +3103,7 @@ async function resolveOpenLendOffersSumRaw({
       const h = String(row?.order_hash ?? '').toLowerCase();
       if (h && seenHashes.has(h)) continue;
       if (h) seenHashes.add(h);
-      if (row?.status === 'open' || row?.status === 'partially_filled' || row?.status === 'unknown') {
+      if (isNonFinalOrderStatus(row?.status)) {
         total += BigInt(row?.remaining_usdc?.raw ?? row?.min_usdc?.raw ?? 0n);
       }
     }
@@ -3125,10 +3220,21 @@ export async function prepareAndSignLendOffer({
   }
   assertExpectedQuoteUnchanged(expectedQuote, quote, { requireExpectedQuote });
 
+  const resolvedExistingOpenUsdcSumRaw =
+    existingOpenUsdcSumRaw === null
+      ? await resolveOpenLendOffersSumRaw({
+          lenderAddress: wallet,
+          existingOpenSumRaw: null,
+          storage,
+          cfg,
+          publicClient,
+        })
+      : BigInt(existingOpenUsdcSumRaw ?? 0n);
+
   const exact = resolveExactLendAmounts(quote, {
     minFillRaw: minFillBig,
     perFillUsdcRawList,
-    existingOpenSumRaw: existingOpenUsdcSumRaw ?? 0n,
+    existingOpenSumRaw: resolvedExistingOpenUsdcSumRaw,
   });
   if (minFillBig < 500_000_000n) {
     throw new Error('Minimum fill cannot be below $500.00 (500000000 raw USDC).');
@@ -3472,7 +3578,7 @@ export async function verifyAndPreviewBorrowOrderFill({
     );
   }
 
-  const lenderAddr = lenderAddress && isAddress(lenderAddress) ? getAddress(lenderAddress) : null;
+  const lenderAddr = parseOptionalCounterpartyAddress(lenderAddress, 'lender');
   if (lenderAddr && normalizedOrder.borrower.toLowerCase() === lenderAddr.toLowerCase()) {
     throw new Error('SelfLoanNotAllowed: Lender and borrower cannot be the same wallet address.');
   }

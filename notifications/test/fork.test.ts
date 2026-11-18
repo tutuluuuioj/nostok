@@ -4161,6 +4161,86 @@ async function runTests(): Promise<void> {
         assert.equal(d2ReplayGet.status, 400);
         assert.equal(d2ReplayGet.body.error?.code, 'MANAGE_TOKEN_ALREADY_USED');
 
+        // Low (ROW_NUMBER ordering): wallet with two pending alias rows must NOT appear twice when its older alias re-requests mid-pass
+        const dupWallet = privateKeyToAccount(generatePrivateKey());
+        const dupOthers = Array.from({ length: 6 }, () => privateKeyToAccount(generatePrivateKey()));
+        await Promise.all(
+          [dupWallet, ...dupOthers].map((a) => rpcCall('anvil_setBalance', [a.address, '0x470de4df820000']))
+        );
+        const dupMailStart = deliveredEmails.length;
+        // 1) Oldest alias submitted first (sits before cursor after Page 1)
+        await createSubWithSiwe(d1Url, dupWallet, 'reprod2dup@gmail.com', '198.52.30.1');
+        await new Promise((r) => setTimeout(r, 15));
+        // 2) 6 distinct wallets create middle rows
+        for (let i = 0; i < dupOthers.length; i++) {
+          await createSubWithSiwe(d1Url, dupOthers[i], 'reprod2.dup@gmail.com', `198.52.30.${i + 2}`);
+        }
+        await new Promise((r) => setTimeout(r, 15));
+        // 3) Newest alias for dupWallet submitted last -> rank #1 on Page 1 (limit=5)
+        await createSubWithSiwe(d1Url, dupWallet, 'r.eprod2.dup@googlemail.com', '198.52.30.20');
+        const dupManageMail = deliveredEmails
+          .slice(dupMailStart)
+          .reverse()
+          .find((m) => typeof m.payload?.manage_token === 'string');
+        assert.ok(dupManageMail, 'Expected manage_token on reprod2.dup notification email');
+        const dupManageTok = String(dupManageMail.payload.manage_token);
+
+        const dupP1 = await httpJson<{
+          pagination: { as_of?: string; next_cursor?: string | null; returned: number; total: number; has_more: boolean };
+          data: Array<{ subscription_id: string; wallet_address: string }>;
+        }>(
+          'GET',
+          `${d1Url}/subscriptions/manage?token=${encodeURIComponent(dupManageTok)}&limit=5`,
+          undefined,
+          { 'X-Forwarded-For': '198.52.31.1' }
+        );
+        assert.equal(dupP1.status, 200);
+        assert.equal(dupP1.body.pagination.total, 7);
+        assert.equal(dupP1.body.data.length, 5);
+        const dupP1Wallets = dupP1.body.data.map((r) => r.wallet_address.toLowerCase());
+        assert.ok(
+          dupP1Wallets.includes(dupWallet.address.toLowerCase()),
+          'Test precondition: dupWallet newest alias must sit on Page 1'
+        );
+
+        // Mid-pass: dupWallet re-requests via its OLDER alias, bumping updated_at while created_at stays before Page 1 cursor
+        await createSubWithSiwe(d1Url, dupWallet, 'reprod2dup@gmail.com', '198.52.31.2');
+
+        const dupAsOf = dupP1.body.pagination.as_of!;
+        const dupCursor = dupP1.body.pagination.next_cursor!;
+        const dupP2 = await httpJson<{
+          pagination: { returned: number; total: number; has_more: boolean; next_cursor?: string | null };
+          data: Array<{ subscription_id: string; wallet_address: string }>;
+        }>(
+          'GET',
+          `${d1Url}/subscriptions/manage?token=${encodeURIComponent(dupManageTok)}&limit=5&as_of=${encodeURIComponent(dupAsOf)}&cursor=${encodeURIComponent(dupCursor)}`,
+          undefined,
+          { 'X-Forwarded-For': '198.52.31.3' }
+        );
+        assert.equal(dupP2.status, 200);
+        assert.equal(dupP2.body.pagination.has_more, false);
+        assert.equal(dupP2.body.pagination.next_cursor, null);
+        assert.equal(dupP2.body.data.length, 2, 'Page 2 must contain only remaining 2 unique wallets, not re-emit dupWallet');
+
+        const dupP2NoAsOf = await httpJson<{
+          pagination: { returned: number; has_more: boolean };
+          data: Array<{ subscription_id: string; wallet_address: string }>;
+        }>(
+          'GET',
+          `${d1Url}/subscriptions/manage?token=${encodeURIComponent(dupManageTok)}&limit=5&cursor=${encodeURIComponent(dupCursor)}`,
+          undefined,
+          { 'X-Forwarded-For': '198.52.31.4' }
+        );
+        assert.equal(dupP2NoAsOf.status, 200);
+        assert.equal(dupP2NoAsOf.body.data.length, 2);
+
+        const allDupTraversed = [
+          ...dupP1Wallets,
+          ...dupP2.body.data.map((r) => r.wallet_address.toLowerCase()),
+        ];
+        assert.equal(allDupTraversed.length, 7);
+        assert.equal(new Set(allDupTraversed).size, 7, 'Older alias re-request mid-pass must not duplicate dupWallet across pages');
+
         // Low 2: Timer-driven purge of expired unverified rows while keeping active pending & verified rows intact
         const expiredTargetIds = [crowdSubIds[11], crowdSubIds[12]];
         const pastExpSec = (Math.floor(Date.now() / 1000) - 10).toString();

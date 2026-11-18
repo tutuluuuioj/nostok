@@ -18,19 +18,30 @@ import {
   fillBorrowOrderAsLender,
   formatTokenUnitsDisplay,
   formatWeb3Error,
+  isNonFinalOrderStatus,
   loadPersistedSignedLendOffers,
   parseBorrowOrderFromJson,
   parseLendOfferFromJson,
   prepareAndSignLendOffer,
   readLendAllowanceAndNonce,
   refreshSignedLendOffersState,
+  removeSignedLendOffer,
   resolveExactLendAmounts,
+  resolveOpenLendOffersSumRaw,
   setUsdcAllowanceForLend,
   shortAddress,
   validateLendPartialFillPlan,
   verifyAndPreviewBorrowOrderFill,
 } from '../lib/web3.js';
 import { useStore } from '../store.jsx';
+
+function safeFormatUnits(raw, decimals, fracDigits = 2) {
+  try {
+    return formatTokenUnitsDisplay(raw ?? 0n, decimals, fracDigits);
+  } catch {
+    return 'Invalid';
+  }
+}
 
 function parseRawListInput(rawStr, decimals, label) {
   const clean = String(rawStr ?? '').trim();
@@ -55,7 +66,8 @@ function computeOpenLendOffersRawTotal(
   walletAddress,
   persistedList = [],
   marketOrders = [],
-  excludeHashes = null
+  excludeHashes = null,
+  { ordersTruncated = false } = {}
 ) {
   if (!walletAddress) return { totalRaw: 0n, hasUnknown: false };
   const addrLower = walletAddress.toLowerCase();
@@ -66,21 +78,29 @@ function computeOpenLendOffersRawTotal(
     }
   }
   let totalRaw = 0n;
-  let hasUnknown = false;
+  let hasUnknown = Boolean(ordersTruncated);
 
   for (const item of persistedList ?? []) {
     const maker = String(item?.offerJson?.lender ?? '').toLowerCase();
-    if (maker !== addrLower) continue;
+    if (maker && maker !== addrLower) continue;
+    if (!maker) {
+      hasUnknown = true;
+      continue;
+    }
     const h = String(item?.orderHash ?? '').toLowerCase();
     const st = item?.onchainStatus;
-    if (st === 'unknown') hasUnknown = true;
-    if (st !== 'open' && st !== 'partially_filled' && st !== 'unknown') {
+    if (!isNonFinalOrderStatus(st)) {
       if (h) seenHashes.add(h);
       continue;
     }
+    if (st === 'unknown') hasUnknown = true;
     if (h && seenHashes.has(h)) continue;
     if (h) seenHashes.add(h);
-    totalRaw += BigInt(item.remainingRaw ?? item.offerJson?.usdcAmount ?? 0n);
+    try {
+      totalRaw += BigInt(item.remainingRaw ?? item.offerJson?.usdcAmount ?? 0n);
+    } catch {
+      hasUnknown = true;
+    }
   }
 
   for (const row of marketOrders ?? []) {
@@ -88,12 +108,16 @@ function computeOpenLendOffersRawTotal(
     if (!row?.signed_order || !row?.signature) continue;
     if (String(row.maker ?? '').toLowerCase() !== addrLower) continue;
     const st = row.status;
+    if (!isNonFinalOrderStatus(st)) continue;
     if (st === 'unknown') hasUnknown = true;
-    if (st !== 'open' && st !== 'partially_filled' && st !== 'unknown') continue;
     const h = String(row.order_hash ?? '').toLowerCase();
     if (h && seenHashes.has(h)) continue;
     if (h) seenHashes.add(h);
-    totalRaw += BigInt(row.remaining_usdc?.raw ?? row.min_usdc?.raw ?? 0n);
+    try {
+      totalRaw += BigInt(row.remaining_usdc?.raw ?? row.min_usdc?.raw ?? 0n);
+    } catch {
+      hasUnknown = true;
+    }
   }
   return { totalRaw, hasUnknown };
 }
@@ -134,6 +158,12 @@ export function Lend() {
   const [cancelError, setCancelError] = useState('');
   const [cancelNotice, setCancelNotice] = useState('');
   const [allowanceReductionState, setAllowanceReductionState] = useState(null);
+  const [makerOpenOffers, setMakerOpenOffers] = useState({
+    loading: false,
+    sumRaw: 0n,
+    error: '',
+  });
+  const makerOpenSeqRef = useRef(0);
 
   // BorrowOrder fill workflow (Step 1 verify & simulate -> review terms -> Step 2 approve USDC & fill -> PositionNFT)
   const [borrowOrderJsonStr, setBorrowOrderJsonStr] = useState('');
@@ -231,9 +261,41 @@ export function Lend() {
     void loadAllowanceAndNonce();
   }, [loadAllowanceAndNonce]);
 
+  const loadMakerOpenOffers = useCallback(async () => {
+    if (!web3?.connected || web3?.wrongNetwork || !web3?.address) {
+      setMakerOpenOffers({ loading: false, sumRaw: 0n, error: '' });
+      return null;
+    }
+    const seq = ++makerOpenSeqRef.current;
+    setMakerOpenOffers((prev) => ({ ...prev, loading: true, error: '' }));
+    try {
+      const sumRaw = await resolveOpenLendOffersSumRaw({
+        lenderAddress: web3.address,
+        existingOpenSumRaw: null,
+        cfg: web3?.config,
+      });
+      if (seq !== makerOpenSeqRef.current) return null;
+      setMakerOpenOffers({ loading: false, sumRaw, error: '' });
+      return sumRaw;
+    } catch (err) {
+      if (seq !== makerOpenSeqRef.current) return null;
+      setMakerOpenOffers({
+        loading: false,
+        sumRaw: 0n,
+        error: formatWeb3Error(err),
+      });
+      return null;
+    }
+  }, [web3?.address, web3?.config, web3?.connected, web3?.wrongNetwork]);
+
+  useEffect(() => {
+    void loadMakerOpenOffers();
+  }, [loadMakerOpenOffers, persistedOffers]);
+
   useEffect(() => {
     quoteSeqRef.current += 1;
     borrowPreviewSeqRef.current += 1;
+    makerOpenSeqRef.current += 1;
     setQuoteLoading(false);
     setQuoteResult(null);
     setQuoteError('');
@@ -243,6 +305,7 @@ export function Lend() {
     setCancelError('');
     setCancelNotice('');
     setAllowanceReductionState(null);
+    setMakerOpenOffers({ loading: false, sumRaw: 0n, error: '' });
     setBorrowPreviewBusy(false);
     setBorrowPreview(null);
     setBorrowFillResult(null);
@@ -259,15 +322,7 @@ export function Lend() {
     setter(value);
   }, []);
 
-  const existingOpenUsdcSumRaw = useMemo(
-    () =>
-      computeOpenLendOffersRawTotal(
-        web3?.address,
-        persistedOffers,
-        marketState.data?.orders
-      ).totalRaw,
-    [marketState.data?.orders, persistedOffers, web3?.address]
-  );
+  const existingOpenUsdcSumRaw = makerOpenOffers.sumRaw;
 
   const parseValidatedOfferInputs = useCallback(() => {
     if (!quoteAssetObj?.token) {
@@ -377,7 +432,7 @@ export function Lend() {
   );
 
   const exactOfferAmounts = useMemo(() => {
-    if (!quoteResult) return null;
+    if (!quoteResult || makerOpenOffers.error) return null;
     try {
       const minFillRawParsed = parseDecimalToRaw(minFillStr, USDC_DECIMALS);
       const planParsed = parseRawListInput(partialPlanStr, USDC_DECIMALS, 'USDC partial fill');
@@ -390,7 +445,7 @@ export function Lend() {
     } catch {
       return null;
     }
-  }, [existingOpenUsdcSumRaw, minFillStr, partialPlanStr, quoteResult]);
+  }, [existingOpenUsdcSumRaw, makerOpenOffers.error, minFillStr, partialPlanStr, quoteResult]);
 
   const partialRemainderWarning = useMemo(() => {
     const prinRawStr = exactOfferAmounts
@@ -460,10 +515,16 @@ export function Lend() {
     txBusyRef.current = true;
     setTxBusy('approve');
     try {
+      const liveOpenUsdcSumRaw = await resolveOpenLendOffersSumRaw({
+        lenderAddress: web3.address,
+        existingOpenSumRaw: null,
+        cfg: web3.config,
+      });
+      setMakerOpenOffers({ loading: false, sumRaw: liveOpenUsdcSumRaw, error: '' });
       const exact = resolveExactLendAmounts(quoteResult, {
         minFillRaw: parsed.minFillRaw,
         perFillUsdcRawList: parsed.perFillUsdcRawList,
-        existingOpenSumRaw: existingOpenUsdcSumRaw,
+        existingOpenSumRaw: liveOpenUsdcSumRaw,
       });
       const res = await approveUsdcForLend({
         address: web3.address,
@@ -523,7 +584,7 @@ export function Lend() {
         expiryDays: parsed.expiryDays,
         yieldMode,
         perFillUsdcRawList: parsed.perFillUsdcRawList,
-        existingOpenUsdcSumRaw,
+        existingOpenUsdcSumRaw: null,
         attestationHex: web3.attestationHex,
         autoApprove: true,
         cfg: web3.config,
@@ -531,7 +592,7 @@ export function Lend() {
       setQuoteResult(signed.quote);
       setLatestSignedOffer(signed);
       setAllowanceReductionState(null);
-      await Promise.all([loadAllowanceAndNonce(), syncPersistedOffers(), loadMarkets()]);
+      await Promise.all([loadAllowanceAndNonce(), syncPersistedOffers(), loadMarkets(), loadMakerOpenOffers()]);
       setActionNotice(
         `Signed EIP-712 LendOffer ${signed.orderHash} for ${signed.exactAmounts.principalRaw} raw USDC${signed.publishedToApi ? ' and published to api/ orderbook.' : '.'}`
       );
@@ -546,7 +607,9 @@ export function Lend() {
   async function refreshPostCancelAllowance(cancelledHash = null, allInvalidated = false) {
     if (!web3?.address) return;
     const stored = loadPersistedSignedLendOffers();
-    const [freshMeta, freshPersisted, freshMarkets] = await Promise.all([
+    const exclude = cancelledHash ? new Set([String(cancelledHash).toLowerCase()]) : null;
+    let makerResolveError = false;
+    const [freshMeta, freshPersisted, makerRemainingRaw, freshMarkets] = await Promise.all([
       loadAllowanceAndNonce(),
       stored.length > 0
         ? refreshSignedLendOffersState({ offers: stored, cfg: web3?.config }).then((enriched) => {
@@ -557,6 +620,17 @@ export function Lend() {
             setPersistedOffers([]);
             return [];
           }),
+      allInvalidated
+        ? Promise.resolve(0n)
+        : resolveOpenLendOffersSumRaw({
+            lenderAddress: web3.address,
+            existingOpenSumRaw: null,
+            excludeHashes: exclude,
+            cfg: web3?.config,
+          }).catch(() => {
+            makerResolveError = true;
+            return null;
+          }),
       fetchMarketSnapshot({
         cfg: web3?.config,
         includeLoans: false,
@@ -566,26 +640,38 @@ export function Lend() {
     if (freshMarkets) {
       setMarketState({ loading: false, data: freshMarkets });
     }
-    const exclude = cancelledHash ? new Set([String(cancelledHash).toLowerCase()]) : null;
-    const remainingSummary = allInvalidated
+    if (makerRemainingRaw !== null) {
+      setMakerOpenOffers({ loading: false, sumRaw: makerRemainingRaw, error: '' });
+    }
+    const localSummary = allInvalidated
       ? { totalRaw: 0n, hasUnknown: false }
       : computeOpenLendOffersRawTotal(
           web3.address,
           freshPersisted,
-          freshMarkets?.orders,
-          exclude
+          [],
+          exclude,
+          { ordersTruncated: Boolean(freshMarkets?.ordersTruncated) && makerRemainingRaw === null }
         );
     const blockedByUnknown =
       !allInvalidated &&
-      (remainingSummary.hasUnknown || !freshMarkets || Boolean(freshMarkets?.stale));
+      (makerResolveError ||
+        makerRemainingRaw === null ||
+        localSummary.hasUnknown ||
+        !freshMarkets ||
+        Boolean(freshMarkets?.stale));
+    const targetRaw = allInvalidated
+      ? 0n
+      : makerRemainingRaw !== null
+        ? makerRemainingRaw
+        : localSummary.totalRaw;
     const liveAllowanceRaw = freshMeta ? BigInt(freshMeta.allowanceRaw) : allowanceRawBig;
     if (
-      liveAllowanceRaw > remainingSummary.totalRaw ||
+      liveAllowanceRaw > targetRaw ||
       (blockedByUnknown && liveAllowanceRaw > 0n)
     ) {
       setAllowanceReductionState({
         currentAllowanceRaw: liveAllowanceRaw.toString(),
-        targetAllowanceRaw: remainingSummary.totalRaw.toString(),
+        targetAllowanceRaw: targetRaw.toString(),
         blockedByUnknown,
       });
     } else {
@@ -777,7 +863,7 @@ export function Lend() {
         signature: payload.signature,
         fillUsdcRaw,
         perFillUsdcRawList: multiPlan.list,
-        existingOpenSumRaw: existingOpenUsdcSumRaw,
+        existingOpenSumRaw: null,
         lenderAddress: web3?.connected && !web3?.wrongNetwork ? web3.address : null,
         lenderAttestation: web3?.attestationHex ?? '0x',
         cfg: web3?.config,
@@ -814,7 +900,7 @@ export function Lend() {
         signature: borrowPreview.signature,
         fillUsdcRaw: borrowPreview.fillAmountRaw,
         perFillUsdcRawList: borrowPreview.perFillUsdcRawList ?? null,
-        existingOpenSumRaw: existingOpenUsdcSumRaw,
+        existingOpenSumRaw: null,
         expectedPreview: borrowPreview,
         lenderAttestation: web3.attestationHex,
         autoApprove: true,
@@ -822,7 +908,7 @@ export function Lend() {
       });
       setBorrowFillResult(res);
       setBorrowPreview(null);
-      await Promise.all([loadAllowanceAndNonce(), loadMarkets(), web3.refresh()]);
+      await Promise.all([loadAllowanceAndNonce(), loadMarkets(), loadMakerOpenOffers(), web3.refresh()]);
     } catch (err) {
       setBorrowFillError(formatWeb3Error(err));
     } finally {
@@ -841,6 +927,13 @@ export function Lend() {
         <div className="err block" role="status">
           <strong>Live api/ orderbook read degraded.</strong>{' '}
           {marketState.data?.apiError || 'Ensure api/ is reachable on Base.'}
+        </div>
+      ) : null}
+
+      {marketState.data?.ordersTruncated ? (
+        <div className="note block" role="status">
+          <strong>Public orderbook display truncated (&gt;1,000 rows).</strong>{' '}
+          Cumulative LoanCore allowance reserves use your full maker-scoped <code>/orders</code> query directly.
         </div>
       ) : null}
 
@@ -1058,6 +1151,7 @@ export function Lend() {
           note="USDC approvals to LoanCore and EIP-712 LendOffers use exact or rounded-up raw 6-decimal bigint amounts from api/, never display strings or floats."
         >
           {lendMeta.error ? <p className="err">{lendMeta.error}</p> : null}
+          {makerOpenOffers.error ? <p className="err">{makerOpenOffers.error}</p> : null}
           <Rows
             items={[
               { label: 'OrderSettlement', value: web3?.config?.contracts?.orderSettlement ?? 'Unset' },
@@ -1074,7 +1168,11 @@ export function Lend() {
               {
                 label: 'Maker nonce / Open offers sum',
                 value: lendMeta.data
-                  ? `Nonce ${lendMeta.data.makerNonce} · Open $${formatTokenUnitsDisplay(existingOpenUsdcSumRaw, USDC_DECIMALS, 2)} (${existingOpenUsdcSumRaw.toString()} raw)`
+                  ? makerOpenOffers.loading
+                    ? `Nonce ${lendMeta.data.makerNonce} · Refreshing open offers…`
+                    : makerOpenOffers.error
+                      ? `Nonce ${lendMeta.data.makerNonce} · Error loading open offers`
+                      : `Nonce ${lendMeta.data.makerNonce} · Open $${safeFormatUnits(existingOpenUsdcSumRaw, USDC_DECIMALS, 2)} (${existingOpenUsdcSumRaw.toString()} raw)`
                   : '—',
               },
               ...(exactOfferAmounts
@@ -1172,24 +1270,28 @@ export function Lend() {
           <p className="hint">No locally persisted signed LendOffers yet.</p>
         ) : (
           <div className="fields">
-            {persistedOffers.map((item) => (
-              <div className="note" key={item.orderHash} style={{ marginBottom: 8 }}>
+            {persistedOffers.map((item, idx) => (
+              <div className="note" key={item?.orderHash || `corrupt-${idx}`} style={{ marginBottom: 8 }}>
                 <div>
-                  <strong>LendOffer {shortAddress(item.orderHash)}</strong> · Status:{' '}
-                  <code>{item.onchainStatus ?? 'open'}</code> · Offered:{' '}
+                  <strong>LendOffer {item?.orderHash ? shortAddress(item.orderHash) : '(corrupt entry)'}</strong> · Status:{' '}
+                  <code>{item?.onchainStatus ?? 'open'}</code> · Offered:{' '}
                   <code>
-                    ${formatTokenUnitsDisplay(item.offerJson?.usdcAmount ?? 0n, USDC_DECIMALS, 2)}
+                    ${safeFormatUnits(item?.offerJson?.usdcAmount ?? 0n, USDC_DECIMALS, 2)}
                   </code>{' '}
                   · Remaining:{' '}
                   <code>
-                    ${formatTokenUnitsDisplay(item.remainingRaw ?? item.offerJson?.usdcAmount ?? 0n, USDC_DECIMALS, 2)}
+                    ${safeFormatUnits(item?.remainingRaw ?? item?.offerJson?.usdcAmount ?? 0n, USDC_DECIMALS, 2)}
                   </code>
                 </div>
                 <div className="actions" style={{ marginTop: 8 }}>
-                  <button className="btn secondary" type="button" onClick={() => void copyOfferPayload(item)}>
-                    {copiedHash === item.orderHash ? 'Copied JSON' : 'Copy LendOffer JSON'}
-                  </button>
-                  {(item.onchainStatus === 'open' || item.onchainStatus === 'partially_filled') &&
+                  {item?.offerJson ? (
+                    <button className="btn secondary" type="button" onClick={() => void copyOfferPayload(item)}>
+                      {copiedHash === item.orderHash ? 'Copied JSON' : 'Copy LendOffer JSON'}
+                    </button>
+                  ) : null}
+                  {item?.offerJson &&
+                  isNonFinalOrderStatus(item.onchainStatus) &&
+                  item.onchainStatus !== 'unknown' &&
                   web3?.address?.toLowerCase() === String(item.offerJson?.lender ?? '').toLowerCase() ? (
                     <button
                       className="btn secondary"
@@ -1200,6 +1302,18 @@ export function Lend() {
                       Cancel on-chain
                     </button>
                   ) : null}
+                  <button
+                    className="btn secondary"
+                    type="button"
+                    onClick={() => {
+                      removeSignedLendOffer(item?.orderHash || idx);
+                      setPersistedOffers(loadPersistedSignedLendOffers());
+                      void loadMakerOpenOffers();
+                    }}
+                    disabled={Boolean(txBusy)}
+                  >
+                    Remove saved entry
+                  </button>
                 </div>
               </div>
             ))}

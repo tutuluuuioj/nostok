@@ -443,7 +443,7 @@ async function queryPendingUniqueWalletsPage(
            SELECT id, wallet, verify_code_hash, verify_expires_at::TEXT AS verify_expires_at,
                   created_at,
                   to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_iso,
-                  ROW_NUMBER() OVER (PARTITION BY LOWER(wallet) ORDER BY updated_at DESC, created_at DESC, id ASC) AS rn
+                  ROW_NUMBER() OVER (PARTITION BY LOWER(wallet) ORDER BY created_at DESC, id ASC) AS rn
            FROM notif_subscriptions
            WHERE verified = FALSE
              AND channel = $1
@@ -473,7 +473,7 @@ async function queryPendingUniqueWalletsPage(
            SELECT id, wallet, verify_code_hash, verify_expires_at::TEXT AS verify_expires_at,
                   created_at,
                   to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at_iso,
-                  ROW_NUMBER() OVER (PARTITION BY LOWER(wallet) ORDER BY updated_at DESC, created_at DESC, id ASC) AS rn
+                  ROW_NUMBER() OVER (PARTITION BY LOWER(wallet) ORDER BY created_at DESC, id ASC) AS rn
            FROM notif_subscriptions
            WHERE verified = FALSE
              AND channel = $1

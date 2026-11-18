@@ -20,26 +20,44 @@ import {
   fillLendOfferAsBorrower,
   formatTokenUnitsDisplay,
   formatWeb3Error,
+  isNonFinalOrderStatus,
   loadPersistedSignedOrders,
   parseBorrowOrderFromJson,
   prepareAndSignBorrowOrder,
   readBorrowAllowanceAndNonce,
   refreshSignedBorrowOrdersState,
+  removeSignedBorrowOrder,
   resolveExactBorrowAmounts,
+  resolveOpenBorrowOrdersCollateralSumRaw,
   setCollateralAllowanceForBorrow,
   shortAddress,
   verifyAndPreviewLendOfferFill,
 } from '../lib/web3.js';
 import { useStore } from '../store.jsx';
 
+function safeFormatUnits(rawVal, decimals, maxDigits = 2) {
+  try {
+    return formatTokenUnitsDisplay(rawVal ?? '0', decimals, maxDigits);
+  } catch {
+    return '—';
+  }
+}
+
+function safeFormatBps(bps) {
+  const n = Number(bps);
+  if (!Number.isFinite(n)) return '—';
+  return formatBpsPercent(n);
+}
+
 function computeOpenBorrowOrdersCollateralTotal(
   walletAddress,
   collateralToken,
   persistedList = [],
   marketOrders = [],
-  excludeHashes = null
+  excludeHashes = null,
+  { ordersTruncated = false } = {}
 ) {
-  if (!walletAddress || !collateralToken) return { totalRaw: 0n, hasUnknown: false };
+  if (!walletAddress || !collateralToken) return { totalRaw: 0n, hasUnknown: Boolean(ordersTruncated) };
   const addrLower = walletAddress.toLowerCase();
   const tokLower = collateralToken.toLowerCase();
   const seenHashes = new Set();
@@ -49,28 +67,32 @@ function computeOpenBorrowOrdersCollateralTotal(
     }
   }
   let totalRaw = 0n;
-  let hasUnknown = false;
+  let hasUnknown = Boolean(ordersTruncated);
 
   for (const item of persistedList ?? []) {
     const ord = item?.orderJson ?? item?.order ?? {};
     const maker = String(ord?.borrower ?? '').toLowerCase();
     const tok = String(ord?.collateralToken ?? '').toLowerCase();
-    if (maker !== addrLower || tok !== tokLower) continue;
-    const h = String(item?.orderHash ?? '').toLowerCase();
     const st = item?.onchainStatus;
     if (st === 'unknown') hasUnknown = true;
-    if (st !== 'open' && st !== 'partially_filled' && st !== 'unknown') {
+    if (maker !== addrLower || tok !== tokLower) continue;
+    const h = String(item?.orderHash ?? '').toLowerCase();
+    if (!isNonFinalOrderStatus(st)) {
       if (h) seenHashes.add(h);
       continue;
     }
     if (h && seenHashes.has(h)) continue;
     if (h) seenHashes.add(h);
-    totalRaw += computeRemainingBorrowCollateralRequirement(
-      ord.collateralAmount,
-      ord.minUsdc,
-      ord.minFill,
-      item.remainingRaw ?? ord.minUsdc
-    );
+    try {
+      totalRaw += computeRemainingBorrowCollateralRequirement(
+        ord.collateralAmount,
+        ord.minUsdc,
+        ord.minFill,
+        item.remainingRaw ?? ord.minUsdc
+      );
+    } catch {
+      hasUnknown = true;
+    }
   }
 
   for (const row of marketOrders ?? []) {
@@ -82,16 +104,20 @@ function computeOpenBorrowOrdersCollateralTotal(
     if (tok !== tokLower) continue;
     const st = row.status;
     if (st === 'unknown') hasUnknown = true;
-    if (st !== 'open' && st !== 'partially_filled' && st !== 'unknown') continue;
+    if (!isNonFinalOrderStatus(st)) continue;
     const h = String(row.order_hash ?? '').toLowerCase();
     if (h && seenHashes.has(h)) continue;
     if (h) seenHashes.add(h);
-    totalRaw += computeRemainingBorrowCollateralRequirement(
-      ord?.collateralAmount ?? row?.collateral_amount?.raw,
-      ord?.minUsdc ?? row?.min_usdc?.raw,
-      ord?.minFill ?? row?.min_fill?.raw,
-      row?.remaining_usdc?.raw ?? ord?.minUsdc ?? row?.min_usdc?.raw
-    );
+    try {
+      totalRaw += computeRemainingBorrowCollateralRequirement(
+        ord?.collateralAmount ?? row?.collateral_amount?.raw,
+        ord?.minUsdc ?? row?.min_usdc?.raw,
+        ord?.minFill ?? row?.min_fill?.raw,
+        row?.remaining_usdc?.raw ?? ord?.minUsdc ?? row?.min_usdc?.raw
+      );
+    } catch {
+      hasUnknown = true;
+    }
   }
   return { totalRaw, hasUnknown };
 }
@@ -134,6 +160,12 @@ export function Borrow() {
   const [cancelError, setCancelError] = useState('');
   const [cancelNotice, setCancelNotice] = useState('');
   const [collateralReductionState, setCollateralReductionState] = useState(null);
+  const [makerOpenCollateral, setMakerOpenCollateral] = useState({
+    loading: false,
+    totalRaw: 0n,
+    error: '',
+  });
+  const makerOpenSeqRef = useRef(0);
 
   // LendOffer fill workflow (Step 1 verify & simulate -> review terms -> Step 2 confirm & fill)
   const [lendOfferJsonStr, setLendOfferJsonStr] = useState('');
@@ -237,6 +269,7 @@ export function Borrow() {
   useEffect(() => {
     quoteSeqRef.current += 1;
     lendPreviewSeqRef.current += 1;
+    makerOpenSeqRef.current += 1;
     setQuoteLoading(false);
     setQuoteResult(null);
     setQuoteError('');
@@ -246,6 +279,7 @@ export function Borrow() {
     setCancelError('');
     setCancelNotice('');
     setCollateralReductionState(null);
+    setMakerOpenCollateral({ loading: false, totalRaw: 0n, error: '' });
     setLendPreviewBusy(false);
     setLendPreview(null);
     setLendFillResult(null);
@@ -256,16 +290,37 @@ export function Borrow() {
     setCollateralReductionState(null);
   }, [assetObj?.token]);
 
-  const existingOpenBorrowCollateralSumRaw = useMemo(
-    () =>
-      computeOpenBorrowOrdersCollateralTotal(
-        web3?.address,
-        assetObj?.token,
-        persistedOrders,
-        marketState.data?.orders
-      ).totalRaw,
-    [assetObj?.token, marketState.data?.orders, persistedOrders, web3?.address]
-  );
+  const loadMakerOpenCollateral = useCallback(async () => {
+    if (!web3?.connected || web3?.wrongNetwork || !web3?.address || !assetObj?.token) {
+      setMakerOpenCollateral({ loading: false, totalRaw: 0n, error: '' });
+      return null;
+    }
+    const seq = ++makerOpenSeqRef.current;
+    setMakerOpenCollateral((prev) => ({ loading: true, totalRaw: prev.totalRaw, error: '' }));
+    try {
+      const total = await resolveOpenBorrowOrdersCollateralSumRaw({
+        borrowerAddress: web3.address,
+        collateralToken: assetObj.token,
+        existingOpenCollateralRaw: null,
+        cfg: web3.config,
+      });
+      if (seq !== makerOpenSeqRef.current) return null;
+      setMakerOpenCollateral({ loading: false, totalRaw: total, error: '' });
+      return total;
+    } catch (err) {
+      if (seq !== makerOpenSeqRef.current) return null;
+      setMakerOpenCollateral({ loading: false, totalRaw: null, error: formatWeb3Error(err) });
+      return null;
+    }
+  }, [assetObj?.token, web3?.address, web3?.config, web3?.connected, web3?.wrongNetwork]);
+
+  useEffect(() => {
+    void loadMakerOpenCollateral();
+  }, [loadMakerOpenCollateral, persistedOrders]);
+
+  const existingOpenBorrowCollateralSumRaw = makerOpenCollateral.error
+    ? null
+    : makerOpenCollateral.totalRaw;
 
   // Notice: field edits clear the stale quote preview & action banners,
   // but NEVER delete persisted signed orders from state/storage.
@@ -402,6 +457,7 @@ export function Borrow() {
         : null;
       const safeMinFillRaw =
         minFillRawParsed && BigInt(minFillRawParsed) > 0n ? minFillRawParsed : null;
+      if (existingOpenBorrowCollateralSumRaw === null) return null;
       return resolveExactBorrowAmounts(quoteResult, {
         userCollateralRaw: userCol,
         bufferBps: parsedBufferBps ?? DEFAULT_COLLATERAL_BUFFER_BPS,
@@ -471,11 +527,17 @@ export function Borrow() {
     txBusyRef.current = true;
     setTxBusy('approve');
     try {
+      const liveOpenCollateralRaw = await resolveOpenBorrowOrdersCollateralSumRaw({
+        borrowerAddress: web3.address,
+        collateralToken: assetObj.token,
+        existingOpenCollateralRaw: null,
+        cfg: web3.config,
+      });
       const exact = resolveExactBorrowAmounts(quoteResult, {
         userCollateralRaw: parsed.collateralRaw,
         bufferBps: parsed.bufferBps,
         minFillRaw: parsed.minFillRaw,
-        existingOpenCollateralRaw: existingOpenBorrowCollateralSumRaw,
+        existingOpenCollateralRaw: liveOpenCollateralRaw,
       });
       const res = await approveCollateralForBorrow({
         address: web3.address,
@@ -483,11 +545,11 @@ export function Borrow() {
         requiredCollateralRaw: exact.requiredApprovalRaw,
         cfg: web3.config,
       });
-      await loadAllowanceAndNonce();
+      await Promise.all([loadAllowanceAndNonce(), loadMakerOpenCollateral()]);
       setActionNotice(
         res.alreadyApproved
           ? `CollateralEscrow already approved for ${res.allowanceRaw} raw units.`
-          : `Approved CollateralEscrow for ${exact.requiredApprovalRaw.toString()} raw ${assetObj.symbol} units (open ${existingOpenBorrowCollateralSumRaw.toString()} + signed ${exact.collateralAmountRaw.toString()} + ${exact.approvalSlackRaw.toString()} wei slack, tx ${res.txHash}).`
+          : `Approved CollateralEscrow for ${exact.requiredApprovalRaw.toString()} raw ${assetObj.symbol} units (open ${liveOpenCollateralRaw.toString()} + signed ${exact.collateralAmountRaw.toString()} + ${exact.approvalSlackRaw.toString()} wei slack, tx ${res.txHash}).`
       );
     } catch (err) {
       setActionError(formatWeb3Error(err));
@@ -534,7 +596,7 @@ export function Borrow() {
         termDays: parsed.termDays,
         maxLtvBps: parsed.maxLtvBps,
         minFillRaw: parsed.minFillRaw,
-        existingOpenCollateralRaw: existingOpenBorrowCollateralSumRaw,
+        existingOpenCollateralRaw: null,
         expiryDays: parsed.expiryDays,
         yieldMode: yieldOn ? 1 : 0,
         allowInKindSettlement: false,
@@ -560,7 +622,9 @@ export function Borrow() {
   async function refreshPostCancelCollateralAllowance(cancelledHash = null, allInvalidated = false) {
     if (!web3?.address || !assetObj?.token) return;
     const stored = loadPersistedSignedOrders();
-    const [freshMeta, freshPersisted, freshMarkets] = await Promise.all([
+    const exclude = cancelledHash ? new Set([String(cancelledHash).toLowerCase()]) : null;
+    let makerOpenErr = '';
+    const [freshMeta, freshPersisted, makerResolvedRaw] = await Promise.all([
       loadAllowanceAndNonce(),
       stored.length > 0
         ? refreshSignedBorrowOrdersState({ orders: stored, cfg: web3?.config }).then((enriched) => {
@@ -571,31 +635,44 @@ export function Borrow() {
             setPersistedOrders([]);
             return [];
           }),
-      fetchMarketSnapshot({
-        cfg: web3?.config,
-        includeLoans: false,
-        includeAuctions: false,
-      }),
+      allInvalidated
+        ? Promise.resolve(0n)
+        : resolveOpenBorrowOrdersCollateralSumRaw({
+            borrowerAddress: web3.address,
+            collateralToken: assetObj.token,
+            existingOpenCollateralRaw: null,
+            excludeHashes: exclude,
+            cfg: web3?.config,
+          }).catch((err) => {
+            makerOpenErr = formatWeb3Error(err);
+            return null;
+          }),
     ]);
-    if (freshMarkets) {
-      setMarketState({ loading: false, data: freshMarkets });
-    }
-    const exclude = cancelledHash ? new Set([String(cancelledHash).toLowerCase()]) : null;
-    const remainingSummary = allInvalidated
-      ? { totalRaw: 0n, hasUnknown: false }
-      : computeOpenBorrowOrdersCollateralTotal(
-          web3.address,
-          assetObj.token,
-          freshPersisted,
-          freshMarkets?.orders,
-          exclude
-        );
+    void loadMarkets();
+
+    const fallbackSummary = computeOpenBorrowOrdersCollateralTotal(
+      web3.address,
+      assetObj.token,
+      freshPersisted,
+      [],
+      exclude
+    );
     const blockedByUnknown =
       !allInvalidated &&
-      (remainingSummary.hasUnknown || !freshMarkets || Boolean(freshMarkets?.stale));
+      (Boolean(makerOpenErr) ||
+        makerResolvedRaw === null ||
+        fallbackSummary.hasUnknown);
+    const targetRaw =
+      makerResolvedRaw !== null ? makerResolvedRaw : fallbackSummary.totalRaw;
+    if (makerResolvedRaw !== null) {
+      setMakerOpenCollateral({ loading: false, totalRaw: makerResolvedRaw, error: '' });
+    } else if (makerOpenErr) {
+      setMakerOpenCollateral({ loading: false, totalRaw: null, error: makerOpenErr });
+    }
+
     const liveAllowanceRaw = freshMeta ? BigInt(freshMeta.allowanceRaw) : allowanceRawBig;
     if (
-      liveAllowanceRaw > remainingSummary.totalRaw ||
+      liveAllowanceRaw > targetRaw ||
       (blockedByUnknown && liveAllowanceRaw > 0n)
     ) {
       setCollateralReductionState({
@@ -603,8 +680,9 @@ export function Borrow() {
         symbol: assetObj.symbol ?? 'collateral',
         decimals: Number(assetObj.decimals ?? 18),
         currentAllowanceRaw: liveAllowanceRaw.toString(),
-        targetAllowanceRaw: remainingSummary.totalRaw.toString(),
+        targetAllowanceRaw: targetRaw.toString(),
         blockedByUnknown,
+        blockReason: makerOpenErr,
       });
     } else {
       setCollateralReductionState(null);
@@ -813,7 +891,7 @@ export function Borrow() {
         collateralToken: assetObj.token,
         fillUsdcRaw,
         collateralBufferBps: parsedBufferBps,
-        existingOpenCollateralRaw: existingOpenBorrowCollateralSumRaw,
+        existingOpenCollateralRaw: null,
         borrowerAddress: web3?.connected && !web3?.wrongNetwork ? web3.address : null,
         borrowerAttestation: web3?.attestationHex ?? '0x',
         cfg: web3?.config,
@@ -848,7 +926,7 @@ export function Borrow() {
         collateralToken: lendPreview.collateralToken,
         fillUsdcRaw: lendPreview.fillAmountRaw,
         collateralBufferBps: parsedBufferBps ?? DEFAULT_COLLATERAL_BUFFER_BPS,
-        existingOpenCollateralRaw: existingOpenBorrowCollateralSumRaw,
+        existingOpenCollateralRaw: null,
         expectedPreview: lendPreview,
         borrowerAttestation: web3.attestationHex,
         autoApprove: true,
@@ -1172,8 +1250,12 @@ export function Borrow() {
                 : null,
               tokenMeta.data
                 ? {
-                    label: 'Open BorrowOrders collateral reserve',
-                    value: `${formatTokenUnitsDisplay(existingOpenBorrowCollateralSumRaw, tokenMeta.data.decimals, 6)} ${tokenMeta.data.symbol} (${existingOpenBorrowCollateralSumRaw.toString()} raw)`,
+                    label: 'Open BorrowOrders collateral reserve (maker-scoped)',
+                    value: makerOpenCollateral.error
+                      ? `Unavailable (${makerOpenCollateral.error})`
+                      : makerOpenCollateral.loading || existingOpenBorrowCollateralSumRaw === null
+                        ? 'Checking maker-scoped open orders…'
+                        : `${safeFormatUnits(existingOpenBorrowCollateralSumRaw, tokenMeta.data.decimals, 6)} ${tokenMeta.data.symbol} (${existingOpenBorrowCollateralSumRaw.toString()} raw)`,
                   }
                 : null,
               exactQuoteAmounts
@@ -1304,34 +1386,38 @@ export function Borrow() {
           <p className="hint block">No persisted BorrowOrders saved in this browser yet.</p>
         ) : (
           <div className="block">
-            {persistedOrders.map((item) => {
-              const ord = item.orderJson ?? {};
-              const statusLabel = item.onchainStatus ?? (item.cancelledTxHash ? 'cancelled' : 'saved');
+            {persistedOrders.map((item, idx) => {
+              const ord = item?.orderJson ?? item?.order ?? {};
+              const statusLabel = item?.onchainStatus ?? (item?.cancelledTxHash ? 'cancelled' : 'saved');
+              const isCorrupt = statusLabel === 'unknown' || !ord || !ord.borrower;
               const isCancelable =
-                statusLabel === 'open' || statusLabel === 'partially_filled' || statusLabel === 'saved';
+                !isCorrupt &&
+                (statusLabel === 'open' || statusLabel === 'partially_filled' || statusLabel === 'saved');
               return (
-                <article className="order-row" key={item.orderHash}>
+                <article className="order-row" key={item?.orderHash || `corrupt-order-${idx}`}>
                   <div>
                     <strong>
-                      Order {String(item.orderHash).slice(0, 14)}… · Status: {statusLabel}
+                      Order {ord.borrower && item?.orderHash ? String(item.orderHash).slice(0, 14) + '…' : `#${idx + 1} (unreadable)`} · Status: {statusLabel}
                     </strong>
                     <span className="quiet">
-                      Principal ${formatTokenUnitsDisplay(ord.minUsdc ?? '0', USDC_DECIMALS, 2)} · Collateral raw{' '}
-                      {ord.collateralAmount ?? '0'} · Fixed APR {formatBpsPercent(ord.maxRateBps)} · Term {ord.termDays}d · Nonce {ord.nonce}
+                      Principal ${safeFormatUnits(ord.minUsdc ?? '0', USDC_DECIMALS, 2)} · Collateral raw{' '}
+                      {String(ord.collateralAmount ?? '0')} · Fixed APR {safeFormatBps(ord.maxRateBps)} · Term {ord.termDays ?? '—'}d · Nonce {ord.nonce ?? '—'}
                     </span>
                     <span className="quiet">
-                      Maker {shortAddress(ord.borrower)} · Remaining $
-                      {formatTokenUnitsDisplay(item.remainingRaw ?? ord.minUsdc ?? '0', USDC_DECIMALS, 2)} ·{' '}
-                      {item.publishedToApi ? 'Published to api/' : 'Local only'}
+                      Maker {ord.borrower ? shortAddress(ord.borrower) : '—'} · Remaining $
+                      {safeFormatUnits(item?.remainingRaw ?? ord.minUsdc ?? '0', USDC_DECIMALS, 2)} ·{' '}
+                      {item?.publishedToApi ? 'Published to api/' : 'Local only'}
                     </span>
+                    {item?.stateError ? <span className="err">{item.stateError}</span> : null}
                   </div>
                   <div className="actions">
                     <button
                       className="btn secondary"
                       type="button"
                       onClick={() => void copyOrderPayload(item)}
+                      disabled={Boolean(isCorrupt)}
                     >
-                      {copiedHash === item.orderHash ? 'Copied JSON' : 'Copy JSON'}
+                      {copiedHash === item?.orderHash ? 'Copied JSON' : 'Copy JSON'}
                     </button>
                     {isCancelable && web3?.address && ord.borrower?.toLowerCase() === web3.address.toLowerCase() ? (
                       <button
@@ -1343,6 +1429,22 @@ export function Borrow() {
                         {txBusy === 'cancel' ? 'Cancelling…' : 'Cancel on-chain'}
                       </button>
                     ) : null}
+                    <button
+                      className="btn secondary"
+                      type="button"
+                      onClick={() => {
+                        const updated = removeSignedBorrowOrder({
+                          orderHash: item?.orderHash,
+                          index: idx,
+                        });
+                        setPersistedOrders(updated);
+                        void syncPersistedOrders();
+                        void loadMakerOpenCollateral();
+                      }}
+                      disabled={Boolean(txBusy)}
+                    >
+                      Remove saved entry
+                    </button>
                   </div>
                 </article>
               );

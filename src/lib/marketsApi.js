@@ -417,6 +417,7 @@ export async function fetchMarketSnapshot({
       fees: assetsRes.fees ?? null,
       assets: assetsRes.rows,
       orders: ordersRes.rows,
+      ordersTruncated: Boolean(ordersRes.truncated),
       loans: loansRes.rows,
       auctions: auctionsRes.rows,
       bookSummary,
