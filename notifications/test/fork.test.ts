@@ -3970,6 +3970,127 @@ async function runTests(): Promise<void> {
           'Manage list SQL deduplication must keep the newest pending request per unique wallet'
         );
 
+        // Item 8: Keyset cursor + as_of snapshot prevents page drift/duplicates/skips when new requests or re-requests arrive mid-pagination
+        const htmlPage1Res = await fetch(
+          `${d1Url}/subscriptions/manage?token=${encodeURIComponent(d2ManageTok)}&limit=20`,
+          { headers: { Accept: 'text/html', 'X-Forwarded-For': '198.52.20.1' } }
+        );
+        assert.equal(htmlPage1Res.status, 200);
+        const htmlPage1Body = await htmlPage1Res.text();
+        assert.ok(
+          htmlPage1Body.includes('as_of=') && htmlPage1Body.includes('cursor='),
+          'HTML manage Next link must carry as_of and keyset cursor params'
+        );
+
+        const keysetP1 = await httpJson<{
+          pagination: {
+            limit: number;
+            as_of?: string;
+            next_cursor?: string | null;
+            returned: number;
+            total: number;
+            has_more: boolean;
+          };
+          data: Array<{ subscription_id: string; wallet_address: string }>;
+        }>(
+          'GET',
+          `${d1Url}/subscriptions/manage?token=${encodeURIComponent(d2ManageTok)}&limit=20`,
+          undefined,
+          { 'X-Forwarded-For': '198.52.20.2' }
+        );
+        assert.equal(keysetP1.status, 200);
+        assert.ok(keysetP1.body.pagination.as_of, 'JSON pagination must include as_of snapshot timestamp');
+        assert.ok(keysetP1.body.pagination.next_cursor, 'JSON pagination must include keyset next_cursor');
+        assert.equal(keysetP1.body.pagination.has_more, true);
+        assert.equal(keysetP1.body.data.length, 20);
+
+        const snapshotAsOf = keysetP1.body.pagination.as_of!;
+        const p1Cursor = keysetP1.body.pagination.next_cursor!;
+        const keysetSeen = new Set<string>(keysetP1.body.data.map((r) => r.wallet_address.toLowerCase()));
+
+        // Wait a few ms and submit BOTH 3 brand-new pending requests AND a re-request from a Page 1 wallet!
+        await new Promise((r) => setTimeout(r, 25));
+        const shiftAccts = Array.from({ length: 3 }, () => privateKeyToAccount(generatePrivateKey()));
+        await Promise.all(
+          shiftAccts.map((a) => rpcCall('anvil_setBalance', [a.address, '0x470de4df820000']))
+        );
+        for (let i = 0; i < shiftAccts.length; i++) {
+          await createSubWithSiwe(d1Url, shiftAccts[i], 'reprod2.owner@gmail.com', `198.52.21.${i + 1}`);
+        }
+        // Re-request from a Page 1 wallet updates its updated_at to NOW (> snapshotAsOf)
+        await createSubWithSiwe(d1Url, crowdAccts[55], 'reprod2.owner@gmail.com', '198.52.21.99');
+
+        const keysetP2 = await httpJson<{
+          pagination: {
+            as_of?: string;
+            next_cursor?: string | null;
+            returned: number;
+            total: number;
+            has_more: boolean;
+          };
+          data: Array<{ subscription_id: string; wallet_address: string }>;
+        }>(
+          'GET',
+          `${d1Url}/subscriptions/manage?token=${encodeURIComponent(d2ManageTok)}&limit=20&as_of=${encodeURIComponent(snapshotAsOf)}&cursor=${encodeURIComponent(p1Cursor)}`,
+          undefined,
+          { 'X-Forwarded-For': '198.52.20.3' }
+        );
+        assert.equal(keysetP2.status, 200);
+        assert.equal(keysetP2.body.pagination.total, 57, 'Snapshot total must remain pinned at 57 despite 3 new arrivals');
+        assert.equal(keysetP2.body.pagination.has_more, true);
+        assert.equal(keysetP2.body.data.length, 20);
+        for (const r of keysetP2.body.data) {
+          assert.ok(
+            !keysetSeen.has(r.wallet_address.toLowerCase()),
+            `Keyset Page 2 must not duplicate Page 1 wallet ${r.wallet_address}`
+          );
+          keysetSeen.add(r.wallet_address.toLowerCase());
+        }
+
+        const keysetP3 = await httpJson<{
+          pagination: {
+            as_of?: string;
+            next_cursor?: string | null;
+            returned: number;
+            total: number;
+            has_more: boolean;
+          };
+          data: Array<{ subscription_id: string; wallet_address: string }>;
+        }>(
+          'GET',
+          `${d1Url}/subscriptions/manage?token=${encodeURIComponent(d2ManageTok)}&limit=20&as_of=${encodeURIComponent(snapshotAsOf)}&cursor=${encodeURIComponent(keysetP2.body.pagination.next_cursor!)}`,
+          undefined,
+          { 'X-Forwarded-For': '198.52.20.4' }
+        );
+        assert.equal(keysetP3.status, 200);
+        assert.equal(keysetP3.body.pagination.has_more, false);
+        assert.equal(keysetP3.body.pagination.next_cursor, null);
+        assert.equal(keysetP3.body.data.length, 17);
+        for (const r of keysetP3.body.data) {
+          assert.ok(
+            !keysetSeen.has(r.wallet_address.toLowerCase()),
+            `Keyset Page 3 must not duplicate prior wallet ${r.wallet_address}`
+          );
+          keysetSeen.add(r.wallet_address.toLowerCase());
+        }
+        assert.equal(keysetSeen.size, 57, 'Keyset + as_of pagination must traverse all 57 unique wallets without duplicates or shifts');
+
+        // Keyset cursor WITHOUT as_of must also avoid shifting/duplicating boundary rows when new arrivals occur
+        const noAsOfP2 = await httpJson<{
+          data: Array<{ subscription_id: string; wallet_address: string }>;
+        }>(
+          'GET',
+          `${d1Url}/subscriptions/manage?token=${encodeURIComponent(d2ManageTok)}&limit=20&cursor=${encodeURIComponent(p1Cursor)}`,
+          undefined,
+          { 'X-Forwarded-For': '198.52.20.5' }
+        );
+        assert.equal(noAsOfP2.status, 200);
+        assert.deepEqual(
+          noAsOfP2.body.data.map((r) => r.wallet_address),
+          keysetP2.body.data.map((r) => r.wallet_address),
+          'Keyset cursor alone (without as_of) must produce identical stable next page after new arrivals'
+        );
+
         // Low 4: Confirm early owner (uses the 1 confirm) AND allow up to 10 blocks with that same token; reject 2nd confirm and 11th block!
         const d2ConfirmRes = await httpJson<{
           confirmed: boolean;

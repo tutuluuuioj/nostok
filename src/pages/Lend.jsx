@@ -25,7 +25,9 @@ import {
   readLendAllowanceAndNonce,
   refreshSignedLendOffersState,
   resolveExactLendAmounts,
+  setUsdcAllowanceForLend,
   shortAddress,
+  validateLendPartialFillPlan,
   verifyAndPreviewBorrowOrderFill,
 } from '../lib/web3.js';
 import { useStore } from '../store.jsx';
@@ -47,6 +49,45 @@ function parseRawListInput(rawStr, decimals, label) {
     out.push(raw);
   }
   return { error: '', list: out };
+}
+
+function computeOpenLendOffersRawTotal(
+  walletAddress,
+  persistedList = [],
+  marketOrders = [],
+  excludeHashes = null
+) {
+  if (!walletAddress) return 0n;
+  const addrLower = walletAddress.toLowerCase();
+  const seenHashes = new Set();
+  if (excludeHashes) {
+    for (const h of excludeHashes) {
+      if (h) seenHashes.add(String(h).toLowerCase());
+    }
+  }
+  let total = 0n;
+
+  for (const item of persistedList ?? []) {
+    const st = item?.onchainStatus;
+    if (st !== 'open' && st !== 'partially_filled') continue;
+    const maker = String(item?.offerJson?.lender ?? '').toLowerCase();
+    if (maker !== addrLower) continue;
+    const h = String(item?.orderHash ?? '').toLowerCase();
+    if (h && seenHashes.has(h)) continue;
+    if (h) seenHashes.add(h);
+    total += BigInt(item.remainingRaw ?? item.offerJson?.usdcAmount ?? 0n);
+  }
+
+  for (const row of marketOrders ?? []) {
+    if (row.order_type !== 'lend' && row.order_type !== 'LendOffer') continue;
+    if (row.status !== 'open' && row.status !== 'partially_filled') continue;
+    if (String(row.maker ?? '').toLowerCase() !== addrLower) continue;
+    const h = String(row.order_hash ?? '').toLowerCase();
+    if (h && seenHashes.has(h)) continue;
+    if (h) seenHashes.add(h);
+    total += BigInt(row.remaining_usdc?.raw ?? row.min_usdc?.raw ?? 0n);
+  }
+  return total;
 }
 
 export function Lend() {
@@ -84,6 +125,7 @@ export function Lend() {
   const [pasteCancelJson, setPasteCancelJson] = useState('');
   const [cancelError, setCancelError] = useState('');
   const [cancelNotice, setCancelNotice] = useState('');
+  const [allowanceReductionState, setAllowanceReductionState] = useState(null);
 
   // BorrowOrder fill workflow (Step 1 verify & simulate -> review terms -> Step 2 approve USDC & fill -> PositionNFT)
   const [borrowOrderJsonStr, setBorrowOrderJsonStr] = useState('');
@@ -180,6 +222,22 @@ export function Lend() {
     void loadAllowanceAndNonce();
   }, [loadAllowanceAndNonce]);
 
+  useEffect(() => {
+    quoteSeqRef.current += 1;
+    setQuoteLoading(false);
+    setQuoteResult(null);
+    setQuoteError('');
+    setActionError('');
+    setActionNotice('');
+    setLatestSignedOffer(null);
+    setCancelError('');
+    setCancelNotice('');
+    setAllowanceReductionState(null);
+    setBorrowPreview(null);
+    setBorrowFillResult(null);
+    setBorrowFillError('');
+  }, [web3?.address, web3?.chainId, web3?.wrongNetwork]);
+
   const updateField = useCallback((setter) => (value) => {
     quoteSeqRef.current += 1;
     setQuoteLoading(false);
@@ -190,33 +248,15 @@ export function Lend() {
     setter(value);
   }, []);
 
-  const existingOpenUsdcSumRaw = useMemo(() => {
-    if (!web3?.address) return 0n;
-    const addrLower = web3.address.toLowerCase();
-    const seenHashes = new Set();
-    let total = 0n;
-
-    for (const item of persistedOffers) {
-      const st = item?.onchainStatus;
-      if (st !== 'open' && st !== 'partially_filled') continue;
-      const maker = String(item?.offerJson?.lender ?? '').toLowerCase();
-      if (maker !== addrLower) continue;
-      const h = String(item?.orderHash ?? '').toLowerCase();
-      if (h) seenHashes.add(h);
-      total += BigInt(item.remainingRaw ?? item.offerJson?.usdcAmount ?? 0n);
-    }
-
-    for (const row of marketState.data?.orders ?? []) {
-      if (row.order_type !== 'lend' && row.order_type !== 'LendOffer') continue;
-      if (row.status !== 'open' && row.status !== 'partially_filled') continue;
-      if (String(row.maker ?? '').toLowerCase() !== addrLower) continue;
-      const h = String(row.order_hash ?? '').toLowerCase();
-      if (h && seenHashes.has(h)) continue;
-      if (h) seenHashes.add(h);
-      total += BigInt(row.remaining_usdc?.raw ?? row.min_usdc?.raw ?? 0n);
-    }
-    return total;
-  }, [marketState.data?.orders, persistedOffers, web3?.address]);
+  const existingOpenUsdcSumRaw = useMemo(
+    () =>
+      computeOpenLendOffersRawTotal(
+        web3?.address,
+        persistedOffers,
+        marketState.data?.orders
+      ),
+    [marketState.data?.orders, persistedOffers, web3?.address]
+  );
 
   const parseValidatedOfferInputs = useCallback(() => {
     if (!quoteAssetObj?.token) {
@@ -236,6 +276,13 @@ export function Lend() {
     const planParsed = parseRawListInput(partialPlanStr, USDC_DECIMALS, 'USDC partial fill');
     if (planParsed.error) {
       return { error: planParsed.error };
+    }
+    if (planParsed.list) {
+      try {
+        validateLendPartialFillPlan(planParsed.list, principalRaw, minFillRaw);
+      } catch (planErr) {
+        return { error: planErr instanceof Error ? planErr.message : String(planErr) };
+      }
     }
     const aprBps = parsePercentToBps(ratePct);
     if (aprBps === null || aprBps > 4000) {
@@ -378,6 +425,10 @@ export function Lend() {
       setActionError('Connect your wallet on Base before approving USDC.');
       return;
     }
+    if (!quoteResult) {
+      setActionError('Click "1. Simulate live quote" and review terms before approving USDC.');
+      return;
+    }
     const parsed = parseValidatedOfferInputs();
     if (parsed.error) {
       setActionError(parsed.error);
@@ -386,14 +437,7 @@ export function Lend() {
     txBusyRef.current = true;
     setTxBusy('approve');
     try {
-      let activeQuote = quoteResult;
-      if (!activeQuote) {
-        activeQuote = await handleQuote();
-      }
-      if (!activeQuote) {
-        throw new Error('Obtain a live /quote response before approving USDC.');
-      }
-      const exact = resolveExactLendAmounts(activeQuote, {
+      const exact = resolveExactLendAmounts(quoteResult, {
         minFillRaw: parsed.minFillRaw,
         perFillUsdcRawList: parsed.perFillUsdcRawList,
         existingOpenSumRaw: existingOpenUsdcSumRaw,
@@ -430,6 +474,10 @@ export function Lend() {
       setActionError('IneligibleCounterparty: Wallet is not eligible in EligibilityGate on-chain.');
       return;
     }
+    if (!quoteResult) {
+      setActionError('Click "1. Simulate live quote" and review terms before signing a LendOffer.');
+      return;
+    }
     const parsed = parseValidatedOfferInputs();
     if (parsed.error) {
       setActionError(parsed.error);
@@ -444,6 +492,7 @@ export function Lend() {
         allowedCollateral,
         quoteAsset: parsed.quoteAsset,
         expectedQuote: quoteResult,
+        requireExpectedQuote: true,
         minRateBps: parsed.aprBps,
         termDays: parsed.termDays,
         maxLtvBps: parsed.maxLtvBps,
@@ -458,6 +507,7 @@ export function Lend() {
       });
       setQuoteResult(signed.quote);
       setLatestSignedOffer(signed);
+      setAllowanceReductionState(null);
       await Promise.all([loadAllowanceAndNonce(), syncPersistedOffers(), loadMarkets()]);
       setActionNotice(
         `Signed EIP-712 LendOffer ${signed.orderHash} for ${signed.exactAmounts.principalRaw} raw USDC${signed.publishedToApi ? ' and published to api/ orderbook.' : '.'}`
@@ -470,10 +520,81 @@ export function Lend() {
     }
   }
 
+  async function refreshPostCancelAllowance(cancelledHash = null, allInvalidated = false) {
+    if (!web3?.address) return;
+    const stored = loadPersistedSignedLendOffers();
+    const [freshMeta, freshPersisted, freshMarkets] = await Promise.all([
+      loadAllowanceAndNonce(),
+      stored.length > 0
+        ? refreshSignedLendOffersState({ offers: stored, cfg: web3?.config }).then((enriched) => {
+            setPersistedOffers(enriched);
+            return enriched;
+          })
+        : Promise.resolve([]).then(() => {
+            setPersistedOffers([]);
+            return [];
+          }),
+      fetchMarketSnapshot({
+        cfg: web3?.config,
+        includeLoans: false,
+        includeAuctions: false,
+      }),
+    ]);
+    if (freshMarkets) {
+      setMarketState({ loading: false, data: freshMarkets });
+    }
+    const exclude = cancelledHash ? new Set([String(cancelledHash).toLowerCase()]) : null;
+    const remainingOpenRaw = allInvalidated
+      ? 0n
+      : computeOpenLendOffersRawTotal(
+          web3.address,
+          freshPersisted,
+          freshMarkets?.orders,
+          exclude
+        );
+    const liveAllowanceRaw = freshMeta ? BigInt(freshMeta.allowanceRaw) : allowanceRawBig;
+    if (liveAllowanceRaw > remainingOpenRaw) {
+      setAllowanceReductionState({
+        currentAllowanceRaw: liveAllowanceRaw.toString(),
+        targetAllowanceRaw: remainingOpenRaw.toString(),
+      });
+    } else {
+      setAllowanceReductionState(null);
+    }
+  }
+
+  async function handleReduceAllowanceAfterCancel() {
+    if (txBusyRef.current || !web3?.address || !allowanceReductionState) return;
+    setCancelError('');
+    txBusyRef.current = true;
+    setTxBusy('reduce-allowance');
+    try {
+      const targetRaw = allowanceReductionState.targetAllowanceRaw;
+      const res = await setUsdcAllowanceForLend({
+        address: web3.address,
+        targetAllowanceRaw: targetRaw,
+        cfg: web3.config,
+      });
+      await loadAllowanceAndNonce();
+      setAllowanceReductionState(null);
+      setCancelNotice(
+        res.unchanged
+          ? `LoanCore USDC allowance is already $${formatTokenUnitsDisplay(targetRaw, USDC_DECIMALS, 2)} (${targetRaw} raw).`
+          : `Reduced LoanCore USDC allowance to $${formatTokenUnitsDisplay(res.allowanceRaw, USDC_DECIMALS, 2)} (${res.allowanceRaw} raw) (tx ${res.txHash}).`
+      );
+    } catch (err) {
+      setCancelError(formatWeb3Error(err));
+    } finally {
+      txBusyRef.current = false;
+      setTxBusy('');
+    }
+  }
+
   async function handleCancelOffer(offerObj) {
     if (txBusyRef.current || !web3?.address) return;
     setCancelError('');
     setCancelNotice('');
+    setAllowanceReductionState(null);
     txBusyRef.current = true;
     setTxBusy('cancel');
     try {
@@ -482,7 +603,7 @@ export function Lend() {
         offer: offerObj,
         cfg: web3.config,
       });
-      await Promise.all([syncPersistedOffers(), loadMarkets()]);
+      await refreshPostCancelAllowance(res.orderHash, false);
       setCancelNotice(`Cancelled LendOffer ${res.orderHash} on-chain (tx ${res.txHash}).`);
     } catch (err) {
       setCancelError(formatWeb3Error(err));
@@ -497,6 +618,7 @@ export function Lend() {
     if (txBusyRef.current) return;
     setCancelError('');
     setCancelNotice('');
+    setAllowanceReductionState(null);
     if (!web3?.connected || web3?.wrongNetwork || !web3?.address) {
       setCancelError('Connect your wallet on Base before cancelling an offer.');
       return;
@@ -513,10 +635,10 @@ export function Lend() {
     try {
       const res = await cancelSignedLendOffer({
         address: web3.address,
-        order: parsed.order,
+        offer: parsed.order,
         cfg: web3.config,
       });
-      await Promise.all([syncPersistedOffers(), loadMarkets()]);
+      await refreshPostCancelAllowance(res.orderHash, false);
       setCancelNotice(`Cancelled pasted LendOffer ${res.orderHash} on-chain (tx ${res.txHash}).`);
     } catch (err) {
       setCancelError(formatWeb3Error(err));
@@ -530,6 +652,7 @@ export function Lend() {
     if (txBusyRef.current) return;
     setCancelError('');
     setCancelNotice('');
+    setAllowanceReductionState(null);
     if (!web3?.connected || web3?.wrongNetwork || !web3?.address) {
       setCancelError('Connect your wallet on Base before bumping your maker nonce.');
       return;
@@ -541,7 +664,7 @@ export function Lend() {
         address: web3.address,
         cfg: web3.config,
       });
-      await Promise.all([loadAllowanceAndNonce(), syncPersistedOffers(), loadMarkets()]);
+      await refreshPostCancelAllowance(null, true);
       setCancelNotice(
         `Called OrderSettlement.bumpNonce() (tx ${res.txHash}). Maker nonce is now ${res.newNonce}; all open orders signed at earlier nonces are invalidated on-chain.`
       );
@@ -616,6 +739,8 @@ export function Lend() {
         order: payload.order,
         signature: payload.signature,
         fillUsdcRaw,
+        perFillUsdcRawList: multiPlan.list,
+        existingOpenSumRaw: existingOpenUsdcSumRaw,
         lenderAddress: web3?.connected && !web3?.wrongNetwork ? web3.address : null,
         lenderAttestation: web3?.attestationHex ?? '0x',
         cfg: web3?.config,
@@ -648,6 +773,7 @@ export function Lend() {
         signature: borrowPreview.signature,
         fillUsdcRaw: borrowPreview.fillAmountRaw,
         perFillUsdcRawList: borrowPreview.perFillUsdcRawList ?? null,
+        existingOpenSumRaw: existingOpenUsdcSumRaw,
         expectedPreview: borrowPreview,
         lenderAttestation: web3.attestationHex,
         autoApprove: true,
@@ -852,7 +978,14 @@ export function Lend() {
               className="btn secondary"
               type="button"
               onClick={() => void handleApproveUsdc()}
-              disabled={!web3?.connected || web3?.wrongNetwork || Boolean(txBusy) || !quoteAssetObj}
+              disabled={
+                !web3?.connected ||
+                web3?.wrongNetwork ||
+                Boolean(txBusy) ||
+                !quoteAssetObj ||
+                quoteLoading ||
+                !quoteResult
+              }
             >
               {txBusy === 'approve'
                 ? '2. Approving USDC…'
@@ -868,6 +1001,8 @@ export function Lend() {
                 web3?.wrongNetwork ||
                 Boolean(txBusy) ||
                 !quoteAssetObj ||
+                quoteLoading ||
+                !quoteResult ||
                 Boolean(eligibilityInfo && !eligibilityInfo.isEligible)
               }
             >
@@ -944,6 +1079,31 @@ export function Lend() {
         </p>
         {cancelError ? <p className="err" role="alert">{cancelError}</p> : null}
         {cancelNotice ? <p className="note" role="status">{cancelNotice}</p> : null}
+        {allowanceReductionState ? (
+          <div className="err block" role="status" style={{ marginTop: 10, marginBottom: 12 }}>
+            <p>
+              Warning: LoanCore USDC allowance is still $
+              {formatTokenUnitsDisplay(allowanceReductionState.currentAllowanceRaw, USDC_DECIMALS, 2)}{' '}
+              ({allowanceReductionState.currentAllowanceRaw} raw), above your remaining open
+              LendOffers ($
+              {formatTokenUnitsDisplay(allowanceReductionState.targetAllowanceRaw, USDC_DECIMALS, 2)}{' '}
+              / {allowanceReductionState.targetAllowanceRaw} raw). Reduce or revoke excess allowance
+              to limit contract exposure.
+            </p>
+            <div className="actions" style={{ marginTop: 8 }}>
+              <button
+                className="btn secondary"
+                type="button"
+                onClick={() => void handleReduceAllowanceAfterCancel()}
+                disabled={Boolean(txBusy)}
+              >
+                {txBusy === 'reduce-allowance'
+                  ? 'Updating LoanCore USDC allowance…'
+                  : `Reduce LoanCore USDC allowance to $${formatTokenUnitsDisplay(allowanceReductionState.targetAllowanceRaw, USDC_DECIMALS, 2)}`}
+              </button>
+            </div>
+          </div>
+        ) : null}
         <div className="actions" style={{ marginBottom: 12 }}>
           <button
             className="btn secondary"
@@ -1190,10 +1350,14 @@ export function Lend() {
                   value: `$${formatTokenUnitsDisplay(borrowPreview.exact.lenderNetInterestRaw, USDC_DECIMALS, 2)} (${borrowPreview.exact.lenderNetInterestRaw.toString()} raw) / $${formatTokenUnitsDisplay(borrowPreview.exact.protocolInterestCutRaw, USDC_DECIMALS, 2)}`,
                 },
                 {
+                  label: 'Open LendOffers sum / Required LoanCore allowance',
+                  value: `$${formatTokenUnitsDisplay(borrowPreview.existingOpenSumRaw ?? '0', USDC_DECIMALS, 2)} (${borrowPreview.existingOpenSumRaw ?? '0'} raw) · Need $${formatTokenUnitsDisplay(borrowPreview.requiredApprovalRaw ?? borrowPreview.fillAmountRaw, USDC_DECIMALS, 2)} (${borrowPreview.requiredApprovalRaw ?? borrowPreview.fillAmountRaw} raw)`,
+                },
+                {
                   label: 'Pre-approval eth_call simulation',
                   value: borrowPreview.simulationVerified
                     ? borrowPreview.needsApproval
-                      ? 'Verified (LoanCore USDC approval required before fill)'
+                      ? `Verified (LoanCore USDC approval required: $${formatTokenUnitsDisplay(borrowPreview.requiredApprovalRaw ?? borrowPreview.fillAmountRaw, USDC_DECIMALS, 2)})`
                       : 'Verified (LoanCore USDC allowance sufficient)'
                     : 'Pending wallet connection',
                 },

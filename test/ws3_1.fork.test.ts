@@ -88,9 +88,11 @@ import {
   resolveExactBorrowAmounts,
   resolveExactLendAmounts,
   setInjectedProvider,
+  setUsdcAllowanceForLend,
   signInWithSiwe,
   signOutSiwe,
   sumRawBigints,
+  validateLendPartialFillPlan,
   verifyAndPreviewBorrowOrderFill,
   verifyAndPreviewLendOfferFill,
 } from '../src/lib/web3.js';
@@ -2286,14 +2288,58 @@ async function runTests(): Promise<void> {
       // Verify pure raw bigint helper invariants (no floats/display strings, sum of per-fill rounded-up amounts)
       assert.equal(sumRawBigints(['600000001', '700000001']), 1_300_000_002n);
       const multiLendSizing = computeLendApprovalAmountRaw('1300000000', {
-        perFillUsdcRawList: ['600000001', '700000001'],
+        perFillUsdcRawList: ['600000000', '700000000'],
         existingOpenSumRaw: '500000000',
       });
       assert.equal(
         multiLendSizing.requiredApprovalRaw,
-        1_800_000_002n,
-        'Partial-fill lend allowance must cover existing open offers plus sum of per-fill rounded-up raw amounts'
+        1_800_000_000n,
+        'Partial-fill lend allowance must cover existing open offers plus validated per-fill chunks'
       );
+      // Item 3: Partial-fill plan validation rejects sums > offer/remaining or chunks below minFill/$500 other than final closing remainder
+      assert.throws(
+        () =>
+          computeLendApprovalAmountRaw('1000000000', {
+            perFillUsdcRawList: ['900000000', '900000000'],
+          }),
+        /exceeds offer\/remaining/
+      );
+      assert.throws(
+        () =>
+          computeLendApprovalAmountRaw('1300000000', {
+            perFillUsdcRawList: ['600000001', '700000001'],
+          }),
+        /exceeds offer\/remaining/
+      );
+      assert.throws(
+        () =>
+          computeLendApprovalAmountRaw('1000000000', {
+            perFillUsdcRawList: ['400000000', '600000000'],
+          }),
+        /below minimum fill/
+      );
+      assert.throws(
+        () =>
+          computeLendApprovalAmountRaw('1100000000', {
+            perFillUsdcRawList: ['500000000', '600000000'],
+            minFillRaw: '600000000',
+          }),
+        /below minimum fill/
+      );
+      assert.throws(
+        () =>
+          computeLendApprovalAmountRaw('1000000000', {
+            perFillUsdcRawList: ['600000000', '300000000'],
+          }),
+        /below minimum fill/
+      );
+      const validClosingPlan = validateLendPartialFillPlan(
+        ['600000000', '500000000'],
+        '1100000000',
+        '600000000'
+      );
+      assert.deepEqual(validClosingPlan, [600_000_000n, 500_000_000n]);
+
       assert.equal(
         computeBorrowCollateralForFill(10_000_000_000_000_000_001n, 1_400_000_000n, 700_000_000n),
         5_000_000_000_000_000_001n,
@@ -2351,9 +2397,9 @@ async function runTests(): Promise<void> {
       assert.equal(quote1300Lend.accepted, true);
       const exactLend1300 = resolveExactLendAmounts(quote1300Lend, {
         minFillRaw: '500000000',
-        perFillUsdcRawList: ['600000001', '700000001'],
+        perFillUsdcRawList: ['600000000', '700000000'],
       });
-      assert.equal(exactLend1300.requiredApprovalRaw, 1_300_000_002n);
+      assert.equal(exactLend1300.requiredApprovalRaw, 1_300_000_000n);
 
       const lendMemMap = new Map<string, string>();
       const lendStorage = {
@@ -2362,6 +2408,26 @@ async function runTests(): Promise<void> {
           lendMemMap.set(k, v);
         },
       };
+
+      // Item 6: Signing a LendOffer without a live reviewed quote (expectedQuote = null) must be refused by default
+      walletProvider.setAccount(KEYS.lender);
+      await assert.rejects(
+        () =>
+          prepareAndSignLendOffer({
+            address: ADDRESSES.lender,
+            principalRaw: '1300000000',
+            allowedCollateral: nvdac,
+            expectedQuote: null,
+            minRateBps: 850,
+            termDays: 30,
+            maxLtvBps: 6000,
+            minFillRaw: '500000000',
+            expiryDays: 7,
+            provider: walletProvider,
+            cfg,
+          }),
+        /No reviewed on-screen quote found/
+      );
 
       // Stale quote guard before signing
       walletProvider.setAccount(KEYS.lender);
@@ -2399,7 +2465,7 @@ async function runTests(): Promise<void> {
         termDays: 30,
         maxLtvBps: 6000,
         minFillRaw: '500000000',
-        perFillUsdcRawList: ['600000001', '700000001'],
+        perFillUsdcRawList: ['600000000', '700000000'],
         expiryDays: 7,
         autoApprove: true,
         publishToApi: true,
@@ -2415,18 +2481,43 @@ async function runTests(): Promise<void> {
       const postLendApproveMeta = await readLendAllowanceAndNonce(ADDRESSES.lender, { cfg });
       assert.equal(
         postLendApproveMeta.allowanceRaw,
-        '1300000002',
-        'LoanCore allowance must equal exact sum of per-fill rounded-up raw amounts (1300000002)'
+        '1300000000',
+        'LoanCore allowance must equal exact sum of validated partial-fill chunks (1300000000)'
       );
       const parsedLendJson = parseLendOfferFromJson(
         JSON.stringify({ order: signedLend1.offerJson, signature: signedLend1.signature, orderHash: signedLend1.orderHash })
       );
       assert.equal(parsedLendJson.order.usdcAmount, 1_300_000_000n);
 
+      // Item 4: Refuse self-loans (lender === borrower) on LendOffer fill preview
+      await assert.rejects(
+        () =>
+          verifyAndPreviewLendOfferFill({
+            offer: signedLend1.offer,
+            signature: signedLend1.signature,
+            collateralToken: nvdac,
+            fillUsdcRaw: '600000000',
+            borrowerAddress: ADDRESSES.lender,
+            cfg,
+          }),
+        /SelfLoanNotAllowed/
+      );
+
       // Sign & cancel a second open LendOffer ($600 with allowedCollateral=zeroAddress + existingOpenUsdcSumRaw cumulative allowance!)
+      const quote600Lend = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '600000000',
+        termDays: 30,
+        aprBps: 900,
+        maxLtvBps: 6000,
+        lender: ADDRESSES.lender,
+      });
+      assert.equal(quote600Lend.accepted, true);
       const signedLendCancel = await prepareAndSignLendOffer({
         address: ADDRESSES.lender,
         principalRaw: '600000000',
+        expectedQuote: quote600Lend,
         minRateBps: 900,
         termDays: 30,
         maxLtvBps: 6000,
@@ -2443,9 +2534,17 @@ async function runTests(): Promise<void> {
       const cumMeta = await readLendAllowanceAndNonce(ADDRESSES.lender, { cfg });
       assert.equal(cumMeta.allowanceRaw, '1900000000');
 
+      // Item 2: Verify parseLendOfferFromJson -> cancelSignedLendOffer({ offer: parsed.order }) cancels cleanly
+      const parsedCancelJson = parseLendOfferFromJson(
+        JSON.stringify({
+          order: signedLendCancel.offerJson,
+          signature: signedLendCancel.signature,
+          orderHash: signedLendCancel.orderHash,
+        })
+      );
       const cancelLendRes = await cancelSignedLendOffer({
         address: ADDRESSES.lender,
-        offer: signedLendCancel.offer,
+        offer: parsedCancelJson.order,
         storage: lendStorage,
         provider: walletProvider,
         cfg,
@@ -2457,6 +2556,18 @@ async function runTests(): Promise<void> {
       });
       assert.equal(syncedLendStates.find((o) => o.orderHash === signedLendCancel.orderHash)?.onchainStatus, 'cancelled');
       assert.equal(syncedLendStates.find((o) => o.orderHash === signedLend1.orderHash)?.onchainStatus, 'open');
+
+      // Item 5: Post-cancel allowance reduction helper lowers excess allowance (1900000000 -> remaining open 1300000000)
+      const postCancelMetaBefore = await readLendAllowanceAndNonce(ADDRESSES.lender, { cfg });
+      assert.equal(postCancelMetaBefore.allowanceRaw, '1900000000');
+      const reduceAfterCancel = await setUsdcAllowanceForLend({
+        address: ADDRESSES.lender,
+        targetAllowanceRaw: '1300000000',
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(reduceAfterCancel.updated, true);
+      assert.equal(reduceAfterCancel.allowanceRaw, '1300000000');
 
       // Multi-fill signedLend1 as borrower (600 + 700 = 1300 USDC)
       walletProvider.setAccount(KEYS.borrower);
@@ -2561,6 +2672,34 @@ async function runTests(): Promise<void> {
         /FillAmountTooLow/
       );
 
+      // Item 4: Refuse self-loans (borrower === lender) on BorrowOrder fill preview
+      await assert.rejects(
+        () =>
+          verifyAndPreviewBorrowOrderFill({
+            order: borrowOrder1400.order,
+            signature: borrowOrder1400.signature,
+            fillUsdcRaw: '700000000',
+            lenderAddress: ADDRESSES.borrower,
+            cfg,
+          }),
+        /SelfLoanNotAllowed/
+      );
+
+      // Item 3: Partial-fill plan exceeding remaining BorrowOrder must reject before any approval or fill
+      await assert.rejects(
+        () =>
+          fillBorrowOrderAsLender({
+            address: ADDRESSES.lender,
+            order: borrowOrder1400.order,
+            signature: borrowOrder1400.signature,
+            fillUsdcRaw: '700000000',
+            perFillUsdcRawList: ['900000000', '900000000'],
+            provider: walletProvider,
+            cfg,
+          }),
+        /exceeds offer\/remaining/
+      );
+
       // Stale expectedPreview check must abort before fill
       await assert.rejects(
         () =>
@@ -2616,7 +2755,7 @@ async function runTests(): Promise<void> {
       assert.ok(borrowFill2.positionTokenId && borrowFill2.positionTokenId !== borrowFill1.positionTokenId);
       assert.equal(borrowFill2.positionOwner?.toLowerCase(), ADDRESSES.lender.toLowerCase());
 
-      // Approve helper direct verification (no float/display parsing)
+      // Approve helper direct verification + reset to 0n (Item 5)
       const directAppRes = await approveUsdcForLend({
         address: ADDRESSES.lender,
         requiredUsdcRaw: 1_000_000n,
@@ -2624,6 +2763,266 @@ async function runTests(): Promise<void> {
         cfg,
       });
       assert.equal(directAppRes.approved, true);
+      const resetZeroRes = await setUsdcAllowanceForLend({
+        address: ADDRESSES.lender,
+        targetAllowanceRaw: '0',
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(resetZeroRes.allowanceRaw, '0');
+
+      // Item 1 Medium (Repro A1): Open $1,000 LendOffer with 1000000000 allowance -> fill $600 BorrowOrder
+      // Must raise allowance to 1600000000 (not skip approval!) leaving 1000000000 so the $1,000 LendOffer STILL fills in full!
+      walletProvider.setAccount(KEYS.lender);
+      const quote1000Lend = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '1000000000',
+        termDays: 30,
+        aprBps: 850,
+        maxLtvBps: 6000,
+        lender: ADDRESSES.lender,
+      });
+      assert.equal(quote1000Lend.accepted, true);
+      const openOfferA1 = await prepareAndSignLendOffer({
+        address: ADDRESSES.lender,
+        principalRaw: '1000000000',
+        allowedCollateral: nvdac,
+        expectedQuote: quote1000Lend,
+        minRateBps: 850,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '500000000',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: true,
+        storage: lendStorage,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal((await readLendAllowanceAndNonce(ADDRESSES.lender, { cfg })).allowanceRaw, '1000000000');
+
+      walletProvider.setAccount(KEYS.borrower);
+      const quote600BorrowA1 = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '600000000',
+        termDays: 30,
+        aprBps: 950,
+        maxLtvBps: 6000,
+        borrower: ADDRESSES.borrower,
+      });
+      const borrowOrderA1 = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '600000000',
+        expectedQuote: quote600BorrowA1,
+        maxRateBps: 950,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '600000000',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: false,
+        provider: walletProvider,
+        cfg,
+      });
+
+      walletProvider.setAccount(KEYS.lender);
+      const previewA1 = await verifyAndPreviewBorrowOrderFill({
+        order: borrowOrderA1.order,
+        signature: borrowOrderA1.signature,
+        fillUsdcRaw: '600000000',
+        lenderAddress: ADDRESSES.lender,
+        storage: lendStorage,
+        cfg,
+      });
+      assert.equal(previewA1.existingOpenSumRaw, '1000000000');
+      assert.equal(previewA1.requiredApprovalRaw, '1600000000');
+      assert.equal(previewA1.needsApproval, true, 'Fill $600 with open $1,000 LendOffer must still require LoanCore approval up to 1600000000');
+
+      const fillA1Res = await fillBorrowOrderAsLender({
+        address: ADDRESSES.lender,
+        order: borrowOrderA1.order,
+        signature: borrowOrderA1.signature,
+        fillUsdcRaw: '600000000',
+        expectedPreview: previewA1,
+        storage: lendStorage,
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(fillA1Res.approvalTxHash, 'Repro A1 must submit cumulative approve(1600000000) before filling $600');
+      assert.equal(fillA1Res.requiredApprovalRaw, '1600000000');
+      assert.equal(
+        (await readLendAllowanceAndNonce(ADDRESSES.lender, { cfg })).allowanceRaw,
+        '1000000000',
+        'After $600 fill, LoanCore allowance must still equal 1000000000 for open $1,000 LendOffer'
+      );
+
+      walletProvider.setAccount(KEYS.borrower);
+      const fillOpenOfferA1 = await fillLendOfferAsBorrower({
+        address: ADDRESSES.borrower,
+        offer: openOfferA1.offer,
+        signature: openOfferA1.signature,
+        collateralToken: nvdac,
+        fillUsdcRaw: '1000000000',
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(fillOpenOfferA1.loanId, 'Open $1,000 LendOffer must still fill in full after $600 BorrowOrder fill');
+
+      // Item 1 Medium (Repro A2): Open $700 LendOffer with 700000000 allowance -> fill $900 BorrowOrder
+      // Must approve 1600000000 (not overwrite with 900000000!), leaving 700000000 so the $700 LendOffer still fills!
+      walletProvider.setAccount(KEYS.lender);
+      await setUsdcAllowanceForLend({
+        address: ADDRESSES.lender,
+        targetAllowanceRaw: '0',
+        provider: walletProvider,
+        cfg,
+      });
+      const quote700Lend = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '700000000',
+        termDays: 30,
+        aprBps: 850,
+        maxLtvBps: 6000,
+        lender: ADDRESSES.lender,
+      });
+      const openOfferA2 = await prepareAndSignLendOffer({
+        address: ADDRESSES.lender,
+        principalRaw: '700000000',
+        allowedCollateral: nvdac,
+        expectedQuote: quote700Lend,
+        minRateBps: 850,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '700000000',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: true,
+        storage: lendStorage,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal((await readLendAllowanceAndNonce(ADDRESSES.lender, { cfg })).allowanceRaw, '700000000');
+
+      walletProvider.setAccount(KEYS.borrower);
+      const quote900BorrowA2 = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '900000000',
+        termDays: 30,
+        aprBps: 950,
+        maxLtvBps: 6000,
+        borrower: ADDRESSES.borrower,
+      });
+      const borrowOrderA2 = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '900000000',
+        expectedQuote: quote900BorrowA2,
+        maxRateBps: 950,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '900000000',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: false,
+        provider: walletProvider,
+        cfg,
+      });
+
+      walletProvider.setAccount(KEYS.lender);
+      const fillA2Res = await fillBorrowOrderAsLender({
+        address: ADDRESSES.lender,
+        order: borrowOrderA2.order,
+        signature: borrowOrderA2.signature,
+        fillUsdcRaw: '900000000',
+        existingOpenSumRaw: '700000000',
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(fillA2Res.requiredApprovalRaw, '1600000000');
+      assert.equal(
+        (await readLendAllowanceAndNonce(ADDRESSES.lender, { cfg })).allowanceRaw,
+        '700000000',
+        'After $900 fill, LoanCore allowance must equal 700000000 (not 0!) so open $700 LendOffer remains fillable'
+      );
+
+      walletProvider.setAccount(KEYS.borrower);
+      const fillOpenOfferA2 = await fillLendOfferAsBorrower({
+        address: ADDRESSES.borrower,
+        offer: openOfferA2.offer,
+        signature: openOfferA2.signature,
+        collateralToken: nvdac,
+        fillUsdcRaw: '700000000',
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(fillOpenOfferA2.loanId, 'Open $700 LendOffer must still fill cleanly after $900 BorrowOrder fill');
+
+      // Item 9 (Small hardening): PositionNFT owner mismatch after fill must throw an explicit error
+      const quote500Mismatch = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '500000000',
+        termDays: 30,
+        aprBps: 950,
+        maxLtvBps: 6000,
+        borrower: ADDRESSES.borrower,
+      });
+      const borrowOrderMismatch = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '500000000',
+        expectedQuote: quote500Mismatch,
+        maxRateBps: 950,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '500000000',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: false,
+        provider: walletProvider,
+        cfg,
+      });
+      walletProvider.setAccount(KEYS.lender);
+      const mismatchClient = new Proxy(publicClient, {
+        get(target, prop, receiver) {
+          if (prop === 'readContract') {
+            return async (args: { functionName?: string; address?: string }) => {
+              if (
+                args?.functionName === 'ownerOf' &&
+                args?.address?.toLowerCase() === deployed.positionNFT.toLowerCase()
+              ) {
+                return ADDRESSES.borrower;
+              }
+              return target.readContract(args as never);
+            };
+          }
+          const v = Reflect.get(target, prop, receiver);
+          return typeof v === 'function' ? v.bind(target) : v;
+        },
+      });
+      await assert.rejects(
+        () =>
+          fillBorrowOrderAsLender({
+            address: ADDRESSES.lender,
+            order: borrowOrderMismatch.order,
+            signature: borrowOrderMismatch.signature,
+            fillUsdcRaw: '500000000',
+            autoApprove: true,
+            provider: walletProvider,
+            publicClient: mismatchClient as never,
+            cfg,
+          }),
+        /PositionNFT owner mismatch/
+      );
 
       // Verify indexer/API reflects new loans and lender's newly minted PositionNFT IDs
       await runIndexerSync(idxCtx);
@@ -2636,7 +3035,7 @@ async function runTests(): Promise<void> {
       );
 
       walletProvider.setAccount(KEYS.borrower);
-      console.log('PASS WS3.4 Piece 1: Lend primitives (exact raw bigints, LendOffer sign/cancel/multi-fill, BorrowOrder partial fills -> PositionNFT IDs) verified.');
+      console.log('PASS WS3.4 Piece 1: Lend primitives (exact raw bigints, LendOffer sign/cancel/multi-fill, BorrowOrder partial fills -> PositionNFT IDs, cumulative open-offer allowance & Item 1-6/9 fixes) verified.');
 
       // 3.6 WS3.4 Piece 2: Live Lend.jsx UI verification (no PreviewBanner/mock assets, live LoanCore/Quote/BorrowOrder fill controls)
       console.log('\n=== WS3.4 Piece 2: Live Lend.jsx UI verification ===');
@@ -2661,6 +3060,24 @@ async function runTests(): Promise<void> {
       assert.match(liveLendHtml, /Bump maker nonce/);
       assert.match(liveLendHtml, /Fill open BorrowOrders \(mint PositionNFT\)/);
       assert.match(liveLendHtml, /1\. Verify &amp; preview BorrowOrder fill/);
+      // Item 6 SSR check: Approve & Sign buttons render disabled without a displayed quoteResult
+      assert.match(
+        liveLendHtml,
+        /<button[^>]*disabled=""[^>]*>2\. Approve \/ verify LoanCore allowance<\/button>/
+      );
+      assert.match(
+        liveLendHtml,
+        /<button[^>]*disabled=""[^>]*>3\. Sign &amp; publish LendOffer<\/button>/
+      );
+      // Item 7 UI source guard check: account/chain switch useEffect resets preview/quote/action states
+      const lendSrc = fs.readFileSync(path.join(process.cwd(), 'src/pages/Lend.jsx'), 'utf8');
+      assert.ok(
+        lendSrc.includes('[web3?.address, web3?.chainId, web3?.wrongNetwork]') &&
+          lendSrc.includes('setBorrowPreview(null)') &&
+          lendSrc.includes('setQuoteResult(null)') &&
+          lendSrc.includes('setUsdcAllowanceForLend'),
+        'Lend.jsx must reset quote/preview state on account/network switch and support post-cancel allowance reduction'
+      );
       console.log('PASS WS3.4 Piece 2: Live Lend.jsx SSR, LoanCore approval, LendOffer sign/cancel, & BorrowOrder fill UI verified.');
 
       console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1 & PIECE 2 FORK TESTS PASSED.');

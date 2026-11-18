@@ -954,6 +954,8 @@ async function sendWalletTransaction(provider, publicClient, { from, to, data, v
   return { txHash, receipt };
 }
 
+const PROTOCOL_MIN_FILL_USDC_RAW = 500_000_000n;
+
 export function sumRawBigints(values) {
   if (!Array.isArray(values) || values.length === 0) return 0n;
   let total = 0n;
@@ -969,19 +971,82 @@ export function sumRawBigints(values) {
 }
 
 /**
+ * Validates a planned sequence of partial-fill USDC amounts against an order/remaining total
+ * and minimum fill rule (`max(minFill, $500)`). Rejects plans whose sum exceeds the total cap
+ * or contain non-final fills below minimum (a final fill below minimum is valid only when it
+ * closes out the exact remaining amount).
+ */
+export function validateLendPartialFillPlan(
+  perFillUsdcRawList,
+  maxAllowedTotalRaw,
+  minFillRaw = null
+) {
+  if (!Array.isArray(perFillUsdcRawList)) return [];
+  const cleaned = perFillUsdcRawList
+    .map((item) => (item === null || item === undefined ? '' : String(item).trim()))
+    .filter((s) => s.length > 0);
+  if (cleaned.length === 0) return [];
+
+  const maxTotal = BigInt(maxAllowedTotalRaw);
+  if (maxTotal <= 0n) {
+    throw new Error('Offer or remaining USDC raw amount must be positive.');
+  }
+  const parsedMinFill = minFillRaw !== null && minFillRaw !== undefined ? BigInt(minFillRaw) : 0n;
+  const effectiveMin =
+    parsedMinFill > PROTOCOL_MIN_FILL_USDC_RAW ? parsedMinFill : PROTOCOL_MIN_FILL_USDC_RAW;
+
+  const parsed = cleaned.map((raw) => {
+    const v = BigInt(raw);
+    if (v <= 0n) {
+      throw new Error('Per-fill raw amount must be positive.');
+    }
+    return v;
+  });
+  const sum = parsed.reduce((acc, v) => acc + v, 0n);
+  if (sum > maxTotal) {
+    throw new Error(
+      `Partial-fill plan sum ($${formatTokenUnitsDisplay(sum, USDC_DECIMALS, 2)}) exceeds offer/remaining amount ($${formatTokenUnitsDisplay(maxTotal, USDC_DECIMALS, 2)}).`
+    );
+  }
+  for (let i = 0; i < parsed.length; i += 1) {
+    const v = parsed[i];
+    const isLast = i === parsed.length - 1;
+    if (v < effectiveMin && (!isLast || sum !== maxTotal)) {
+      throw new Error(
+        `Planned fill #${i + 1} ($${formatTokenUnitsDisplay(v, USDC_DECIMALS, 2)}) is below minimum fill ($${formatTokenUnitsDisplay(effectiveMin, USDC_DECIMALS, 2)}); only the final exact-remainder fill may be below minimum.`
+      );
+    }
+  }
+  return parsed;
+}
+
+/**
  * Computes exact raw USDC allowance needed on LoanCore for signing a LendOffer
- * or executing partial/multi-fill lender transactions. Covers the sum of
- * per-fill rounded-up raw amounts when provided plus any open offer total.
+ * or executing partial/multi-fill lender transactions. Covers the fill/offer
+ * requirement (or validated partial-fill plan sum) plus any open offer total.
  */
 export function computeLendApprovalAmountRaw(
   usdcAmountRaw,
-  { perFillUsdcRawList = null, existingOpenSumRaw = 0n } = {}
+  {
+    perFillUsdcRawList = null,
+    existingOpenSumRaw = 0n,
+    minFillRaw = null,
+    maxAllowedTotalRaw = null,
+  } = {}
 ) {
   const orderUsdcRaw = BigInt(usdcAmountRaw);
   const existingSum = BigInt(existingOpenSumRaw ?? 0n);
   if (orderUsdcRaw <= 0n || existingSum < 0n) {
     throw new Error('Lend USDC raw amount must be positive.');
   }
+  const maxTotal =
+    maxAllowedTotalRaw !== null && maxAllowedTotalRaw !== undefined
+      ? BigInt(maxAllowedTotalRaw)
+      : orderUsdcRaw;
+  if (maxTotal < orderUsdcRaw) {
+    throw new Error('Offer or remaining USDC cap cannot be below current fill/order amount.');
+  }
+  validateLendPartialFillPlan(perFillUsdcRawList, maxTotal, minFillRaw);
   const plannedFillsSum = sumRawBigints(perFillUsdcRawList);
   const orderRequirement = plannedFillsSum > orderUsdcRaw ? plannedFillsSum : orderUsdcRaw;
   return {
@@ -1011,6 +1076,8 @@ export function resolveExactLendAmounts(
   const approvalSizing = computeLendApprovalAmountRaw(principalRaw, {
     perFillUsdcRawList,
     existingOpenSumRaw,
+    minFillRaw: effectiveMinFill,
+    maxAllowedTotalRaw: principalRaw,
   });
   return {
     principalRaw,
@@ -1190,6 +1257,78 @@ export async function approveUsdcForLend({
     cfg,
     publicClient,
   });
+}
+
+/**
+ * Explicitly sets LoanCore USDC allowance to `targetAllowanceRaw` (including `0n`),
+ * used after cancelling open LendOffers to revoke excess allowance.
+ */
+export async function setUsdcAllowanceForLend({
+  address,
+  targetAllowanceRaw,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!cfg.usdcAddress || !cfg.contracts.loanCore) {
+    throw new Error('USDC or LoanCore contract address is not configured.');
+  }
+  const target = BigInt(targetAllowanceRaw);
+  if (target < 0n) {
+    throw new Error('Target USDC allowance raw amount cannot be negative.');
+  }
+  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
+  const token = getAddress(cfg.usdcAddress);
+  const spender = getAddress(cfg.contracts.loanCore);
+
+  const currentAllowance = BigInt(
+    await publicClient.readContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: 'allowance',
+      args: [wallet, spender],
+    })
+  );
+  if (currentAllowance === target) {
+    return {
+      updated: false,
+      unchanged: true,
+      txHash: null,
+      allowanceRaw: currentAllowance.toString(),
+    };
+  }
+
+  const data = encodeFunctionData({
+    abi: erc20Abi,
+    functionName: 'approve',
+    args: [spender, target],
+  });
+  const { txHash } = await sendWalletTransaction(provider, publicClient, {
+    from: wallet,
+    to: token,
+    data,
+  });
+
+  const postAllowance = BigInt(
+    await publicClient.readContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: 'allowance',
+      args: [wallet, spender],
+    })
+  );
+  if (postAllowance !== target) {
+    throw new Error(
+      `Post-update allowance check failed; expected ${target.toString()}, got ${postAllowance.toString()}.`
+    );
+  }
+
+  return {
+    updated: true,
+    unchanged: false,
+    txHash,
+    allowanceRaw: postAllowance.toString(),
+  };
 }
 
 function normalizeAttestationHex(raw) {
@@ -1650,8 +1789,19 @@ export async function refreshSignedBorrowOrdersState({
   );
 }
 
-function assertExpectedQuoteUnchanged(expectedQuote, freshQuote) {
-  if (!expectedQuote) return;
+function assertExpectedQuoteUnchanged(
+  expectedQuote,
+  freshQuote,
+  { requireExpectedQuote = false } = {}
+) {
+  if (!expectedQuote) {
+    if (requireExpectedQuote) {
+      throw new Error(
+        'No reviewed on-screen quote found. Click "Quote & Risk Check" and review terms before approving or signing.'
+      );
+    }
+    return;
+  }
   const checks = [
     ['principal.raw', expectedQuote?.amounts?.principal?.raw, freshQuote?.amounts?.principal?.raw],
     [
@@ -1709,6 +1859,7 @@ export async function prepareAndSignBorrowOrder({
   collateralAmountRaw = null,
   collateralBufferBps = DEFAULT_COLLATERAL_BUFFER_BPS,
   expectedQuote = null,
+  requireExpectedQuote = false,
   maxRateBps,
   termDays,
   maxLtvBps = null,
@@ -1759,7 +1910,7 @@ export async function prepareAndSignBorrowOrder({
     const reasons = (quote.rejection_reasons ?? []).map((r) => `${r.code}: ${r.message}`).join('; ');
     throw new Error(`Quote rejected by on-chain protocol rules: ${reasons || 'Unknown rejection'}`);
   }
-  assertExpectedQuoteUnchanged(expectedQuote, quote);
+  assertExpectedQuoteUnchanged(expectedQuote, quote, { requireExpectedQuote });
 
   const exact = resolveExactBorrowAmounts(quote, {
     userCollateralRaw: collateralAmountRaw,
@@ -2147,6 +2298,9 @@ export async function verifyAndPreviewLendOfferFill({
   }
 
   const borrowerAddr = borrowerAddress && isAddress(borrowerAddress) ? getAddress(borrowerAddress) : null;
+  if (borrowerAddr && normalizedOffer.lender.toLowerCase() === borrowerAddr.toLowerCase()) {
+    throw new Error('SelfLoanNotAllowed: Lender and borrower cannot be the same wallet address.');
+  }
   if (cfg.contracts.eligibilityGate) {
     const gateAddr = getAddress(cfg.contracts.eligibilityGate);
     const lenderEligible = await publicClient.readContract({
@@ -2543,6 +2697,48 @@ export function computeBorrowCollateralForFill(collateralAmountRaw, totalUsdcRaw
   return (collateral * fill + (total - 1n)) / total;
 }
 
+export function sumOpenSignedLendOffersRaw(offers, lenderAddress = null) {
+  if (!Array.isArray(offers) || offers.length === 0) return 0n;
+  const targetLender =
+    lenderAddress && isAddress(lenderAddress) ? getAddress(lenderAddress).toLowerCase() : null;
+  return offers.reduce((acc, item) => {
+    if (item?.onchainStatus !== 'open' && item?.onchainStatus !== 'partially_filled') {
+      return acc;
+    }
+    if (targetLender) {
+      const maker = String(
+        item?.offer?.lender ?? item?.offerJson?.lender ?? item?.lender ?? ''
+      ).toLowerCase();
+      if (maker && maker !== targetLender) return acc;
+    }
+    return acc + BigInt(item?.remainingRaw ?? item?.offer?.usdcAmount ?? item?.offerJson?.usdcAmount ?? 0n);
+  }, 0n);
+}
+
+async function resolveOpenLendOffersSumRaw({
+  lenderAddress,
+  existingOpenSumRaw = null,
+  storage = null,
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (existingOpenSumRaw !== null && existingOpenSumRaw !== undefined) {
+    return BigInt(existingOpenSumRaw);
+  }
+  const persisted = loadPersistedSignedLendOffers(storage);
+  if (!lenderAddress || persisted.length === 0) return 0n;
+  const targetLender = getAddress(lenderAddress).toLowerCase();
+  const mine = persisted.filter((item) => {
+    const maker = String(
+      item?.offer?.lender ?? item?.offerJson?.lender ?? item?.lender ?? ''
+    ).toLowerCase();
+    return !maker || maker === targetLender;
+  });
+  if (mine.length === 0) return 0n;
+  const synced = await refreshSignedLendOffersState({ offers: mine, cfg, publicClient });
+  return sumOpenSignedLendOffersRaw(synced, targetLender);
+}
+
 async function resolveQuoteAssetForLendOffer({
   allowedCollateral,
   quoteAsset = null,
@@ -2575,6 +2771,7 @@ export async function prepareAndSignLendOffer({
   allowedCollateral = zeroAddress,
   quoteAsset = null,
   expectedQuote = null,
+  requireExpectedQuote = true,
   minRateBps,
   termDays,
   maxLtvBps = 6000,
@@ -2648,7 +2845,7 @@ export async function prepareAndSignLendOffer({
     const reasons = blockingRejections.map((r) => `${r.code}: ${r.message}`).join('; ');
     throw new Error(`Quote rejected by on-chain protocol rules: ${reasons}`);
   }
-  assertExpectedQuoteUnchanged(expectedQuote, quote);
+  assertExpectedQuoteUnchanged(expectedQuote, quote, { requireExpectedQuote });
 
   const exact = resolveExactLendAmounts(quote, {
     minFillRaw: minFillBig,
@@ -2856,6 +3053,9 @@ export async function verifyAndPreviewBorrowOrderFill({
   order,
   signature,
   fillUsdcRaw = null,
+  perFillUsdcRawList = null,
+  existingOpenSumRaw = null,
+  storage = null,
   lenderAddress = null,
   borrowerAttestation = '0x',
   lenderAttestation = '0x',
@@ -2995,6 +3195,22 @@ export async function verifyAndPreviewBorrowOrderFill({
   }
 
   const lenderAddr = lenderAddress && isAddress(lenderAddress) ? getAddress(lenderAddress) : null;
+  if (lenderAddr && normalizedOrder.borrower.toLowerCase() === lenderAddr.toLowerCase()) {
+    throw new Error('SelfLoanNotAllowed: Lender and borrower cannot be the same wallet address.');
+  }
+  const resolvedExistingOpenSumRaw = await resolveOpenLendOffersSumRaw({
+    lenderAddress: lenderAddr,
+    existingOpenSumRaw,
+    storage,
+    cfg,
+    publicClient,
+  });
+  const approvalSizing = computeLendApprovalAmountRaw(fillUsdcBig, {
+    perFillUsdcRawList,
+    existingOpenSumRaw: resolvedExistingOpenSumRaw,
+    minFillRaw: normalizedOrder.minFill,
+    maxAllowedTotalRaw: remainingBig,
+  });
   if (cfg.contracts.eligibilityGate) {
     const gateAddr = getAddress(cfg.contracts.eligibilityGate);
     const borrowerEligible = await publicClient.readContract({
@@ -3084,7 +3300,7 @@ export async function verifyAndPreviewBorrowOrderFill({
     ]);
     lenderBalanceRaw = BigInt(bal).toString();
     lenderAllowanceRaw = BigInt(allow).toString();
-    needsApproval = BigInt(allow) < fillUsdcBig;
+    needsApproval = BigInt(allow) < approvalSizing.requiredApprovalRaw;
 
     if (BigInt(bal) < fillUsdcBig) {
       throw new Error(
@@ -3133,6 +3349,9 @@ export async function verifyAndPreviewBorrowOrderFill({
     borrowerCollateralAllowanceRaw: BigInt(borrowerCollAllowance).toString(),
     lenderBalanceRaw,
     lenderAllowanceRaw,
+    existingOpenSumRaw: approvalSizing.existingOpenSumRaw.toString(),
+    plannedFillsSumRaw: approvalSizing.plannedFillsSum.toString(),
+    requiredApprovalRaw: approvalSizing.requiredApprovalRaw.toString(),
     needsApproval,
     simulationVerified,
     warnings,
@@ -3151,6 +3370,8 @@ export async function fillBorrowOrderAsLender({
   signature,
   fillUsdcRaw = null,
   perFillUsdcRawList = null,
+  existingOpenSumRaw = null,
+  storage = null,
   expectedPreview = null,
   borrowerAttestation = '0x',
   lenderAttestation = '0x',
@@ -3169,6 +3390,9 @@ export async function fillBorrowOrderAsLender({
     order,
     signature,
     fillUsdcRaw,
+    perFillUsdcRawList,
+    existingOpenSumRaw,
+    storage,
     lenderAddress: wallet,
     borrowerAttestation,
     lenderAttestation,
@@ -3192,19 +3416,17 @@ export async function fillBorrowOrderAsLender({
     }
   }
 
-  const approvalSizing = computeLendApprovalAmountRaw(preview.fillAmountRaw, {
-    perFillUsdcRawList,
-  });
+  const requiredApprovalRaw = BigInt(preview.requiredApprovalRaw);
   let approvalTxHash = null;
-  if (BigInt(preview.lenderAllowanceRaw) < approvalSizing.requiredApprovalRaw) {
+  if (BigInt(preview.lenderAllowanceRaw) < requiredApprovalRaw) {
     if (!autoApprove) {
       throw new Error(
-        `LoanCore USDC allowance is below required ${approvalSizing.requiredApprovalRaw.toString()} raw units; approve USDC first.`
+        `LoanCore USDC allowance is below required ${requiredApprovalRaw.toString()} raw units (covers open offers + fill); approve USDC first.`
       );
     }
     const appRes = await approveUsdcForLend({
       address: wallet,
-      requiredUsdcRaw: approvalSizing.requiredApprovalRaw,
+      requiredUsdcRaw: requiredApprovalRaw,
       provider,
       cfg,
       publicClient,
@@ -3240,8 +3462,15 @@ export async function fillBorrowOrderAsLender({
         functionName: 'ownerOf',
         args: [BigInt(loanId)],
       });
-    } catch {
-      positionOwner = null;
+    } catch (ownerErr) {
+      throw new Error(
+        `PositionNFT ownerOf(${loanId}) verification failed after fill: ${formatWeb3Error(ownerErr)}`
+      );
+    }
+    if (!positionOwner || positionOwner.toLowerCase() !== wallet.toLowerCase()) {
+      throw new Error(
+        `PositionNFT owner mismatch for loan ${loanId}: expected lender ${wallet}, got ${positionOwner ?? 'none'}.`
+      );
     }
   }
 
@@ -3257,6 +3486,7 @@ export async function fillBorrowOrderAsLender({
     preview,
     collateralForFillRaw: preview.collateralForFillRaw,
     fillUsdcRaw: preview.fillAmountRaw,
-    requiredApprovalRaw: approvalSizing.requiredApprovalRaw.toString(),
+    existingOpenSumRaw: preview.existingOpenSumRaw,
+    requiredApprovalRaw: requiredApprovalRaw.toString(),
   };
 }

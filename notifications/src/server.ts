@@ -24,9 +24,12 @@ import { type NotificationsContext, defaultPreferencesMap } from './engine.js';
 import { issueSiweNonce, verifySiweAuth } from './siwe.js';
 import {
   blockSenderSchema,
+  buildManagePaginationSchema,
   buildPaginationSchema,
   confirmSubscriptionSchema,
   createSubscriptionSchema,
+  encodeManageCursor,
+  type ManageKeysetCursor,
   manageActionSchema,
   nonceRequestSchema,
   redriveDeadLettersSchema,
@@ -317,6 +320,7 @@ interface PendingTargetWalletEntry {
   wallet: string;
   verifyCodeHash: string;
   expiresAtSec: number | null;
+  updatedAtIso?: string;
 }
 
 export async function purgeExpiredPendingSubscriptions(
@@ -382,8 +386,32 @@ async function queryPendingUniqueWalletsPage(
   channel: 'email' | 'telegram',
   nowSecBig: bigint,
   limit: number,
-  offset: number
-): Promise<{ total: number; items: PendingTargetWalletEntry[] }> {
+  offset: number,
+  asOfIso: string | null = null,
+  keysetCursor: ManageKeysetCursor | null = null
+): Promise<{
+  total: number;
+  items: PendingTargetWalletEntry[];
+  asOfIso: string;
+  nextCursor: string | null;
+  hasMore: boolean;
+}> {
+  let effectiveAsOf = asOfIso;
+  if (!effectiveAsOf) {
+    const asOfRes = await ctx.notifDb.query<{ as_of_iso: string }>(
+      `SELECT to_char(
+         GREATEST(
+           clock_timestamp(),
+           COALESCE(MAX(created_at), clock_timestamp()),
+           COALESCE(MAX(updated_at), clock_timestamp())
+         ) AT TIME ZONE 'UTC',
+         'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+       ) AS as_of_iso
+       FROM notif_subscriptions`
+    );
+    effectiveAsOf = asOfRes.rows[0]?.as_of_iso ?? new Date().toISOString();
+  }
+
   const nowStr = nowSecBig.toString();
   const countRes = await ctx.notifDb.query<{ total: number }>(
     `SELECT COUNT(DISTINCT LOWER(wallet))::INT AS total
@@ -392,46 +420,91 @@ async function queryPendingUniqueWalletsPage(
        AND channel = $1
        AND verify_code_hash IS NOT NULL
        AND (verify_expires_at IS NULL OR verify_expires_at > $2)
-       AND canonical_target_hash = $3`,
-    [channel, nowStr, canonicalTargetHash]
+       AND canonical_target_hash = $3
+       AND created_at <= $4::TIMESTAMPTZ`,
+    [channel, nowStr, canonicalTargetHash, effectiveAsOf]
   );
   const total = Number(countRes.rows[0]?.total ?? 0);
   if (total === 0) {
-    return { total: 0, items: [] };
+    return { total: 0, items: [], asOfIso: effectiveAsOf, nextCursor: null, hasMore: false };
   }
 
-  const pageRes = await ctx.notifDb.query<{
+  const limitPlusOne = limit + 1;
+  type PageRow = {
     id: string;
     wallet: string;
     verify_code_hash: string;
     verify_expires_at: string | null;
-  }>(
-    `WITH ranked AS (
-       SELECT id, wallet, verify_code_hash, verify_expires_at::TEXT AS verify_expires_at,
-              updated_at,
-              ROW_NUMBER() OVER (PARTITION BY LOWER(wallet) ORDER BY updated_at DESC, id ASC) AS rn
-       FROM notif_subscriptions
-       WHERE verified = FALSE
-         AND channel = $1
-         AND verify_code_hash IS NOT NULL
-         AND (verify_expires_at IS NULL OR verify_expires_at > $2)
-         AND canonical_target_hash = $3
-     )
-     SELECT id, wallet, verify_code_hash, verify_expires_at
-     FROM ranked
-     WHERE rn = 1
-     ORDER BY updated_at DESC, id ASC
-     LIMIT $4 OFFSET $5`,
-    [channel, nowStr, canonicalTargetHash, limit, offset]
-  );
+    updated_at_iso: string;
+  };
+  const pageRes = keysetCursor
+    ? await ctx.notifDb.query<PageRow>(
+        `WITH ranked AS (
+           SELECT id, wallet, verify_code_hash, verify_expires_at::TEXT AS verify_expires_at,
+                  updated_at,
+                  to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso,
+                  ROW_NUMBER() OVER (PARTITION BY LOWER(wallet) ORDER BY updated_at DESC, id ASC) AS rn
+           FROM notif_subscriptions
+           WHERE verified = FALSE
+             AND channel = $1
+             AND verify_code_hash IS NOT NULL
+             AND (verify_expires_at IS NULL OR verify_expires_at > $2)
+             AND canonical_target_hash = $3
+             AND created_at <= $4::TIMESTAMPTZ
+         )
+         SELECT id, wallet, verify_code_hash, verify_expires_at, updated_at_iso
+         FROM ranked
+         WHERE rn = 1
+           AND (updated_at < $5::TIMESTAMPTZ OR (updated_at = $5::TIMESTAMPTZ AND id > $6))
+         ORDER BY updated_at DESC, id ASC
+         LIMIT $7`,
+        [
+          channel,
+          nowStr,
+          canonicalTargetHash,
+          effectiveAsOf,
+          keysetCursor.ts,
+          keysetCursor.id,
+          limitPlusOne,
+        ]
+      )
+    : await ctx.notifDb.query<PageRow>(
+        `WITH ranked AS (
+           SELECT id, wallet, verify_code_hash, verify_expires_at::TEXT AS verify_expires_at,
+                  updated_at,
+                  to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso,
+                  ROW_NUMBER() OVER (PARTITION BY LOWER(wallet) ORDER BY updated_at DESC, id ASC) AS rn
+           FROM notif_subscriptions
+           WHERE verified = FALSE
+             AND channel = $1
+             AND verify_code_hash IS NOT NULL
+             AND (verify_expires_at IS NULL OR verify_expires_at > $2)
+             AND canonical_target_hash = $3
+             AND created_at <= $4::TIMESTAMPTZ
+         )
+         SELECT id, wallet, verify_code_hash, verify_expires_at, updated_at_iso
+         FROM ranked
+         WHERE rn = 1
+         ORDER BY updated_at DESC, id ASC
+         LIMIT $5 OFFSET $6`,
+        [channel, nowStr, canonicalTargetHash, effectiveAsOf, limitPlusOne, offset]
+      );
 
-  const items: PendingTargetWalletEntry[] = pageRes.rows.map((row) => ({
+  const hasMore = pageRes.rows.length > limit;
+  const slicedRows = hasMore ? pageRes.rows.slice(0, limit) : pageRes.rows;
+  const items: PendingTargetWalletEntry[] = slicedRows.map((row) => ({
     id: row.id,
     wallet: row.wallet,
     verifyCodeHash: row.verify_code_hash,
     expiresAtSec: row.verify_expires_at ? Number(row.verify_expires_at) : null,
+    updatedAtIso: row.updated_at_iso,
   }));
-  return { total, items };
+  const last = items.length > 0 ? items[items.length - 1] : null;
+  const nextCursor =
+    hasMore && last?.updatedAtIso
+      ? encodeManageCursor({ ts: last.updatedAtIso, id: last.id })
+      : null;
+  return { total, items, asOfIso: effectiveAsOf, nextCursor, hasMore };
 }
 
 type SybilCostCacheEntry = { qualified: boolean; expiresAtMs: number };
@@ -1582,19 +1655,28 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
           );
         }
 
-        const pag = parseOrThrow(buildPaginationSchema(ctx.config.maxPageLimit), {
+        const pag = parseOrThrow(buildManagePaginationSchema(ctx.config.maxPageLimit), {
           limit: queryObj.limit,
           offset: queryObj.offset,
           cursor: queryObj.cursor,
+          as_of: queryObj.as_of,
         });
         const nowSecBig = BigInt(Math.floor(Date.now() / 1000));
-        const { total, items: pageItems } = await queryPendingUniqueWalletsPage(
+        const {
+          total,
+          items: pageItems,
+          asOfIso,
+          nextCursor,
+          hasMore,
+        } = await queryPendingUniqueWalletsPage(
           ctx,
           verified.canonicalTargetHash,
           verified.channel,
           nowSecBig,
           pag.limit,
-          pag.offset
+          pag.offset,
+          pag.asOf,
+          pag.keysetCursor
         );
         const blockedRes = await ctx.notifDb.query<{ canonical_target_hash: string }>(
           `SELECT canonical_target_hash FROM notif_blocked_senders
@@ -1636,17 +1718,16 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
                   })
                   .join('');
           const encTok = encodeURIComponent(rawToken);
-          const prevOffset = Math.max(0, pag.offset - pag.limit);
-          const nextOffset = pag.offset + pag.limit;
+          const encAsOf = encodeURIComponent(asOfIso);
           const navLinks: string[] = [];
-          if (pag.offset > 0) {
+          if (pag.keysetCursor || pag.offset > 0) {
             navLinks.push(
-              `<a href="/subscriptions/manage?token=${encTok}&limit=${pag.limit}&offset=${prevOffset}">Previous</a>`
+              `<a href="/subscriptions/manage?token=${encTok}&limit=${pag.limit}">First page</a>`
             );
           }
-          if (nextOffset < total) {
+          if (hasMore && nextCursor) {
             navLinks.push(
-              `<a href="/subscriptions/manage?token=${encTok}&limit=${pag.limit}&offset=${nextOffset}">Next</a>`
+              `<a href="/subscriptions/manage?token=${encTok}&limit=${pag.limit}&as_of=${encAsOf}&cursor=${encodeURIComponent(nextCursor)}">Next</a>`
             );
           }
           const blockedNote = targetBlocked
@@ -1676,10 +1757,12 @@ ${navLinks.length > 0 ? `<div class="actions">${navLinks.join(' ')}</div>` : ''}
           },
           pagination: {
             limit: pag.limit,
-            offset: pag.offset,
+            offset: pag.keysetCursor ? 0 : pag.offset,
+            as_of: asOfIso,
+            next_cursor: nextCursor,
             returned: pageItems.length,
             total,
-            has_more: pag.offset + pageItems.length < total,
+            has_more: hasMore,
           },
           data: pageItems.map((item) => ({
             subscription_id: item.id,
