@@ -71,6 +71,12 @@ export const unsubscribeBodySchema = z.object({
   token: z.string().trim().min(10).max(2048),
 });
 
+export const manageActionSchema = z.object({
+  token: z.string().trim().min(10).max(2048),
+  subscription_id: z.string().trim().min(4).max(128),
+  action: z.enum(['confirm', 'block']).default('confirm'),
+});
+
 export const blockSenderSchema = z.object({
   token: z.string().trim().min(10).max(2048),
   scope: z.enum(['wallet', 'target_all']).optional(),

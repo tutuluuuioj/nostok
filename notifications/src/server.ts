@@ -8,11 +8,13 @@ import {
   maskTarget,
   signBlockSenderToken,
   signConfirmSubscriptionToken,
+  signManageRequestsToken,
   signSessionToken,
   signUnblockTargetToken,
   signUnsubscribeToken,
   verifyBlockSenderToken,
   verifyConfirmSubscriptionToken,
+  verifyManageRequestsToken,
   verifySessionTokenClaims,
   verifyUnblockTargetToken,
   verifyUnsubscribeToken,
@@ -24,6 +26,7 @@ import {
   buildPaginationSchema,
   confirmSubscriptionSchema,
   createSubscriptionSchema,
+  manageActionSchema,
   nonceRequestSchema,
   redriveDeadLettersSchema,
   siweVerifyRequestSchema,
@@ -302,6 +305,102 @@ const SYBIL_COST_CACHE_TTL_MS = 15_000;
 const SYBIL_COST_CACHE_MAX_ENTRIES = 10_000;
 const BLOCK_EXISTING_SUBS_NOTE =
   'Blocking prevents new subscription requests and removes unverified pending requests, but does NOT stop existing verified subscriptions (use the alert email unsubscribe link or Wallet settings to disable those).';
+const MANAGE_REQUESTS_TOKEN_TTL_SECS = 30 * 86_400;
+
+interface PendingTargetWalletEntry {
+  id: string;
+  wallet: string;
+  verifyCodeHash: string;
+  expiresAtSec: number | null;
+}
+
+function buildManageRequestsLinks(
+  ctx: NotificationsContext,
+  canonicalTargetHash: string,
+  channel: 'email' | 'telegram'
+): { manageToken: string; manageUrl: string; frontendManageUrl: string } {
+  const manageToken = signManageRequestsToken(
+    ctx.config.confirmSecret,
+    canonicalTargetHash,
+    channel,
+    MANAGE_REQUESTS_TOKEN_TTL_SECS
+  );
+  const encoded = encodeURIComponent(manageToken);
+  const siweAppOrigin = ctx.config.siweUri
+    ? ctx.config.siweUri.replace(/\/+$/, '')
+    : ctx.config.publicBaseUrl;
+  return {
+    manageToken,
+    manageUrl: `${ctx.config.publicBaseUrl}/subscriptions/manage?token=${encoded}`,
+    frontendManageUrl: `${siweAppOrigin}/subscriptions/manage?token=${encoded}`,
+  };
+}
+
+function subscriptionRowMatchesTarget(
+  ctx: NotificationsContext,
+  row: {
+    channel: 'email' | 'telegram' | 'webhook';
+    target_ciphertext: string;
+    key_id: string;
+    canonical_target_hash: string | null;
+  },
+  canonicalTargetHash: string
+): boolean {
+  if (row.canonical_target_hash === canonicalTargetHash) return true;
+  if (row.canonical_target_hash) return false;
+  try {
+    const plain = ctx.cipher.decrypt(row.target_ciphertext, row.key_id);
+    return ctx.cipher.computeGlobalTargetHash(row.channel, plain) === canonicalTargetHash;
+  } catch {
+    return false;
+  }
+}
+
+async function queryPendingUniqueWalletsForTarget(
+  ctx: NotificationsContext,
+  canonicalTargetHash: string,
+  channel: 'email' | 'telegram',
+  nowSecBig: bigint
+): Promise<PendingTargetWalletEntry[]> {
+  const pendingRows = await ctx.notifDb.query<{
+    id: string;
+    wallet: string;
+    channel: 'email' | 'telegram' | 'webhook';
+    target_ciphertext: string;
+    key_id: string;
+    verify_code_hash: string | null;
+    verify_expires_at: string | null;
+    canonical_target_hash: string | null;
+  }>(
+    `SELECT id, wallet, channel, target_ciphertext, key_id, verify_code_hash,
+            verify_expires_at::TEXT AS verify_expires_at, canonical_target_hash
+     FROM notif_subscriptions
+     WHERE verified = FALSE
+       AND channel = $1
+       AND verify_code_hash IS NOT NULL
+       AND (verify_expires_at IS NULL OR verify_expires_at > $2)
+       AND (canonical_target_hash = $3 OR canonical_target_hash IS NULL)
+     ORDER BY updated_at DESC, id ASC`,
+    [channel, nowSecBig.toString(), canonicalTargetHash]
+  );
+
+  const seenWallets = new Set<string>();
+  const uniquePending: PendingTargetWalletEntry[] = [];
+  for (const row of pendingRows.rows) {
+    if (!row.verify_code_hash) continue;
+    if (!subscriptionRowMatchesTarget(ctx, row, canonicalTargetHash)) continue;
+    const walletLower = row.wallet.toLowerCase();
+    if (seenWallets.has(walletLower)) continue;
+    seenWallets.add(walletLower);
+    uniquePending.push({
+      id: row.id,
+      wallet: row.wallet,
+      verifyCodeHash: row.verify_code_hash,
+      expiresAtSec: row.verify_expires_at ? Number(row.verify_expires_at) : null,
+    });
+  }
+  return uniquePending;
+}
 
 type SybilCostCacheEntry = { qualified: boolean; expiresAtMs: number };
 
@@ -781,7 +880,10 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
         const codeHash = verificationCode
           ? hashVerificationCode(ctx.config.confirmSecret, newId, wallet, verificationCode)
           : null;
-        const expiresAtSec = verificationCode ? Math.floor(Date.now() / 1000) + 3600 : null;
+        const pendingVerifyTtlSecs = Math.max(3600, ctx.config.verifyDigestCooldownSecs + 3600);
+        const expiresAtSec = verificationCode
+          ? Math.floor(Date.now() / 1000) + pendingVerifyTtlSecs
+          : null;
 
         const resSub = await ctx.notifDb.query<{
           id: string;
@@ -872,7 +974,7 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
               created.id,
               wallet,
               codeHash,
-              3600
+              pendingVerifyTtlSecs
             );
             const confirmUrl = `${ctx.config.publicBaseUrl}/subscriptions/confirm?token=${encodeURIComponent(confirmToken)}`;
             const blockToken = signBlockSenderToken(
@@ -885,6 +987,11 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             const blockUrl = `${ctx.config.publicBaseUrl}/subscriptions/block?token=${encodeURIComponent(blockToken)}`;
             const frontendConfirmUrl = `${siweAppOrigin}/subscriptions/confirm?token=${encodeURIComponent(confirmToken)}`;
             const frontendBlockUrl = `${siweAppOrigin}/subscriptions/block?token=${encodeURIComponent(blockToken)}`;
+            const manageLinks = buildManageRequestsLinks(
+              ctx,
+              canonicalTargetHash,
+              input.channel as 'email' | 'telegram'
+            );
             const unsubToken = signUnsubscribeToken(
               ctx.config.unsubscribeSecret,
               created.id,
@@ -899,7 +1006,7 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
               alertType: 'subscription_verification',
               severity: 'info' as const,
               title: 'Confirm your NOSTOK alert subscription',
-              message: `Verification code: ${verificationCode}. Confirm link: ${confirmUrl}. Not me, block this address: ${blockUrl} (link valid 24h, single-use; stops new requests only, not existing verified subscriptions).`,
+              message: `Verification code: ${verificationCode}. Confirm link: ${confirmUrl}. Manage all pending requests (valid 30d, single-use): ${manageLinks.manageUrl}. Not me, block this address: ${blockUrl} (link valid 24h, single-use; stops new requests only, not existing verified subscriptions).`,
               payload: {
                 subscription_id: created.id,
                 verification_code: verificationCode,
@@ -909,6 +1016,9 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
                 block_token: blockToken,
                 block_url: blockUrl,
                 frontend_block_url: frontendBlockUrl,
+                manage_token: manageLinks.manageToken,
+                manage_url: manageLinks.manageUrl,
+                frontend_manage_url: manageLinks.frontendManageUrl,
               },
               unsubscribeUrl,
             };
@@ -918,55 +1028,13 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
               await ctx.transports.sendTelegram(verifyMsg);
             }
           } else if (sendDecision === 'digest') {
-            const pendingRows = await ctx.notifDb.query<{
-              id: string;
-              wallet: string;
-              channel: 'email' | 'telegram' | 'webhook';
-              target_ciphertext: string;
-              key_id: string;
-              verify_code_hash: string | null;
-              verify_expires_at: string | null;
-              canonical_target_hash: string | null;
-            }>(
-              `SELECT id, wallet, channel, target_ciphertext, key_id, verify_code_hash,
-                      verify_expires_at::TEXT AS verify_expires_at, canonical_target_hash
-               FROM notif_subscriptions
-               WHERE verified = FALSE
-                 AND channel = $1
-                 AND verify_code_hash IS NOT NULL
-                 AND (verify_expires_at IS NULL OR verify_expires_at > $2)
-                 AND (canonical_target_hash = $3 OR canonical_target_hash IS NULL)
-               ORDER BY updated_at DESC
-               LIMIT 50`,
-              [input.channel, nowSecBig.toString(), canonicalTargetHash]
+            const matchingPending = await queryPendingUniqueWalletsForTarget(
+              ctx,
+              canonicalTargetHash,
+              input.channel as 'email' | 'telegram',
+              nowSecBig
             );
-            const matchingPending: Array<{
-              id: string;
-              wallet: string;
-              verifyCodeHash: string;
-              expiresAtSec: number | null;
-            }> = [];
-            for (const row of pendingRows.rows) {
-              if (!row.verify_code_hash) continue;
-              let matches = row.canonical_target_hash === canonicalTargetHash;
-              if (!matches && !row.canonical_target_hash) {
-                try {
-                  const plain = ctx.cipher.decrypt(row.target_ciphertext, row.key_id);
-                  matches = ctx.cipher.computeGlobalTargetHash(row.channel, plain) === canonicalTargetHash;
-                } catch {
-                  matches = false;
-                }
-              }
-              if (matches) {
-                matchingPending.push({
-                  id: row.id,
-                  wallet: row.wallet,
-                  verifyCodeHash: row.verify_code_hash,
-                  expiresAtSec: row.verify_expires_at ? Number(row.verify_expires_at) : null,
-                });
-              }
-            }
-            if (!matchingPending.some((e) => e.id === created.id)) {
+            if (!matchingPending.some((e) => e.wallet.toLowerCase() === wallet.toLowerCase())) {
               matchingPending.unshift({
                 id: created.id,
                 wallet: wallet.toLowerCase(),
@@ -978,7 +1046,9 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
             const nowNumSec = Number(nowSecBig);
             const digestEntries = matchingPending.map((item) => {
               const checksumWallet = getAddress(item.wallet);
-              const ttlSecs = item.expiresAtSec ? Math.max(60, item.expiresAtSec - nowNumSec) : 3600;
+              const ttlSecs = item.expiresAtSec
+                ? Math.max(60, item.expiresAtSec - nowNumSec)
+                : pendingVerifyTtlSecs;
               const cTok = signConfirmSubscriptionToken(
                 ctx.config.confirmSecret,
                 item.id,
@@ -1013,6 +1083,11 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
               (entry, idx) =>
                 `${idx + 1}. Wallet ${entry.wallet} — Confirm link: ${entry.confirm_url} | Not me, block this address: ${entry.block_url}`
             );
+            const manageLinks = buildManageRequestsLinks(
+              ctx,
+              canonicalTargetHash,
+              input.channel as 'email' | 'telegram'
+            );
             const digestUnsubToken = signUnsubscribeToken(
               ctx.config.unsubscribeSecret,
               created.id,
@@ -1027,12 +1102,15 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
               alertType: 'subscription_verification_digest',
               severity: 'info' as const,
               title: `NOSTOK alert verification digest (${digestEntries.length} pending wallet request${digestEntries.length === 1 ? '' : 's'})`,
-              message: `More than ${ctx.config.verifyEmailTargetPer24hMax} wallets requested verification for this address in 24h. Digest summary (max once per 6h):\n${entryLines.join('\n')}`,
+              message: `More than ${ctx.config.verifyEmailTargetPer24hMax} wallets requested verification for this address in 24h. Digest summary (max once per 6h):\nManage all pending requests (valid 30d, single-use): ${manageLinks.manageUrl}\n${entryLines.join('\n')}`,
               payload: {
                 digest: true,
                 subscription_id: created.id,
                 pending_count: digestEntries.length,
                 entries: digestEntries,
+                manage_token: manageLinks.manageToken,
+                manage_url: manageLinks.manageUrl,
+                frontend_manage_url: manageLinks.frontendManageUrl,
               },
               unsubscribeUrl: digestUnsubUrl,
             };
@@ -1252,6 +1330,11 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
               ? ctx.config.siweUri.replace(/\/+$/, '')
               : ctx.config.publicBaseUrl;
             const frontendUnblockUrl = `${siweAppOrigin}/subscriptions/unblock?token=${encodeURIComponent(unblockToken)}`;
+            const manageLinks = buildManageRequestsLinks(
+              ctx,
+              verified.canonicalTargetHash,
+              blockTargetChannel
+            );
             const unsubToken = signUnsubscribeToken(
               ctx.config.unsubscribeSecret,
               verified.subId,
@@ -1266,7 +1349,7 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
               alertType: 'target_block_confirmation',
               severity: 'info' as const,
               title: 'Your address is now blocked from new NOSTOK requests',
-              message: `Your address has been blocked from all new NOSTOK alert subscription requests (${deletedIds.length} unverified pending request(s) removed). ${BLOCK_EXISTING_SUBS_NOTE} Changed your mind? Unblock this address: ${unblockUrl}`,
+              message: `Your address has been blocked from all new NOSTOK alert subscription requests (${deletedIds.length} unverified pending request(s) removed). ${BLOCK_EXISTING_SUBS_NOTE} Manage pending requests (valid 30d, single-use): ${manageLinks.manageUrl}. Changed your mind? Unblock this address: ${unblockUrl}`,
               payload: {
                 scope: 'target_all',
                 block_all: true,
@@ -1274,6 +1357,9 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
                 unblock_token: unblockToken,
                 unblock_url: unblockUrl,
                 frontend_unblock_url: frontendUnblockUrl,
+                manage_token: manageLinks.manageToken,
+                manage_url: manageLinks.manageUrl,
+                frontend_manage_url: manageLinks.frontendManageUrl,
               },
               unsubscribeUrl,
             };
@@ -1406,6 +1492,292 @@ export function createNotificationsServer(ctx: NotificationsContext): http.Serve
           unblocked: true,
           scope: 'target_all',
           channel: verified.channel,
+        });
+        return;
+      }
+
+      if (pathname === '/subscriptions/manage' && req.method === 'GET') {
+        enforceScopedRateLimit(res, confirmIpLimiter, clientIp, '/subscriptions/manage IP');
+        const rawToken = parseOrThrow(unsubscribeBodySchema, { token: queryObj.token }).token;
+        let verified: { canonicalTargetHash: string; channel: 'email' | 'telegram'; jti: string; exp: number };
+        try {
+          verified = verifyManageRequestsToken(ctx.config.confirmSecret, rawToken);
+        } catch (err) {
+          throw new HttpError(400, 'VALIDATION_ERROR', err instanceof Error ? err.message : 'Invalid token');
+        }
+        const tokenJti = `mng_${verified.jti}`;
+        const usedRes = await ctx.notifDb.query<{ jti: string }>(
+          'SELECT jti FROM notif_revoked_sessions WHERE jti = $1 LIMIT 1',
+          [tokenJti]
+        );
+        if (usedRes.rows.length > 0) {
+          throw new HttpError(400, 'MANAGE_TOKEN_ALREADY_USED', 'This single-use manage link has already been used.');
+        }
+
+        const pag = parseOrThrow(buildPaginationSchema(ctx.config.maxPageLimit), {
+          limit: queryObj.limit,
+          offset: queryObj.offset,
+          cursor: queryObj.cursor,
+        });
+        const nowSecBig = BigInt(Math.floor(Date.now() / 1000));
+        const allPending = await queryPendingUniqueWalletsForTarget(
+          ctx,
+          verified.canonicalTargetHash,
+          verified.channel,
+          nowSecBig
+        );
+        const pageItems = allPending.slice(pag.offset, pag.offset + pag.limit);
+        const blockedRes = await ctx.notifDb.query<{ canonical_target_hash: string }>(
+          `SELECT canonical_target_hash FROM notif_blocked_senders
+           WHERE canonical_target_hash = $1 AND wallet = '*' LIMIT 1`,
+          [verified.canonicalTargetHash]
+        );
+        const targetBlocked = blockedRes.rows.length > 0;
+
+        if (prefersHtmlResponse(req)) {
+          const escToken = escapeHtml(rawToken);
+          const rowsHtml =
+            pageItems.length === 0
+              ? '<p>No unverified pending wallet requests currently waiting for this address.</p>'
+              : pageItems
+                  .map((item) => {
+                    const checksumWallet = getAddress(item.wallet);
+                    const escWallet = escapeHtml(checksumWallet);
+                    const escSubId = escapeHtml(item.id);
+                    const expText = item.expiresAtSec
+                      ? new Date(item.expiresAtSec * 1000).toISOString()
+                      : 'N/A';
+                    return `<div style="border:1px solid #dedad2;border-radius:8px;padding:12px;margin:0 0 12px">
+  <p style="margin:0 0 8px">Wallet: <code>${escWallet}</code><br/><small>Expires: ${escapeHtml(expText)}</small></p>
+  <div class="actions">
+    <form method="POST" action="/subscriptions/manage">
+      <input type="hidden" name="token" value="${escToken}" />
+      <input type="hidden" name="subscription_id" value="${escSubId}" />
+      <input type="hidden" name="action" value="confirm" />
+      <button type="submit">Confirm</button>
+    </form>
+    <form method="POST" action="/subscriptions/manage">
+      <input type="hidden" name="token" value="${escToken}" />
+      <input type="hidden" name="subscription_id" value="${escSubId}" />
+      <input type="hidden" name="action" value="block" />
+      <button type="submit" class="danger">Block wallet</button>
+    </form>
+  </div>
+</div>`;
+                  })
+                  .join('');
+          const encTok = encodeURIComponent(rawToken);
+          const prevOffset = Math.max(0, pag.offset - pag.limit);
+          const nextOffset = pag.offset + pag.limit;
+          const navLinks: string[] = [];
+          if (pag.offset > 0) {
+            navLinks.push(
+              `<a href="/subscriptions/manage?token=${encTok}&limit=${pag.limit}&offset=${prevOffset}">Previous</a>`
+            );
+          }
+          if (nextOffset < allPending.length) {
+            navLinks.push(
+              `<a href="/subscriptions/manage?token=${encTok}&limit=${pag.limit}&offset=${nextOffset}">Next</a>`
+            );
+          }
+          const blockedNote = targetBlocked
+            ? '<p><strong>Note:</strong> New requests to this address are currently blocked globally.</p>'
+            : '';
+          sendHtmlPage(
+            res,
+            200,
+            'Manage Pending NOSTOK Requests',
+            `<h1>Pending subscription requests (${allPending.length})</h1>
+${blockedNote}
+<p>Showing ${pageItems.length} of ${allPending.length} unique pending wallet(s) (single-use approval link).</p>
+${rowsHtml}
+${navLinks.length > 0 ? `<div class="actions">${navLinks.join(' ')}</div>` : ''}`
+          );
+          return;
+        }
+
+        sendJson(res, 200, {
+          confirmation_required: true,
+          method: 'POST',
+          channel: verified.channel,
+          target_blocked: targetBlocked,
+          pagination: {
+            limit: pag.limit,
+            offset: pag.offset,
+            returned: pageItems.length,
+            total: allPending.length,
+            has_more: pag.offset + pageItems.length < allPending.length,
+          },
+          data: pageItems.map((item) => ({
+            subscription_id: item.id,
+            wallet_address: getAddress(item.wallet),
+            channel: verified.channel,
+            expires_at: item.expiresAtSec ? new Date(item.expiresAtSec * 1000).toISOString() : null,
+          })),
+        });
+        return;
+      }
+
+      if (pathname === '/subscriptions/manage' && req.method === 'POST') {
+        enforceScopedRateLimit(res, confirmIpLimiter, clientIp, '/subscriptions/manage IP');
+        const rawBody = await readJsonBody(req, ctx.config.maxBodyBytes);
+        const bodyObj =
+          rawBody && typeof rawBody === 'object' && 'token' in rawBody
+            ? rawBody
+            : { ...queryObj, ...(rawBody && typeof rawBody === 'object' ? rawBody : {}) };
+        const input = parseOrThrow(manageActionSchema, bodyObj);
+        let verified: { canonicalTargetHash: string; channel: 'email' | 'telegram'; jti: string; exp: number };
+        try {
+          verified = verifyManageRequestsToken(ctx.config.confirmSecret, input.token);
+        } catch (err) {
+          throw new HttpError(400, 'VALIDATION_ERROR', err instanceof Error ? err.message : 'Invalid token');
+        }
+        const nowSec = Math.floor(Date.now() / 1000);
+        const tokenJti = `mng_${verified.jti}`;
+
+        const txResult = await ctx.notifDb.transaction(async (tx) => {
+          const usedRes = await tx.query<{ jti: string }>(
+            'SELECT jti FROM notif_revoked_sessions WHERE jti = $1 LIMIT 1',
+            [tokenJti]
+          );
+          if (usedRes.rows.length > 0) {
+            throw new HttpError(
+              400,
+              'MANAGE_TOKEN_ALREADY_USED',
+              'This single-use manage link has already been used.'
+            );
+          }
+
+          const subRes = await tx.query<{
+            id: string;
+            wallet: string;
+            channel: 'email' | 'telegram' | 'webhook';
+            target_ciphertext: string;
+            key_id: string;
+            canonical_target_hash: string | null;
+            verified: boolean;
+            verify_code_hash: string | null;
+            verify_expires_at: string | null;
+          }>(
+            `SELECT id, wallet, channel, target_ciphertext, key_id, canonical_target_hash, verified,
+                    verify_code_hash, verify_expires_at::TEXT AS verify_expires_at
+             FROM notif_subscriptions
+             WHERE id = $1 AND channel = $2`,
+            [input.subscription_id, verified.channel]
+          );
+          const row = subRes.rows[0];
+          if (
+            !row ||
+            row.verified ||
+            !row.verify_code_hash ||
+            !subscriptionRowMatchesTarget(ctx, row, verified.canonicalTargetHash)
+          ) {
+            throw new HttpError(
+              404,
+              'SUBSCRIPTION_NOT_FOUND',
+              'Pending subscription not found for this manage link'
+            );
+          }
+          if (
+            input.action === 'confirm' &&
+            row.verify_expires_at &&
+            BigInt(row.verify_expires_at) <= BigInt(nowSec)
+          ) {
+            throw new HttpError(
+              400,
+              'VALIDATION_ERROR',
+              'Pending subscription request has expired; please submit a new request.'
+            );
+          }
+
+          const consumed = await tx.query<{ jti: string }>(
+            `INSERT INTO notif_revoked_sessions (jti, wallet, expires_at, revoked_at)
+             VALUES ($1, '*', $2, $3)
+             ON CONFLICT (jti) DO NOTHING
+             RETURNING jti`,
+            [tokenJti, verified.exp.toString(), nowSec.toString()]
+          );
+          if (consumed.rows.length === 0) {
+            throw new HttpError(
+              400,
+              'MANAGE_TOKEN_ALREADY_USED',
+              'This single-use manage link has already been used.'
+            );
+          }
+          await tx.query('DELETE FROM notif_revoked_sessions WHERE expires_at < $1', [
+            (nowSec - 3600).toString(),
+          ]);
+
+          if (input.action === 'confirm') {
+            await tx.query(
+              `UPDATE notif_subscriptions
+               SET enabled = TRUE, verified = TRUE, verify_code_hash = NULL, verify_expires_at = NULL,
+                   verify_attempts = 0, updated_at = NOW()
+               WHERE id = $1`,
+              [row.id]
+            );
+          } else {
+            await tx.query(
+              `INSERT INTO notif_blocked_senders (wallet, canonical_target_hash)
+               VALUES ($1, $2)
+               ON CONFLICT (wallet, canonical_target_hash) DO NOTHING`,
+              [row.wallet.toLowerCase(), verified.canonicalTargetHash]
+            );
+            await tx.query(
+              `DELETE FROM notif_subscriptions WHERE id = $1 AND verified = FALSE`,
+              [row.id]
+            );
+          }
+          return row;
+        });
+
+        if (input.action === 'block') {
+          confirmTargetGlobalLimiter.refund(verified.canonicalTargetHash);
+          confirmTargetResendLimiter.refund(verified.canonicalTargetHash);
+          pendingWalletsByTarget
+            .get(verified.canonicalTargetHash)
+            ?.wallets.delete(txResult.wallet.toLowerCase());
+        }
+
+        const checksumWallet = getAddress(txResult.wallet);
+        if (input.action === 'confirm') {
+          if (prefersHtmlResponse(req)) {
+            sendHtmlPage(
+              res,
+              200,
+              'Subscription Confirmed',
+              `<h1>Alert subscription confirmed</h1><p>Subscription <code>${escapeHtml(txResult.id)}</code> for wallet <code>${escapeHtml(checksumWallet)}</code> is now active.</p>`
+            );
+            return;
+          }
+          sendJson(res, 200, {
+            confirmed: true,
+            action: 'confirm',
+            id: txResult.id,
+            wallet_address: checksumWallet,
+            channel: txResult.channel,
+            enabled: true,
+            verified: true,
+          });
+          return;
+        }
+
+        if (prefersHtmlResponse(req)) {
+          sendHtmlPage(
+            res,
+            200,
+            'Sender Wallet Blocked',
+            `<h1>Sender wallet blocked</h1><p>Wallet <code>${escapeHtml(checksumWallet)}</code> has been blocked and its pending request was removed. ${escapeHtml(BLOCK_EXISTING_SUBS_NOTE)}</p>`
+          );
+          return;
+        }
+        sendJson(res, 200, {
+          blocked: true,
+          action: 'block',
+          subscription_id: txResult.id,
+          blocked_wallet: checksumWallet,
+          stops_existing_verified_subscriptions: false,
+          note: BLOCK_EXISTING_SUBS_NOTE,
         });
         return;
       }

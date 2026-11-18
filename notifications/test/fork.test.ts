@@ -44,6 +44,7 @@ import {
   signBlockSenderToken,
   signConfirmSubscriptionToken,
   verifyBlockSenderToken,
+  verifyManageRequestsToken,
   verifyWebhookPayloadSignature,
 } from '../src/crypto.js';
 import {
@@ -3690,6 +3691,307 @@ async function runTests(): Promise<void> {
         }
       } finally {
         await new Promise<void>((r) => digestSrvB.close(() => r()));
+      }
+
+      // 6.6b Verification, digest, block confirmation manage-requests links, Repro D1 (survival past cooldown+1h) & Repro D2 (55+ funded requests >50 + pagination)
+      const manageStartIdx = deliveredEmails.length;
+      const d1Srv = createNotificationsServer({
+        ...notifCtx,
+        config: { ...notifCtx.config, trustProxyHops: 1, rateLimitMax: 5000 },
+      });
+      await new Promise<void>((r) => d1Srv.listen(0, '127.0.0.1', r));
+      const d1Url = `http://127.0.0.1:${(d1Srv.address() as net.AddressInfo).port}`;
+
+      const createSubWithSiwe = async (
+        baseUrl: string,
+        acct: ReturnType<typeof privateKeyToAccount>,
+        targetEmail: string,
+        ip: string
+      ) => {
+        const nRes = await httpJson<{ nonce: string }>(
+          'POST',
+          `${baseUrl}/auth/nonce`,
+          { wallet_address: acct.address },
+          { 'X-Forwarded-For': ip }
+        );
+        assert.equal(nRes.status, 200);
+        const siweMsg = formatSiweMessage({
+          domain: 'app.nostok.xyz',
+          address: acct.address,
+          uri: 'https://app.nostok.xyz',
+          chainId: 8453,
+          nonce: nRes.body.nonce,
+          issuedAt: nowIso,
+          expirationTime: futureIso,
+        });
+        const vRes = await httpJson<{ token: string }>(
+          'POST',
+          `${baseUrl}/auth/verify`,
+          { message: siweMsg, signature: await acct.signMessage({ message: siweMsg }) },
+          { 'X-Forwarded-For': ip }
+        );
+        assert.equal(vRes.status, 200);
+        const sRes = await httpJson<{ id: string; verification_required: boolean }>(
+          'POST',
+          `${baseUrl}/subscriptions`,
+          { channel: 'email', target: targetEmail },
+          { Authorization: `Bearer ${vRes.body.token}`, 'X-Forwarded-For': ip }
+        );
+        assert.equal(sRes.status, 201);
+        return sRes.body;
+      };
+
+      try {
+        // Test block confirmation email ALSO carries a valid 30d single-use manage_url / manage_token
+        const blkAcct = privateKeyToAccount(generatePrivateKey());
+        await createSubWithSiwe(d1Url, blkAcct, 'manage.block.confirm@gmail.com', '198.51.180.1');
+        const blkDirectMail = deliveredEmails[deliveredEmails.length - 1];
+        assert.equal(blkDirectMail.alertType, 'subscription_verification');
+        assert.ok(
+          typeof blkDirectMail.payload.manage_token === 'string' &&
+            typeof blkDirectMail.payload.manage_url === 'string' &&
+            String(blkDirectMail.payload.manage_url).includes('/subscriptions/manage?token='),
+          'Direct verification email must include target-scoped manage_url & manage_token'
+        );
+        const directManageClaims = verifyManageRequestsToken(
+          notifCtx.config.confirmSecret,
+          String(blkDirectMail.payload.manage_token)
+        );
+        const nowFloor = Math.floor(Date.now() / 1000);
+        assert.ok(
+          directManageClaims.exp >= nowFloor + 29 * 86_400 && directManageClaims.exp <= nowFloor + 31 * 86_400,
+          'Manage token TTL must be 30 days'
+        );
+        const blockAllRes = await httpJson<{ blocked: boolean }>(
+          'POST',
+          `${d1Url}/subscriptions/block`,
+          { token: blkDirectMail.payload.block_token, scope: 'target_all' },
+          { 'X-Forwarded-For': '198.51.180.2' }
+        );
+        assert.equal(blockAllRes.status, 200);
+        const blkConfMail = deliveredEmails[deliveredEmails.length - 1];
+        assert.equal(blkConfMail.alertType, 'target_block_confirmation');
+        assert.ok(
+          typeof blkConfMail.payload.manage_token === 'string' &&
+            String(blkConfMail.payload.manage_url).includes('/subscriptions/manage?token=') &&
+            blkConfMail.message.includes('/subscriptions/manage?token='),
+          'Block confirmation email must include 30d manage_url & manage_token'
+        );
+
+        // Repro D1: Bots exhaust 5/24h + trigger digest on repro.d1.victim@gmail.com; zero-ETH owners submit during 6h cooldown ->
+        // verify pending requests survive >= cooldown + 1h (> 1h!), earlier email's manage_url lists & confirms owner immediately,
+        // and another still-pending owner survives past cooldown and appears in the next digest!
+        const d1Bots = Array.from({ length: 6 }, () => privateKeyToAccount(generatePrivateKey()));
+        for (let b = 0; b < d1Bots.length; b++) {
+          await createSubWithSiwe(d1Url, d1Bots[b], 'repro.d1.victim@gmail.com', `198.51.181.${b + 1}`);
+        }
+        const d1Mails = deliveredEmails.slice(manageStartIdx);
+        const d1DigestMail = d1Mails.find(
+          (m) => m.alertType === 'subscription_verification_digest' && m.target === 'repro.d1.victim@gmail.com'
+        );
+        assert.ok(d1DigestMail, '6th request must trigger digest email for Repro D1');
+        assert.ok(
+          typeof d1DigestMail.payload.manage_token === 'string' &&
+            d1DigestMail.message.includes('/subscriptions/manage?token='),
+          'Digest email must include manage_url & manage_token'
+        );
+
+        // Zero-ETH owner #1 (+10m) and owner #2 (+5h) submit during digest cooldown (zero ETH, zero prior activity)
+        const d1Owner1 = privateKeyToAccount(generatePrivateKey());
+        const d1Owner2 = privateKeyToAccount(generatePrivateKey());
+        const d1Owner1Sub = await createSubWithSiwe(d1Url, d1Owner1, 'repro.d1.victim@gmail.com', '198.51.182.1');
+        const d1Owner2Sub = await createSubWithSiwe(d1Url, d1Owner2, 'repro.d1.victim@gmail.com', '198.51.182.2');
+
+        // Verify DB expiry is >= now + verifyDigestCooldownSecs + 3600 (7h default, strictly > 1h!)
+        const minExpectedExp =
+          Math.floor(Date.now() / 1000) + notifCtx.config.verifyDigestCooldownSecs + 3500;
+        const d1DbRows = await notifCtx.notifDb.query<{ id: string; verify_expires_at: string }>(
+          `SELECT id, verify_expires_at::TEXT AS verify_expires_at
+           FROM notif_subscriptions WHERE id = ANY($1::TEXT[])`,
+          [[d1Owner1Sub.id, d1Owner2Sub.id]]
+        );
+        assert.equal(d1DbRows.rows.length, 2);
+        for (const r of d1DbRows.rows) {
+          assert.ok(
+            Number(r.verify_expires_at) >= minExpectedExp,
+            `Pending expiry ${r.verify_expires_at} must be >= cooldown + 1h (${minExpectedExp})`
+          );
+        }
+
+        // Cross-target swap check: block confirmation manage_token (for manage.block.confirm) cannot confirm d1Owner1Sub (repro.d1.victim)
+        const swapRes = await httpJson<{ error?: { code?: string } }>(
+          'POST',
+          `${d1Url}/subscriptions/manage`,
+          {
+            token: blkConfMail.payload.manage_token,
+            subscription_id: d1Owner1Sub.id,
+            action: 'confirm',
+          },
+          { 'X-Forwarded-For': '198.51.182.9' }
+        );
+        assert.equal(swapRes.status, 404, 'Manage token for target A must reject subscription from target B');
+
+        // Owner #1 uses manage_url from the t=0 digest immediately (without waiting 6h): GET does NOT burn token, HTML shows Confirm forms
+        const d1ManageTok = String(d1DigestMail.payload.manage_token);
+        const d1HtmlRes = await fetch(
+          `${d1Url}/subscriptions/manage?token=${encodeURIComponent(d1ManageTok)}`,
+          { headers: { Accept: 'text/html', 'X-Forwarded-For': '198.51.182.10' } }
+        );
+        assert.equal(d1HtmlRes.status, 200);
+        const d1Html = await d1HtmlRes.text();
+        assert.ok(d1Html.includes('action="/subscriptions/manage"'));
+        assert.ok(d1Html.includes(getAddress(d1Owner1.address)));
+        assert.ok(d1Html.includes(getAddress(d1Owner2.address)));
+
+        // Confirm Owner #1 via POST /subscriptions/manage
+        const d1Confirm1 = await httpJson<{ confirmed: boolean; verified: boolean; wallet_address: string }>(
+          'POST',
+          `${d1Url}/subscriptions/manage`,
+          { token: d1ManageTok, subscription_id: d1Owner1Sub.id, action: 'confirm' },
+          { 'X-Forwarded-For': '198.51.182.11' }
+        );
+        assert.equal(d1Confirm1.status, 200);
+        assert.equal(d1Confirm1.body.confirmed, true);
+        assert.equal(d1Confirm1.body.verified, true);
+        assert.equal(d1Confirm1.body.wallet_address, getAddress(d1Owner1.address));
+
+        // Now fast-forward cooldown (+6h) and simulate a bot trigger past cooldown -> d1Owner2 MUST STILL BE ALIVE and appear in digest #2!
+        const cthD1 = notifCtx.cipher.computeGlobalTargetHash('email', 'repro.d1.victim@gmail.com');
+        const past6hSec = (Math.floor(Date.now() / 1000) - notifCtx.config.verifyDigestCooldownSecs - 60).toString();
+        await notifCtx.notifDb.query(
+          'UPDATE notif_verify_target_state SET last_digest_sent_at = $2 WHERE canonical_target_hash = $1',
+          [cthD1, past6hSec]
+        );
+        const emailsBeforeSecondDigest = deliveredEmails.length;
+        const d1BotLater = privateKeyToAccount(generatePrivateKey());
+        await createSubWithSiwe(d1Url, d1BotLater, 'repro.d1.victim@gmail.com', '198.51.182.12');
+        const d1Digest2 = deliveredEmails.slice(emailsBeforeSecondDigest)[0];
+        assert.equal(d1Digest2?.alertType, 'subscription_verification_digest');
+        const d1Digest2Entries = d1Digest2.payload.entries as Array<{ wallet: string; confirm_token: string }>;
+        assert.ok(
+          d1Digest2Entries.some((e) => e.wallet.toLowerCase() === d1Owner2.address.toLowerCase()),
+          'Unconfirmed owner request from during cooldown must survive >= cooldown+1h and appear in +6h digest'
+        );
+
+        // Repro D2: 55+ funded requests push early owner past offset 50 -> digest lists all unique wallets (no 50 cap),
+        // duplicate alias requests deduplicate by unique wallet, and /subscriptions/manage paginates all pages & confirms early owner!
+        const earlyOwner = privateKeyToAccount(generatePrivateKey());
+        const crowdAccts = Array.from({ length: 56 }, () => privateKeyToAccount(generatePrivateKey()));
+        await Promise.all(
+          [earlyOwner, ...crowdAccts].map((a) => rpcCall('anvil_setBalance', [a.address, '0x470de4df820000'])) // 0.02 ETH
+        );
+
+        // Early owner submits twice using dot + googlemail variants (must deduplicate to 1 newest entry per wallet)
+        const earlySubOld = await createSubWithSiwe(
+          d1Url,
+          earlyOwner,
+          'r.eprod2.owner@googlemail.com',
+          '198.52.1.1'
+        );
+        const earlySubNew = await createSubWithSiwe(
+          d1Url,
+          earlyOwner,
+          'reprod2owner@gmail.com',
+          '198.52.1.2'
+        );
+        assert.notEqual(earlySubOld.id, earlySubNew.id);
+
+        // Now 55 funded wallets submit AFTER earlyOwner so earlyOwner sits at index 55 (outside any old LIMIT 50!)
+        for (let i = 0; i < 55; i++) {
+          await createSubWithSiwe(
+            d1Url,
+            crowdAccts[i],
+            'reprod2.owner@gmail.com',
+            `198.52.${Math.floor(i / 200) + 2}.${(i % 200) + 1}`
+          );
+        }
+        // Expire digest cooldown on reprod2.owner@gmail.com so 56th funded wallet triggers digest containing ALL 57 unique wallets
+        const cthD2 = notifCtx.cipher.computeGlobalTargetHash('email', 'reprod2.owner@gmail.com');
+        await notifCtx.notifDb.query(
+          'UPDATE notif_verify_target_state SET last_digest_sent_at = 1 WHERE canonical_target_hash = $1',
+          [cthD2]
+        );
+        const emailsBeforeD2Digest = deliveredEmails.length;
+        await createSubWithSiwe(d1Url, crowdAccts[55], 'reprod2.owner@gmail.com', '198.52.9.9');
+        const d2Digest = deliveredEmails.slice(emailsBeforeD2Digest)[0];
+        assert.equal(d2Digest?.alertType, 'subscription_verification_digest');
+        const d2Entries = d2Digest.payload.entries as Array<{ wallet: string; subscription_id: string }>;
+        assert.equal(d2Entries.length, 57, `Digest must list all 57 unique wallets (>50, no LIMIT 50 cap), got ${d2Entries.length}`);
+        assert.equal(
+          d2Entries.filter((e) => e.wallet.toLowerCase() === earlyOwner.address.toLowerCase()).length,
+          1,
+          'Early owner with alias submissions must be deduplicated to strictly 1 wallet entry in digest'
+        );
+
+        // Browse /subscriptions/manage across 3 pages (limit=20, offset=0,20,40) -> token NOT burned by GETs!
+        const d2ManageTok = String(d2Digest.payload.manage_token);
+        const seenManageWallets = new Set<string>();
+        let foundEarlyOwnerPage3: { subscription_id: string; wallet_address: string } | undefined;
+        for (const [offset, expectedCount, expectedHasMore] of [
+          [0, 20, true],
+          [20, 20, true],
+          [40, 17, false],
+        ] as const) {
+          const pRes = await httpJson<{
+            confirmation_required: boolean;
+            pagination: { limit: number; offset: number; returned: number; total: number; has_more: boolean };
+            data: Array<{ subscription_id: string; wallet_address: string }>;
+          }>(
+            'GET',
+            `${d1Url}/subscriptions/manage?token=${encodeURIComponent(d2ManageTok)}&limit=20&offset=${offset}`,
+            undefined,
+            { 'X-Forwarded-For': `198.52.10.${offset + 1}` }
+          );
+          assert.equal(pRes.status, 200);
+          assert.equal(pRes.body.pagination.total, 57);
+          assert.equal(pRes.body.pagination.returned, expectedCount);
+          assert.equal(pRes.body.pagination.has_more, expectedHasMore);
+          for (const row of pRes.body.data) {
+            seenManageWallets.add(row.wallet_address.toLowerCase());
+            if (row.wallet_address.toLowerCase() === earlyOwner.address.toLowerCase()) {
+              foundEarlyOwnerPage3 = row;
+            }
+          }
+        }
+        assert.equal(seenManageWallets.size, 57, 'All 57 unique pending wallets must appear across paginated manage pages');
+        assert.ok(foundEarlyOwnerPage3, 'Early owner pushed past offset 50 must still be reachable on page 3');
+        assert.equal(
+          foundEarlyOwnerPage3.subscription_id,
+          earlySubNew.id,
+          'Manage list deduplication must keep the newest pending request per unique wallet'
+        );
+
+        // Confirm early owner via single-use POST /subscriptions/manage, then verify single-use replay rejection!
+        const d2ConfirmRes = await httpJson<{ confirmed: boolean; id: string; verified: boolean }>(
+          'POST',
+          `${d1Url}/subscriptions/manage`,
+          { token: d2ManageTok, subscription_id: earlySubNew.id, action: 'confirm' },
+          { 'X-Forwarded-For': '198.52.11.1' }
+        );
+        assert.equal(d2ConfirmRes.status, 200);
+        assert.equal(d2ConfirmRes.body.confirmed, true);
+        assert.equal(d2ConfirmRes.body.verified, true);
+        assert.equal(d2ConfirmRes.body.id, earlySubNew.id);
+
+        const d2ReplayPost = await httpJson<{ error?: { code?: string } }>(
+          'POST',
+          `${d1Url}/subscriptions/manage`,
+          { token: d2ManageTok, subscription_id: earlySubNew.id, action: 'confirm' },
+          { 'X-Forwarded-For': '198.52.11.2' }
+        );
+        assert.equal(d2ReplayPost.status, 400);
+        assert.equal(d2ReplayPost.body.error?.code, 'MANAGE_TOKEN_ALREADY_USED');
+
+        const d2ReplayGet = await httpJson<{ error?: { code?: string } }>(
+          'GET',
+          `${d1Url}/subscriptions/manage?token=${encodeURIComponent(d2ManageTok)}`,
+          undefined,
+          { 'X-Forwarded-For': '198.52.11.3' }
+        );
+        assert.equal(d2ReplayGet.status, 400);
+        assert.equal(d2ReplayGet.body.error?.code, 'MANAGE_TOKEN_ALREADY_USED');
+      } finally {
+        await new Promise<void>((r) => d1Srv.close(() => r()));
       }
 
       // 6.7 No pre-auth login lockout across IPs

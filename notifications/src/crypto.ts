@@ -423,23 +423,26 @@ export function verifyBlockSenderToken(
   return { subId: parsed.subId, wallet: parsed.wallet, canonicalTargetHash: parsed.cth, exp: parsed.exp };
 }
 
-interface UnblockTargetPayload {
-  p: 'unblock_target';
+type TargetScopedPurpose = 'unblock_target' | 'manage_requests';
+
+interface TargetScopedPayload {
+  p: TargetScopedPurpose;
   cth: string;
   ch: 'email' | 'telegram';
   jti: string;
   exp: number;
 }
 
-export function signUnblockTargetToken(
+function signTargetScopedToken(
   secret: string,
+  purpose: TargetScopedPurpose,
   canonicalTargetHash: string,
   channel: 'email' | 'telegram',
   ttlSecs = 30 * 86_400,
   nowMs = Date.now()
 ): string {
-  const payload: UnblockTargetPayload = {
-    p: 'unblock_target',
+  const payload: TargetScopedPayload = {
+    p: purpose,
     cth: canonicalTargetHash,
     ch: channel,
     jti: crypto.randomUUID(),
@@ -450,31 +453,33 @@ export function signUnblockTargetToken(
   return `${body}.${sig}`;
 }
 
-export function verifyUnblockTargetToken(
+function verifyTargetScopedToken(
   secret: string,
   token: string,
+  expectedPurpose: TargetScopedPurpose,
+  label: string,
   nowMs = Date.now()
 ): { canonicalTargetHash: string; channel: 'email' | 'telegram'; jti: string; exp: number } {
   const parts = token.split('.');
-  if (parts.length !== 2) throw new Error('Invalid unblock token format');
+  if (parts.length !== 2) throw new Error(`Invalid ${label} token format`);
   const [body, sig] = parts;
   const expected = crypto.createHmac('sha256', secret).update(body).digest('base64url');
   const sigBuf = Buffer.from(sig, 'utf8');
   const expBuf = Buffer.from(expected, 'utf8');
   if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
-    throw new Error('Invalid unblock token signature');
+    throw new Error(`Invalid ${label} token signature`);
   }
-  const parsed = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as Partial<UnblockTargetPayload>;
+  const parsed = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as Partial<TargetScopedPayload>;
   if (
-    parsed.p !== 'unblock_target' ||
+    parsed.p !== expectedPurpose ||
     typeof parsed.cth !== 'string' ||
     (parsed.ch !== 'email' && parsed.ch !== 'telegram') ||
     typeof parsed.jti !== 'string'
   ) {
-    throw new Error('Invalid unblock token purpose');
+    throw new Error(`Invalid ${label} token purpose`);
   }
   if (typeof parsed.exp !== 'number' || Math.floor(nowMs / 1000) > parsed.exp) {
-    throw new Error('Unblock token expired');
+    throw new Error(`${label} token expired`);
   }
   return {
     canonicalTargetHash: parsed.cth,
@@ -482,6 +487,42 @@ export function verifyUnblockTargetToken(
     jti: parsed.jti,
     exp: parsed.exp,
   };
+}
+
+export function signUnblockTargetToken(
+  secret: string,
+  canonicalTargetHash: string,
+  channel: 'email' | 'telegram',
+  ttlSecs = 30 * 86_400,
+  nowMs = Date.now()
+): string {
+  return signTargetScopedToken(secret, 'unblock_target', canonicalTargetHash, channel, ttlSecs, nowMs);
+}
+
+export function verifyUnblockTargetToken(
+  secret: string,
+  token: string,
+  nowMs = Date.now()
+): { canonicalTargetHash: string; channel: 'email' | 'telegram'; jti: string; exp: number } {
+  return verifyTargetScopedToken(secret, token, 'unblock_target', 'Unblock', nowMs);
+}
+
+export function signManageRequestsToken(
+  secret: string,
+  canonicalTargetHash: string,
+  channel: 'email' | 'telegram',
+  ttlSecs = 30 * 86_400,
+  nowMs = Date.now()
+): string {
+  return signTargetScopedToken(secret, 'manage_requests', canonicalTargetHash, channel, ttlSecs, nowMs);
+}
+
+export function verifyManageRequestsToken(
+  secret: string,
+  token: string,
+  nowMs = Date.now()
+): { canonicalTargetHash: string; channel: 'email' | 'telegram'; jti: string; exp: number } {
+  return verifyTargetScopedToken(secret, token, 'manage_requests', 'Manage requests', nowMs);
 }
 
 export function signWebhookPayload(

@@ -29,6 +29,7 @@ import {
   type RelaySignedOrderRecord,
   createApiContext,
   createApiServer,
+  runRelayBackgroundRefresh,
   sanitizeTokenSymbol,
 } from '../src/server.js';
 import { loadConfig as loadIndexerConfig } from '../../indexer/src/config.js';
@@ -3368,6 +3369,283 @@ async function runTests(): Promise<void> {
         );
         assert.equal(raceAccepted.length, 1, `20 parallel POSTs with single-order funding must accept strictly 1, got ${raceAccepted.length}`);
         assert.equal(raceRejected.length, 19, `20 parallel POSTs must reject 19 with INSUFFICIENT_ORDER_FUNDING, got ${raceRejected.length}`);
+
+        // Repro 1 + Item 3 + Item 4: 190 NVDAc bag cycled across 100 makers posting 2000 exact-min orders ->
+        // market closes (VALID_CLOSED) -> unfunded orders marked unfunded & evictable regardless of shortfall flag ->
+        // real funded makers still get 201 (not 429), closed-market +5% buffer order returns 201 with fillable_when_market_opens:true,
+        // and market reopen + background refresh clears shortfall flags across >100 orders cleanly.
+        const snapRepro1 = await rpcCall<string>('evm_snapshot', []);
+        const savedMapBackup = new Map(spamSignedMap);
+        try {
+          spamSignedMap.clear();
+          const transferAbi = parseAbi(['function transfer(address to, uint256 amount) returns (bool)']);
+          const bagMakers = Array.from({ length: 100 }, () => privateKeyToAccount(generatePrivateKey()));
+          const bagAmount = 191n * 10n ** 18n; // 20 orders x 9.55 NVDAc (~$802.20 max borrow @ $140 * 60%) <= 191 NVDAc
+          const perOrderColl = 955n * 10n ** 16n; // 9.55 NVDAc (exact min for $800 minUsdc @ $140 * 60% = $802.20, falls to $762.09 on 5% closed haircut)
+
+          await Promise.all(
+            bagMakers.map((m) => rpcCall('anvil_setBalance', [m.address, '0x1bc16d674ec80000'])) // 2 ETH each
+          );
+          // Fund maker 0 with the single 191 NVDAc bag and let all 100 approve CollateralEscrow in batches
+          await publicClient.waitForTransactionReceipt({
+            hash: await deployerClient.writeContract({
+              address: nvdac,
+              abi: mockB20Artifact.abi,
+              functionName: 'mint',
+              args: [bagMakers[0].address, bagAmount],
+            }),
+          });
+          const waitFast = (hash: Hex) =>
+            publicClient.waitForTransactionReceipt({ hash, pollingInterval: 25 });
+          for (const m of bagMakers) {
+            const mWallet = createWalletClient({
+              account: m,
+              chain: forkChain,
+              transport: viemHttp(LOCAL_RPC_URL),
+            });
+            await waitFast(
+              await mWallet.writeContract({
+                address: nvdac,
+                abi: approveAbi,
+                functionName: 'approve',
+                args: [deployed.collateralEscrow, bagAmount],
+                gas: 120_000n,
+              })
+            );
+          }
+
+          for (let m = 0; m < bagMakers.length; m++) {
+            const makerAcct = bagMakers[m];
+            const makerIp = `198.51.${170 + Math.floor(m / 2)}.${(m % 2) * 20 + 1}`;
+            const mSignedOrders = await Promise.all(
+              Array.from({ length: 20 }, (_, idx) =>
+                signBorrowForTest(makerAcct, {
+                  collateralAmount: perOrderColl.toString(),
+                  minUsdc: (800_000_000 + idx).toString(),
+                  maxLtvBps: 6000,
+                  expiry: sevenDaysExpStr,
+                  nonce: '0',
+                })
+              )
+            );
+            for (const item of mSignedOrders) {
+              const pRes = await postJson<{ order_hash?: string }>(`${spamUrl}/orders`, {
+                order_type: 'borrow',
+                order: item.ord,
+                signature: item.sig,
+              }, { 'X-Forwarded-For': makerIp });
+              assert.equal(pRes.status, 201, `Bag maker ${m} order must be accepted cleanly while holding bag`);
+            }
+            if (m < bagMakers.length - 1) {
+              const mWallet = createWalletClient({
+                account: makerAcct,
+                chain: forkChain,
+                transport: viemHttp(LOCAL_RPC_URL),
+              });
+              await waitFast(
+                await mWallet.writeContract({
+                  address: nvdac,
+                  abi: transferAbi,
+                  functionName: 'transfer',
+                  args: [bagMakers[m + 1].address, bagAmount],
+                  gas: 120_000n,
+                })
+              );
+            }
+          }
+          assert.equal(spamSignedMap.size, 2000, 'Relay must now sit at full 2000-order capacity');
+
+          // Close market (VALID_CLOSED with 5% haircut) and refresh so bagMakers[99]'s 20 orders get closed shortfall flag
+          // plus simulate pre-loss shortfall flags on unfunded entries so both cases are exercised
+          await waitFast(
+            await rawWalletClient.sendTransaction({
+              account: deployed.nostokTimelock,
+              to: deployed.oracleRouter,
+              data: encodeFunctionData({
+                abi: parseAbi(['function setMarketSession(bool isOpen, bool isManual)']),
+                functionName: 'setMarketSession',
+                args: [false, true],
+              }),
+            })
+          );
+          await waitFast(
+            await deployerClient.writeContract({
+              address: nvdaFeed,
+              abi: mockAggArtifact.abi,
+              functionName: 'setPrice',
+              args: [140_00000000n],
+            })
+          );
+          const lastBagMaker = bagMakers[99];
+          const lastBagRes = await getJson<{
+            data: Array<{ status: string; fillable_when_market_opens?: boolean }>;
+          }>(`${spamUrl}/orders?maker=${lastBagMaker.address}`);
+          assert.equal(lastBagRes.status, 200);
+          assert.equal(lastBagRes.body.data.length, 20);
+          assert.ok(
+            lastBagRes.body.data.every((o) => o.status === 'open' && o.fillable_when_market_opens === true),
+            'Funded last bag holder during closed market must stay open with fillable_when_market_opens:true'
+          );
+
+          // Now move the bag away from lastBagMaker to deployer so ALL 2000 orders are unfunded on-chain,
+          // including 20 whose cachedClosedHaircutShortfall had just been set to true!
+          const lastWallet = createWalletClient({
+            account: lastBagMaker,
+            chain: forkChain,
+            transport: viemHttp(LOCAL_RPC_URL),
+          });
+          await waitFast(
+            await lastWallet.writeContract({
+              address: nvdac,
+              abi: transferAbi,
+              functionName: 'transfer',
+              args: [deployerClient.account.address, bagAmount],
+              gas: 120_000n,
+            })
+          );
+          // Also mark remaining cached records stale with shortfall flag as observed in Repro 1
+          for (const rec of spamSignedMap.values()) {
+            rec.cachedClosedHaircutShortfall = true;
+            rec.cachedStatus = 'unfunded';
+          }
+          // Verify GET immediately clears shortfall when unfunded
+          const afterLossGet = await getJson<{
+            data: Array<{ status: string; unfunded: boolean; fillable_when_market_opens?: boolean }>;
+          }>(`${spamUrl}/orders?maker=${lastBagMaker.address}&include_inactive=true`);
+          assert.equal(afterLossGet.status, 200);
+          assert.ok(
+            afterLossGet.body.data.every((o) => o.status === 'unfunded' && o.unfunded && !o.fillable_when_market_opens),
+            'Unfunded order must clear fillable_when_market_opens even during VALID_CLOSED'
+          );
+
+          // Test BOTH eviction paths during VALID_CLOSED:
+          // - 20 entries cachedStatus='unfunded' + cachedClosedHaircutShortfall=true (makers 0..19 evict these)
+          // - 1980 entries cachedStatus='open' + cachedClosedHaircutShortfall=true (stale; makers 20..24 trigger probeCandidates)
+          // ALL 25 real funded makers MUST get 201 Created (never 429)!
+          for (const rec of spamSignedMap.values()) {
+            rec.cachedClosedHaircutShortfall = true;
+            if (rec.maker.toLowerCase() === lastBagMaker.address.toLowerCase()) {
+              rec.cachedStatus = 'unfunded';
+            } else {
+              rec.cachedStatus = 'open';
+              rec.lastRefreshedAtMs = 1;
+            }
+          }
+          const realMakers = Array.from({ length: 25 }, () => privateKeyToAccount(generatePrivateKey()));
+          await Promise.all(
+            realMakers.map((rm) => rpcCall('anvil_setBalance', [rm.address, '0x1bc16d674ec80000']))
+          );
+          for (const rm of realMakers) {
+            await waitFast(
+              await deployerClient.writeContract({
+                address: nvdac,
+                abi: mockB20Artifact.abi,
+                functionName: 'mint',
+                args: [rm.address, 20n * 10n ** 18n],
+                gas: 120_000n,
+              })
+            );
+            await waitFast(
+              await createWalletClient({
+                account: rm,
+                chain: forkChain,
+                transport: viemHttp(LOCAL_RPC_URL),
+              }).writeContract({
+                address: nvdac,
+                abi: approveAbi,
+                functionName: 'approve',
+                args: [deployed.collateralEscrow, 20n * 10n ** 18n],
+                gas: 120_000n,
+              })
+            );
+          }
+          // Item 3 (Low): Submit orders with default UI +5% buffer (12.5 NVDAc, minUsdc=$1,000 -> $997.50 under 5% closed haircut)
+          // WHILE VALID_CLOSED at full 2000 capacity -> MUST return 201 with fillable_when_market_opens:true!
+          for (let i = 0; i < realMakers.length; i++) {
+            const rm = realMakers[i];
+            const rmSigned = await signBorrowForTest(rm, {
+              collateralAmount: (125n * 10n ** 17n).toString(),
+              minUsdc: '1000000000',
+              maxLtvBps: 6000,
+              expiry: sevenDaysExpStr,
+              nonce: '0',
+            });
+            const rmRes = await postJson<{
+              order_hash: string;
+              fillable_when_market_opens?: boolean;
+            }>(`${spamUrl}/orders`, {
+              order_type: 'borrow',
+              order: rmSigned.ord,
+              signature: rmSigned.sig,
+            }, { 'X-Forwarded-For': `198.51.195.${i + 1}` });
+            assert.equal(rmRes.status, 201, `Real funded maker ${i} must evict unfunded shortfall spam cleanly (got ${rmRes.status})`);
+            assert.equal(rmRes.body.fillable_when_market_opens, true, 'Closed-market +5% buffer order must be admitted with fillable_when_market_opens:true');
+          }
+
+          // Reopen market (VALID_OPEN) and verify Item 4: runRelayBackgroundRefresh + timer clears shortfall flags
+          // across >100 orders (e.g. 150 shortfall-flagged entries) without requiring 8+ manual GET loops!
+          await publicClient.waitForTransactionReceipt({
+            hash: await rawWalletClient.sendTransaction({
+              account: deployed.nostokTimelock,
+              to: deployed.oracleRouter,
+              data: encodeFunctionData({
+                abi: parseAbi(['function setMarketSession(bool isOpen, bool isManual)']),
+                functionName: 'setMarketSession',
+                args: [true, true],
+              }),
+            }),
+          });
+          await publicClient.waitForTransactionReceipt({
+            hash: await deployerClient.writeContract({
+              address: nvdaFeed,
+              abi: mockAggArtifact.abi,
+              functionName: 'setPrice',
+              args: [140_00000000n],
+            }),
+          });
+          // Mark 150 entries with stale cachedClosedHaircutShortfall=true and run 2 background refresh passes (100 + 50)
+          const flaggedSubset = Array.from(spamSignedMap.values()).slice(0, 150);
+          for (let f = 0; f < flaggedSubset.length; f++) {
+            flaggedSubset[f].cachedClosedHaircutShortfall = true;
+            flaggedSubset[f].lastRefreshedAtMs = 1000 + f;
+          }
+          // Also ensure none of the remaining 1850 entries still have cachedClosedHaircutShortfall set so these 150 run first
+          for (const rec of Array.from(spamSignedMap.values()).slice(150)) {
+            rec.cachedClosedHaircutShortfall = false;
+            rec.cachedStatus = 'open';
+            rec.cachedOracleStale = false;
+          }
+          const refreshed1 = await runRelayBackgroundRefresh(spamCtx);
+          assert.equal(refreshed1, 100, 'First background refresh pass must handle 100 entries in 1 batch');
+          const remainingAfter1 = flaggedSubset.filter((r) => r.cachedClosedHaircutShortfall).length;
+          assert.ok(
+            remainingAfter1 <= 50,
+            `First background refresh pass must clear at least 100 shortfall entries (remaining=${remainingAfter1})`
+          );
+          const refreshed2 = await runRelayBackgroundRefresh(spamCtx);
+          assert.ok(refreshed2 >= remainingAfter1, 'Second background refresh pass must process remaining shortfall entries');
+          const stillFlagged = flaggedSubset.filter((r) => r.cachedClosedHaircutShortfall);
+          assert.equal(stillFlagged.length, 0, 'Market reopen + background refresh must clear cachedClosedHaircutShortfall across all 150 entries');
+
+          // Also verify timer-driven background refresh in createApiServer (relayBgRefreshIntervalMs)
+          flaggedSubset[0].cachedClosedHaircutShortfall = true;
+          flaggedSubset[0].lastRefreshedAtMs = 1;
+          const timerSrv = createApiServer({ ...spamCtx, relayBgRefreshIntervalMs: 40 });
+          await new Promise<void>((r) => timerSrv.listen(0, '127.0.0.1', r));
+          try {
+            const deadline = Date.now() + 3000;
+            while (flaggedSubset[0].cachedClosedHaircutShortfall && Date.now() < deadline) {
+              await new Promise((r) => setTimeout(r, 50));
+            }
+            assert.equal(flaggedSubset[0].cachedClosedHaircutShortfall, false, 'Server background refresh interval timer must automatically clear reopened shortfall flag');
+          } finally {
+            await new Promise<void>((r) => timerSrv.close(() => r()));
+          }
+        } finally {
+          spamSignedMap.clear();
+          for (const [k, v] of savedMapBackup.entries()) spamSignedMap.set(k, v);
+          await rpcCall('evm_revert', [snapRepro1]);
+        }
       } finally {
         mockSynthFunded = false;
         failRelayMulticall = false;

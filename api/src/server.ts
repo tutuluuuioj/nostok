@@ -121,6 +121,7 @@ export interface ApiContext {
   db: ReadOnlyDatabase;
   assetBlockCache?: AssetsBlockCacheEntry;
   signedOrders?: Map<string, RelaySignedOrderRecord>;
+  relayBgRefreshIntervalMs?: number;
 }
 
 class HttpError extends Error {
@@ -553,6 +554,8 @@ const EVICTION_REFRESH_SCAN_LIMIT = 60;
 const RELAY_STATE_CACHE_TTL_MS = 2000;
 const MAX_RELAY_REFRESH_PER_REQ = 120;
 const UNFUNDED_REFRESH_SLICE = 20;
+const BG_REFRESH_INTERVAL_MS = 30_000;
+const BG_REFRESH_BATCH_LIMIT = 100;
 const RELAY_MULTICALL_CHUNK = 250;
 const FALLBACK_SIGNED_ORDERS = new WeakMap<ApiContext, Map<string, RelaySignedOrderRecord>>();
 const MAKER_ORDER_LOCKS = new WeakMap<ApiContext, Map<string, Promise<void>>>();
@@ -1001,6 +1004,10 @@ function deriveRelayLiveState(
               ? 'partially_filled'
               : 'open';
 
+  if (unfunded) {
+    rec.cachedClosedHaircutShortfall = false;
+  }
+
   const fillableWhenMarketOpens =
     rec.orderType === 'borrow' &&
     Boolean(rec.cachedClosedHaircutShortfall) &&
@@ -1298,13 +1305,15 @@ async function batchRefreshRelayRecords(
             oracleState: oa.oracleState,
           });
           if (check.oracleNonTradable) {
-            // Preserve last collateral/funding status and flag stale instead of marking unfunded
+            // Preserve last collateral/funding status and flag stale instead of marking unfunded;
+            // always clear closed-market shortfall whenever oracle state is outside VALID_CLOSED.
             rec.cachedOracleStale = true;
+            rec.cachedClosedHaircutShortfall = false;
             anyStale = true;
           } else {
             rec.cachedOracleStale = false;
             rec.cachedCollateralCheck = true;
-            if (check.closedHaircutShortfall) {
+            if (check.closedHaircutShortfall && oa.oracleState === OracleState.VALID_CLOSED) {
               rec.cachedClosedHaircutShortfall = true;
               rec.cachedUndercollateralized = false;
             } else {
@@ -1559,6 +1568,7 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
     );
   }
 
+  let acceptedViaClosedShortfall = false;
   // Validate collateral token against AssetRegistry & resolve indexed symbol before storing
   let collateralSymbol: string | null = null;
   let collateralDecimals = 18;
@@ -1675,11 +1685,17 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
         oracleState,
       });
       if (!colCheck.ok) {
-        throw new HttpError(
-          400,
-          'ORDER_UNDERCOLLATERALIZED',
-          `Order collateral (${collateralAmount ?? '0'} raw, effective value ${colCheck.effectiveUsdc.toString()} USDC at oracle state ${oracleState}) does not satisfy minUsdc (${totalUsdc.toString()}) at LTV ${colCheck.allowedLtvBps} bps`
-        );
+        if (colCheck.closedHaircutShortfall && oracleState === OracleState.VALID_CLOSED) {
+          // Closed-market haircut shortfall on an otherwise open-market-valid order:
+          // accept symmetrically with refresh as fillable_when_market_opens=true.
+          acceptedViaClosedShortfall = true;
+        } else {
+          throw new HttpError(
+            400,
+            'ORDER_UNDERCOLLATERALIZED',
+            `Order collateral (${collateralAmount ?? '0'} raw, effective value ${colCheck.effectiveUsdc.toString()} USDC at oracle state ${oracleState}) does not satisfy minUsdc (${totalUsdc.toString()}) at LTV ${colCheck.allowedLtvBps} bps`
+          );
+        }
       }
     }
   }
@@ -1872,10 +1888,10 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
   }
 
   // At capacity, re-verify any cached-unfunded candidates via live multicall BEFORE evicting,
-  // and exclude closed-market haircut shortfalls (fillable when market opens) from eviction.
+  // and exclude only open/funded closed-market haircut shortfalls from eviction.
   if (!signedMap.has(orderHashLower) && signedMap.size >= MAX_SIGNED_ORDERS) {
     const cachedUnfundedToVerify = Array.from(signedMap.entries())
-      .filter(([, e]) => e.cachedStatus === 'unfunded' && !e.cachedClosedHaircutShortfall)
+      .filter(([, e]) => e.cachedStatus === 'unfunded')
       .sort((a, b) => {
         const aExp = BigInt(a[1].expiry);
         const bExp = BigInt(b[1].expiry);
@@ -1898,11 +1914,10 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
     }
 
     const stillCachedUnfunded = Array.from(signedMap.values()).some(
-      (e) => e.cachedStatus === 'unfunded' && !e.cachedClosedHaircutShortfall
+      (e) => e.cachedStatus === 'unfunded'
     );
     if (!stillCachedUnfunded && signedMap.size >= MAX_SIGNED_ORDERS) {
       const probeCandidates = Array.from(signedMap.values())
-        .filter((e) => !e.cachedClosedHaircutShortfall)
         .sort((a, b) => {
           const aExp = BigInt(a.expiry);
           const bExp = BigInt(b.expiry);
@@ -1919,7 +1934,7 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
 
   if (!signedMap.has(orderHashLower) && signedMap.size >= MAX_SIGNED_ORDERS) {
     const unfundedCandidates = Array.from(signedMap.entries())
-      .filter(([, e]) => e.cachedStatus === 'unfunded' && !e.cachedClosedHaircutShortfall)
+      .filter(([, e]) => e.cachedStatus === 'unfunded')
       .sort((a, b) => {
         const aExp = BigInt(a[1].expiry);
         const bExp = BigInt(b[1].expiry);
@@ -1935,7 +1950,11 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
     } else {
       const nearExpiryCandidates = Array.from(signedMap.entries())
         .filter(([, e]) => {
-          if (e.cachedClosedHaircutShortfall) return false;
+          const hasValidShortfallExemption =
+            e.cachedClosedHaircutShortfall &&
+            (e.cachedStatus === 'open' || e.cachedStatus === 'partially_filled') &&
+            !e.cachedFundingOverBudget;
+          if (hasValidShortfallExemption) return false;
           const eExp = BigInt(e.expiry);
           return (
             eExp <= blk.timestamp + NEAR_EXPIRY_EVICTION_WINDOW_SECS &&
@@ -1994,7 +2013,7 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
     cachedCollateralCheck: input.order_type === 'borrow',
     cachedUndercollateralized: false,
     cachedOracleStale: false,
-    cachedClosedHaircutShortfall: false,
+    cachedClosedHaircutShortfall: input.order_type === 'borrow' ? acceptedViaClosedShortfall : false,
     cachedRpcStale: false,
     cachedStatus: initialStatus,
     cachedBlockNumber: blk.number,
@@ -2309,7 +2328,13 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
     const pageCandidates = tentativeActive.slice(pag.offset, pag.offset + pag.limit);
     const pageHashSet = new Set(pageCandidates.map((r) => r.orderHash.toLowerCase()));
     const cachedUnfundedSlice = relayOnlyCandidates
-      .filter((r) => r.cachedStatus === 'unfunded' && !pageHashSet.has(r.orderHash.toLowerCase()))
+      .filter(
+        (r) =>
+          (r.cachedStatus === 'unfunded' ||
+            r.cachedClosedHaircutShortfall ||
+            r.cachedOracleStale) &&
+          !pageHashSet.has(r.orderHash.toLowerCase())
+      )
       .sort((a, b) => (a.lastRefreshedAtMs ?? 0) - (b.lastRefreshedAtMs ?? 0))
       .slice(0, UNFUNDED_REFRESH_SLICE);
     const refreshBatch = [...pageCandidates, ...cachedUnfundedSlice];
@@ -3140,12 +3165,55 @@ async function handleFees(ctx: ApiContext) {
   };
 }
 
+/**
+ * Refreshes up to BG_REFRESH_BATCH_LIMIT (100) cached unfunded, closed-haircut-shortfall,
+ * or oracle-stale relay records per invocation so recovered or reopened orders update without
+ * waiting for paginated GET /orders requests.
+ */
+export async function runRelayBackgroundRefresh(ctx: ApiContext): Promise<number> {
+  const signedMap = getSignedOrdersMap(ctx);
+  if (signedMap.size === 0) return 0;
+
+  const candidates = Array.from(signedMap.values())
+    .filter(
+      (r) =>
+        r.cachedStatus === 'unfunded' ||
+        r.cachedClosedHaircutShortfall ||
+        r.cachedOracleStale
+    )
+    .sort((a, b) => (a.lastRefreshedAtMs ?? 0) - (b.lastRefreshedAtMs ?? 0))
+    .slice(0, BG_REFRESH_BATCH_LIMIT);
+
+  if (candidates.length === 0) return 0;
+
+  const blk = await getLatestBlockForRelay(ctx, 0n);
+  if (blk.rpcFailed) return 0;
+
+  await batchRefreshRelayRecords(ctx, candidates, blk.timestamp, blk.number, false, true);
+  return candidates.length;
+}
+
 export function createApiServer(ctx: ApiContext): http.Server {
   const rateLimiter = new IpRateLimiter(
     ctx.config.rateLimitMax,
     ctx.config.rateLimitWindowMs,
     ctx.config.rateLimitMaxBuckets
   );
+  const bgIntervalMs = ctx.relayBgRefreshIntervalMs ?? BG_REFRESH_INTERVAL_MS;
+  let bgRefreshInFlight = false;
+  const bgRefreshTimer =
+    bgIntervalMs > 0
+      ? setInterval(() => {
+          if (bgRefreshInFlight) return;
+          bgRefreshInFlight = true;
+          void runRelayBackgroundRefresh(ctx)
+            .catch(() => {})
+            .finally(() => {
+              bgRefreshInFlight = false;
+            });
+        }, bgIntervalMs)
+      : null;
+  bgRefreshTimer?.unref();
 
   const server = http.createServer(async (req, res) => {
     setCorsHeaders(req, res, ctx.config.corsOrigins);
@@ -3284,6 +3352,7 @@ export function createApiServer(ctx: ApiContext): http.Server {
   });
 
   server.on('close', () => {
+    if (bgRefreshTimer) clearInterval(bgRefreshTimer);
     rateLimiter.close();
   });
 

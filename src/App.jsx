@@ -25,7 +25,8 @@ function Frame() {
   const isSubscriptionAction =
     location.pathname === '/subscriptions/confirm' ||
     location.pathname === '/subscriptions/block' ||
-    location.pathname === '/subscriptions/unblock';
+    location.pathname === '/subscriptions/unblock' ||
+    location.pathname === '/subscriptions/manage';
   if (state.gate === 'restricted') return <Restricted />;
   if (state.gate !== 'accepted' && !isSubscriptionAction) return <Gate />;
   return (
@@ -48,6 +49,7 @@ function Frame() {
         <Route path="/subscriptions/confirm" element={<SubscriptionAction mode="confirm" />} />
         <Route path="/subscriptions/block" element={<SubscriptionAction mode="block" />} />
         <Route path="/subscriptions/unblock" element={<SubscriptionAction mode="unblock" />} />
+        <Route path="/subscriptions/manage" element={<SubscriptionAction mode="manage" />} />
         <Route path="*" element={<Home />} />
       </Routes>
     </Shell>
