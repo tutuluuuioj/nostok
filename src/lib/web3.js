@@ -16,6 +16,7 @@ import {
   BORROW_ORDER_EIP712_TYPES,
   DEFAULT_B20_DECIMALS,
   ETH_DECIMALS,
+  LEND_OFFER_EIP712_TYPES,
   ORDER_SETTLEMENT_DOMAIN_NAME,
   ORDER_SETTLEMENT_DOMAIN_VERSION,
   PROTOCOL_ERROR_ABI,
@@ -27,11 +28,13 @@ import {
   getMissingContractAddresses,
   loanCoreAbi,
   orderSettlementAbi,
+  positionNftAbi,
 } from './contracts.js';
 
 export const DEFAULT_COLLATERAL_BUFFER_BPS = 500; // +5.00% default buffer for partial fills & price ticks
 export const MAX_COLLATERAL_BUFFER_BPS = 5000;
 export const SIGNED_BORROW_ORDERS_STORAGE_KEY = 'nostok-signed-borrow-orders-v1';
+export const SIGNED_LEND_OFFERS_STORAGE_KEY = 'nostok-signed-lend-offers-v1';
 
 const REVERT_EXPLANATIONS = {
   Unauthorized: 'Caller is not authorized to perform this order action.',
@@ -295,11 +298,11 @@ export function formatSiweMessage(params) {
   ].join('\n');
 }
 
-export async function fetchJsonStrict(url, options = {}, timeoutMs = 8000) {
+export async function fetchJsonStrict(url, options = {}, timeoutMs = 8000, fetchImpl = globalThis.fetch) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
+    const res = await fetchImpl(url, { ...options, signal: controller.signal });
     const text = await res.text();
     let parsed = null;
     try {
@@ -951,6 +954,244 @@ async function sendWalletTransaction(provider, publicClient, { from, to, data, v
   return { txHash, receipt };
 }
 
+export function sumRawBigints(values) {
+  if (!Array.isArray(values) || values.length === 0) return 0n;
+  let total = 0n;
+  for (const item of values) {
+    if (item === null || item === undefined || String(item).trim() === '') continue;
+    const v = BigInt(item);
+    if (v <= 0n) {
+      throw new Error('Per-fill raw amount must be positive.');
+    }
+    total += v;
+  }
+  return total;
+}
+
+/**
+ * Computes exact raw USDC allowance needed on LoanCore for signing a LendOffer
+ * or executing partial/multi-fill lender transactions. Covers the sum of
+ * per-fill rounded-up raw amounts when provided plus any open offer total.
+ */
+export function computeLendApprovalAmountRaw(
+  usdcAmountRaw,
+  { perFillUsdcRawList = null, existingOpenSumRaw = 0n } = {}
+) {
+  const orderUsdcRaw = BigInt(usdcAmountRaw);
+  const existingSum = BigInt(existingOpenSumRaw ?? 0n);
+  if (orderUsdcRaw <= 0n || existingSum < 0n) {
+    throw new Error('Lend USDC raw amount must be positive.');
+  }
+  const plannedFillsSum = sumRawBigints(perFillUsdcRawList);
+  const orderRequirement = plannedFillsSum > orderUsdcRaw ? plannedFillsSum : orderUsdcRaw;
+  return {
+    orderUsdcRaw,
+    plannedFillsSum,
+    existingOpenSumRaw: existingSum,
+    requiredApprovalRaw: existingSum + orderRequirement,
+  };
+}
+
+export function resolveExactLendAmounts(
+  quote,
+  {
+    minFillRaw = null,
+    perFillUsdcRawList = null,
+    existingOpenSumRaw = 0n,
+  } = {}
+) {
+  if (!quote?.amounts?.principal?.raw) {
+    throw new Error('Quote response is missing exact raw principal amount.');
+  }
+  const principalRaw = BigInt(quote.amounts.principal.raw);
+  if (principalRaw <= 0n) {
+    throw new Error('Lend principal raw amount must be positive.');
+  }
+  const effectiveMinFill = BigInt(minFillRaw ?? principalRaw);
+  const approvalSizing = computeLendApprovalAmountRaw(principalRaw, {
+    perFillUsdcRawList,
+    existingOpenSumRaw,
+  });
+  return {
+    principalRaw,
+    minFillRaw: effectiveMinFill,
+    plannedFillsSum: approvalSizing.plannedFillsSum,
+    existingOpenSumRaw: approvalSizing.existingOpenSumRaw,
+    requiredApprovalRaw: approvalSizing.requiredApprovalRaw,
+    originationFeeRaw: BigInt(quote.amounts.origination_fee?.raw ?? 0n),
+    netProceedsRaw: BigInt(quote.amounts.net_proceeds?.raw ?? 0n),
+    interestMaturityRaw: BigInt(quote.amounts.interest_maturity?.raw ?? 0n),
+    protocolInterestCutRaw: BigInt(quote.amounts.protocol_interest_cut?.raw ?? 0n),
+    lenderNetInterestRaw: BigInt(quote.amounts.lender_net_interest?.raw ?? 0n),
+    totalRepaymentAtMaturityRaw: BigInt(quote.amounts.total_repayment_at_maturity?.raw ?? 0n),
+  };
+}
+
+async function readEligibilitySummary(publicClient, cfg, wallet, cleanAtt) {
+  if (!cfg.contracts.eligibilityGate) return null;
+  const gateAddr = getAddress(cfg.contracts.eligibilityGate);
+  const [permissionlessMode, isRevoked, allowlisted, isEligible] = await Promise.all([
+    publicClient.readContract({ address: gateAddr, abi: eligibilityGateAbi, functionName: 'permissionlessMode' }),
+    publicClient.readContract({ address: gateAddr, abi: eligibilityGateAbi, functionName: 'isRevoked', args: [wallet] }),
+    publicClient.readContract({ address: gateAddr, abi: eligibilityGateAbi, functionName: 'allowlist', args: [wallet] }),
+    publicClient.readContract({
+      address: gateAddr,
+      abi: eligibilityGateAbi,
+      functionName: 'isEligible',
+      args: [wallet, cleanAtt],
+    }),
+  ]);
+  return {
+    permissionlessMode: Boolean(permissionlessMode),
+    isRevoked: Boolean(isRevoked),
+    allowlisted: Boolean(allowlisted),
+    isEligible: Boolean(isEligible),
+  };
+}
+
+async function approveErc20Exact({
+  address,
+  tokenAddress,
+  spenderAddress,
+  tokenLabel,
+  requiredRaw,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  const required = BigInt(requiredRaw);
+  if (required <= 0n) {
+    throw new Error(`Required ${tokenLabel} raw amount must be positive.`);
+  }
+  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
+  const token = getAddress(tokenAddress);
+  const spender = getAddress(spenderAddress);
+
+  const currentAllowance = BigInt(
+    await publicClient.readContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: 'allowance',
+      args: [wallet, spender],
+    })
+  );
+  if (currentAllowance >= required) {
+    return {
+      approved: true,
+      alreadyApproved: true,
+      txHash: null,
+      allowanceRaw: currentAllowance.toString(),
+    };
+  }
+
+  const data = encodeFunctionData({
+    abi: erc20Abi,
+    functionName: 'approve',
+    args: [spender, required],
+  });
+  const { txHash } = await sendWalletTransaction(provider, publicClient, {
+    from: wallet,
+    to: token,
+    data,
+  });
+
+  const postAllowance = BigInt(
+    await publicClient.readContract({
+      address: token,
+      abi: erc20Abi,
+      functionName: 'allowance',
+      args: [wallet, spender],
+    })
+  );
+  if (postAllowance < required) {
+    throw new Error(
+      `Post-approval allowance check failed; allowance still below required ${tokenLabel}.`
+    );
+  }
+
+  return {
+    approved: true,
+    alreadyApproved: false,
+    txHash,
+    allowanceRaw: postAllowance.toString(),
+  };
+}
+
+export async function readLendAllowanceAndNonce(
+  address,
+  {
+    cfg = getFrontendConfig(),
+    publicClient = createProtocolPublicClient(cfg),
+    attestationHex = '0x',
+  } = {}
+) {
+  if (!address || !isAddress(address)) {
+    throw new Error('Valid wallet address required.');
+  }
+  if (!cfg.contracts.loanCore || !cfg.contracts.orderSettlement || !cfg.usdcAddress) {
+    throw new Error('Missing USDC, LoanCore, or OrderSettlement address in configuration.');
+  }
+  const wallet = getAddress(address);
+  const usdcAddr = getAddress(cfg.usdcAddress);
+  const loanCoreAddr = getAddress(cfg.contracts.loanCore);
+  const cleanAtt = normalizeAttestationHex(attestationHex);
+
+  const [bal, allowance, dec, sym, nonce, eligibility] = await Promise.all([
+    publicClient.readContract({ address: usdcAddr, abi: erc20Abi, functionName: 'balanceOf', args: [wallet] }),
+    publicClient.readContract({
+      address: usdcAddr,
+      abi: erc20Abi,
+      functionName: 'allowance',
+      args: [wallet, loanCoreAddr],
+    }),
+    publicClient.readContract({ address: usdcAddr, abi: erc20Abi, functionName: 'decimals' }),
+    publicClient.readContract({ address: usdcAddr, abi: erc20Abi, functionName: 'symbol' }),
+    publicClient.readContract({
+      address: getAddress(cfg.contracts.orderSettlement),
+      abi: orderSettlementAbi,
+      functionName: 'getMakerNonce',
+      args: [wallet],
+    }),
+    readEligibilitySummary(publicClient, cfg, wallet, cleanAtt),
+  ]);
+
+  const decimals = Number(dec);
+  return {
+    token: usdcAddr,
+    spender: loanCoreAddr,
+    symbol: sym,
+    decimals,
+    balanceRaw: BigInt(bal).toString(),
+    balanceFormatted: formatTokenUnitsDisplay(bal, decimals, 2),
+    allowanceRaw: BigInt(allowance).toString(),
+    allowanceFormatted: formatTokenUnitsDisplay(allowance, decimals, 2),
+    makerNonce: BigInt(nonce).toString(),
+    eligibility,
+  };
+}
+
+export async function approveUsdcForLend({
+  address,
+  requiredUsdcRaw,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!cfg.usdcAddress || !cfg.contracts.loanCore) {
+    throw new Error('USDC or LoanCore contract address is not configured.');
+  }
+  return approveErc20Exact({
+    address,
+    tokenAddress: cfg.usdcAddress,
+    spenderAddress: cfg.contracts.loanCore,
+    tokenLabel: 'USDC',
+    requiredRaw: requiredUsdcRaw,
+    provider,
+    cfg,
+    publicClient,
+  });
+}
+
 function normalizeAttestationHex(raw) {
   return typeof raw === 'string' && /^0x([0-9a-fA-F]{2})*$/.test(raw.trim()) ? raw.trim() : '0x';
 }
@@ -977,7 +1218,7 @@ export async function readBorrowAllowanceAndNonce(
   const token = getAddress(collateralToken);
   const cleanAtt = normalizeAttestationHex(attestationHex);
 
-  const [bal, allowance, dec, sym, nonce] = await Promise.all([
+  const [bal, allowance, dec, sym, nonce, eligibility] = await Promise.all([
     publicClient.readContract({ address: token, abi: erc20Abi, functionName: 'balanceOf', args: [wallet] }),
     publicClient.readContract({
       address: token,
@@ -993,29 +1234,8 @@ export async function readBorrowAllowanceAndNonce(
       functionName: 'getMakerNonce',
       args: [wallet],
     }),
+    readEligibilitySummary(publicClient, cfg, wallet, cleanAtt),
   ]);
-
-  let eligibility = null;
-  if (cfg.contracts.eligibilityGate) {
-    const gateAddr = getAddress(cfg.contracts.eligibilityGate);
-    const [permissionlessMode, isRevoked, allowlisted, isEligible] = await Promise.all([
-      publicClient.readContract({ address: gateAddr, abi: eligibilityGateAbi, functionName: 'permissionlessMode' }),
-      publicClient.readContract({ address: gateAddr, abi: eligibilityGateAbi, functionName: 'isRevoked', args: [wallet] }),
-      publicClient.readContract({ address: gateAddr, abi: eligibilityGateAbi, functionName: 'allowlist', args: [wallet] }),
-      publicClient.readContract({
-        address: gateAddr,
-        abi: eligibilityGateAbi,
-        functionName: 'isEligible',
-        args: [wallet, cleanAtt],
-      }),
-    ]);
-    eligibility = {
-      permissionlessMode: Boolean(permissionlessMode),
-      isRevoked: Boolean(isRevoked),
-      allowlisted: Boolean(allowlisted),
-      isEligible: Boolean(isEligible),
-    };
-  }
 
   const decimals = Number(dec);
   return {
@@ -1050,56 +1270,16 @@ export async function approveCollateralForBorrow({
     throw new Error('Required collateral raw amount must be positive.');
   }
 
-  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
-  const token = getAddress(collateralToken);
-  const escrow = getAddress(cfg.contracts.collateralEscrow);
-
-  const currentAllowance = BigInt(
-    await publicClient.readContract({
-      address: token,
-      abi: erc20Abi,
-      functionName: 'allowance',
-      args: [wallet, escrow],
-    })
-  );
-  if (currentAllowance >= required) {
-    return {
-      approved: true,
-      alreadyApproved: true,
-      txHash: null,
-      allowanceRaw: currentAllowance.toString(),
-    };
-  }
-
-  const data = encodeFunctionData({
-    abi: erc20Abi,
-    functionName: 'approve',
-    args: [escrow, required],
+  return approveErc20Exact({
+    address,
+    tokenAddress: collateralToken,
+    spenderAddress: cfg.contracts.collateralEscrow,
+    tokenLabel: 'collateral',
+    requiredRaw: requiredCollateralRaw,
+    provider,
+    cfg,
+    publicClient,
   });
-  const { txHash } = await sendWalletTransaction(provider, publicClient, {
-    from: wallet,
-    to: token,
-    data,
-  });
-
-  const postAllowance = BigInt(
-    await publicClient.readContract({
-      address: token,
-      abi: erc20Abi,
-      functionName: 'allowance',
-      args: [wallet, escrow],
-    })
-  );
-  if (postAllowance < required) {
-    throw new Error('Post-approval allowance check failed; allowance still below required collateral.');
-  }
-
-  return {
-    approved: true,
-    alreadyApproved: false,
-    txHash,
-    allowanceRaw: postAllowance.toString(),
-  };
 }
 
 export function normalizeBorrowOrderStruct(order) {
@@ -1186,11 +1366,11 @@ function resolveStorage(explicitStorage) {
   return null;
 }
 
-export function loadPersistedSignedOrders(storage = null) {
+function loadPersistedOrderList(storageKey, storage = null) {
   const store = resolveStorage(storage);
   if (!store) return [];
   try {
-    const raw = store.getItem(SIGNED_BORROW_ORDERS_STORAGE_KEY);
+    const raw = store.getItem(storageKey);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
@@ -1199,9 +1379,9 @@ export function loadPersistedSignedOrders(storage = null) {
   }
 }
 
-export function saveSignedBorrowOrder(record, storage = null) {
+function savePersistedOrderRecord(storageKey, record, storage = null) {
   const store = resolveStorage(storage);
-  const existing = store ? loadPersistedSignedOrders(store) : [];
+  const existing = store ? loadPersistedOrderList(storageKey, store) : [];
   const hashLower = String(record?.orderHash ?? '').toLowerCase();
   const nextRecord = {
     ...record,
@@ -1212,12 +1392,77 @@ export function saveSignedBorrowOrder(record, storage = null) {
   const nextList = [nextRecord, ...filtered].slice(0, 50);
   if (store) {
     try {
-      store.setItem(SIGNED_BORROW_ORDERS_STORAGE_KEY, JSON.stringify(nextList));
+      store.setItem(storageKey, JSON.stringify(nextList));
     } catch {
       // ignore quota/private-mode storage errors
     }
   }
   return nextList;
+}
+
+export function loadPersistedSignedOrders(storage = null) {
+  return loadPersistedOrderList(SIGNED_BORROW_ORDERS_STORAGE_KEY, storage);
+}
+
+export function saveSignedBorrowOrder(record, storage = null) {
+  return savePersistedOrderRecord(SIGNED_BORROW_ORDERS_STORAGE_KEY, record, storage);
+}
+
+export function loadPersistedSignedLendOffers(storage = null) {
+  return loadPersistedOrderList(SIGNED_LEND_OFFERS_STORAGE_KEY, storage);
+}
+
+export function saveSignedLendOffer(record, storage = null) {
+  return savePersistedOrderRecord(SIGNED_LEND_OFFERS_STORAGE_KEY, record, storage);
+}
+
+export function buildLendOfferTypedData({ offer, cfg = getFrontendConfig() }) {
+  if (!cfg?.contracts?.orderSettlement) {
+    throw new Error('OrderSettlement contract address is not configured.');
+  }
+  const message = normalizeLendOfferStruct(offer);
+  return {
+    domain: {
+      name: ORDER_SETTLEMENT_DOMAIN_NAME,
+      version: ORDER_SETTLEMENT_DOMAIN_VERSION,
+      chainId: Number(cfg.chainId || BASE_CHAIN_ID),
+      verifyingContract: getAddress(cfg.contracts.orderSettlement),
+    },
+    types: LEND_OFFER_EIP712_TYPES,
+    primaryType: 'LendOffer',
+    message,
+  };
+}
+
+export function parseLendOfferFromJson(rawInput) {
+  let parsed = rawInput;
+  if (typeof rawInput === 'string') {
+    const trimmed = rawInput.trim();
+    if (!trimmed) {
+      throw new Error('Paste LendOffer JSON first.');
+    }
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      throw new Error('Invalid JSON format in LendOffer payload.');
+    }
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('LendOffer payload must be a JSON object.');
+  }
+  const rawOrder = parsed.order ?? parsed.signed_order ?? parsed;
+  const normalized = normalizeLendOfferStruct(rawOrder);
+  return {
+    order: normalized,
+    offerJson: lendOfferToJson(normalized),
+    signature: typeof parsed.signature === 'string' ? parsed.signature : null,
+    orderHash:
+      typeof parsed.orderHash === 'string'
+        ? parsed.orderHash
+        : typeof parsed.order_hash === 'string'
+          ? parsed.order_hash
+          : null,
+  };
 }
 
 export function normalizeLendOfferStruct(offer) {
@@ -2009,13 +2254,7 @@ export async function verifyAndPreviewLendOfferFill({
       simulationVerified = true;
     } catch (simErr) {
       const decoded = decodeContractRevert(simErr);
-      const isExpectedPreApprovalAllowanceErr =
-        needsApproval &&
-        ((decoded?.errorName === 'ERC20InsufficientAllowance' &&
-          (!decoded.args?.[0] || String(decoded.args[0]).toLowerCase() === escrowAddr.toLowerCase())) ||
-          (!decoded && /InsufficientAllowance/i.test(String(simErr?.message ?? ''))));
-
-      if (!isExpectedPreApprovalAllowanceErr) {
+      if (!needsApproval || !isExpectedPreApprovalError(simErr, escrowAddr)) {
         throw new Error(decoded ? decoded.message : formatWeb3Error(simErr));
       }
       // In OrderSettlement + LoanCore.openLoan, all order/oracle/cap/LTV validations execute BEFORE
@@ -2162,23 +2401,7 @@ export async function fillLendOfferAsBorrower({
     data: preview.fillCallData,
   });
 
-  let loanId = null;
-  for (const log of receipt.logs ?? []) {
-    if (log.address?.toLowerCase() !== settlementAddr.toLowerCase()) continue;
-    try {
-      const decoded = decodeEventLog({
-        abi: orderSettlementAbi,
-        data: log.data,
-        topics: log.topics,
-      });
-      if (decoded.eventName === 'OrderFilled' && decoded.args?.loanId !== undefined) {
-        loanId = decoded.args.loanId.toString();
-        break;
-      }
-    } catch {
-      // ignore non-matching logs
-    }
-  }
+  const loanId = decodeOrderFilledLoanId(receipt, settlementAddr);
 
   return {
     txHash,
@@ -2190,5 +2413,850 @@ export async function fillLendOfferAsBorrower({
     preview,
     collateralAmountRaw: preview.exact.collateralAmountRaw.toString(),
     fillUsdcRaw: preview.fillAmountRaw,
+  };
+}
+
+function decodeOrderFilledLoanId(receipt, settlementAddr) {
+  for (const log of receipt?.logs ?? []) {
+    if (log.address?.toLowerCase() !== settlementAddr.toLowerCase()) continue;
+    try {
+      const decoded = decodeEventLog({
+        abi: orderSettlementAbi,
+        data: log.data,
+        topics: log.topics,
+      });
+      if (decoded.eventName === 'OrderFilled' && decoded.args?.loanId !== undefined) {
+        return decoded.args.loanId.toString();
+      }
+    } catch {
+      // ignore non-matching logs
+    }
+  }
+  return null;
+}
+
+function isExpectedPreApprovalError(simErr, expectedSpender) {
+  const decoded = decodeContractRevert(simErr);
+  const rawText = [simErr?.details, simErr?.shortMessage, simErr?.message]
+    .filter((v) => typeof v === 'string')
+    .join(' ');
+  return Boolean(
+    (decoded?.errorName === 'ERC20InsufficientAllowance' &&
+      (!decoded.args?.[0] || String(decoded.args[0]).toLowerCase() === expectedSpender.toLowerCase())) ||
+      (!decoded && /(InsufficientAllowance|transfer amount exceeds allowance)/i.test(rawText))
+  );
+}
+
+export async function refreshSignedLendOffersState({
+  offers,
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!Array.isArray(offers) || offers.length === 0) return [];
+  if (!cfg?.contracts?.orderSettlement) return offers;
+  const settlementAddr = getAddress(cfg.contracts.orderSettlement);
+  const blk = await publicClient.getBlock({ blockTag: 'latest' });
+
+  return Promise.all(
+    offers.map(async (item) => {
+      try {
+        const offerObj = item.offerJson ?? item.orderJson ?? item.order;
+        const normalized = normalizeLendOfferStruct(offerObj);
+        const computedHash = await publicClient.readContract({
+          address: settlementAddr,
+          abi: orderSettlementAbi,
+          functionName: 'hashLendOffer',
+          args: [normalized],
+        });
+        const [cancelled, filledRaw, currentMakerNonce] = await Promise.all([
+          publicClient.readContract({
+            address: settlementAddr,
+            abi: orderSettlementAbi,
+            functionName: 'isOrderCancelled',
+            args: [computedHash],
+          }),
+          publicClient.readContract({
+            address: settlementAddr,
+            abi: orderSettlementAbi,
+            functionName: 'getOrderFilledAmount',
+            args: [computedHash],
+          }),
+          publicClient.readContract({
+            address: settlementAddr,
+            abi: orderSettlementAbi,
+            functionName: 'getMakerNonce',
+            args: [normalized.lender],
+          }),
+        ]);
+
+        const totalUsdc = normalized.usdcAmount;
+        const filled = BigInt(filledRaw);
+        const remaining = totalUsdc > filled ? totalUsdc - filled : 0n;
+        const expired = normalized.expiry <= blk.timestamp;
+        const nonceBumped = BigInt(currentMakerNonce) !== normalized.nonce;
+        const onchainStatus = cancelled
+          ? 'cancelled'
+          : nonceBumped
+            ? 'nonce_bumped'
+            : remaining === 0n
+              ? 'filled'
+              : expired
+                ? 'expired'
+                : filled > 0n
+                  ? 'partially_filled'
+                  : 'open';
+
+        return {
+          ...item,
+          orderHash: computedHash,
+          offerJson: lendOfferToJson(normalized),
+          filledRaw: filled.toString(),
+          remainingRaw: remaining.toString(),
+          cancelled: Boolean(cancelled),
+          expired,
+          nonceBumped,
+          currentMakerNonce: BigInt(currentMakerNonce).toString(),
+          onchainStatus,
+        };
+      } catch (err) {
+        return {
+          ...item,
+          onchainStatus: 'unknown',
+          stateError: formatWeb3Error(err),
+        };
+      }
+    })
+  );
+}
+
+/**
+ * Computes exact pro-rata collateral required on-chain for a partial/full BorrowOrder fill
+ * (`ceil(collateralAmount * fillUsdc / minUsdc)` matching OrderSettlement.sol).
+ */
+export function computeBorrowCollateralForFill(collateralAmountRaw, totalUsdcRaw, fillUsdcRaw) {
+  const collateral = BigInt(collateralAmountRaw);
+  const total = BigInt(totalUsdcRaw);
+  const fill = BigInt(fillUsdcRaw);
+  if (collateral <= 0n || total <= 0n || fill <= 0n) {
+    throw new Error('Collateral, principal, and fill raw amounts must be positive.');
+  }
+  return (collateral * fill + (total - 1n)) / total;
+}
+
+async function resolveQuoteAssetForLendOffer({
+  allowedCollateral,
+  quoteAsset = null,
+  cfg = getFrontendConfig(),
+  fetchImpl = globalThis.fetch,
+}) {
+  if (allowedCollateral && allowedCollateral !== zeroAddress) {
+    return getAddress(allowedCollateral);
+  }
+  if (quoteAsset && isAddress(quoteAsset) && quoteAsset !== zeroAddress) {
+    return getAddress(quoteAsset);
+  }
+  if (!cfg?.apiUrl || typeof fetchImpl !== 'function') {
+    throw new Error('Configure VITE_API_URL or provide an active registered collateral asset.');
+  }
+  const assetsRes = await fetchJsonStrict(`${cfg.apiUrl}/assets`, { method: 'GET' }, 8000, fetchImpl);
+  const rows = Array.isArray(assetsRes?.data) ? assetsRes.data : [];
+  const active = rows.find((a) => Number(a?.status) === 0 && isAddress(a?.token));
+  const fallback = rows.find((a) => isAddress(a?.token));
+  const chosen = active ?? fallback;
+  if (!chosen) {
+    throw new Error('No registered collateral assets returned by api/ /assets.');
+  }
+  return getAddress(chosen.token);
+}
+
+export async function prepareAndSignLendOffer({
+  address,
+  principalRaw,
+  allowedCollateral = zeroAddress,
+  quoteAsset = null,
+  expectedQuote = null,
+  minRateBps,
+  termDays,
+  maxLtvBps = 6000,
+  minFillRaw = null,
+  expiryDays = 2,
+  expiryTimestamp = null,
+  yieldMode = 0,
+  perFillUsdcRawList = null,
+  existingOpenUsdcSumRaw = 0n,
+  attestationHex = '0x',
+  autoApprove = true,
+  publishToApi = true,
+  fetchImpl = globalThis.fetch,
+  storage = null,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!cfg.contracts.orderSettlement || !cfg.contracts.loanCore || !cfg.usdcAddress) {
+    throw new Error('OrderSettlement, LoanCore, or USDC address is not configured.');
+  }
+  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
+  const normalizedAllowed =
+    allowedCollateral && allowedCollateral !== zeroAddress ? getAddress(allowedCollateral) : zeroAddress;
+  const walletMeta = await readLendAllowanceAndNonce(wallet, {
+    cfg,
+    publicClient,
+    attestationHex,
+  });
+  if (walletMeta.eligibility && !walletMeta.eligibility.isEligible) {
+    throw new Error(
+      'IneligibleCounterparty: Connected wallet is not eligible on-chain in EligibilityGate.'
+    );
+  }
+
+  const assetForQuote = await resolveQuoteAssetForLendOffer({
+    allowedCollateral: normalizedAllowed,
+    quoteAsset,
+    cfg,
+    fetchImpl,
+  });
+
+  const quote = await fetchLoanQuote({
+    cfg,
+    asset: assetForQuote,
+    principalRaw: BigInt(principalRaw).toString(),
+    termDays: Number(termDays),
+    aprBps: Number(minRateBps),
+    maxLtvBps: maxLtvBps !== null && maxLtvBps !== undefined ? Number(maxLtvBps) : undefined,
+    lender: wallet,
+    lenderAttestation: attestationHex,
+  });
+
+  const minFillBig = BigInt(minFillRaw ?? quote?.amounts?.principal?.raw ?? principalRaw);
+  const perLoanCapRaw = BigInt(quote?.caps?.per_loan_cap?.raw ?? 0n);
+  const blockingRejections = (quote.rejection_reasons ?? []).filter((r) => {
+    if (
+      r.code === 'PER_LOAN_CAP_EXCEEDED' &&
+      minFillBig >= 500_000_000n &&
+      minFillBig < BigInt(quote?.amounts?.principal?.raw ?? 0n) &&
+      (perLoanCapRaw === 0n || minFillBig <= perLoanCapRaw)
+    ) {
+      return false;
+    }
+    if (r.code === 'LTV_EXCEEDED' && quote?.amounts?.collateral_required?.raw === '0') {
+      return false;
+    }
+    return true;
+  });
+  if (!quote.accepted && blockingRejections.length > 0) {
+    const reasons = blockingRejections.map((r) => `${r.code}: ${r.message}`).join('; ');
+    throw new Error(`Quote rejected by on-chain protocol rules: ${reasons}`);
+  }
+  assertExpectedQuoteUnchanged(expectedQuote, quote);
+
+  const exact = resolveExactLendAmounts(quote, {
+    minFillRaw: minFillBig,
+    perFillUsdcRawList,
+    existingOpenSumRaw: existingOpenUsdcSumRaw ?? 0n,
+  });
+  if (minFillBig < 500_000_000n) {
+    throw new Error('Minimum fill cannot be below $500.00 (500000000 raw USDC).');
+  }
+  if (minFillBig > exact.principalRaw) {
+    throw new Error('Minimum fill cannot exceed offered USDC principal.');
+  }
+
+  if (BigInt(walletMeta.balanceRaw) < exact.requiredApprovalRaw) {
+    throw new Error(
+      `Insufficient ${walletMeta.symbol} balance: have ${walletMeta.balanceRaw} raw units, need ${exact.requiredApprovalRaw.toString()} raw units (covering offer/partial fills${exact.existingOpenSumRaw > 0n ? ' plus existing open offers' : ''}).`
+    );
+  }
+
+  let approvalTxHash = null;
+  if (BigInt(walletMeta.allowanceRaw) < exact.requiredApprovalRaw) {
+    if (!autoApprove) {
+      throw new Error(
+        `LoanCore USDC allowance is below required ${exact.requiredApprovalRaw.toString()} raw units; approve USDC to LoanCore first.`
+      );
+    }
+    const appRes = await approveUsdcForLend({
+      address: wallet,
+      requiredUsdcRaw: exact.requiredApprovalRaw,
+      provider,
+      cfg,
+      publicClient,
+    });
+    approvalTxHash = appRes.txHash;
+  }
+
+  let expiryBig;
+  if (expiryTimestamp !== null && expiryTimestamp !== undefined) {
+    expiryBig = BigInt(expiryTimestamp);
+  } else {
+    const expDaysInt = Number(expiryDays);
+    if (!Number.isInteger(expDaysInt) || expDaysInt < 1 || expDaysInt > 30) {
+      throw new Error('Order expiry must be between 1 and 30 days.');
+    }
+    const blk = await publicClient.getBlock();
+    expiryBig = blk.timestamp + BigInt(expDaysInt) * 86_400n;
+  }
+
+  const effectiveLtv = Number(quote.asset?.allowed_ltv_bps ?? maxLtvBps ?? 6000);
+  const offer = normalizeLendOfferStruct({
+    lender: wallet,
+    usdcAmount: exact.principalRaw,
+    minRateBps: Number(minRateBps),
+    termDays: Number(termDays),
+    allowedCollateral: normalizedAllowed,
+    maxLtvBps: effectiveLtv,
+    minFill: minFillBig,
+    expiry: expiryBig,
+    nonce: BigInt(walletMeta.makerNonce),
+    yieldMode: Number(yieldMode ?? 0),
+  });
+
+  const typedData = buildLendOfferTypedData({ offer, cfg });
+  const signature = await provider.request({
+    method: 'eth_signTypedData_v4',
+    params: [wallet, serializeTypedDataForRpc(typedData)],
+  });
+  if (typeof signature !== 'string' || !/^0x[0-9a-fA-F]+$/.test(signature)) {
+    throw new Error('Wallet returned an invalid EIP-712 signature.');
+  }
+
+  await assertActiveWalletAndChain(provider, wallet, cfg.chainId);
+
+  const orderHash = await publicClient.readContract({
+    address: getAddress(cfg.contracts.orderSettlement),
+    abi: orderSettlementAbi,
+    functionName: 'hashLendOffer',
+    args: [offer],
+  });
+  const recovered = await recoverAddress({ hash: orderHash, signature });
+  if (recovered.toLowerCase() !== wallet.toLowerCase()) {
+    throw new Error(`Signature signer mismatch: recovered ${recovered}, expected ${wallet}.`);
+  }
+
+  const offerJson = lendOfferToJson(offer);
+  const exactAmounts = {
+    principalRaw: exact.principalRaw.toString(),
+    minFillRaw: exact.minFillRaw.toString(),
+    plannedFillsSumRaw: exact.plannedFillsSum.toString(),
+    existingOpenSumRaw: exact.existingOpenSumRaw.toString(),
+    requiredApprovalRaw: exact.requiredApprovalRaw.toString(),
+    originationFeeRaw: exact.originationFeeRaw.toString(),
+    netProceedsRaw: exact.netProceedsRaw.toString(),
+    interestMaturityRaw: exact.interestMaturityRaw.toString(),
+    protocolInterestCutRaw: exact.protocolInterestCutRaw.toString(),
+    lenderNetInterestRaw: exact.lenderNetInterestRaw.toString(),
+    totalRepaymentAtMaturityRaw: exact.totalRepaymentAtMaturityRaw.toString(),
+  };
+
+  let publishedToApi = false;
+  let publishError = '';
+  let apiOrder = null;
+  if (publishToApi && cfg.apiUrl) {
+    try {
+      apiOrder = await publishSignedOrderToApi({
+        orderType: 'lend',
+        order: offer,
+        signature,
+        cfg,
+        fetchImpl,
+      });
+      publishedToApi = true;
+    } catch (err) {
+      publishError = formatWeb3Error(err);
+    }
+  }
+
+  saveSignedLendOffer(
+    {
+      orderHash,
+      offerJson,
+      signature,
+      approvalTxHash,
+      cancelledTxHash: null,
+      createdAt: new Date().toISOString(),
+      publishedToApi,
+      publishError,
+      exactAmounts,
+    },
+    storage
+  );
+
+  return {
+    quote,
+    offer,
+    offerJson,
+    orderHash,
+    signature: /** @type {`0x${string}`} */ (signature),
+    approvalTxHash,
+    publishedToApi,
+    publishError,
+    apiOrder,
+    exactAmounts,
+  };
+}
+
+export async function cancelSignedLendOffer({
+  address,
+  offer,
+  storage = null,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!cfg.contracts.orderSettlement) {
+    throw new Error('OrderSettlement contract address is not configured.');
+  }
+  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
+  const normalized = normalizeLendOfferStruct(offer);
+  if (normalized.lender.toLowerCase() !== wallet.toLowerCase()) {
+    throw new Error('Only the lend offer maker can cancel this offer.');
+  }
+  const settlementAddr = getAddress(cfg.contracts.orderSettlement);
+  const orderHash = await publicClient.readContract({
+    address: settlementAddr,
+    abi: orderSettlementAbi,
+    functionName: 'hashLendOffer',
+    args: [normalized],
+  });
+  const data = encodeFunctionData({
+    abi: orderSettlementAbi,
+    functionName: 'cancelLendOffer',
+    args: [normalized],
+  });
+  const { txHash, receipt } = await sendWalletTransaction(provider, publicClient, {
+    from: wallet,
+    to: settlementAddr,
+    data,
+  });
+
+  const existing = loadPersistedSignedLendOffers(storage).find(
+    (item) => String(item?.orderHash ?? '').toLowerCase() === orderHash.toLowerCase()
+  );
+  if (existing) {
+    saveSignedLendOffer(
+      {
+        ...existing,
+        cancelledTxHash: txHash,
+        cancelled: true,
+        onchainStatus: 'cancelled',
+      },
+      storage
+    );
+  }
+
+  return { txHash, receipt, orderHash };
+}
+
+/**
+ * Full pre-approval verification and eth_call simulation for filling a BorrowOrder as lender.
+ * Catches expired, cancelled, wrong-nonce, invalid-sig, exceeded, minFill, borrower collateral
+ * funding, eligibility, and LTV reverts BEFORE asking the lender for an ERC-20 approve transaction.
+ */
+export async function verifyAndPreviewBorrowOrderFill({
+  order,
+  signature,
+  fillUsdcRaw = null,
+  lenderAddress = null,
+  borrowerAttestation = '0x',
+  lenderAttestation = '0x',
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (
+    !cfg?.contracts?.orderSettlement ||
+    !cfg?.contracts?.collateralEscrow ||
+    !cfg?.contracts?.loanCore ||
+    !cfg?.usdcAddress
+  ) {
+    throw new Error('OrderSettlement, CollateralEscrow, LoanCore, or USDC address is not configured.');
+  }
+  if (typeof signature !== 'string' || !/^0x[0-9a-fA-F]{130,}$/.test(signature.trim())) {
+    throw new Error('InvalidSignature: BorrowOrder signature must be a valid 0x-prefixed hex signature.');
+  }
+
+  const normalizedOrder = normalizeBorrowOrderStruct(order);
+  const sigHex = /** @type {`0x${string}`} */ (signature.trim());
+  const settlementAddr = getAddress(cfg.contracts.orderSettlement);
+  const loanCoreAddr = getAddress(cfg.contracts.loanCore);
+  const escrowAddr = getAddress(cfg.contracts.collateralEscrow);
+  const usdcAddr = getAddress(cfg.usdcAddress);
+  const cleanBorrowerAtt = normalizeAttestationHex(borrowerAttestation);
+  const cleanLenderAtt = normalizeAttestationHex(lenderAttestation);
+
+  const [blk, orderHash] = await Promise.all([
+    publicClient.getBlock({ blockTag: 'latest' }),
+    publicClient.readContract({
+      address: settlementAddr,
+      abi: orderSettlementAbi,
+      functionName: 'hashBorrowOrder',
+      args: [normalizedOrder],
+    }),
+  ]);
+
+  let recovered;
+  try {
+    recovered = await recoverAddress({ hash: orderHash, signature: sigHex });
+  } catch {
+    throw new Error('InvalidSignature: Malformed EIP-712 BorrowOrder signature.');
+  }
+  if (recovered.toLowerCase() !== normalizedOrder.borrower.toLowerCase()) {
+    throw new Error(
+      `InvalidSignature: Signature recovered ${recovered}, expected borrower ${normalizedOrder.borrower}.`
+    );
+  }
+
+  if (normalizedOrder.expiry <= blk.timestamp) {
+    throw new Error('OrderExpired: This BorrowOrder has already expired on-chain.');
+  }
+
+  const [cancelled, makerNonce, filledRaw, borrowerCollBalance, borrowerCollAllowance] =
+    await Promise.all([
+      publicClient.readContract({
+        address: settlementAddr,
+        abi: orderSettlementAbi,
+        functionName: 'isOrderCancelled',
+        args: [orderHash],
+      }),
+      publicClient.readContract({
+        address: settlementAddr,
+        abi: orderSettlementAbi,
+        functionName: 'getMakerNonce',
+        args: [normalizedOrder.borrower],
+      }),
+      publicClient.readContract({
+        address: settlementAddr,
+        abi: orderSettlementAbi,
+        functionName: 'getOrderFilledAmount',
+        args: [orderHash],
+      }),
+      publicClient.readContract({
+        address: normalizedOrder.collateralToken,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [normalizedOrder.borrower],
+      }),
+      publicClient.readContract({
+        address: normalizedOrder.collateralToken,
+        abi: erc20Abi,
+        functionName: 'allowance',
+        args: [normalizedOrder.borrower, escrowAddr],
+      }),
+    ]);
+
+  if (cancelled) {
+    throw new Error('OrderCancelledAlready: This BorrowOrder was cancelled on-chain.');
+  }
+  if (BigInt(makerNonce) !== normalizedOrder.nonce) {
+    throw new Error(
+      `InvalidNonce: BorrowOrder nonce (${normalizedOrder.nonce}) no longer matches borrower maker nonce (${makerNonce}).`
+    );
+  }
+
+  const filledBig = BigInt(filledRaw);
+  const remainingBig =
+    normalizedOrder.minUsdc > filledBig ? normalizedOrder.minUsdc - filledBig : 0n;
+  if (remainingBig <= 0n) {
+    throw new Error('OrderExceeded: BorrowOrder is already completely filled.');
+  }
+
+  const fillUsdcBig =
+    fillUsdcRaw !== null && fillUsdcRaw !== undefined && String(fillUsdcRaw).trim() !== ''
+      ? BigInt(fillUsdcRaw)
+      : remainingBig;
+  if (fillUsdcBig <= 0n) {
+    throw new Error('Fill amount must be greater than zero.');
+  }
+  if (fillUsdcBig > remainingBig) {
+    throw new Error(
+      `OrderExceeded: Requested fill (${fillUsdcBig.toString()} raw) exceeds remaining capacity (${remainingBig.toString()} raw).`
+    );
+  }
+  if (fillUsdcBig < normalizedOrder.minFill && fillUsdcBig !== remainingBig) {
+    throw new Error(
+      `FillAmountTooLow: Requested fill (${fillUsdcBig.toString()} raw) is below minFill (${normalizedOrder.minFill.toString()} raw).`
+    );
+  }
+
+  const collateralForFillBig = computeBorrowCollateralForFill(
+    normalizedOrder.collateralAmount,
+    normalizedOrder.minUsdc,
+    fillUsdcBig
+  );
+
+  if (BigInt(borrowerCollBalance) < collateralForFillBig) {
+    throw new Error(
+      `ERC20InsufficientBalance: Borrower collateral balance (${borrowerCollBalance}) is below pro-rata collateral required (${collateralForFillBig}).`
+    );
+  }
+  if (BigInt(borrowerCollAllowance) < collateralForFillBig) {
+    throw new Error(
+      `ERC20InsufficientAllowance: Borrower CollateralEscrow allowance (${borrowerCollAllowance}) is below pro-rata collateral required (${collateralForFillBig}).`
+    );
+  }
+
+  const lenderAddr = lenderAddress && isAddress(lenderAddress) ? getAddress(lenderAddress) : null;
+  if (cfg.contracts.eligibilityGate) {
+    const gateAddr = getAddress(cfg.contracts.eligibilityGate);
+    const borrowerEligible = await publicClient.readContract({
+      address: gateAddr,
+      abi: eligibilityGateAbi,
+      functionName: 'isEligible',
+      args: [normalizedOrder.borrower, cleanBorrowerAtt],
+    });
+    if (!borrowerEligible) {
+      throw new Error('IneligibleCounterparty: Borrower is not eligible in EligibilityGate.');
+    }
+    if (lenderAddr) {
+      const lenderEligible = await publicClient.readContract({
+        address: gateAddr,
+        abi: eligibilityGateAbi,
+        functionName: 'isEligible',
+        args: [lenderAddr, cleanLenderAtt],
+      });
+      if (!lenderEligible) {
+        throw new Error('IneligibleCounterparty: Connected lender is not eligible in EligibilityGate.');
+      }
+    }
+  }
+
+  const quote = await fetchLoanQuote({
+    cfg,
+    asset: normalizedOrder.collateralToken,
+    principalRaw: fillUsdcBig.toString(),
+    collateralAmountRaw: collateralForFillBig.toString(),
+    termDays: normalizedOrder.termDays,
+    aprBps: normalizedOrder.maxRateBps,
+    maxLtvBps: normalizedOrder.maxLtvBps,
+    borrower: normalizedOrder.borrower,
+    lender: lenderAddr ?? undefined,
+    borrowerAttestation: cleanBorrowerAtt,
+    lenderAttestation: cleanLenderAtt,
+  });
+  if (!quote.accepted) {
+    const reasons = (quote.rejection_reasons ?? []).map((r) => `${r.code}: ${r.message}`).join('; ');
+    throw new Error(`BorrowOrder fill quote rejected: ${reasons || 'Unknown rejection'}`);
+  }
+
+  const exact = resolveExactLendAmounts(quote, {
+    minFillRaw: normalizedOrder.minFill,
+  });
+  const warnings = [...(quote.warnings ?? [])];
+  const remainderAfterFillRaw = remainingBig - fillUsdcBig;
+  if (remainderAfterFillRaw > 0n && remainderAfterFillRaw < 500_000_000n) {
+    warnings.push({
+      code: 'PARTIAL_REMAINDER_BELOW_500',
+      message: `Filling ${formatTokenUnitsDisplay(fillUsdcBig, USDC_DECIMALS, 2)} USDC leaves ${formatTokenUnitsDisplay(remainderAfterFillRaw, USDC_DECIMALS, 2)} USDC remaining (< $500); that remainder can only be filled in full or expired.`,
+    });
+  }
+
+  const useAttestations = cleanBorrowerAtt !== '0x' || cleanLenderAtt !== '0x';
+  const fillCallData = useAttestations
+    ? encodeFunctionData({
+        abi: orderSettlementAbi,
+        functionName: 'fillBorrowOrderWithAttestations',
+        args: [normalizedOrder, sigHex, fillUsdcBig, cleanBorrowerAtt, cleanLenderAtt],
+      })
+    : encodeFunctionData({
+        abi: orderSettlementAbi,
+        functionName: 'fillBorrowOrder',
+        args: [normalizedOrder, sigHex, fillUsdcBig],
+      });
+
+  let lenderBalanceRaw = '0';
+  let lenderAllowanceRaw = '0';
+  let needsApproval = true;
+  let simulationVerified = false;
+
+  if (lenderAddr) {
+    const [bal, allow] = await Promise.all([
+      publicClient.readContract({
+        address: usdcAddr,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [lenderAddr],
+      }),
+      publicClient.readContract({
+        address: usdcAddr,
+        abi: erc20Abi,
+        functionName: 'allowance',
+        args: [lenderAddr, loanCoreAddr],
+      }),
+    ]);
+    lenderBalanceRaw = BigInt(bal).toString();
+    lenderAllowanceRaw = BigInt(allow).toString();
+    needsApproval = BigInt(allow) < fillUsdcBig;
+
+    if (BigInt(bal) < fillUsdcBig) {
+      throw new Error(
+        `ERC20InsufficientBalance: Insufficient USDC balance (${lenderBalanceRaw} raw), need ${fillUsdcBig.toString()} raw.`
+      );
+    }
+
+    try {
+      await publicClient.call({
+        account: lenderAddr,
+        to: settlementAddr,
+        data: fillCallData,
+      });
+      simulationVerified = true;
+    } catch (simErr) {
+      const decoded = decodeContractRevert(simErr);
+      if (!needsApproval || !isExpectedPreApprovalError(simErr, loanCoreAddr)) {
+        throw new Error(decoded ? decoded.message : formatWeb3Error(simErr));
+      }
+      simulationVerified = true;
+    }
+  }
+
+  return {
+    order: normalizedOrder,
+    orderJson: borrowOrderToJson(normalizedOrder),
+    signature: sigHex,
+    orderHash,
+    collateralToken: normalizedOrder.collateralToken,
+    collateralSymbol: quote.asset?.symbol ?? 'B20',
+    collateralDecimals: Number(quote.asset?.decimals ?? 18),
+    borrower: normalizedOrder.borrower,
+    rateBps: normalizedOrder.maxRateBps,
+    termDays: normalizedOrder.termDays,
+    maxLtvBps: normalizedOrder.maxLtvBps,
+    expiry: Number(normalizedOrder.expiry),
+    nonce: normalizedOrder.nonce.toString(),
+    totalUsdcRaw: normalizedOrder.minUsdc.toString(),
+    filledRaw: filledBig.toString(),
+    remainingRaw: remainingBig.toString(),
+    minFillRaw: normalizedOrder.minFill.toString(),
+    fillAmountRaw: fillUsdcBig.toString(),
+    collateralForFillRaw: collateralForFillBig.toString(),
+    remainderAfterFillRaw: remainderAfterFillRaw.toString(),
+    borrowerCollateralBalanceRaw: BigInt(borrowerCollBalance).toString(),
+    borrowerCollateralAllowanceRaw: BigInt(borrowerCollAllowance).toString(),
+    lenderBalanceRaw,
+    lenderAllowanceRaw,
+    needsApproval,
+    simulationVerified,
+    warnings,
+    quote,
+    exact: {
+      ...exact,
+      collateralForFillRaw: collateralForFillBig,
+    },
+    fillCallData,
+  };
+}
+
+export async function fillBorrowOrderAsLender({
+  address,
+  order,
+  signature,
+  fillUsdcRaw = null,
+  perFillUsdcRawList = null,
+  expectedPreview = null,
+  borrowerAttestation = '0x',
+  lenderAttestation = '0x',
+  autoApprove = true,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!cfg.contracts.orderSettlement || !cfg.contracts.loanCore || !cfg.usdcAddress) {
+    throw new Error('OrderSettlement, LoanCore, or USDC address is not configured.');
+  }
+  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
+  const settlementAddr = getAddress(cfg.contracts.orderSettlement);
+
+  const preview = await verifyAndPreviewBorrowOrderFill({
+    order,
+    signature,
+    fillUsdcRaw,
+    lenderAddress: wallet,
+    borrowerAttestation,
+    lenderAttestation,
+    cfg,
+    publicClient,
+  });
+
+  if (expectedPreview) {
+    const expExact = expectedPreview.exact ?? {};
+    const curExact = preview.exact;
+    if (
+      String(expectedPreview.fillAmountRaw ?? '') !== preview.fillAmountRaw ||
+      String(expectedPreview.collateralForFillRaw ?? '') !== preview.collateralForFillRaw ||
+      String(expExact.lenderNetInterestRaw ?? '') !== curExact.lenderNetInterestRaw.toString() ||
+      String(expectedPreview.quote?.asset?.oracle_state ?? '') !==
+        String(preview.quote?.asset?.oracle_state ?? '')
+    ) {
+      throw new Error(
+        'Quote or BorrowOrder fill state changed since preview. Re-verify the BorrowOrder terms before filling.'
+      );
+    }
+  }
+
+  const approvalSizing = computeLendApprovalAmountRaw(preview.fillAmountRaw, {
+    perFillUsdcRawList,
+  });
+  let approvalTxHash = null;
+  if (BigInt(preview.lenderAllowanceRaw) < approvalSizing.requiredApprovalRaw) {
+    if (!autoApprove) {
+      throw new Error(
+        `LoanCore USDC allowance is below required ${approvalSizing.requiredApprovalRaw.toString()} raw units; approve USDC first.`
+      );
+    }
+    const appRes = await approveUsdcForLend({
+      address: wallet,
+      requiredUsdcRaw: approvalSizing.requiredApprovalRaw,
+      provider,
+      cfg,
+      publicClient,
+    });
+    approvalTxHash = appRes.txHash;
+  }
+
+  try {
+    await publicClient.call({
+      account: wallet,
+      to: settlementAddr,
+      data: preview.fillCallData,
+    });
+  } catch (simErr) {
+    const decoded = decodeContractRevert(simErr);
+    throw new Error(decoded ? decoded.message : formatWeb3Error(simErr));
+  }
+
+  const { txHash, receipt } = await sendWalletTransaction(provider, publicClient, {
+    from: wallet,
+    to: settlementAddr,
+    data: preview.fillCallData,
+  });
+
+  const loanId = decodeOrderFilledLoanId(receipt, settlementAddr);
+  let positionTokenId = loanId;
+  let positionOwner = null;
+  if (loanId !== null && cfg.contracts.positionNft) {
+    try {
+      positionOwner = await publicClient.readContract({
+        address: getAddress(cfg.contracts.positionNft),
+        abi: positionNftAbi,
+        functionName: 'ownerOf',
+        args: [BigInt(loanId)],
+      });
+    } catch {
+      positionOwner = null;
+    }
+  }
+
+  return {
+    txHash,
+    approvalTxHash,
+    receipt,
+    loanId,
+    positionTokenId,
+    positionOwner,
+    quote: preview.quote,
+    exact: preview.exact,
+    preview,
+    collateralForFillRaw: preview.collateralForFillRaw,
+    fillUsdcRaw: preview.fillAmountRaw,
+    requiredApprovalRaw: approvalSizing.requiredApprovalRaw.toString(),
   };
 }
