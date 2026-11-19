@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
-import { formatUnits } from 'viem';
+import { Link, useSearchParams } from 'react-router-dom';
+import { formatUnits, zeroAddress } from 'viem';
 import { Field, Page, Rows, Sheet, TextInput } from '../components/ui.jsx';
 import { USDC_DECIMALS } from '../lib/contracts.js';
 import {
@@ -18,6 +18,7 @@ import {
   cancelSignedBorrowOrder,
   classifyPersistedOrderRemoval,
   computeRemainingBorrowCollateralRequirement,
+  fetchRelayOrderByHash,
   fillLendOfferAsBorrower,
   formatTokenUnitsDisplay,
   formatWeb3Error,
@@ -125,8 +126,10 @@ function computeOpenBorrowOrdersCollateralTotal(
 
 export function Borrow() {
   const { web3 } = useStore();
+  const [searchParams] = useSearchParams();
   const [marketState, setMarketState] = useState({ loading: true, data: null });
   const reqSeqRef = useRef(0);
+  const prefilledLendHashRef = useRef('');
 
   const [selectedAsset, setSelectedAsset] = useState('');
   const [principalStr, setPrincipalStr] = useState('1000');
@@ -218,6 +221,94 @@ export function Borrow() {
         o.signature
     );
   }, [marketState.data?.orders]);
+
+  const applyLendOfferSelection = useCallback(
+    (row, availableAssets = assets) => {
+      const allowed = String(row?.signed_order?.allowedCollateral ?? row?.collateral_token ?? '').trim();
+      if (allowed && allowed.toLowerCase() !== zeroAddress) {
+        const matched = availableAssets.find(
+          (a) => a.token?.toLowerCase() === allowed.toLowerCase()
+        );
+        if (matched) {
+          setSelectedAsset(matched.token);
+        }
+      }
+      const rawRemaining = String(
+        row?.remaining_usdc?.raw ?? row?.min_usdc?.raw ?? row?.signed_order?.usdcAmount ?? '500000000'
+      );
+      setLendOfferJsonStr(
+        JSON.stringify(
+          {
+            orderHash: row.order_hash,
+            offer: row.signed_order,
+            signature: row.signature,
+          },
+          null,
+          2
+        )
+      );
+      setSelectedLendRemainingRaw(rawRemaining);
+      setLendFillUsdcStr(formatUnits(BigInt(rawRemaining), USDC_DECIMALS));
+      setLendPreview(null);
+      setLendFillError('');
+      setLendFillResult(null);
+    },
+    [assets]
+  );
+
+  useEffect(() => {
+    const assetParam = (searchParams.get('asset') ?? '').trim();
+    if (assetParam && assets.length > 0) {
+      const matched = assets.find((a) => a.token?.toLowerCase() === assetParam.toLowerCase());
+      if (matched) setSelectedAsset(matched.token);
+    }
+
+    const lendOfferParam = (searchParams.get('lendOffer') ?? '').trim();
+    if (!lendOfferParam) return;
+    const targetHash = lendOfferParam.toLowerCase();
+    if (prefilledLendHashRef.current === targetHash) return;
+
+    const fromBook = (marketState.data?.orders ?? []).find(
+      (o) =>
+        String(o?.order_hash ?? '').toLowerCase() === targetHash &&
+        (o.order_type === 'lend' || o.order_type === 'LendOffer') &&
+        o.signed_order &&
+        o.signature
+    );
+    if (fromBook) {
+      prefilledLendHashRef.current = targetHash;
+      applyLendOfferSelection(fromBook, assets);
+      return;
+    }
+    if (marketState.loading || !web3?.config?.apiUrl) return;
+
+    let cancelled = false;
+    prefilledLendHashRef.current = targetHash;
+    void fetchRelayOrderByHash(targetHash, { cfg: web3.config })
+      .then((row) => {
+        if (cancelled) return;
+        if (
+          row &&
+          (row.order_type === 'lend' || row.order_type === 'LendOffer') &&
+          row.signed_order &&
+          row.signature
+        ) {
+          applyLendOfferSelection(row, assets);
+        } else if (row) {
+          setLendFillError(
+            `Order ${row.order_hash} cannot be filled on /borrow (type=${row.order_type}, status=${row.status}).`
+          );
+        } else {
+          setLendFillError(`LendOffer ${lendOfferParam} was not found in api/ /orders.`);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) setLendFillError(formatWeb3Error(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [applyLendOfferSelection, assets, marketState.data?.orders, marketState.loading, searchParams, web3?.config]);
 
   const syncPersistedOrders = useCallback(async () => {
     const stored = loadPersistedSignedOrders();
@@ -1504,35 +1595,32 @@ export function Borrow() {
 
         {openLendOffers.length > 0 ? (
           <div className="chips block" role="group" aria-label="Open relayed lend offers">
-            {openLendOffers.map((row) => (
-              <button
-                key={row.order_hash}
-                type="button"
-                onClick={() => {
-                  const rawRemaining = String(row.remaining_usdc?.raw ?? row.min_usdc?.raw ?? '500000000');
-                  setLendOfferJsonStr(
-                    JSON.stringify(
-                      {
-                        orderHash: row.order_hash,
-                        offer: row.signed_order,
-                        signature: row.signature,
-                      },
-                      null,
-                      2
-                    )
-                  );
-                  setSelectedLendRemainingRaw(rawRemaining);
-                  setLendFillUsdcStr(formatUnits(BigInt(rawRemaining), USDC_DECIMALS));
-                  setLendPreview(null);
-                  setLendFillError('');
-                  setLendFillResult(null);
-                }}
-              >
-                LendOffer {row.order_hash.slice(0, 10)}… · $
-                {formatTokenUnitsDisplay(row.remaining_usdc?.raw ?? row.min_usdc?.raw ?? '0', USDC_DECIMALS, 2)} @{' '}
-                {formatBpsPercent(row.min_rate_bps ?? row.rate_bps)}
-              </button>
-            ))}
+            {openLendOffers.map((row) => {
+              const allowed = String(row.signed_order?.allowedCollateral ?? row.collateral_token ?? zeroAddress);
+              const isAnyAsset = !allowed || allowed.toLowerCase() === zeroAddress;
+              const matchedAsset = !isAnyAsset
+                ? assets.find((a) => a.token?.toLowerCase() === allowed.toLowerCase())
+                : null;
+              const collLabel = isAnyAsset
+                ? 'Any B20'
+                : matchedAsset?.symbol || row.collateral_symbol || shortAddress(allowed);
+              const needsAssetSwitch =
+                !isAnyAsset &&
+                assetObj?.token &&
+                allowed.toLowerCase() !== assetObj.token.toLowerCase();
+              return (
+                <button
+                  key={row.order_hash}
+                  type="button"
+                  onClick={() => applyLendOfferSelection(row, assets)}
+                >
+                  LendOffer {row.order_hash.slice(0, 10)}… · {collLabel}
+                  {needsAssetSwitch ? ' (switches asset)' : ''} · $
+                  {formatTokenUnitsDisplay(row.remaining_usdc?.raw ?? row.min_usdc?.raw ?? '0', USDC_DECIMALS, 2)} @{' '}
+                  {formatBpsPercent(row.min_rate_bps ?? row.rate_bps)}
+                </button>
+              );
+            })}
           </div>
         ) : null}
 
@@ -1545,6 +1633,7 @@ export function Borrow() {
               value={lendOfferJsonStr}
               onChange={(e) => {
                 setLendOfferJsonStr(e.target.value);
+                setSelectedLendRemainingRaw('');
                 setLendPreview(null);
                 setLendFillError('');
               }}
@@ -1577,7 +1666,8 @@ export function Borrow() {
           {lendFillResult ? (
             <p className="note" role="status">
               Opened Loan #{lendFillResult.loanId ?? '?'} (tx {lendFillResult.txHash}) · Escrowed{' '}
-              {lendFillResult.collateralAmountRaw} raw units for {lendFillResult.fillUsdcRaw} raw USDC.
+              {lendFillResult.collateralAmountRaw} raw units for {lendFillResult.fillUsdcRaw} raw USDC.{' '}
+              {lendFillResult.loanId ? <Link to={`/loans/${lendFillResult.loanId}`}>Inspect Loan</Link> : null}
             </p>
           ) : null}
 

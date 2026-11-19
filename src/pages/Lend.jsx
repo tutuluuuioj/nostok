@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { formatUnits, zeroAddress } from 'viem';
 import { Field, Page, Rows, Sheet, TextInput } from '../components/ui.jsx';
 import { USDC_DECIMALS } from '../lib/contracts.js';
@@ -16,6 +16,7 @@ import {
   bumpMakerNonceOnChain,
   cancelSignedLendOffer,
   classifyPersistedOrderRemoval,
+  fetchRelayOrderByHash,
   fillBorrowOrderAsLender,
   formatTokenUnitsDisplay,
   formatWeb3Error,
@@ -125,8 +126,10 @@ function computeOpenLendOffersRawTotal(
 
 export function Lend() {
   const { web3 } = useStore();
+  const [searchParams] = useSearchParams();
   const [marketState, setMarketState] = useState({ loading: true, data: null });
   const reqSeqRef = useRef(0);
+  const prefilledBorrowHashRef = useRef('');
 
   const [usdcStr, setUsdcStr] = useState('1000');
   const [ratePct, setRatePct] = useState('8.00');
@@ -213,6 +216,76 @@ export function Lend() {
         o.signature
     );
   }, [marketState.data?.orders]);
+
+  const applyBorrowOrderSelection = useCallback((row) => {
+    const remRaw = String(
+      row?.remaining_usdc?.raw ?? row?.min_usdc?.raw ?? row?.signed_order?.minUsdc ?? '500000000'
+    );
+    setBorrowOrderJsonStr(
+      JSON.stringify(
+        {
+          orderHash: row.order_hash,
+          order: row.signed_order,
+          signature: row.signature,
+        },
+        null,
+        2
+      )
+    );
+    setSelectedBorrowRemainingRaw(remRaw);
+    setBorrowFillUsdcStr(formatUnits(BigInt(remRaw), USDC_DECIMALS));
+    setBorrowPreview(null);
+    setBorrowFillError('');
+    setBorrowFillResult(null);
+  }, []);
+
+  useEffect(() => {
+    const borrowOrderParam = (searchParams.get('borrowOrder') ?? '').trim();
+    if (!borrowOrderParam) return;
+    const targetHash = borrowOrderParam.toLowerCase();
+    if (prefilledBorrowHashRef.current === targetHash) return;
+
+    const fromBook = (marketState.data?.orders ?? []).find(
+      (o) =>
+        String(o?.order_hash ?? '').toLowerCase() === targetHash &&
+        (o.order_type === 'borrow' || o.order_type === 'BorrowOrder') &&
+        o.signed_order &&
+        o.signature
+    );
+    if (fromBook) {
+      prefilledBorrowHashRef.current = targetHash;
+      applyBorrowOrderSelection(fromBook);
+      return;
+    }
+    if (marketState.loading || !web3?.config?.apiUrl) return;
+
+    let cancelled = false;
+    prefilledBorrowHashRef.current = targetHash;
+    void fetchRelayOrderByHash(targetHash, { cfg: web3.config })
+      .then((row) => {
+        if (cancelled) return;
+        if (
+          row &&
+          (row.order_type === 'borrow' || row.order_type === 'BorrowOrder') &&
+          row.signed_order &&
+          row.signature
+        ) {
+          applyBorrowOrderSelection(row);
+        } else if (row) {
+          setBorrowFillError(
+            `Order ${row.order_hash} cannot be filled on /lend (type=${row.order_type}, status=${row.status}).`
+          );
+        } else {
+          setBorrowFillError(`BorrowOrder ${borrowOrderParam} was not found in api/ /orders.`);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) setBorrowFillError(formatWeb3Error(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [applyBorrowOrderSelection, marketState.data?.orders, marketState.loading, searchParams, web3?.config]);
 
   const syncPersistedOffers = useCallback(async () => {
     const stored = loadPersistedSignedLendOffers();
@@ -1382,24 +1455,7 @@ export function Lend() {
                   key={row.order_hash}
                   className="btn secondary"
                   type="button"
-                  onClick={() => {
-                    setBorrowOrderJsonStr(
-                      JSON.stringify(
-                        {
-                          orderHash: row.order_hash,
-                          order: row.signed_order,
-                          signature: row.signature,
-                        },
-                        null,
-                        2
-                      )
-                    );
-                    setSelectedBorrowRemainingRaw(remRaw);
-                    setBorrowFillUsdcStr(formatUnits(BigInt(remRaw), USDC_DECIMALS));
-                    setBorrowPreview(null);
-                    setBorrowFillError('');
-                    setBorrowFillResult(null);
-                  }}
+                  onClick={() => applyBorrowOrderSelection(row)}
                 >
                   BorrowOrder {row.order_hash.slice(0, 10)}… · {row.collateral_symbol ?? 'B20'} · $
                   {formatTokenUnitsDisplay(remRaw, USDC_DECIMALS, 2)} @{' '}

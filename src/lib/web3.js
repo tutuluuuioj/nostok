@@ -576,6 +576,34 @@ export async function fetchPaginatedApiRows(
 }
 
 /**
+ * Look up a specific order/offer by bytes32 orderHash from api/ GET /orders.
+ * @param {string} orderHash
+ * @param {{ cfg?: any, includeInactive?: boolean, timeoutMs?: number }} [opts]
+ */
+export async function fetchRelayOrderByHash(
+  orderHash,
+  { cfg = getFrontendConfig(), includeInactive = true, timeoutMs = 8000 } = {}
+) {
+  const cleanHash = String(orderHash ?? '').trim().toLowerCase();
+  if (!/^0x[0-9a-f]{64}$/.test(cleanHash)) {
+    throw new Error(`Invalid order hash: ${orderHash}`);
+  }
+  if (!cfg?.apiUrl) {
+    throw new Error('VITE_API_URL is not configured.');
+  }
+  const params = new URLSearchParams({
+    order_hash: cleanHash,
+    limit: '5',
+  });
+  if (includeInactive) {
+    params.set('include_inactive', 'true');
+  }
+  const json = await fetchJsonStrict(`${cfg.apiUrl}/orders?${params.toString()}`, {}, timeoutMs);
+  const rows = Array.isArray(json?.data) ? json.data : [];
+  return rows.find((row) => String(row?.order_hash ?? '').toLowerCase() === cleanHash) ?? null;
+}
+
+/**
  * @param {string} address
  * @param {{
  *   cfg?: any,
@@ -2922,6 +2950,15 @@ export async function fillLendOfferAsBorrower({
         'Quote or offer fill state changed since preview. Re-verify the LendOffer terms before filling.'
       );
     }
+    if (
+      expectedPreview.requiredApprovalRaw !== undefined &&
+      expectedPreview.requiredApprovalRaw !== null &&
+      BigInt(preview.requiredApprovalRaw) > BigInt(expectedPreview.requiredApprovalRaw)
+    ) {
+      throw new Error(
+        `Required CollateralEscrow approval increased since preview (${expectedPreview.requiredApprovalRaw} -> ${preview.requiredApprovalRaw} raw); re-verify before approving.`
+      );
+    }
   }
 
   let approvalTxHash = null;
@@ -3899,6 +3936,20 @@ export async function fillBorrowOrderAsLender({
     ) {
       throw new Error(
         'Quote or BorrowOrder fill state changed since preview. Re-verify the BorrowOrder terms before filling.'
+      );
+    }
+    const openIncreased =
+      expectedPreview.existingOpenSumRaw !== undefined &&
+      expectedPreview.existingOpenSumRaw !== null &&
+      BigInt(preview.existingOpenSumRaw) > BigInt(expectedPreview.existingOpenSumRaw);
+    const reqIncreased =
+      (!perFillUsdcRawList || expectedPreview.perFillUsdcRawList) &&
+      expectedPreview.requiredApprovalRaw !== undefined &&
+      expectedPreview.requiredApprovalRaw !== null &&
+      BigInt(preview.requiredApprovalRaw) > BigInt(expectedPreview.requiredApprovalRaw);
+    if (openIncreased || reqIncreased) {
+      throw new Error(
+        `Required LoanCore USDC approval increased since preview (${expectedPreview.requiredApprovalRaw ?? expectedPreview.existingOpenSumRaw} -> ${preview.requiredApprovalRaw} raw); re-verify before approving.`
       );
     }
   }

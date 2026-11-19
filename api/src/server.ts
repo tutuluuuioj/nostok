@@ -2145,6 +2145,11 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
     conditions.push(`LOWER(o.maker) = LOWER($${params.length})`);
   }
 
+  if (filters.order_hash) {
+    params.push(filters.order_hash);
+    conditions.push(`LOWER(o.order_hash) = $${params.length}`);
+  }
+
   if (filters.order_type) {
     params.push(filters.order_type);
     conditions.push(`LOWER(o.order_type) = LOWER($${params.length})`);
@@ -2282,6 +2287,7 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
 
   const filterMatchedRelays: RelaySignedOrderRecord[] = [];
   for (const rec of signedMap.values()) {
+    if (filters.order_hash && rec.orderHash.toLowerCase() !== filters.order_hash) continue;
     if (filters.maker && rec.maker.toLowerCase() !== filters.maker.toLowerCase()) continue;
     if (filters.order_type && rec.orderType !== filters.order_type) continue;
     if (filters.asset) {

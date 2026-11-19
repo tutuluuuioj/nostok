@@ -17,16 +17,30 @@ const ORDER_STATUS_FILTERS = [
   ['all', 'All statuses'],
   ['open', 'Open (signed)'],
   ['partially_filled', 'Partially filled'],
+  ['unfunded', 'Unfunded'],
   ['filled', 'Filled'],
   ['cancelled', 'Cancelled'],
+  ['expired', 'Expired'],
+  ['nonce_bumped', 'Nonce bumped'],
   ['unknown', 'Unfilled / unknown'],
 ];
+
+const INACTIVE_STATUS_FILTERS = new Set([
+  'unfunded',
+  'filled',
+  'cancelled',
+  'expired',
+  'nonce_bumped',
+  'unknown',
+]);
 
 export function Markets() {
   const { web3 } = useStore();
   const [snapshot, setSnapshot] = useState({ loading: true, data: null });
   const [assetFilter, setAssetFilter] = useState('All');
   const [statusFilter, setStatusFilter] = useState('all');
+  const [showInactive, setShowInactive] = useState(false);
+  const [copiedOrderHash, setCopiedOrderHash] = useState('');
   const reqSeqRef = useRef(0);
 
   // Live on-chain quote simulator state (read-only GET /quote)
@@ -41,6 +55,9 @@ export function Markets() {
   const [quoteError, setQuoteError] = useState('');
   const quoteSeqRef = useRef(0);
 
+  const shouldIncludeInactive =
+    showInactive || INACTIVE_STATUS_FILTERS.has(statusFilter);
+
   const updateQuoteField = useCallback((setter) => (value) => {
     quoteSeqRef.current += 1;
     setQuoteLoading(false);
@@ -54,6 +71,7 @@ export function Markets() {
     setSnapshot((prev) => ({ loading: true, data: prev.data }));
     const next = await fetchMarketSnapshot({
       cfg: web3?.config,
+      includeInactive: shouldIncludeInactive,
       requestId,
       includeLoans: false,
       includeAuctions: false,
@@ -66,7 +84,21 @@ export function Markets() {
         return next.assets[0].token;
       });
     }
-  }, [web3?.config]);
+  }, [shouldIncludeInactive, web3?.config]);
+
+  async function copySignedOrderPayload(item) {
+    if (!item?.signed_order || !item?.signature) return;
+    const isLend = item.order_type === 'lend' || item.order_type === 'LendOffer';
+    const payload = isLend
+      ? { orderHash: item.order_hash, offer: item.signed_order, signature: item.signature }
+      : { orderHash: item.order_hash, order: item.signed_order, signature: item.signature };
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
+      setCopiedOrderHash(item.order_hash);
+    } catch {
+      setCopiedOrderHash('');
+    }
+  }
 
   useEffect(() => {
     void loadMarkets();
@@ -188,7 +220,7 @@ export function Markets() {
     <Page
       kicker="Markets"
       title="Live markets & order activity."
-      lede="Read-only Base Mainnet order book activity, live Chainlink collateral pricing from AssetRegistry/OracleRouter, and exact on-chain loan quotes from api/. Order submission and fills arrive in the next release."
+      lede="Live Base Mainnet order book activity, Chainlink collateral pricing from AssetRegistry/OracleRouter, and exact on-chain loan quotes from api/ — select any open BorrowOrder or LendOffer below to fill on /lend or /borrow."
     >
       <div className="actions">
         <button
@@ -199,6 +231,8 @@ export function Markets() {
         >
           {snapshot.loading ? 'Refreshing live book…' : 'Refresh market data'}
         </button>
+        <Link className="btn secondary" to="/borrow">Open BorrowOrder</Link>
+        <Link className="btn secondary" to="/lend">Post LendOffer / Fill Borrow</Link>
         {data?.health ? (
           <span className="hint">
             Indexed block #{data.health.last_indexed_block ?? '—'} · Chain head #
@@ -216,6 +250,13 @@ export function Markets() {
         <p className="err block" role="alert">
           Live market state degraded or unavailable — {data.error || 'Indexer or RPC health check failed.'} No preview or cached fallback prices are displayed.
         </p>
+      ) : null}
+
+      {data?.ordersTruncated ? (
+        <div className="note block" role="status">
+          <strong>Public orderbook display truncated (&gt;1,000 rows).</strong>{' '}
+          Filter by collateral or open a specific order by hash via /lend or /borrow.
+        </div>
       ) : null}
 
       <section className="block">
@@ -291,66 +332,105 @@ export function Markets() {
               {label}
             </button>
           ))}
+          <button
+            type="button"
+            aria-pressed={showInactive}
+            onClick={() => setShowInactive((v) => !v)}
+          >
+            {showInactive ? 'Showing inactive/unfunded' : 'Include inactive/unfunded'}
+          </button>
         </div>
       </div>
 
-      <section className="block">
-        <h2>Indexed borrow orders</h2>
-        <p className="hint">Borrow orders observed in OrderSettlement fills and cancellations (USDC 6 dec).</p>
-        {borrows.length === 0 ? (
-          <p className="lede">No indexed borrow orders match the current filter.</p>
-        ) : (
-          borrows.map((item) => (
-            <article className="order-row" key={item.order_hash}>
-              <div>
-                <strong>
-                  {item.collateral_symbol || (item.collateral_token ? shortAddress(item.collateral_token) : 'Asset')} · {item.status}
-                </strong>
-                <span className="quiet">
-                  Maker {shortAddress(item.maker)} · Order {item.order_hash.slice(0, 14)}… · Fills {item.fills_count} · Block #{item.last_updated_block}
-                </span>
-                <span className="quiet">
-                  Filled {formatApiAmount(item.filled_usdc, { prefixUsd: true })} of{' '}
-                  {formatApiAmount(item.min_usdc, { prefixUsd: true })}
-                  {item.remaining_usdc ? ` · ${formatApiAmount(item.remaining_usdc, { prefixUsd: true })} remaining` : ''}
-                </span>
-              </div>
-              <span className="numline">
-                {formatApiAmount(item.filled_usdc, { showSymbol: true })}
-              </span>
-            </article>
-          ))
-        )}
-      </section>
-
-      <section className="block">
-        <h2>Indexed lend offers</h2>
-        <p className="hint">Lend offers observed in OrderSettlement fills and cancellations (read-only; live fill signing lands in WS3.3–3.4).</p>
-        {lends.length === 0 ? (
-          <p className="lede">No indexed lend offers match the current filter.</p>
-        ) : (
-          lends.map((item) => (
-            <article className="order-row" key={item.order_hash}>
-              <div>
-                <strong>
-                  {item.collateral_symbol || (item.collateral_token ? shortAddress(item.collateral_token) : 'Multi-asset')} · {item.status}
-                </strong>
-                <span className="quiet">
-                  Maker {shortAddress(item.maker)} · Order {item.order_hash.slice(0, 14)}… · Fills {item.fills_count} · Block #{item.last_updated_block}
-                </span>
-                <span className="quiet">
-                  Filled {formatApiAmount(item.filled_usdc, { prefixUsd: true })} of{' '}
-                  {formatApiAmount(item.min_usdc, { prefixUsd: true })}
-                  {item.remaining_usdc ? ` · ${formatApiAmount(item.remaining_usdc, { prefixUsd: true })} remaining` : ''}
-                </span>
-              </div>
-              <span className="numline">
-                {formatApiAmount(item.filled_usdc, { showSymbol: true })}
-              </span>
-            </article>
-          ))
-        )}
-      </section>
+      {(() => {
+        const renderOrderBookSection = (title, hint, rows, emptyText, isLend) => (
+          <section className="block">
+            <h2>{title}</h2>
+            <p className="hint">{hint}</p>
+            {rows.length === 0 ? (
+              <p className="lede">{emptyText}</p>
+            ) : (
+              rows.map((item) => {
+                const isFillable =
+                  (item.status === 'open' || item.status === 'partially_filled') &&
+                  Boolean(item.signed_order) &&
+                  Boolean(item.signature);
+                const allowedAddr = isLend ? item.signed_order?.allowedCollateral : item.collateral_token;
+                const fillHref = isLend
+                  ? `/borrow?lendOffer=${encodeURIComponent(item.order_hash)}${allowedAddr && allowedAddr !== '0x0000000000000000000000000000000000000000' ? `&asset=${encodeURIComponent(allowedAddr)}` : ''}`
+                  : `/lend?borrowOrder=${encodeURIComponent(item.order_hash)}`;
+                return (
+                  <article className="order-row" key={item.order_hash}>
+                    <div>
+                      <strong>
+                        {item.collateral_symbol || (item.collateral_token ? shortAddress(item.collateral_token) : isLend ? 'Multi-asset' : 'Asset')} · {item.status}
+                      </strong>
+                      <span className="quiet">
+                        Maker {shortAddress(item.maker)} · Order {item.order_hash.slice(0, 14)}… · Fills {item.fills_count} · Block #{item.last_updated_block}
+                      </span>
+                      <span className="quiet">
+                        Filled {formatApiAmount(item.filled_usdc, { prefixUsd: true })} of{' '}
+                        {formatApiAmount(item.min_usdc, { prefixUsd: true })}
+                        {item.remaining_usdc ? ` · ${formatApiAmount(item.remaining_usdc, { prefixUsd: true })} remaining` : ''}
+                      </span>
+                      {Array.isArray(item.fills) && item.fills.length > 0 ? (
+                        <span className="quiet">
+                          Loans:{' '}
+                          {item.fills.map((f, fIdx) => (
+                            <span key={`${f.loan_id}-${fIdx}`}>
+                              {fIdx > 0 ? ', ' : ''}
+                              <Link to={`/loans/${f.loan_id}`}>#{f.loan_id}</Link>
+                            </span>
+                          ))}
+                        </span>
+                      ) : null}
+                      {isFillable || (item.signed_order && item.signature) ? (
+                        <div className="actions" style={{ marginTop: 8 }}>
+                          {isFillable ? (
+                            <Link className="btn secondary" to={fillHref}>
+                              {isLend ? 'Fill on /borrow' : 'Fill on /lend'}
+                            </Link>
+                          ) : null}
+                          {item.signed_order && item.signature ? (
+                            <button
+                              className="btn secondary"
+                              type="button"
+                              onClick={() => void copySignedOrderPayload(item)}
+                            >
+                              {copiedOrderHash === item.order_hash ? 'Copied JSON' : 'Copy JSON'}
+                            </button>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </div>
+                    <span className="numline">
+                      {formatApiAmount(item.remaining_usdc ?? item.min_usdc, { prefixUsd: true, showSymbol: true })}
+                    </span>
+                  </article>
+                );
+              })
+            )}
+          </section>
+        );
+        return (
+          <>
+            {renderOrderBookSection(
+              'Borrow orders',
+              'Live signed BorrowOrders and historical OrderSettlement fills (select an open order to fill on /lend).',
+              borrows,
+              'No borrow orders match the current filter.',
+              false
+            )}
+            {renderOrderBookSection(
+              'Lend offers',
+              'Live signed LendOffers and historical OrderSettlement fills (select an open offer to fill on /borrow).',
+              lends,
+              'No lend offers match the current filter.',
+              true
+            )}
+          </>
+        );
+      })()}
 
       <form className="block" onSubmit={runQuoteSimulation}>
         <Sheet

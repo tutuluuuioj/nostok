@@ -28,6 +28,7 @@ import {
   keccak256,
   parseAbi,
   stringToBytes,
+  zeroAddress,
 } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { base } from 'viem/chains';
@@ -75,6 +76,7 @@ import {
   decodeContractRevert,
   fetchNotificationsSessionState,
   fetchPaginatedApiRows,
+  fetchRelayOrderByHash,
   fetchWalletState,
   fillBorrowOrderAsLender,
   fillLendOfferAsBorrower,
@@ -738,7 +740,7 @@ async function runTests(): Promise<void> {
       forkChainId: BASE_CHAIN_ID,
       databaseUrl: 'memory://',
       corsOrigins: ['https://app.nostok.xyz'],
-      rateLimitMax: 200,
+      rateLimitMax: 2000,
       rateLimitWindowMs: 60_000,
       maxBodyBytes: 4096,
       maxPageLimit: 100,
@@ -4536,7 +4538,267 @@ async function runTests(): Promise<void> {
         'PASS WS3.4 Piece 3 + M1 + M2 + Low 1 + Low 2 + Info: All checks verified cleanly.'
       );
 
-      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1, PIECE 2 & PIECE 3 FORK TESTS PASSED.');
+      // 3.8 WS3.4 Piece 4: Markets orderbook fill navigation, deep-link lookup, Any-B20 LendOffer fill & approval TOCTOU guard
+      console.log('\n=== WS3.4 Piece 4: Orderbook-to-fill deep links, Any-B20 LendOffer & TOCTOU approval guard ===');
+      walletProvider.setAccount(KEYS.lender);
+      await setUsdcAllowanceForLend({
+        address: ADDRESSES.lender,
+        targetAllowanceRaw: '0',
+        provider: walletProvider,
+        cfg,
+      });
+      const p4AnyLendOffer = await prepareAndSignLendOffer({
+        address: ADDRESSES.lender,
+        principalRaw: '500000000',
+        allowedCollateral: zeroAddress,
+        quoteAsset: nvdac,
+        expectedQuote: m1LendQuote500,
+        minRateBps: 850,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '500000000',
+        existingOpenUsdcSumRaw: null,
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: true,
+        storage: m1LendStorage,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(p4AnyLendOffer.publishedToApi, true);
+      assert.equal(p4AnyLendOffer.offer.allowedCollateral.toLowerCase(), zeroAddress);
+
+      walletProvider.setAccount(KEYS.borrower);
+      clearStorage(p3BorrowStorage);
+      await setCollateralAllowanceForBorrow({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        targetAllowanceRaw: '0',
+        provider: walletProvider,
+        cfg,
+      });
+      const p4BorrowOrder = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '500000000',
+        expectedQuote: m1BorrowQuote500,
+        requireExpectedQuote: true,
+        maxRateBps: 950,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '500000000',
+        existingOpenCollateralRaw: null,
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: true,
+        storage: borrowStorageApi,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(p4BorrowOrder.publishedToApi, true);
+
+      // fetchRelayOrderByHash validation + exact lookups + includeInactive snapshot
+      await assert.rejects(() => fetchRelayOrderByHash('0x1234', { cfg }), /Invalid order hash/);
+      const fetchedAnyLend = await fetchRelayOrderByHash(p4AnyLendOffer.orderHash, { cfg });
+      assert.equal(fetchedAnyLend?.order_hash?.toLowerCase(), p4AnyLendOffer.orderHash.toLowerCase());
+      assert.equal(fetchedAnyLend?.order_type, 'lend');
+      const fetchedP4Borrow = await fetchRelayOrderByHash(p4BorrowOrder.orderHash, { cfg });
+      assert.equal(fetchedP4Borrow?.order_hash?.toLowerCase(), p4BorrowOrder.orderHash.toLowerCase());
+      assert.equal(fetchedP4Borrow?.order_type, 'borrow');
+      assert.equal(await fetchRelayOrderByHash(`0x${'ee'.repeat(32)}`, { cfg }), null);
+
+      const inactiveSnap = await fetchMarketSnapshot({
+        cfg,
+        includeInactive: true,
+        includeLoans: false,
+        includeAuctions: false,
+      });
+      assert.ok(
+        inactiveSnap.orders.some((o: { status?: string }) => o.status === 'filled' || o.status === 'cancelled'),
+        'fetchMarketSnapshot({ includeInactive: true }) must surface historical/inactive orders'
+      );
+
+      // TOCTOU approval-increase guard (borrower side): another open BorrowOrder opens after preview -> fill rejects cleanly
+      const p4LendPreviewBefore = await verifyAndPreviewLendOfferFill({
+        offer: p4AnyLendOffer.offer,
+        signature: p4AnyLendOffer.signature,
+        collateralToken: nvdac,
+        fillUsdcRaw: '500000000',
+        borrowerAddress: ADDRESSES.borrower,
+        existingOpenCollateralRaw: null,
+        storage: null,
+        cfg,
+      });
+      walletProvider.setAccount(KEYS.borrower);
+      const p4ExtraBorrow = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '500000000',
+        expectedQuote: m1BorrowQuote500,
+        requireExpectedQuote: true,
+        maxRateBps: 950,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '500000000',
+        existingOpenCollateralRaw: null,
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: true,
+        storage: borrowStorageApi,
+        provider: walletProvider,
+        cfg,
+      });
+      await assert.rejects(
+        () =>
+          fillLendOfferAsBorrower({
+            address: ADDRESSES.borrower,
+            offer: p4AnyLendOffer.offer,
+            signature: p4AnyLendOffer.signature,
+            collateralToken: nvdac,
+            fillUsdcRaw: '500000000',
+            existingOpenCollateralRaw: null,
+            storage: null,
+            expectedPreview: p4LendPreviewBefore,
+            autoApprove: true,
+            provider: walletProvider,
+            cfg,
+          }),
+        /Required CollateralEscrow approval increased/
+      );
+      await cancelSignedBorrowOrder({
+        address: ADDRESSES.borrower,
+        order: p4ExtraBorrow.order,
+        storage: borrowStorageApi,
+        provider: walletProvider,
+        cfg,
+      });
+
+      // TOCTOU approval-increase guard (lender side): another open LendOffer opens after preview -> fill rejects cleanly
+      const p4BorPreviewBefore = await verifyAndPreviewBorrowOrderFill({
+        order: p4BorrowOrder.order,
+        signature: p4BorrowOrder.signature,
+        fillUsdcRaw: '500000000',
+        lenderAddress: ADDRESSES.lender,
+        existingOpenSumRaw: null,
+        storage: null,
+        cfg,
+      });
+      walletProvider.setAccount(KEYS.lender);
+      const p4ExtraLend = await prepareAndSignLendOffer({
+        address: ADDRESSES.lender,
+        principalRaw: '500000000',
+        allowedCollateral: nvdac,
+        expectedQuote: m1LendQuote500,
+        minRateBps: 850,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '500000000',
+        existingOpenUsdcSumRaw: null,
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: true,
+        storage: m1LendStorage,
+        provider: walletProvider,
+        cfg,
+      });
+      await assert.rejects(
+        () =>
+          fillBorrowOrderAsLender({
+            address: ADDRESSES.lender,
+            order: p4BorrowOrder.order,
+            signature: p4BorrowOrder.signature,
+            fillUsdcRaw: '500000000',
+            existingOpenSumRaw: null,
+            storage: null,
+            expectedPreview: p4BorPreviewBefore,
+            autoApprove: true,
+            provider: walletProvider,
+            cfg,
+          }),
+        /Required LoanCore USDC approval increased/
+      );
+      await cancelSignedLendOffer({
+        address: ADDRESSES.lender,
+        offer: p4ExtraLend.offer,
+        storage: m1LendStorage,
+        provider: walletProvider,
+        cfg,
+      });
+
+      // Multi-asset zeroAddress LendOffer fills cleanly on-chain with NVDAc while preserving open p4BorrowOrder allowance
+      walletProvider.setAccount(KEYS.borrower);
+      const p4AnyFill = await fillLendOfferAsBorrower({
+        address: ADDRESSES.borrower,
+        offer: p4AnyLendOffer.offer,
+        signature: p4AnyLendOffer.signature,
+        collateralToken: nvdac,
+        fillUsdcRaw: '500000000',
+        existingOpenCollateralRaw: null,
+        storage: null,
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(p4AnyFill.loanId, 'Any-B20 (zeroAddress) LendOffer must fill cleanly on-chain');
+
+      // Piece 4 SSR & source checks across Markets, Lend & Borrow deep-link / multi-asset UX
+      const p4MarketsHtml = renderToStaticMarkup(
+        createElement(
+          StoreProvider,
+          null,
+          createElement(MemoryRouter, { initialEntries: ['/markets'] }, createElement(Shell, null, createElement(Markets)))
+        )
+      );
+      assert.ok(!p4MarketsHtml.includes('Order submission and fills arrive in the next release'));
+      assert.ok(p4MarketsHtml.includes('Open BorrowOrder') && p4MarketsHtml.includes('Post LendOffer / Fill Borrow'));
+      assert.ok(p4MarketsHtml.includes('Include inactive/unfunded') && p4MarketsHtml.includes('Nonce bumped'));
+
+      const p4LendDeepHtml = renderToStaticMarkup(
+        createElement(
+          StoreProvider,
+          null,
+          createElement(
+            MemoryRouter,
+            { initialEntries: [`/lend?borrowOrder=${p4BorrowOrder.orderHash}`] },
+            createElement(Shell, null, createElement(Lend))
+          )
+        )
+      );
+      assert.match(p4LendDeepHtml, /Fill open BorrowOrders/);
+      const p4BorrowDeepHtml = renderToStaticMarkup(
+        createElement(
+          StoreProvider,
+          null,
+          createElement(
+            MemoryRouter,
+            { initialEntries: [`/borrow?lendOffer=${p4AnyLendOffer.orderHash}&asset=${nvdac}`] },
+            createElement(Shell, null, createElement(Borrow))
+          )
+        )
+      );
+      assert.match(p4BorrowDeepHtml, /Fill a signed LendOffer/);
+
+      const p4MarketsSrc = fs.readFileSync(path.join(process.cwd(), 'src/pages/Markets.jsx'), 'utf8');
+      const p4LendSrc = fs.readFileSync(path.join(process.cwd(), 'src/pages/Lend.jsx'), 'utf8');
+      const p4BorrowSrc = fs.readFileSync(path.join(process.cwd(), 'src/pages/Borrow.jsx'), 'utf8');
+      assert.ok(
+        p4MarketsSrc.includes('Fill on /lend') &&
+          p4MarketsSrc.includes('Fill on /borrow') &&
+          p4MarketsSrc.includes('includeInactive') &&
+          p4MarketsSrc.includes('ordersTruncated') &&
+          p4LendSrc.includes('useSearchParams') &&
+          p4LendSrc.includes('fetchRelayOrderByHash') &&
+          p4LendSrc.includes('applyBorrowOrderSelection') &&
+          p4BorrowSrc.includes('useSearchParams') &&
+          p4BorrowSrc.includes('fetchRelayOrderByHash') &&
+          p4BorrowSrc.includes('applyLendOfferSelection') &&
+          p4BorrowSrc.includes('Any B20') &&
+          p4BorrowSrc.includes('Inspect Loan'),
+        'Markets.jsx, Lend.jsx, and Borrow.jsx must implement WS3.4 Piece 4 orderbook fill links, deep-link lookup & multi-asset selection'
+      );
+      console.log('PASS WS3.4 Piece 4: Orderbook fill links, deep-link lookup, Any-B20 LendOffer & TOCTOU approval guards verified.');
+
+      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 FORK TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
       await new Promise<void>((r) => apiServer.close(() => r()));

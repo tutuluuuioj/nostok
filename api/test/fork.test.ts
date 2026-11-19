@@ -3723,6 +3723,22 @@ async function runTests(): Promise<void> {
             assert.notEqual(row.status, 'filled');
             assert.notEqual(row.status, 'cancelled');
           }
+
+          // WS3.4 Piece 4: exact GET /orders?order_hash=0x... lookup + 400 validation on malformed hash
+          const targetRec = busySubset[1101];
+          const byHashRes = await getJson<{
+            pagination: { total: number };
+            data: Array<{ order_hash: string; status: string }>;
+          }>(
+            `${spamUrl}/orders?order_hash=${encodeURIComponent(targetRec.orderHash)}&include_inactive=true`
+          );
+          assert.equal(byHashRes.status, 200);
+          assert.equal(byHashRes.body.pagination.total, 1);
+          assert.equal(byHashRes.body.data.length, 1);
+          assert.equal(byHashRes.body.data[0].order_hash.toLowerCase(), targetRec.orderHash.toLowerCase());
+
+          const badHashRes = await getJson<{ error?: { code?: string } }>(`${spamUrl}/orders?order_hash=0x1234`);
+          assert.equal(badHashRes.status, 400);
         } finally {
           spamSignedMap.clear();
           for (const [k, v] of savedMapBackup.entries()) spamSignedMap.set(k, v);

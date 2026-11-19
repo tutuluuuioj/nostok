@@ -334,6 +334,7 @@ export async function fetchMarketSnapshot({
   cfg = getFrontendConfig(),
   assetFilter = null,
   statusFilter = null,
+  includeInactive = false,
   requestId = null,
   includeLoans = true,
   includeAuctions = true,
@@ -363,6 +364,9 @@ export async function fetchMarketSnapshot({
     }
     if (statusFilter && statusFilter !== 'all') {
       orderParams.set('status', statusFilter);
+    }
+    if (includeInactive) {
+      orderParams.set('include_inactive', 'true');
     }
     const orderQuery = orderParams.toString();
     const ordersBase = `${cfg.apiUrl}/orders${orderQuery ? `?${orderQuery}` : ''}`;

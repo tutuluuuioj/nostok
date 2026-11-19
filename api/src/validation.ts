@@ -90,6 +90,12 @@ export function buildPaginationSchema(maxLimit: number) {
 
 export const ordersQuerySchema = z.object({
   status: z.enum(['cancelled', 'partially_filled', 'filled', 'unknown']).optional(),
+  order_hash: z
+    .string()
+    .trim()
+    .regex(/^0x[0-9a-fA-F]{64}$/, 'order_hash must be a 32-byte 0x hex string')
+    .transform((v) => v.toLowerCase())
+    .optional(),
   maker: checksumAddressSchema.optional(),
   asset: checksumAddressSchema.optional(),
   order_type: z.enum(['borrow', 'lend']).optional(),
