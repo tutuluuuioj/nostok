@@ -12,12 +12,14 @@ import {
 import {
   buildBookSummary,
   buildDataMetricRows,
+  buildOnChainEnvironmentRows,
   buildProtocolFeeCards,
   buildRiskSummaryRows,
   formatApiAmount,
   formatBpsPercent,
   parseDecimalToRaw,
   parsePercentToBps,
+  reconcileLiveAssetsWithApi,
 } from './marketsApi.js';
 import { termSheet } from './money.js';
 import {
@@ -401,5 +403,100 @@ assert.throws(
     ),
   /SIWE challenge chain_id mismatch/
 );
+
+// WS3.7 Piece 1 unit checks: reconcileLiveAssetsWithApi + on-chain Risk/Data row helpers
+const mockOnChainSnapshot = {
+  ok: true,
+  error: '',
+  blockNumber: '123456',
+  blockTimestamp: 1795000000,
+  protocol: {
+    paused: true,
+    nextLoanId: '4',
+    originatedLoansCount: '3',
+    globalUsdcCap: { raw: '10000000000', formatted: '10000', decimals: 6, symbol: 'USDC' },
+    totalOutstandingPrincipal: { raw: '2500000000', formatted: '2500', decimals: 6, symbol: 'USDC' },
+    globalRemainingUsdc: { raw: '7500000000', formatted: '7500', decimals: 6, symbol: 'USDC' },
+    marketOpen: false,
+    sequencerValid: true,
+    maxStaleClosedSecs: 345600,
+    useManualMarketSession: true,
+    isMarketOpenManual: false,
+  },
+  assets: [
+    {
+      source: 'onchain_rpc',
+      token: '0x2222222222222222222222222222222222222222',
+      symbol: 'NVDAc',
+      decimals: 18,
+      status: 3,
+      status_name: 'Frozen',
+      ltv: {
+        max_init_ltv_bps: 5500,
+        margin_call_ltv_bps: 7000,
+        liq_ltv_bps: 7500,
+        bad_debt_ltv_bps: 9000,
+        max_discount_bps: 600,
+        closed_market_haircut_bps: 500,
+      },
+      caps: {
+        per_loan_cap: { raw: '2000000000', formatted: '2000', decimals: 6, symbol: 'USDC' },
+        asset_cap: { raw: '5000000000', formatted: '5000', decimals: 6, symbol: 'USDC' },
+        asset_outstanding_principal: { raw: '500000000', formatted: '500', decimals: 6, symbol: 'USDC' },
+        asset_remaining: { raw: '4500000000', formatted: '4500', decimals: 6, symbol: 'USDC' },
+      },
+      multiplier: {
+        recorded: { raw: '2000000000000000000', formatted: '2', decimals: 18 },
+      },
+      oracle: {
+        price: { raw: '14000000000', formatted: '140', decimals: 8, symbol: 'USD' },
+        state: 2,
+        state_name: 'FROZEN_CORPORATE_ACTION',
+      },
+      escrow_balance: { raw: '5000000000000000000', formatted: '5', decimals: 18, symbol: 'NVDAc' },
+    },
+  ],
+};
+
+const staleApiAssets = [
+  {
+    token: '0x2222222222222222222222222222222222222222',
+    symbol: 'NVDAc',
+    status: 0,
+    status_name: 'Active',
+    ltv: { max_init_ltv_bps: 6000, liq_ltv_bps: 7800 },
+    caps: { asset_cap: { raw: '10000000000' } },
+    multiplier: { recorded: { raw: '1000000000000000000' } },
+    oracle: { state: 0, state_name: 'VALID_OPEN' },
+  },
+];
+
+const reconciledMismatch = reconcileLiveAssetsWithApi(staleApiAssets, mockOnChainSnapshot);
+assert.equal(reconciledMismatch.usingOnChain, true);
+assert.equal(reconciledMismatch.assets[0].status, 3);
+assert.equal(reconciledMismatch.assets[0].oracle.state_name, 'FROZEN_CORPORATE_ACTION');
+assert.equal(reconciledMismatch.assets[0].ltv.max_init_ltv_bps, 5500);
+assert.equal(reconciledMismatch.discrepancies.length, 6);
+
+const reconciledApiOutage = reconcileLiveAssetsWithApi([], mockOnChainSnapshot);
+assert.equal(reconciledApiOutage.assets.length, 1);
+assert.equal(reconciledApiOutage.discrepancies.length, 0);
+
+const envRows = buildOnChainEnvironmentRows(mockOnChainSnapshot);
+const envMap = Object.fromEntries(envRows.map((r) => [r.label, r.value]));
+assert.match(envMap['Base RPC block / timestamp'], /#123456/);
+assert.match(envMap['LoanCore.paused()'], /^PAUSED/);
+assert.equal(envMap['Originated loans (LoanCore.nextLoanId - 1)'], '3');
+assert.match(envMap['OracleRouter.isMarketOpen()'], /^Closed \(manual override: closed\)/);
+
+const onChainOnlyDataRows = buildDataMetricRows(null, { error: 'api down' }, null, mockOnChainSnapshot);
+const onChainDataMap = Object.fromEntries(onChainOnlyDataRows.map((r) => [r.label, r.value]));
+assert.equal(onChainDataMap['Outstanding principal'], '$2,500.00 USDC');
+assert.equal(onChainDataMap['Global USDC cap / remaining'], '$10,000.00 / $7,500.00');
+assert.equal(onChainDataMap['Protocol status (LoanCore.paused)'], 'PAUSED');
+assert.equal(onChainDataMap['Originated loans (LoanCore)'], '3');
+assert.equal(onChainDataMap['Collateral escrowed (CollateralEscrow)'], 'NVDAc 5');
+assert.equal(onChainDataMap['Active loans (status 0)'], 'Indexer unavailable');
+assert.match(onChainDataMap['Indexed block / chain head'], /#— \/ #123456/);
 
 console.log('book ok');

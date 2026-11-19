@@ -3,26 +3,36 @@ import { Link } from 'react-router-dom';
 import { Page, Rows } from '../components/ui.jsx';
 import {
   buildDataMetricRows,
-  fetchMarketSnapshot,
+  fetchMarketsAndLiveContracts,
 } from '../lib/marketsApi.js';
 import { useStore } from '../store.jsx';
 
 export function Data() {
   const { web3 } = useStore();
-  const [snapshot, setSnapshot] = useState({ loading: true, data: null });
+  const [snapshot, setSnapshot] = useState({ loading: true, data: null, onChain: null, discrepancies: [] });
   const reqSeqRef = useRef(0);
 
   const loadBook = useCallback(async () => {
     const reqId = ++reqSeqRef.current;
-    setSnapshot((prev) => ({ loading: true, data: prev.data }));
-    const next = await fetchMarketSnapshot({
+    setSnapshot((prev) => ({
+      loading: true,
+      data: prev.data,
+      onChain: prev.onChain,
+      discrepancies: prev.discrepancies,
+    }));
+    const next = await fetchMarketsAndLiveContracts({
       cfg: web3?.config,
       requestId: reqId,
       includeLoans: true,
       includeAuctions: true,
     });
     if (reqId !== reqSeqRef.current) return;
-    setSnapshot({ loading: false, data: next });
+    setSnapshot({
+      loading: false,
+      data: next.market,
+      onChain: next.onChain,
+      discrepancies: next.discrepancies,
+    });
   }, [web3?.config]);
 
   useEffect(() => {
@@ -30,6 +40,8 @@ export function Data() {
   }, [loadBook]);
 
   const data = snapshot.data;
+  const onChain = snapshot.onChain;
+  const discrepancies = snapshot.discrepancies ?? [];
   const summary = data?.bookSummary;
   const health = data?.health;
 
@@ -37,7 +49,7 @@ export function Data() {
     <Page
       kicker="Book"
       title="Live protocol book metrics."
-      lede="Figures below come strictly from the Base indexer API (/health, /assets, /orders, /loans, /auctions) using exact USDC 6-decimal accounting."
+      lede="Figures below combine direct Base contract readings (LoanCore, CollateralEscrow, AssetRegistry, OracleRouter) with indexed loan, order, and auction breakdowns from api/ using exact USDC 6-decimal accounting."
     >
       <div className="actions">
         <button
@@ -50,17 +62,31 @@ export function Data() {
         </button>
       </div>
 
-      {snapshot.loading && !data ? (
-        <p className="hint block">Loading live protocol book metrics from api/…</p>
+      {snapshot.loading && !data && !onChain ? (
+        <p className="hint block">Loading live protocol book metrics from Base contracts &amp; api/…</p>
       ) : null}
 
-      {data && (data.stale || data.degraded || data.error) ? (
+      {onChain && !onChain.ok ? (
         <p className="err block" role="alert">
-          Live book telemetry degraded or unavailable — {data.error || 'Indexer health degraded.'}
+          Direct Base RPC contract read unavailable — {onChain.error}
         </p>
       ) : null}
 
-      <Rows items={buildDataMetricRows(summary, data, health)} />
+      {data && (data.stale || data.degraded || data.error) ? (
+        <p className={onChain?.ok ? 'hint block' : 'err block'} role="alert">
+          {onChain?.ok
+            ? `Indexer api/ degraded or unavailable (${data.error || 'Indexer health degraded.'}) — live LoanCore caps, principal, loan counter, and CollateralEscrow totals are read directly from Base RPC.`
+            : `Live book telemetry degraded or unavailable — ${data.error || 'Indexer health degraded.'}`}
+        </p>
+      ) : null}
+
+      {discrepancies.length > 0 ? (
+        <p className="err block" role="alert">
+          Contract vs api/ mismatch detected (Base RPC values shown): {discrepancies.join(' · ')}
+        </p>
+      ) : null}
+
+      <Rows items={buildDataMetricRows(summary, data, health, onChain)} />
       <p className="block hint">
         Collateral remains isolated per loan in CollateralEscrow. Live asset configurations and oracle states are published on <Link to="/risk">risk parameters</Link> and <Link to="/markets">live markets</Link>.
       </p>

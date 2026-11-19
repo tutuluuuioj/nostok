@@ -63,10 +63,15 @@ import {
   setFrontendConfigOverrides,
 } from '../src/lib/contracts.js';
 import {
+  buildDataMetricRows,
+  buildOnChainEnvironmentRows,
+  fetchLiveProtocolContractState,
   fetchLoanQuote,
   fetchMarketSnapshot,
+  fetchMarketsAndLiveContracts,
   formatApiAmount,
   formatBpsPercent,
+  reconcileLiveAssetsWithApi,
 } from '../src/lib/marketsApi.js';
 import {
   DEFAULT_COLLATERAL_BUFFER_BPS,
@@ -143,18 +148,20 @@ import {
   verifyAndPreviewLoanTopUp,
   verifyEligibilityDeclaration,
 } from '../src/lib/web3.js';
-import { App, Frame } from '../src/App.jsx';
+import { App, Frame, isSafetyOrExitRoute, normalizeRoutePath } from '../src/App.jsx';
 import { Gate, GateChecking, Restricted } from '../src/components/Gate.jsx';
 import { Shell } from '../src/components/Shell.jsx';
 import { ErrorBoundary } from '../src/components/ui.jsx';
 import { Alerts } from '../src/pages/Alerts.jsx';
 import { Borrow } from '../src/pages/Borrow.jsx';
 import { Builders } from '../src/pages/Builders.jsx';
+import { Data } from '../src/pages/Data.jsx';
 import { Lend } from '../src/pages/Lend.jsx';
 import { Loan } from '../src/pages/Loan.jsx';
 import { Loans } from '../src/pages/Loans.jsx';
 import { Markets } from '../src/pages/Markets.jsx';
 import { Positions } from '../src/pages/Positions.jsx';
+import { Risk } from '../src/pages/Risk.jsx';
 import { SubscriptionAction } from '../src/pages/SubscriptionAction.jsx';
 import { Wallet } from '../src/pages/Wallet.jsx';
 import {
@@ -7093,7 +7100,8 @@ async function runTests(): Promise<void> {
         assert.ok(blockedMarketsHtml.includes('This interface is not available here.'));
         assert.ok(blockedMarketsHtml.includes('Manage existing positions (/loans)'));
 
-        for (const exitRoute of ['/loans', '/loans/1', '/loan/1', '/borrow', '/lend', '/wallet']) {
+        for (const exitRoute of ['/loans', '/loans/', '/loans/1', '/loans/1/', '/loan/1', '/loan/1/', '/borrow', '/borrow/', '/lend', '/lend/', '/wallet', '/wallet/']) {
+          assert.equal(isSafetyOrExitRoute(exitRoute), true, `${exitRoute} must match isSafetyOrExitRoute`);
           const exitHtml = renderToStaticMarkup(
             createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: [exitRoute] }, createElement(Frame)))
           );
@@ -7103,6 +7111,19 @@ async function runTests(): Promise<void> {
           );
           assert.ok(!exitHtml.includes('<h1>Verifying eligibility.</h1>'), `${exitRoute} must not hold behind GateChecking`);
         }
+
+        // Trailing-empty or extra segments (/loan/, /loan/1/x, /loans/1/x, /borrow/x) must NEVER bypass Restricted/Gate!
+        for (const nonExitRoute of ['/loan/', '/loan/1/x', '/loan/1/x/', '/loans/1/x', '/borrow/extra']) {
+          assert.equal(isSafetyOrExitRoute(nonExitRoute), false, `${nonExitRoute} must not match isSafetyOrExitRoute`);
+          const nonExitHtml = renderToStaticMarkup(
+            createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: [nonExitRoute] }, createElement(Frame)))
+          );
+          assert.ok(
+            nonExitHtml.includes('This interface is not available here.'),
+            `${nonExitRoute} must remain gated behind Restricted instead of showing Home ungated`
+          );
+        }
+        assert.equal(normalizeRoutePath('/borrow/'), '/borrow');
 
         const restrictedWithRouter = renderToStaticMarkup(
           createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: ['/'] }, createElement(Restricted)))
@@ -7609,7 +7630,404 @@ async function runTests(): Promise<void> {
 
       console.log('PASS WS3.6 Piece 2b M1 Fix: Safety/exit paths open & new-risk actions blocked across US IP, revoked wallet & API outage.');
 
-      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 + WS3.6 PIECE 1 & 2 (WITH M1 FIX) FORK TESTS PASSED.');
+      // ---------------------------------------------------------------------
+      // 3.15 Low 1 Repro & Fix: API-only $1,000 LendOffer + API down + Repay with trim -> allowance MUST stay intact!
+      // ---------------------------------------------------------------------
+      console.log('\n=== Low 1 Repro Fix: Skip post-repay USDC allowance trim when openOrdersWarning is set ===');
+
+      // Top up borrower USDC & mint NVDAc for borrower & lender so exact offer creation + repay + subsequent fill succeed cleanly
+      await publicClient.waitForTransactionReceipt({
+        hash: await rawWalletClient.sendTransaction({
+          account: BASE_USDC_WHALE,
+          to: BASE_USDC,
+          data: encodeFunctionData({
+            abi: parseAbi(['function transfer(address to, uint256 value) returns (bool)']),
+            functionName: 'transfer',
+            args: [ADDRESSES.borrower, 3_000_000_000n],
+          }),
+        }),
+      });
+      for (const mintTo of [ADDRESSES.borrower, ADDRESSES.lender]) {
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdac,
+            abi: mockB20Artifact.abi,
+            functionName: 'mint',
+            args: [mintTo, 20n * 10n ** 18n],
+          }),
+        });
+      }
+      await rpcCall('evm_mine', []);
+
+      // 1) Open an active $500 loan for borrower (lender fills borrower's BorrowOrder)
+      const low1SetupMap = new Map<string, string>();
+      const low1SetupStorage = {
+        getItem: (k: string) => low1SetupMap.get(k) ?? null,
+        setItem: (k: string, v: string) => { low1SetupMap.set(k, String(v)); },
+        removeItem: (k: string) => { low1SetupMap.delete(k); },
+      };
+      walletProvider.setAccount(KEYS.borrower);
+      const low1LoanQuote = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '500000000',
+        termDays: 14,
+        aprBps: 800,
+        maxLtvBps: 6000,
+        borrower: ADDRESSES.borrower,
+      });
+      const low1BorrowOrder = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '500000000',
+        expectedQuote: low1LoanQuote,
+        requireExpectedQuote: true,
+        maxRateBps: 800,
+        termDays: 14,
+        maxLtvBps: 6000,
+        minFillRaw: '500000000',
+        existingOpenCollateralRaw: 0n,
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: false,
+        storage: low1SetupStorage,
+        provider: walletProvider,
+        cfg,
+      });
+      walletProvider.setAccount(KEYS.lender);
+      const low1Opened = await fillBorrowOrderAsLender({
+        address: ADDRESSES.lender,
+        order: low1BorrowOrder.order,
+        signature: low1BorrowOrder.signature,
+        fillUsdcRaw: '500000000',
+        existingOpenSumRaw: 0n,
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      const low1LoanId = low1Opened.loanId;
+      assert.ok(low1LoanId, 'Low 1 test loan must open on-chain');
+
+      // 2) Borrower signs & relays an API-ONLY $1,000 USDC LendOffer, using throwaway local storage (not present locally later!)
+      const low1ApiOfferStore = new Map<string, string>();
+      const low1ApiOfferStorage = {
+        getItem: (k: string) => low1ApiOfferStore.get(k) ?? null,
+        setItem: (k: string, v: string) => { low1ApiOfferStore.set(k, String(v)); },
+        removeItem: (k: string) => { low1ApiOfferStore.delete(k); },
+      };
+      walletProvider.setAccount(KEYS.borrower);
+      const low1LendQuote = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '1000000000',
+        termDays: 14,
+        aprBps: 800,
+        maxLtvBps: 6000,
+      });
+      const low1ApiOnlyOffer = await prepareAndSignLendOffer({
+        address: ADDRESSES.borrower,
+        principalRaw: '1000000000',
+        allowedCollateral: nvdac,
+        expectedQuote: low1LendQuote,
+        requireExpectedQuote: true,
+        minRateBps: 800,
+        termDays: 14,
+        maxLtvBps: 6000,
+        minFillRaw: '500000000',
+        expiryDays: 7,
+        existingOpenSumRaw: 0n,
+        autoApprove: true,
+        publishToApi: true,
+        storage: low1ApiOfferStorage,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(low1ApiOnlyOffer.publishedToApi, true, 'API-only $1,000 LendOffer must be published to api/');
+
+      // Reset borrower local storage completely so the $1,000 LendOffer exists ONLY on api/ (repro setup)
+      const low1EmptyMap = new Map<string, string>();
+      const low1EmptyStorage = {
+        getItem: (k: string) => low1EmptyMap.get(k) ?? null,
+        setItem: (k: string, v: string) => { low1EmptyMap.set(k, String(v)); },
+        removeItem: (k: string) => { low1EmptyMap.delete(k); },
+      };
+
+      // Preview while API is healthy just to inspect combined approval target, then ensure exact combined allowance (1,000 + repayMax)
+      const low1OnlinePrev = await verifyAndPreviewLoanRepay({
+        loanId: low1LoanId,
+        payerAddress: ADDRESSES.borrower,
+        storage: low1EmptyStorage,
+        cfg,
+      });
+      assert.ok(
+        BigInt(low1OnlinePrev.existingOpenSumRaw) >= 1_000_000_000n,
+        'Online preview must discover API-only $1,000 LendOffer'
+      );
+      await approveUsdcForLend({
+        address: ADDRESSES.borrower,
+        requiredUsdcRaw: low1OnlinePrev.requiredApprovalRaw,
+        provider: walletProvider,
+        cfg,
+      });
+
+      // 3) Simulate API outage (deadApiCfg) and repay WITH trimBufferAllowance: true
+      const low1DeadApiTopUpPrev = await verifyAndPreviewLoanTopUp({
+        loanId: low1LoanId,
+        additionalCollateralRaw: '100000000000000000',
+        payerAddress: ADDRESSES.borrower,
+        storage: low1EmptyStorage,
+        cfg: deadApiCfg,
+      });
+      assert.ok(low1DeadApiTopUpPrev.openOrdersWarning.includes('api/ open-orders query unavailable'));
+
+      const low1DeadApiRepayPrev = await verifyAndPreviewLoanRepay({
+        loanId: low1LoanId,
+        payerAddress: ADDRESSES.borrower,
+        storage: low1EmptyStorage,
+        cfg: deadApiCfg,
+      });
+      assert.ok(low1DeadApiRepayPrev.openOrdersWarning.includes('api/ open-orders query unavailable'));
+      assert.equal(
+        low1DeadApiRepayPrev.existingOpenSumRaw,
+        '0',
+        'Local empty storage yields 0 local open LendOffers while API is unreachable'
+      );
+
+      const low1RepayRes = await executeLoanRepay({
+        address: ADDRESSES.borrower,
+        loanId: low1LoanId,
+        expectedPreview: low1DeadApiRepayPrev,
+        autoApprove: true,
+        trimBufferAllowance: true,
+        storage: low1EmptyStorage,
+        provider: walletProvider,
+        cfg: deadApiCfg,
+      });
+      assert.ok(low1RepayRes.txHash, 'Repay during API outage must still settle on-chain');
+      assert.equal(
+        low1RepayRes.allowanceTrimTxHash,
+        null,
+        'Post-repay LoanCore allowance trim MUST be skipped when openOrdersWarning is set'
+      );
+      assert.match(
+        low1RepayRes.allowanceTrimSkippedReason || '',
+        /api\/ open-orders query unavailable/i
+      );
+
+      const postOutageAllow = BigInt(
+        (await readLendAllowanceAndNonce(ADDRESSES.borrower, { cfg: deadApiCfg })).allowanceRaw
+      );
+      assert.ok(
+        postOutageAllow >= 1_000_000_000n,
+        `API-only $1,000 LendOffer allowance MUST NOT be cut to 0 during outage (got ${postOutageAllow})`
+      );
+
+      // 4) API recovers: counterparty (lender acting as borrower) fills borrower's API-only $1,000 LendOffer and it succeeds!
+      walletProvider.setAccount(KEYS.lender);
+      const low1OfferFillPrev = await verifyAndPreviewLendOfferFill({
+        offer: low1ApiOnlyOffer.offer,
+        signature: low1ApiOnlyOffer.signature,
+        collateralToken: nvdac,
+        fillUsdcRaw: '1000000000',
+        borrowerAddress: ADDRESSES.lender,
+        storage: low1EmptyStorage,
+        cfg,
+      });
+      const low1OfferFillRes = await fillLendOfferAsBorrower({
+        address: ADDRESSES.lender,
+        offer: low1ApiOnlyOffer.offer,
+        signature: low1ApiOnlyOffer.signature,
+        collateralToken: nvdac,
+        fillUsdcRaw: '1000000000',
+        expectedPreview: low1OfferFillPrev,
+        autoApprove: true,
+        storage: low1EmptyStorage,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(low1OfferFillRes.loanId, 'API-only $1,000 LendOffer must still be fillable after outage repay');
+
+      // Source & policy sanity: Loan.jsx shows openOrdersWarning on both previews + skipped reason; web3.js never uses MaxUint256
+      const low1LoanSrc = fs.readFileSync(path.join(REPO_ROOT, 'src', 'pages', 'Loan.jsx'), 'utf8');
+      assert.ok(low1LoanSrc.includes('repayPreview.openOrdersWarning'));
+      assert.ok(low1LoanSrc.includes('topUpPreview.openOrdersWarning'));
+      assert.ok(low1LoanSrc.includes('repayResult.allowanceTrimSkippedReason'));
+      const web3CodeOnly = fs
+        .readFileSync(path.join(REPO_ROOT, 'src', 'lib', 'web3.js'), 'utf8')
+        .replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, '');
+      assert.ok(
+        !/maxUint256|0xf{64}|2n\s*\*\*\s*256n\s*-\s*1n/i.test(web3CodeOnly),
+        'web3.js code must never approve MaxUint256 / unlimited allowance'
+      );
+
+      console.log('PASS Low 1 Fix: Post-repay trim skipped during API outage; API-only $1,000 LendOffer allowance preserved & fillable.');
+
+      // ---------------------------------------------------------------------
+      // 3.16 WS3.7 Piece 1: Direct Base RPC Readings for Risk.jsx & Data.jsx
+      // ---------------------------------------------------------------------
+      console.log('\n=== WS3.7 Piece 1: Live Base AssetRegistry, OracleRouter, LoanCore & FeeCollector reads on Risk & Data ===');
+
+      const ws37LiveBefore = await fetchLiveProtocolContractState({ cfg });
+      assert.equal(ws37LiveBefore.ok, true, `Direct Base RPC snapshot failed: ${ws37LiveBefore.error}`);
+      assert.ok(BigInt(ws37LiveBefore.blockNumber) > 0n);
+      assert.equal(ws37LiveBefore.protocol.paused, false);
+      assert.equal(ws37LiveBefore.protocol.marketOpen, true);
+      assert.equal(ws37LiveBefore.protocol.sequencerValid, true);
+      assert.ok(BigInt(ws37LiveBefore.protocol.originatedLoansCount) >= 1n);
+      assert.ok(ws37LiveBefore.fees && Number.isInteger(ws37LiveBefore.fees.origination_fee_bps));
+
+      const nvdaLiveOpen = ws37LiveBefore.assets.find((a) => a.token.toLowerCase() === nvdac.toLowerCase());
+      assert.ok(nvdaLiveOpen, 'AssetRegistry log discovery must detect NVDAc without hardcoding');
+      assert.equal(nvdaLiveOpen.status, 0);
+      assert.equal(nvdaLiveOpen.status_name, 'Active');
+      assert.equal(nvdaLiveOpen.oracle.state, 0);
+      assert.equal(nvdaLiveOpen.oracle.state_name, 'VALID_OPEN');
+      assert.equal(nvdaLiveOpen.ltv.max_init_ltv_bps, 6000);
+      assert.equal(nvdaLiveOpen.ltv.liq_ltv_bps, 7800);
+      assert.equal(nvdaLiveOpen.ltv.closed_market_haircut_bps, 500);
+      assert.ok(BigInt(nvdaLiveOpen.oracle.price.raw) > 0n);
+      assert.equal(
+        nvdaLiveOpen.oracle.gross_unit_value_usdc.raw,
+        nvdaLiveOpen.oracle.effective_unit_value_usdc.raw,
+        'Open session must have zero closed-market haircut on OracleRouter.getValue'
+      );
+
+      // Mutate real on-chain protocol state via timelock: Closed market + Paused LoanCore + Frozen AssetStatus
+      try {
+        await publicClient.waitForTransactionReceipt({
+          hash: await rawWalletClient.sendTransaction({
+            account: deployed.nostokTimelock,
+            to: deployed.oracleRouter,
+            data: encodeFunctionData({
+              abi: parseAbi(['function setMarketSession(bool isOpen, bool isManual)']),
+              functionName: 'setMarketSession',
+              args: [false, true],
+            }),
+          }),
+        });
+        const ws37LiveClosed = await fetchLiveProtocolContractState({ cfg });
+        assert.equal(ws37LiveClosed.ok, true);
+        assert.equal(ws37LiveClosed.protocol.marketOpen, false);
+        const nvdaClosed = ws37LiveClosed.assets.find((a) => a.token.toLowerCase() === nvdac.toLowerCase())!;
+        assert.equal(nvdaClosed.oracle.state, 1, 'OracleRouter must report VALID_CLOSED when market session closed');
+        assert.equal(nvdaClosed.oracle.state_name, 'VALID_CLOSED');
+        assert.ok(
+          BigInt(nvdaClosed.oracle.effective_unit_value_usdc.raw) < BigInt(nvdaClosed.oracle.gross_unit_value_usdc.raw),
+          'OracleRouter.getValue must apply 500 bps closed-market haircut live on-chain'
+        );
+
+        await publicClient.waitForTransactionReceipt({
+          hash: await rawWalletClient.sendTransaction({
+            account: deployed.nostokTimelock,
+            to: deployed.loanCore,
+            data: encodeFunctionData({
+              abi: parseAbi(['function setPaused(bool isPaused)']),
+              functionName: 'setPaused',
+              args: [true],
+            }),
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await rawWalletClient.sendTransaction({
+            account: deployed.nostokTimelock,
+            to: deployed.assetRegistry,
+            data: encodeFunctionData({
+              abi: parseAbi(['function setAssetStatus(address token, uint8 newStatus)']),
+              functionName: 'setAssetStatus',
+              args: [nvdac, 3],
+            }),
+          }),
+        });
+
+        const ws37LiveFrozenPaused = await fetchLiveProtocolContractState({ cfg });
+        assert.equal(ws37LiveFrozenPaused.protocol.paused, true);
+        const nvdaFrozen = ws37LiveFrozenPaused.assets.find((a) => a.token.toLowerCase() === nvdac.toLowerCase())!;
+        assert.equal(nvdaFrozen.status, 3);
+        assert.equal(nvdaFrozen.status_name, 'Frozen');
+        assert.equal(nvdaFrozen.oracle.state, 2);
+        assert.equal(nvdaFrozen.oracle.state_name, 'FROZEN_CORPORATE_ACTION');
+
+        const envRowsFrozen = buildOnChainEnvironmentRows(ws37LiveFrozenPaused);
+        assert.ok(envRowsFrozen.some((r) => r.label === 'LoanCore.paused()' && r.value.startsWith('PAUSED')));
+
+        const reconciledDrift = reconcileLiveAssetsWithApi(
+          [{ token: nvdac, symbol: 'NVDAc', status: 0, status_name: 'Active', oracle: { state: 0, state_name: 'VALID_OPEN' } }],
+          ws37LiveFrozenPaused
+        );
+        assert.ok(reconciledDrift.discrepancies.length >= 2, 'Live RPC vs stale API mismatch must be flagged');
+      } finally {
+        await publicClient.waitForTransactionReceipt({
+          hash: await rawWalletClient.sendTransaction({
+            account: deployed.nostokTimelock,
+            to: deployed.assetRegistry,
+            data: encodeFunctionData({
+              abi: parseAbi(['function setAssetStatus(address token, uint8 newStatus)']),
+              functionName: 'setAssetStatus',
+              args: [nvdac, 0],
+            }),
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await rawWalletClient.sendTransaction({
+            account: deployed.nostokTimelock,
+            to: deployed.loanCore,
+            data: encodeFunctionData({
+              abi: parseAbi(['function setPaused(bool isPaused)']),
+              functionName: 'setPaused',
+              args: [false],
+            }),
+          }),
+        });
+        await publicClient.waitForTransactionReceipt({
+          hash: await rawWalletClient.sendTransaction({
+            account: deployed.nostokTimelock,
+            to: deployed.oracleRouter,
+            data: encodeFunctionData({
+              abi: parseAbi(['function setMarketSession(bool isOpen, bool isManual)']),
+              functionName: 'setMarketSession',
+              args: [true, true],
+            }),
+          }),
+        });
+      }
+
+      // API unreachable fallback: fetchMarketsAndLiveContracts & buildDataMetricRows MUST still read live AssetRegistry/OracleRouter/LoanCore/FeeCollector!
+      const ws37OutageCombined = await fetchMarketsAndLiveContracts({
+        cfg: deadApiCfg,
+        includeLoans: true,
+        includeAuctions: true,
+      });
+      assert.equal(ws37OutageCombined.market.degraded, true);
+      assert.equal(ws37OutageCombined.onChain.ok, true);
+      assert.ok(ws37OutageCombined.assets.length >= 1, 'Risk & Book must still list on-chain assets during API outage');
+      assert.ok(ws37OutageCombined.onChain.fees && ws37OutageCombined.onChain.fees.max_origination_bps > 0);
+      const outageDataRows = buildDataMetricRows(
+        ws37OutageCombined.market.bookSummary,
+        ws37OutageCombined.market,
+        ws37OutageCombined.market.health,
+        ws37OutageCombined.onChain
+      );
+      const outageDataMap = Object.fromEntries(outageDataRows.map((r) => [r.label, r.value]));
+      assert.notEqual(outageDataMap['Outstanding principal'], 'Unavailable');
+      assert.notEqual(outageDataMap['Global USDC cap / remaining'], 'Unavailable');
+      assert.equal(outageDataMap['Protocol status (LoanCore.paused)'], 'Active');
+      assert.match(outageDataMap['Collateral escrowed (CollateralEscrow)'], /NVDAc/);
+
+      // Render Risk & Data components safely
+      const riskPageHtml = renderToStaticMarkup(
+        createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: ['/risk'] }, createElement(Shell, null, createElement(Risk))))
+      );
+      assert.ok(riskPageHtml.includes('Live asset state (AssetRegistry &amp; OracleRouter)'));
+      assert.ok(riskPageHtml.includes('Protocol fees &amp; caps (FeeCollector)'));
+
+      const dataPageHtml = renderToStaticMarkup(
+        createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: ['/data'] }, createElement(Shell, null, createElement(Data))))
+      );
+      assert.ok(dataPageHtml.includes('Live protocol book metrics.'));
+
+      console.log('PASS WS3.7 Piece 1: Direct Base RPC AssetRegistry/OracleRouter/LoanCore/FeeCollector readings & Risk/Data rendering verified.');
+
+      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 + WS3.6 + WS3.7 PIECE 1 (WITH LOW 1 & ROUTE FIX) FORK TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
       await new Promise<void>((r) => apiServer.close(() => r()));

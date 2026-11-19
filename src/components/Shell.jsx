@@ -30,6 +30,7 @@ const TITLES = {
 export function Shell({ children }) {
   const { web3 } = useStore();
   const { pathname } = useLocation();
+  const normPath = pathname.replace(/\/+$/, '') || '/';
   const [menu, setMenu] = useState(false);
 
   useLayoutEffect(() => {
@@ -38,12 +39,12 @@ export function Shell({ children }) {
 
   useEffect(() => {
     setMenu(false);
-    const name = TITLES[pathname] || (pathname.startsWith('/loans/') || pathname.startsWith('/loan/') ? 'Loan' : 'NOSTOK');
-    document.title = pathname === '/' ? 'NOSTOK' : `${name} · NOSTOK`;
-  }, [pathname]);
+    const name = TITLES[normPath] || (/^\/loans?\/[^/]+$/.test(normPath) ? 'Loan' : 'NOSTOK');
+    document.title = normPath === '/' ? 'NOSTOK' : `${name} · NOSTOK`;
+  }, [normPath]);
 
   function item(path, label) {
-    const current = pathname === path;
+    const current = normPath === path;
     return (
       <Link key={path} to={path} aria-current={current ? 'page' : undefined}>
         {label}

@@ -4977,30 +4977,37 @@ export async function executeLoanRepay({
     throw new Error(`${eventName} event missing in transaction receipt for Loan #${preview.loanId}.`);
   }
 
+  const trimBlockedReason =
+    preview.openOrdersWarning || expectedPreview?.openOrdersWarning || '';
   let allowanceTrimTxHash = null;
   let postTrimAllowanceRaw = null;
+  let allowanceTrimSkippedReason = '';
   if (trimBufferAllowance) {
-    const openSum = BigInt(preview.existingOpenSumRaw ?? 0n);
-    const currentAllow = BigInt(
-      await publicClient.readContract({
-        address: preview.token,
-        abi: erc20Abi,
-        functionName: 'allowance',
-        args: [wallet, loanCoreAddr],
-      })
-    );
-    if (currentAllow > openSum) {
-      const trimRes = await setUsdcAllowanceForLend({
-        address: wallet,
-        targetAllowanceRaw: openSum,
-        provider,
-        cfg,
-        publicClient,
-      });
-      allowanceTrimTxHash = trimRes.txHash;
-      postTrimAllowanceRaw = trimRes.allowanceRaw;
+    if (trimBlockedReason) {
+      allowanceTrimSkippedReason = `${trimBlockedReason} Post-repay LoanCore USDC allowance trim skipped to protect API-only open LendOffers.`;
     } else {
-      postTrimAllowanceRaw = currentAllow.toString();
+      const openSum = BigInt(preview.existingOpenSumRaw ?? 0n);
+      const currentAllow = BigInt(
+        await publicClient.readContract({
+          address: preview.token,
+          abi: erc20Abi,
+          functionName: 'allowance',
+          args: [wallet, loanCoreAddr],
+        })
+      );
+      if (currentAllow > openSum) {
+        const trimRes = await setUsdcAllowanceForLend({
+          address: wallet,
+          targetAllowanceRaw: openSum,
+          provider,
+          cfg,
+          publicClient,
+        });
+        allowanceTrimTxHash = trimRes.txHash;
+        postTrimAllowanceRaw = trimRes.allowanceRaw;
+      } else {
+        postTrimAllowanceRaw = currentAllow.toString();
+      }
     }
   }
 
@@ -5009,6 +5016,7 @@ export async function executeLoanRepay({
     approvalTxHash,
     allowanceTrimTxHash,
     postTrimAllowanceRaw,
+    allowanceTrimSkippedReason: allowanceTrimSkippedReason || null,
     receipt,
     kind: preview.kind,
     isPartial: preview.isPartial,

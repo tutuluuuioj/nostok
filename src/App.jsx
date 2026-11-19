@@ -19,25 +19,28 @@ import { Terms } from './pages/Terms.jsx';
 import { Wallet } from './pages/Wallet.jsx';
 import { StoreProvider, useStore } from './store.jsx';
 
-function isSafetyOrExitRoute(pathname) {
-  return (
-    pathname === '/loans' ||
-    pathname.startsWith('/loans/') ||
-    pathname.startsWith('/loan/') ||
-    pathname === '/borrow' ||
-    pathname === '/lend' ||
-    pathname === '/wallet'
-  );
+export function normalizeRoutePath(pathname) {
+  const clean = String(pathname || '/').replace(/\/+$/, '');
+  return clean || '/';
+}
+
+export function isSafetyOrExitRoute(pathname) {
+  const norm = normalizeRoutePath(pathname);
+  if (norm === '/loans' || norm === '/borrow' || norm === '/lend' || norm === '/wallet') {
+    return true;
+  }
+  return /^\/loans?\/[^/]+$/.test(norm);
 }
 
 export function Frame() {
   const { state, web3 } = useStore();
   const location = useLocation();
+  const normPath = normalizeRoutePath(location.pathname);
   const isSubscriptionAction =
-    location.pathname === '/subscriptions/confirm' ||
-    location.pathname === '/subscriptions/block' ||
-    location.pathname === '/subscriptions/unblock' ||
-    location.pathname === '/subscriptions/manage';
+    normPath === '/subscriptions/confirm' ||
+    normPath === '/subscriptions/block' ||
+    normPath === '/subscriptions/unblock' ||
+    normPath === '/subscriptions/manage';
   const allowExitBypass = isSubscriptionAction || isSafetyOrExitRoute(location.pathname);
   const screening = web3?.eligibilityScreening;
   if (!allowExitBypass && (web3?.hardRestricted || state.gate === 'restricted')) return <Restricted />;

@@ -32,6 +32,11 @@ export const ASSET_STATUS_NAMES = {
   3: 'Frozen',
 };
 
+export const ASSET_TIER_NAMES = {
+  0: 'Tier A',
+  1: 'Tier B',
+};
+
 export const LOAN_STATUS_NAMES = {
   0: 'Active',
   1: 'Grace',
@@ -213,6 +218,10 @@ export const loanCoreAbi = [
   { type: 'function', name: 'totalOutstandingPrincipal', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint128' }] },
   { type: 'function', name: 'assetOutstandingPrincipal', stateMutability: 'view', inputs: [{ name: '', type: 'address' }], outputs: [{ name: '', type: 'uint128' }] },
   { type: 'function', name: 'nextLoanId', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint256' }] },
+  { type: 'function', name: 'feeCollector', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'address' }] },
+  { type: 'function', name: 'escrow', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'address' }] },
+  { type: 'function', name: 'assetRegistry', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'address' }] },
+  { type: 'function', name: 'oracleRouter', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'address' }] },
   { type: 'function', name: 'SECONDS_PER_YEAR', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint256' }] },
   {
     type: 'function',
@@ -568,6 +577,8 @@ export const orderSettlementAbi = [
 
 export const assetRegistryAbi = [
   { type: 'function', name: 'isAssetSupported', stateMutability: 'view', inputs: [{ name: 'token', type: 'address' }], outputs: [{ name: '', type: 'bool' }] },
+  { type: 'function', name: 'getAssetStatus', stateMutability: 'view', inputs: [{ name: 'token', type: 'address' }], outputs: [{ name: '', type: 'uint8' }] },
+  { type: 'function', name: 'oracleRouter', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'address' }] },
   {
     type: 'function',
     name: 'getAssetConfig',
@@ -594,6 +605,42 @@ export const assetRegistryAbi = [
           { name: 'restricted', type: 'bool' },
         ],
       },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'AssetConfigSet',
+    inputs: [
+      { name: 'token', type: 'address', indexed: true },
+      {
+        name: 'config',
+        type: 'tuple',
+        indexed: false,
+        components: [
+          { name: 'feed', type: 'address' },
+          { name: 'feedDecimals', type: 'uint8' },
+          { name: 'tier', type: 'uint8' },
+          { name: 'maxInitLtvBps', type: 'uint16' },
+          { name: 'marginCallLtvBps', type: 'uint16' },
+          { name: 'liqLtvBps', type: 'uint16' },
+          { name: 'badDebtLtvBps', type: 'uint16' },
+          { name: 'maxDiscountBps', type: 'uint16' },
+          { name: 'closedMarketHaircutBps', type: 'uint16' },
+          { name: 'perLoanCap', type: 'uint128' },
+          { name: 'assetCap', type: 'uint128' },
+          { name: 'maxStaleOpenSecs', type: 'uint32' },
+          { name: 'status', type: 'uint8' },
+          { name: 'restricted', type: 'bool' },
+        ],
+      },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'AssetStatusSet',
+    inputs: [
+      { name: 'token', type: 'address', indexed: true },
+      { name: 'status', type: 'uint8', indexed: false },
     ],
   },
   { type: 'error', name: 'UnauthorizedCaller', inputs: [] },
@@ -631,11 +678,51 @@ export const oracleRouterAbi = [
       { name: 'state', type: 'uint8' },
     ],
   },
+  { type: 'function', name: 'getOracleState', stateMutability: 'view', inputs: [{ name: 'token', type: 'address' }], outputs: [{ name: 'state', type: 'uint8' }] },
   { type: 'function', name: 'recordedMultiplier', stateMutability: 'view', inputs: [{ name: 'token', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
+  { type: 'function', name: 'isMarketOpen', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'bool' }] },
+  { type: 'function', name: 'isSequencerValid', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'bool' }] },
+  { type: 'function', name: 'maxStaleClosedSecs', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint32' }] },
+  { type: 'function', name: 'useManualMarketSession', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'bool' }] },
+  { type: 'function', name: 'isMarketOpenManual', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'bool' }] },
+  { type: 'function', name: 'sequencerUptimeFeed', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'address' }] },
+  { type: 'function', name: 'assetRegistry', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'address' }] },
   { type: 'error', name: 'ZeroAddress', inputs: [] },
   { type: 'error', name: 'InvalidAnswer', inputs: [] },
   { type: 'error', name: 'AssetNotConfigured', inputs: [] },
   { type: 'error', name: 'CorporateActionSplitPending', inputs: [] },
+];
+
+export const aggregatorV3Abi = [
+  { type: 'function', name: 'decimals', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint8' }] },
+  { type: 'function', name: 'description', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'string' }] },
+  {
+    type: 'function',
+    name: 'latestRoundData',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [
+      { name: 'roundId', type: 'uint80' },
+      { name: 'answer', type: 'int256' },
+      { name: 'startedAt', type: 'uint256' },
+      { name: 'updatedAt', type: 'uint256' },
+      { name: 'answeredInRound', type: 'uint80' },
+    ],
+  },
+];
+
+export const feeCollectorAbi = [
+  { type: 'function', name: 'MAX_ORIGINATION_BPS', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint16' }] },
+  { type: 'function', name: 'MAX_INTEREST_CUT_BPS', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint16' }] },
+  { type: 'function', name: 'MAX_LIQUIDATION_BPS', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint16' }] },
+  { type: 'function', name: 'originationFeeBps', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint16' }] },
+  { type: 'function', name: 'interestCutBps', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint16' }] },
+  { type: 'function', name: 'liquidationFeeBps', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint16' }] },
+  { type: 'function', name: 'safetyReserveShareBps', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint16' }] },
+  { type: 'function', name: 'treasury', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'address' }] },
+  { type: 'function', name: 'safetyReserve', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'address' }] },
+  { type: 'error', name: 'ZeroAddress', inputs: [] },
+  { type: 'error', name: 'FeeCapExceeded', inputs: [] },
 ];
 
 export const positionNftAbi = [
@@ -713,6 +800,7 @@ export const PROTOCOL_ERROR_ABI = Array.from(
       ...eligibilityGateAbi,
       ...assetRegistryAbi,
       ...oracleRouterAbi,
+      ...feeCollectorAbi,
       ...positionNftAbi,
       ...collateralEscrowAbi,
       ...liquidationAuctionAbi,

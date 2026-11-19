@@ -739,7 +739,9 @@ export function Loan() {
                     {loanState.collateralSymbol}.
                     {repayResult.allowanceTrimTxHash
                       ? ` Trimmed leftover LoanCore allowance to ${repayResult.postTrimAllowanceRaw} raw (tx ${repayResult.allowanceTrimTxHash}).`
-                      : ''}
+                      : repayResult.allowanceTrimSkippedReason
+                        ? ` Post-repay allowance trim skipped: ${repayResult.allowanceTrimSkippedReason}`
+                        : ''}
                   </p>
                 ) : null}
 
@@ -763,6 +765,16 @@ export function Loan() {
 
               {repayPreview ? (
                 <div className="block" style={{ marginTop: 14 }}>
+                  {repayPreview.openOrdersWarning ? (
+                    <div className="err block" role="alert">
+                      <p>
+                        {repayPreview.openOrdersWarning}
+                        {trimBufferAllowance
+                          ? ' Post-repay LoanCore USDC allowance trim will be skipped while API open LendOffers cannot be queried.'
+                          : ''}
+                      </p>
+                    </div>
+                  ) : null}
                   {repayPreview.isThirdPartyPayer ? (
                     <div className="err block" role="alert">
                       <p>{repayPreview.thirdPartyWarning}</p>
@@ -885,6 +897,11 @@ export function Loan() {
 
               {topUpPreview ? (
                 <div className="block" style={{ marginTop: 14 }}>
+                  {topUpPreview.openOrdersWarning ? (
+                    <div className="err block" role="alert">
+                      <p>{topUpPreview.openOrdersWarning}</p>
+                    </div>
+                  ) : null}
                   {topUpPreview.isThirdPartyPayer ? (
                     <div className="err block" role="alert">
                       <p>{topUpPreview.thirdPartyWarning}</p>

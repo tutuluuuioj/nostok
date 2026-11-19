@@ -2,9 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Page, Rows } from '../components/ui.jsx';
 import { ORACLE_STATES } from '../lib/data.js';
 import {
+  buildOnChainEnvironmentRows,
   buildProtocolFeeCards,
   buildRiskSummaryRows,
-  fetchMarketSnapshot,
+  fetchMarketsAndLiveContracts,
   fetchRiskSummaryOptional,
   formatApiAmount,
   formatBpsPercent,
@@ -14,14 +15,22 @@ import { useStore } from '../store.jsx';
 
 export function Risk() {
   const { web3 } = useStore();
-  const [state, setState] = useState({ loading: true, market: null, risk: null, riskError: '' });
+  const [state, setState] = useState({
+    loading: true,
+    market: null,
+    onChain: null,
+    assets: [],
+    discrepancies: [],
+    risk: null,
+    riskError: '',
+  });
   const reqSeqRef = useRef(0);
 
   const loadRisk = useCallback(async () => {
     const seq = ++reqSeqRef.current;
     setState((prev) => ({ ...prev, loading: true }));
-    const [market, riskRes] = await Promise.all([
-      fetchMarketSnapshot({
+    const [combined, riskRes] = await Promise.all([
+      fetchMarketsAndLiveContracts({
         cfg: web3?.config,
         requestId: seq,
         includeLoans: false,
@@ -32,7 +41,10 @@ export function Risk() {
     if (seq !== reqSeqRef.current) return;
     setState({
       loading: false,
-      market,
+      market: combined.market,
+      onChain: combined.onChain,
+      assets: combined.assets,
+      discrepancies: combined.discrepancies,
       risk: riskRes.data,
       riskError: riskRes.error || '',
     });
@@ -43,9 +55,11 @@ export function Risk() {
   }, [loadRisk]);
 
   const market = state.market;
-  const assets = market?.assets ?? [];
+  const onChain = state.onChain;
+  const assets = state.assets ?? [];
+  const discrepancies = state.discrepancies ?? [];
   const risk = state.risk;
-  const feeCards = buildProtocolFeeCards(market?.fees);
+  const feeCards = buildProtocolFeeCards(onChain?.fees ?? market?.fees);
 
   return (
     <Page
@@ -64,9 +78,23 @@ export function Risk() {
         </button>
       </div>
 
-      {market && (market.stale || market.degraded || market.error) ? (
+      {onChain && !onChain.ok ? (
         <p className="err block" role="alert">
-          Live asset &amp; oracle state unavailable or degraded — {market.error}
+          Direct Base RPC contract read unavailable — {onChain.error}
+        </p>
+      ) : null}
+
+      {market && (market.stale || market.degraded || market.error) ? (
+        <p className={onChain?.ok && assets.length > 0 ? 'hint block' : 'err block'} role="alert">
+          {onChain?.ok && assets.length > 0
+            ? `api/ asset feed degraded or unreachable (${market.error}) — displaying live AssetRegistry, OracleRouter, LoanCore & FeeCollector contract readings directly from Base RPC.`
+            : `Live asset & oracle state unavailable or degraded — ${market.error}`}
+        </p>
+      ) : null}
+
+      {discrepancies.length > 0 ? (
+        <p className="err block" role="alert">
+          Contract vs api/ mismatch detected (Base RPC values shown): {discrepancies.join(' · ')}
         </p>
       ) : null}
 
@@ -79,8 +107,15 @@ export function Risk() {
 
       {state.riskError && !risk ? (
         <p className="hint block">
-          Risk monitor summary endpoint unavailable ({state.riskError}); showing AssetRegistry and OracleRouter state from api/.
+          Risk monitor summary endpoint unavailable ({state.riskError}); showing direct Base contracts &amp; AssetRegistry/OracleRouter state.
         </p>
+      ) : null}
+
+      {onChain?.ok ? (
+        <section className="block">
+          <h2>Live Base contracts (LoanCore &amp; OracleRouter)</h2>
+          <Rows items={buildOnChainEnvironmentRows(onChain)} />
+        </section>
       ) : null}
 
       {risk ? (
@@ -91,14 +126,14 @@ export function Risk() {
       ) : null}
 
       <section className="block">
-        <h2>Live asset state (GET /assets)</h2>
-        {state.loading && !market ? (
-          <p className="hint">Loading registered collateral assets from api/…</p>
+        <h2>Live asset state (AssetRegistry &amp; OracleRouter)</h2>
+        {state.loading && assets.length === 0 ? (
+          <p className="hint">Loading registered collateral assets from Base contracts &amp; api/…</p>
         ) : assets.length === 0 ? (
           <p className="lede">
-            {market?.error
-              ? 'Live asset parameters could not be loaded while api/ is unreachable.'
-              : 'No registered assets indexed yet.'}
+            {onChain?.error && market?.error
+              ? 'Live asset parameters could not be loaded while both Base RPC and api/ are unreachable.'
+              : 'No registered assets discovered on-chain or indexed yet.'}
           </p>
         ) : (
           assets.map((asset) => (
@@ -108,22 +143,40 @@ export function Risk() {
                   {asset.symbol || shortAddress(asset.token)} · {asset.status_name}
                 </strong>
                 <span className="quiet">
-                  {asset.token} · Tier {asset.tier ?? '—'} · {asset.oracle?.state_name} · Multiplier{' '}
+                  {asset.token} · {asset.tier_name ?? `Tier ${asset.tier ?? '—'}`} · Oracle{' '}
+                  {asset.oracle?.state_name ?? '—'} · Recorded mult{' '}
                   {asset.multiplier?.recorded?.formatted ?? '—'}
+                  {asset.multiplier?.ui
+                    ? ` · uiMultiplier ${asset.multiplier.ui.formatted} (drift ${
+                        asset.multiplier.drift_bps !== null && asset.multiplier.drift_bps !== undefined
+                          ? `${asset.multiplier.drift_bps} bps`
+                          : 'unrecorded'
+                      })`
+                    : ''}
                 </span>
                 <span className="quiet">
                   Init {formatBpsPercent(asset.ltv?.max_init_ltv_bps)} · Margin{' '}
                   {formatBpsPercent(asset.ltv?.margin_call_ltv_bps)} · Liq{' '}
                   {formatBpsPercent(asset.ltv?.liq_ltv_bps)} · Bad debt{' '}
-                  {formatBpsPercent(asset.ltv?.bad_debt_ltv_bps)} · Haircut{' '}
+                  {formatBpsPercent(asset.ltv?.bad_debt_ltv_bps)} · Max disc{' '}
+                  {formatBpsPercent(asset.ltv?.max_discount_bps)} · Haircut{' '}
                   {formatBpsPercent(asset.ltv?.closed_market_haircut_bps)}
                 </span>
                 <span className="quiet">
                   Per loan {formatApiAmount(asset.caps?.per_loan_cap, { prefixUsd: true })} · Outstanding{' '}
                   {formatApiAmount(asset.caps?.asset_outstanding_principal, { prefixUsd: true })} / Cap{' '}
                   {formatApiAmount(asset.caps?.asset_cap, { prefixUsd: true })} · Escrow{' '}
-                  {formatApiAmount(asset.escrow_balance, { maxFractionDigits: 6, showSymbol: true })}
+                  {formatApiAmount(asset.escrow_balance, { maxFractionDigits: 6, showSymbol: true })} · Restricted{' '}
+                  {asset.restricted ? 'Yes' : 'No'}
                 </span>
+                {asset.oracle?.gross_unit_value_usdc ? (
+                  <span className="quiet">
+                    1 {asset.symbol || 'token'} value: gross{' '}
+                    {formatApiAmount(asset.oracle.gross_unit_value_usdc, { prefixUsd: true })} / effective{' '}
+                    {formatApiAmount(asset.oracle.effective_unit_value_usdc, { prefixUsd: true })} · Feed age{' '}
+                    {asset.oracle.feed_age_seconds ?? '—'}s / open max {asset.oracle.max_stale_open_secs ?? '—'}s
+                  </span>
+                ) : null}
               </div>
               <span className="numline">
                 {formatApiAmount(asset.oracle?.price, { prefixUsd: true, maxFractionDigits: 2 })}
@@ -131,7 +184,13 @@ export function Risk() {
             </article>
           ))
         )}
-        <p className="hint">AssetRegistry keys each collateral asset strictly by contract address on Base (block #{market?.health?.live_block_number ?? market?.health?.block_number ?? '—'}).</p>
+        <p className="hint">
+          AssetRegistry keys each collateral asset strictly by contract address on Base (
+          {onChain?.ok
+            ? `Base RPC block #${onChain.blockNumber}`
+            : `api/ block #${market?.health?.live_block_number ?? market?.health?.block_number ?? '—'}`}
+          ).
+        </p>
       </section>
 
       <section className="block">
@@ -153,9 +212,9 @@ export function Risk() {
       </section>
 
       <section className="block">
-        <h2>Protocol fees &amp; caps (FeeCollector via api/)</h2>
+        <h2>Protocol fees &amp; caps (FeeCollector)</h2>
         {feeCards.length === 0 ? (
-          <p className="hint">Live protocol fee parameters could not be loaded while api/ is unreachable.</p>
+          <p className="hint">Live protocol fee parameters could not be loaded from Base RPC or api/.</p>
         ) : (
           <div className="stack">
             {feeCards.map((fee) => (
