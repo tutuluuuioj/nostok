@@ -65,11 +65,13 @@ import {
 import {
   buildDataMetricRows,
   buildOnChainEnvironmentRows,
+  evaluateAssetOriginationStatus,
   fetchLiveProtocolContractState,
   fetchLoanQuote,
   fetchMarketSnapshot,
   fetchMarketsAndLiveContracts,
   formatApiAmount,
+  formatAssetOraclePrice,
   formatBpsPercent,
   reconcileLiveAssetsWithApi,
 } from '../src/lib/marketsApi.js';
@@ -8027,7 +8029,193 @@ async function runTests(): Promise<void> {
 
       console.log('PASS WS3.7 Piece 1: Direct Base RPC AssetRegistry/OracleRouter/LoanCore/FeeCollector readings & Risk/Data rendering verified.');
 
-      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 + WS3.6 + WS3.7 PIECE 1 (WITH LOW 1 & ROUTE FIX) FORK TESTS PASSED.');
+      // ---------------------------------------------------------------------
+      // 3.17 WS3.7 Piece 2 + Low 1 + Infos (1)-(5): Markets.jsx & hardened on-chain readers
+      // ---------------------------------------------------------------------
+      console.log('\n=== WS3.7 Piece 2: Markets.jsx live contracts + Low 1 (unsupported/failing asset isolation) & Infos (1)-(5) ===');
+
+      // Info (4) & (5): Verify sequencerGracePeriod read dynamically from OracleRouter and updated paused label
+      assert.equal(typeof ws37LiveBefore.protocol.sequencerGracePeriodSecs, 'number');
+      assert.ok(ws37LiveBefore.protocol.sequencerGracePeriodSecs > 0);
+      const envRowsGrace = buildOnChainEnvironmentRows(ws37LiveBefore);
+      assert.ok(
+        envRowsGrace.some(
+          (r) =>
+            r.label === 'OracleRouter.isSequencerValid()' &&
+            r.value.includes(`${ws37LiveBefore.protocol.sequencerGracePeriodSecs}s`)
+        ),
+        'sequencerGracePeriod must be read from chain rather than hardcoded'
+      );
+
+      // Low 1 (part A): API / list includes an unregistered ERC20 -> isAssetSupported checked FIRST -> skipped without breaking snapshot (`ok:true`) and marked `not verified on-chain`!
+      const unregReceipt = await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.deployContract({
+          abi: mockB20Artifact.abi,
+          bytecode: mockB20Artifact.bytecode,
+          args: ['Unregistered Equity', 'UNREG', 18, 1_000_000_000_000_000_000n],
+        }),
+      });
+      const unregToken = getAddress(unregReceipt.contractAddress!);
+      const low1OnChainWithUnreg = await fetchLiveProtocolContractState({
+        cfg,
+        tokenAddresses: [nvdac, unregToken],
+      });
+      assert.equal(
+        low1OnChainWithUnreg.ok,
+        true,
+        'Unregistered token in candidate list MUST NOT cause overall snapshot ok=false'
+      );
+      assert.ok(
+        low1OnChainWithUnreg.assets.some((a) => a.token.toLowerCase() === nvdac.toLowerCase() && a.onchain_verified),
+        'NVDAc must still load live on-chain alongside unsupported token'
+      );
+      assert.ok(
+        low1OnChainWithUnreg.unsupportedTokens.some((t) => t.toLowerCase() === unregToken.toLowerCase()),
+        'Unsupported token must be skipped after isAssetSupported(token)=false check'
+      );
+      const low1RecWithUnreg = reconcileLiveAssetsWithApi(
+        [
+          { token: nvdac, symbol: 'NVDAc', status: 0, status_name: 'Active', oracle: { state: 0, state_name: 'VALID_OPEN' } },
+          {
+            token: unregToken,
+            symbol: 'UNREG',
+            status: 0,
+            status_name: 'Active',
+            oracle: {
+              price: { raw: '5000000000', formatted: '50', decimals: 8, symbol: 'USD' },
+              state: 0,
+              state_name: 'VALID_OPEN',
+            },
+          },
+        ],
+        low1OnChainWithUnreg
+      );
+      const unregMerged = low1RecWithUnreg.assets.find((a) => a.token.toLowerCase() === unregToken.toLowerCase())!;
+      assert.equal(unregMerged.source, 'api_only');
+      assert.equal(unregMerged.status_name, 'not verified on-chain');
+      assert.equal(unregMerged.oracle.state_name, 'not verified on-chain');
+      assert.equal(unregMerged.oracle.price, null);
+      assert.equal(formatAssetOraclePrice(unregMerged.oracle), 'not verified on-chain');
+      assert.equal(evaluateAssetOriginationStatus(unregMerged, low1OnChainWithUnreg.protocol).canOriginate, false);
+
+      // Low 1 (part B) & Info (2): Failed individual asset read (and sub-read failures) mark that asset/field as "unavailable", NEVER valid, 0, or STALE_FEED!
+      const brokenSupportedFake = '0x8888888888888888888888888888888888888888';
+      const spyClientPartialAndAssetFail = {
+        ...publicClient,
+        getBlock: (args: any) => publicClient.getBlock(args),
+        getLogs: (args: any) => publicClient.getLogs(args),
+        readContract: async (args: any) => {
+          if (args.functionName === 'isAssetSupported' && getAddress(args.args[0]) === brokenSupportedFake) {
+            return true;
+          }
+          if (args.functionName === 'getAssetConfig' && getAddress(args.args[0]) === brokenSupportedFake) {
+            throw new Error('Simulated getAssetConfig revert on single bad asset');
+          }
+          if (
+            (args.functionName === 'getPrice' ||
+              args.functionName === 'recordedMultiplier' ||
+              args.functionName === 'getBalance') &&
+            getAddress(args.args[0]) === nvdac
+          ) {
+            throw new Error(`Simulated sub-read RPC failure for ${args.functionName}`);
+          }
+          return publicClient.readContract(args);
+        },
+      };
+      const partialFailSnap = await fetchLiveProtocolContractState({
+        cfg,
+        publicClient: spyClientPartialAndAssetFail,
+        tokenAddresses: [nvdac, brokenSupportedFake],
+        includeLogDiscovery: false,
+      });
+      assert.equal(partialFailSnap.ok, true, 'Single failing asset MUST NOT mark entire snapshot ok=false');
+      const brokenOut = partialFailSnap.assets.find(
+        (a) => a.token.toLowerCase() === brokenSupportedFake.toLowerCase()
+      )!;
+      assert.equal(brokenOut.unavailable, true);
+      assert.equal(brokenOut.status_name, 'unavailable');
+      assert.equal(brokenOut.oracle.state_name, 'unavailable');
+      assert.equal(formatAssetOraclePrice(brokenOut.oracle), 'unavailable');
+
+      const partialNvda = partialFailSnap.assets.find((a) => a.token.toLowerCase() === nvdac.toLowerCase())!;
+      assert.equal(partialNvda.unavailable, false);
+      assert.equal(partialNvda.oracle.state, null, 'Failed getPrice must yield null state, NOT STALE_FEED (3)');
+      assert.equal(partialNvda.oracle.state_name, 'unavailable');
+      assert.equal(partialNvda.oracle.price, null);
+      assert.equal(formatAssetOraclePrice(partialNvda.oracle), 'unavailable');
+      assert.equal(partialNvda.multiplier.recorded, null, 'Failed recordedMultiplier must yield null (unavailable), NOT 0');
+      assert.equal(partialNvda.escrow_balance, null, 'Failed escrow getBalance must yield null (unavailable), NOT 0');
+
+      // Info (1): Configurable deployBlock (`fromBlock`) chunked AssetConfigSet discovery across small chunks!
+      let getLogsCallCount = 0;
+      const chunkSpyClient = {
+        ...publicClient,
+        getBlock: (args: any) => publicClient.getBlock(args),
+        readContract: (args: any) => publicClient.readContract(args),
+        getLogs: async (args: any) => {
+          getLogsCallCount += 1;
+          return publicClient.getLogs(args);
+        },
+      };
+      const deployBlockSnap = await fetchLiveProtocolContractState({
+        cfg: { ...cfg, deployBlock: startBlock.toString() },
+        publicClient: chunkSpyClient,
+        logChunkSize: 15n,
+      });
+      assert.equal(deployBlockSnap.ok, true);
+      assert.ok(getLogsCallCount > 1, `Expected multi-chunk getLogs scan from deployBlock=${startBlock} (got ${getLogsCallCount})`);
+      assert.ok(deployBlockSnap.assets.some((a) => a.token.toLowerCase() === nvdac.toLowerCase()));
+
+      // Info (3): Stale feed price MUST be marked `(stale)` when OracleState is STALE_FEED!
+      try {
+        const latestBlk = await publicClient.getBlock({ blockTag: 'latest' });
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdaFeed,
+            abi: mockAggArtifact.abi,
+            functionName: 'setUpdatedAt',
+            args: [BigInt(latestBlk.timestamp) - 30_000n],
+          }),
+        });
+        const staleCombined = await fetchMarketsAndLiveContracts({
+          cfg,
+          includeLoans: false,
+          includeAuctions: false,
+        });
+        assert.equal(staleCombined.onChain.ok, true);
+        const nvdaStale = staleCombined.assets.find((a) => a.token.toLowerCase() === nvdac.toLowerCase())!;
+        assert.equal(nvdaStale.oracle.state, 3);
+        assert.equal(nvdaStale.oracle.state_name, 'STALE_FEED');
+        const stalePriceDisplay = formatAssetOraclePrice(nvdaStale.oracle);
+        assert.match(stalePriceDisplay, /^\$140\.00 \(stale\)$/);
+        const staleReady = evaluateAssetOriginationStatus(nvdaStale, staleCombined.onChain.protocol);
+        assert.equal(staleReady.canOriginate, false);
+        assert.match(staleReady.message, /STALE_FEED.*stale/);
+      } finally {
+        await publicClient.waitForTransactionReceipt({
+          hash: await deployerClient.writeContract({
+            address: nvdaFeed,
+            abi: mockAggArtifact.abi,
+            functionName: 'setPrice',
+            args: [140_00000000n],
+          }),
+        });
+      }
+
+      // WS3.7 Piece 2: Markets.jsx renders cleanly with live contract headers & source check
+      const marketsPageHtml = renderToStaticMarkup(
+        createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: ['/markets'] }, createElement(Shell, null, createElement(Markets))))
+      );
+      assert.ok(marketsPageHtml.includes('Registered collateral assets (AssetRegistry &amp; OracleRouter)'));
+      assert.ok(marketsPageHtml.includes('Live on-chain loan quote calculator'));
+      const marketsPageSrc = fs.readFileSync(path.join(REPO_ROOT, 'src', 'pages', 'Markets.jsx'), 'utf8');
+      assert.ok(marketsPageSrc.includes('fetchMarketsAndLiveContracts'));
+      assert.ok(marketsPageSrc.includes('formatAssetOraclePrice'));
+      assert.ok(marketsPageSrc.includes('evaluateAssetOriginationStatus'));
+
+      console.log('PASS WS3.7 Piece 2 + Low 1 + Infos (1)-(5): Markets.jsx live AssetRegistry/OracleRouter integration & hardened snapshot semantics verified.');
+
+      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 + WS3.6 + WS3.7 PIECE 1-2 (WITH LOW 1 & INFOS) FORK TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
       await new Promise<void>((r) => apiServer.close(() => r()));

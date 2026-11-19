@@ -15,8 +15,11 @@ import {
   buildOnChainEnvironmentRows,
   buildProtocolFeeCards,
   buildRiskSummaryRows,
+  evaluateAssetOriginationStatus,
   formatApiAmount,
+  formatAssetOraclePrice,
   formatBpsPercent,
+  formatDurationHuman,
   parseDecimalToRaw,
   parsePercentToBps,
   reconcileLiveAssetsWithApi,
@@ -485,7 +488,7 @@ assert.equal(reconciledApiOutage.discrepancies.length, 0);
 const envRows = buildOnChainEnvironmentRows(mockOnChainSnapshot);
 const envMap = Object.fromEntries(envRows.map((r) => [r.label, r.value]));
 assert.match(envMap['Base RPC block / timestamp'], /#123456/);
-assert.match(envMap['LoanCore.paused()'], /^PAUSED/);
+assert.equal(envMap['LoanCore.paused()'], 'PAUSED (blocks new loans only)');
 assert.equal(envMap['Originated loans (LoanCore.nextLoanId - 1)'], '3');
 assert.match(envMap['OracleRouter.isMarketOpen()'], /^Closed \(manual override: closed\)/);
 
@@ -493,10 +496,101 @@ const onChainOnlyDataRows = buildDataMetricRows(null, { error: 'api down' }, nul
 const onChainDataMap = Object.fromEntries(onChainOnlyDataRows.map((r) => [r.label, r.value]));
 assert.equal(onChainDataMap['Outstanding principal'], '$2,500.00 USDC');
 assert.equal(onChainDataMap['Global USDC cap / remaining'], '$10,000.00 / $7,500.00');
-assert.equal(onChainDataMap['Protocol status (LoanCore.paused)'], 'PAUSED');
+assert.equal(onChainDataMap['Protocol status (LoanCore.paused)'], 'PAUSED (blocks new loans only)');
 assert.equal(onChainDataMap['Originated loans (LoanCore)'], '3');
 assert.equal(onChainDataMap['Collateral escrowed (CollateralEscrow)'], 'NVDAc 5');
 assert.equal(onChainDataMap['Active loans (status 0)'], 'Indexer unavailable');
 assert.match(onChainDataMap['Indexed block / chain head'], /#— \/ #123456/);
+
+// WS3.7 Piece 2 unit checks: Low 1 (unavailable + api_only) & Infos (stale price mark, sequencer grace, deployBlock)
+assert.equal(
+  formatAssetOraclePrice({
+    price: { raw: '14000000000', formatted: '140', decimals: 8, symbol: 'USD' },
+    state: 3,
+    state_name: 'STALE_FEED',
+  }),
+  '$140.00 (stale)'
+);
+assert.equal(formatAssetOraclePrice({ price: null, state: null, state_name: 'unavailable' }), 'unavailable');
+assert.equal(
+  formatAssetOraclePrice({
+    price: { raw: '10000000000', formatted: '100', decimals: 8, symbol: 'USD' },
+    state: null,
+    state_name: 'not verified on-chain',
+  }),
+  'not verified on-chain'
+);
+assert.equal(formatDurationHuman(7200), '7200s (2h)');
+assert.equal(formatDurationHuman(null), 'unavailable');
+
+const seqCustomEnv = Object.fromEntries(
+  buildOnChainEnvironmentRows({
+    ...mockOnChainSnapshot,
+    protocol: { ...mockOnChainSnapshot.protocol, sequencerValid: false, sequencerGracePeriodSecs: 7200 },
+  }).map((r) => [r.label, r.value])
+);
+assert.equal(seqCustomEnv['OracleRouter.isSequencerValid()'], 'Invalid / within 7200s (2h) grace period');
+
+const seqMissingGraceEnv = Object.fromEntries(
+  buildOnChainEnvironmentRows({
+    ...mockOnChainSnapshot,
+    protocol: { ...mockOnChainSnapshot.protocol, sequencerValid: false, sequencerGracePeriodSecs: null },
+  }).map((r) => [r.label, r.value])
+);
+assert.equal(seqMissingGraceEnv['OracleRouter.isSequencerValid()'], 'Invalid / within unavailable grace period');
+
+const recApiOnlyAndUnavail = reconcileLiveAssetsWithApi(
+  [
+    {
+      token: '0x2222222222222222222222222222222222222222',
+      symbol: 'NVDAc',
+      status: 0,
+      status_name: 'Active',
+      oracle: { state: 0, state_name: 'VALID_OPEN' },
+    },
+    {
+      token: '0x3333333333333333333333333333333333333333',
+      symbol: 'FAKEc',
+      status: 0,
+      status_name: 'Active',
+      oracle: { price: { raw: '9900000000', decimals: 8, symbol: 'USD' }, state: 0, state_name: 'VALID_OPEN' },
+    },
+  ],
+  {
+    ok: true,
+    unsupportedTokens: ['0x3333333333333333333333333333333333333333'],
+    assets: [
+      {
+        source: 'onchain_unavailable',
+        unavailable: true,
+        onchain_verified: false,
+        error: 'RPC timeout',
+        token: '0x2222222222222222222222222222222222222222',
+        symbol: 'NVDAc',
+        status: null,
+        status_name: 'unavailable',
+        oracle: { price: null, state: null, state_name: 'unavailable' },
+      },
+    ],
+  }
+);
+assert.equal(recApiOnlyAndUnavail.assets[0].status_name, 'unavailable');
+assert.equal(recApiOnlyAndUnavail.assets[0].oracle.state_name, 'unavailable');
+assert.equal(recApiOnlyAndUnavail.assets[1].source, 'api_only');
+assert.equal(recApiOnlyAndUnavail.assets[1].status_name, 'not verified on-chain');
+assert.equal(recApiOnlyAndUnavail.assets[1].oracle.state_name, 'not verified on-chain');
+assert.equal(recApiOnlyAndUnavail.assets[1].oracle.price, null);
+assert.ok(recApiOnlyAndUnavail.discrepancies.some((d) => d.includes('unsupported in Base AssetRegistry')));
+assert.equal(evaluateAssetOriginationStatus(recApiOnlyAndUnavail.assets[0]).canOriginate, false);
+assert.equal(evaluateAssetOriginationStatus(recApiOnlyAndUnavail.assets[1]).canOriginate, false);
+
+// deployBlock config parsing
+setFrontendConfigOverrides({ deployBlock: '25000000' });
+assert.equal(getFrontendConfig().deployBlock, '25000000');
+assert.throws(() => {
+  setFrontendConfigOverrides({ deployBlock: 'not-a-block' });
+  getFrontendConfig();
+}, /Invalid VITE_DEPLOY_BLOCK/);
+setFrontendConfigOverrides({});
 
 console.log('book ok');

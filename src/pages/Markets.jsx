@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Field, Page, Rows, Sheet, TextInput } from '../components/ui.jsx';
-import { USDC_DECIMALS } from '../lib/contracts.js';
+import { OracleState, USDC_DECIMALS } from '../lib/contracts.js';
 import {
+  evaluateAssetOriginationStatus,
   fetchLoanQuote,
-  fetchMarketSnapshot,
+  fetchMarketsAndLiveContracts,
   formatApiAmount,
+  formatAssetOraclePrice,
   formatBpsPercent,
   parseDecimalToRaw,
   parsePercentToBps,
@@ -36,7 +38,13 @@ const INACTIVE_STATUS_FILTERS = new Set([
 
 export function Markets() {
   const { web3 } = useStore();
-  const [snapshot, setSnapshot] = useState({ loading: true, data: null });
+  const [snapshot, setSnapshot] = useState({
+    loading: true,
+    data: null,
+    onChain: null,
+    assets: [],
+    discrepancies: [],
+  });
   const [assetFilter, setAssetFilter] = useState('All');
   const [statusFilter, setStatusFilter] = useState('all');
   const [showInactive, setShowInactive] = useState(false);
@@ -68,8 +76,14 @@ export function Markets() {
 
   const loadMarkets = useCallback(async () => {
     const requestId = ++reqSeqRef.current;
-    setSnapshot((prev) => ({ loading: true, data: prev.data }));
-    const next = await fetchMarketSnapshot({
+    setSnapshot((prev) => ({
+      loading: true,
+      data: prev.data,
+      onChain: prev.onChain,
+      assets: prev.assets,
+      discrepancies: prev.discrepancies,
+    }));
+    const combined = await fetchMarketsAndLiveContracts({
       cfg: web3?.config,
       includeInactive: shouldIncludeInactive,
       requestId,
@@ -77,11 +91,20 @@ export function Markets() {
       includeAuctions: false,
     });
     if (requestId !== reqSeqRef.current) return;
-    setSnapshot({ loading: false, data: next });
-    if (next.assets.length > 0) {
+    setSnapshot({
+      loading: false,
+      data: combined.market,
+      onChain: combined.onChain,
+      assets: combined.assets,
+      discrepancies: combined.discrepancies,
+    });
+    if (combined.assets.length > 0) {
+      const firstVerified =
+        combined.assets.find((a) => a.onchain_verified !== false && !a.unavailable) ??
+        combined.assets[0];
       setQuoteAsset((prev) => {
-        if (prev && next.assets.some((a) => a.token === prev)) return prev;
-        return next.assets[0].token;
+        if (prev && combined.assets.some((a) => a.token === prev)) return prev;
+        return firstVerified.token;
       });
     }
   }, [shouldIncludeInactive, web3?.config]);
@@ -105,7 +128,10 @@ export function Markets() {
   }, [loadMarkets]);
 
   const data = snapshot.data;
-  const assets = data?.assets ?? [];
+  const onChain = snapshot.onChain;
+  const assets = snapshot.assets ?? [];
+  const discrepancies = snapshot.discrepancies ?? [];
+
   const assetFilters = useMemo(() => {
     const chips = [['All', 'All']];
     for (const a of assets) {
@@ -136,8 +162,17 @@ export function Markets() {
   );
 
   const selectedAssetObj = useMemo(
-    () => assets.find((a) => a.token === quoteAsset) ?? assets[0] ?? null,
+    () =>
+      assets.find((a) => a.token === quoteAsset) ??
+      assets.find((a) => a.onchain_verified !== false && !a.unavailable) ??
+      assets[0] ??
+      null,
     [assets, quoteAsset]
+  );
+
+  const selectedOriginationStatus = useMemo(
+    () => evaluateAssetOriginationStatus(selectedAssetObj, onChain?.protocol ?? null),
+    [onChain?.protocol, selectedAssetObj]
   );
 
   async function runQuoteSimulation(event) {
@@ -147,6 +182,14 @@ export function Markets() {
 
     if (!selectedAssetObj) {
       setQuoteError('No registered assets available to quote.');
+      return;
+    }
+    if (selectedAssetObj.unavailable || selectedAssetObj.source === 'api_only') {
+      setQuoteError(
+        selectedAssetObj.unavailable
+          ? 'Selected asset contract read is unavailable on Base RPC.'
+          : 'Selected asset is not verified on-chain in AssetRegistry.'
+      );
       return;
     }
 
@@ -220,7 +263,7 @@ export function Markets() {
     <Page
       kicker="Markets"
       title="Live markets & order activity."
-      lede="Live Base Mainnet order book activity, Chainlink collateral pricing from AssetRegistry/OracleRouter, and exact on-chain loan quotes from api/ — select any open BorrowOrder or LendOffer below to fill on /lend or /borrow."
+      lede="Live Base Mainnet order book activity, direct AssetRegistry & OracleRouter collateral readings from Base RPC, and on-chain loan quotes — select any open BorrowOrder or LendOffer below to fill on /lend or /borrow."
     >
       <div className="actions">
         <button
@@ -233,22 +276,54 @@ export function Markets() {
         </button>
         <Link className="btn secondary" to="/borrow">Open BorrowOrder</Link>
         <Link className="btn secondary" to="/lend">Post LendOffer / Fill Borrow</Link>
-        {data?.health ? (
+        {onChain?.ok || data?.health ? (
           <span className="hint">
-            Indexed block #{data.health.last_indexed_block ?? '—'} · Chain head #
-            {data.health.chain_head_block ?? '—'} · Lag {data.health.lag_blocks ?? '—'} blocks · Updated{' '}
-            {data.fetchedAt}
+            {onChain?.ok
+              ? `Base RPC #${onChain.blockNumber} · ${
+                  onChain.protocol?.paused ? 'LoanCore PAUSED (blocks new loans only)' : 'LoanCore active'
+                } · ${
+                  onChain.protocol?.marketOpen === null || onChain.protocol?.marketOpen === undefined
+                    ? 'Market unavailable'
+                    : onChain.protocol.marketOpen
+                      ? 'Market open'
+                      : 'Market closed'
+                }`
+              : ''}
+            {onChain?.ok && data?.health ? ' · ' : ''}
+            {data?.health
+              ? `Indexed #${data.health.last_indexed_block ?? '—'} (lag ${data.health.lag_blocks ?? '—'}) · Updated ${data.fetchedAt}`
+              : ''}
           </span>
         ) : null}
       </div>
 
-      {snapshot.loading && !data ? (
-        <p className="hint block">Loading live asset parameters and indexed order activity from api/…</p>
+      {snapshot.loading && !data && !onChain ? (
+        <p className="hint block">Loading live asset parameters and indexed order activity from Base contracts &amp; api/…</p>
+      ) : null}
+
+      {onChain && !onChain.ok ? (
+        <p className="err block" role="alert">
+          Direct Base RPC contract read unavailable — {onChain.error}
+        </p>
       ) : null}
 
       {data && (data.stale || data.degraded || data.error) ? (
+        <p className={onChain?.ok && assets.length > 0 ? 'hint block' : 'err block'} role="alert">
+          {onChain?.ok && assets.length > 0
+            ? `api/ orderbook feed degraded or unreachable (${data.error || 'Indexer unavailable'}) — displaying live AssetRegistry & OracleRouter contract readings from Base RPC; orderbook & quote queries require api/.`
+            : `Live market state degraded or unavailable — ${data.error || 'Indexer or RPC health check failed.'} No preview or cached fallback prices are displayed.`}
+        </p>
+      ) : null}
+
+      {discrepancies.length > 0 ? (
         <p className="err block" role="alert">
-          Live market state degraded or unavailable — {data.error || 'Indexer or RPC health check failed.'} No preview or cached fallback prices are displayed.
+          Contract vs api/ mismatch detected (Base RPC values shown): {discrepancies.join(' · ')}
+        </p>
+      ) : null}
+
+      {onChain?.protocol?.paused ? (
+        <p className="err block" role="alert">
+          LoanCore is paused on-chain (blocks new loans only; repay, top-up, extensions &amp; auctions remain active).
         </p>
       ) : null}
 
@@ -260,51 +335,101 @@ export function Markets() {
       ) : null}
 
       <section className="block">
-        <h2>Registered collateral assets</h2>
-        <p className="hint">Live prices and risk parameters read from Base contracts and api/ GET /assets.</p>
+        <h2>Registered collateral assets (AssetRegistry &amp; OracleRouter)</h2>
+        <p className="hint">
+          Live risk parameters and validity states read directly from Base contracts alongside api/ GET /assets (
+          {onChain?.ok
+            ? `Base RPC block #${onChain.blockNumber}`
+            : `api/ block #${data?.health?.live_block_number ?? data?.health?.block_number ?? '—'}`}
+          ).
+        </p>
         {assets.length === 0 ? (
           <p className="lede">
-            {data?.error ? 'Assets unavailable while api/ is unreachable.' : 'No registered collateral assets indexed yet.'}
+            {onChain?.error && data?.error
+              ? 'Assets unavailable while both Base RPC and api/ are unreachable.'
+              : 'No registered collateral assets discovered on-chain or indexed yet.'}
           </p>
         ) : (
-          assets.map((item) => (
-            <article className="order-row" key={item.token}>
-              <div>
-                <strong>
-                  {item.symbol || shortAddress(item.token)} · {item.status_name}
-                </strong>
-                <span className="quiet">
-                  {item.token} ({item.decimals} dec) · Tier {item.tier ?? '—'} · Oracle {item.oracle?.state_name}
-                </span>
-                <span className="quiet">
-                  Init {formatBpsPercent(item.ltv?.max_init_ltv_bps)} · Margin{' '}
-                  {formatBpsPercent(item.ltv?.margin_call_ltv_bps)} · Liq{' '}
-                  {formatBpsPercent(item.ltv?.liq_ltv_bps)} · Cap remaining{' '}
-                  {formatApiAmount(item.caps?.asset_remaining, { prefixUsd: true })}
-                </span>
-              </div>
-              <div style={{ textAlign: 'right' }}>
-                <span className="numline">
-                  {formatApiAmount(item.oracle?.price, { prefixUsd: true, maxFractionDigits: 2 })}
-                </span>
-                <div style={{ marginTop: 6 }}>
-                  <button
-                    className="btn secondary"
-                    type="button"
-                    onClick={() => {
-                      quoteSeqRef.current += 1;
-                      setQuoteLoading(false);
-                      setQuoteAsset(item.token);
-                      setQuoteResult(null);
-                      setQuoteError('');
-                    }}
-                  >
-                    Quote
-                  </button>
+          assets.map((item) => {
+            const isApiOnly = item.source === 'api_only';
+            const isUnavailable = Boolean(item.unavailable);
+            return (
+              <article className="order-row" key={item.token}>
+                <div>
+                  <strong>
+                    {item.symbol || shortAddress(item.token)} · {item.status_name || 'unavailable'}
+                  </strong>
+                  {isUnavailable ? (
+                    <span className="quiet">
+                      {item.token} · Live Base contract read unavailable ({item.error || 'RPC error'}) — state not shown as valid.
+                    </span>
+                  ) : isApiOnly ? (
+                    <span className="quiet">
+                      {item.token} · api/ entry is not verified on-chain (Base AssetRegistry/OracleRouter did not confirm this asset).
+                    </span>
+                  ) : (
+                    <>
+                      <span className="quiet">
+                        {item.token} ({item.decimals ?? '—'} dec) · {item.tier_name ?? `Tier ${item.tier ?? '—'}`} · Oracle{' '}
+                        {item.oracle?.state_name ?? 'unavailable'}
+                        {item.multiplier?.ui
+                          ? ` · uiMult drift ${
+                              item.multiplier.drift_bps !== null && item.multiplier.drift_bps !== undefined
+                                ? `${item.multiplier.drift_bps} bps`
+                                : 'unrecorded'
+                            }`
+                          : ''}
+                      </span>
+                      <span className="quiet">
+                        Init {item.ltv ? formatBpsPercent(item.ltv.max_init_ltv_bps) : 'unavailable'} · Margin{' '}
+                        {item.ltv ? formatBpsPercent(item.ltv.margin_call_ltv_bps) : 'unavailable'} · Liq{' '}
+                        {item.ltv ? formatBpsPercent(item.ltv.liq_ltv_bps) : 'unavailable'} · Haircut{' '}
+                        {item.ltv ? formatBpsPercent(item.ltv.closed_market_haircut_bps) : 'unavailable'} · Cap remaining{' '}
+                        {item.caps?.asset_remaining
+                          ? formatApiAmount(item.caps.asset_remaining, { prefixUsd: true })
+                          : 'unavailable'}
+                      </span>
+                      {item.oracle ? (
+                        <span className="quiet">
+                          1 {item.symbol || 'token'} value: gross{' '}
+                          {item.oracle.gross_unit_value_usdc
+                            ? formatApiAmount(item.oracle.gross_unit_value_usdc, { prefixUsd: true })
+                            : 'unavailable'}{' '}
+                          / effective{' '}
+                          {item.oracle.effective_unit_value_usdc
+                            ? formatApiAmount(item.oracle.effective_unit_value_usdc, { prefixUsd: true })
+                            : 'unavailable'}{' '}
+                          · Feed age {item.oracle.feed_age_seconds ?? 'unavailable'}s / open max{' '}
+                          {item.oracle.max_stale_open_secs ?? 'unavailable'}s
+                        </span>
+                      ) : null}
+                    </>
+                  )}
                 </div>
-              </div>
-            </article>
-          ))
+                <div style={{ textAlign: 'right' }}>
+                  <span className="numline">
+                    {formatAssetOraclePrice(item.oracle, { maxFractionDigits: 2 })}
+                  </span>
+                  <div style={{ marginTop: 6 }}>
+                    <button
+                      className="btn secondary"
+                      type="button"
+                      disabled={isUnavailable || isApiOnly}
+                      onClick={() => {
+                        quoteSeqRef.current += 1;
+                        setQuoteLoading(false);
+                        setQuoteAsset(item.token);
+                        setQuoteResult(null);
+                        setQuoteError('');
+                      }}
+                    >
+                      Quote
+                    </button>
+                  </div>
+                </div>
+              </article>
+            );
+          })
         )}
       </section>
 
@@ -435,8 +560,22 @@ export function Markets() {
       <form className="block" onSubmit={runQuoteSimulation}>
         <Sheet
           title="Live on-chain loan quote calculator (GET /quote)"
-          note="Queries LoanCore, AssetRegistry, OracleRouter, FeeCollector, and EligibilityGate via api/ at current Base block state. Read-only simulation; does not submit transactions."
+          note="Displays live AssetRegistry & OracleRouter readiness directly from Base RPC alongside LoanCore/OrderSettlement simulation via api/ /quote. Read-only simulation; does not submit transactions."
         >
+          {selectedAssetObj ? (
+            <p
+              className={
+                selectedOriginationStatus.severity === 'err'
+                  ? 'err'
+                  : 'hint'
+              }
+              role={selectedOriginationStatus.severity === 'err' ? 'alert' : undefined}
+            >
+              Live Base contract status ({selectedAssetObj.symbol || shortAddress(selectedAssetObj.token)}):{' '}
+              {selectedOriginationStatus.message}
+            </p>
+          ) : null}
+
           <div className="fields">
             <div className="field">
               <label htmlFor="quote-asset">Collateral token</label>
@@ -450,7 +589,7 @@ export function Markets() {
                 ) : (
                   assets.map((a) => (
                     <option key={a.token} value={a.token}>
-                      {a.symbol || shortAddress(a.token)} ({a.oracle?.state_name})
+                      {a.symbol || shortAddress(a.token)} ({a.oracle?.state_name ?? 'unavailable'})
                     </option>
                   ))
                 )}
@@ -536,7 +675,12 @@ export function Markets() {
               <button
                 className="btn"
                 type="submit"
-                disabled={quoteLoading || assets.length === 0}
+                disabled={
+                  quoteLoading ||
+                  assets.length === 0 ||
+                  Boolean(selectedAssetObj?.unavailable) ||
+                  selectedAssetObj?.source === 'api_only'
+                }
               >
                 {quoteLoading ? 'Calculating quote…' : 'Simulate live quote'}
               </button>
@@ -554,6 +698,17 @@ export function Markets() {
                   ? 'Accepted by on-chain parameters'
                   : `Rejected (${quoteResult.rejection_reasons.map((r) => `${r.code}: ${r.message}`).join('; ')})`}
               </p>
+              {onChain?.ok &&
+              selectedAssetObj?.onchain_verified &&
+              selectedAssetObj.oracle?.state !== null &&
+              selectedAssetObj.oracle?.state !== undefined &&
+              Number(quoteResult.asset?.oracle_state) !== Number(selectedAssetObj.oracle.state) ? (
+                <p className="err" role="alert">
+                  Base OracleRouter state changed vs /quote reply: chain reports{' '}
+                  {selectedAssetObj.oracle.state_name} while /quote reported{' '}
+                  {quoteResult.asset.oracle_state_name}.
+                </p>
+              ) : null}
               {quoteResult.warnings?.length > 0 ? (
                 <p className="hint">
                   Warnings: {quoteResult.warnings.map((w) => `${w.code}: ${w.message}`).join('; ')}
@@ -563,7 +718,11 @@ export function Markets() {
                 items={[
                   {
                     label: 'Asset & oracle',
-                    value: `${quoteResult.asset.symbol} · ${formatApiAmount(quoteResult.asset.oracle_price, { prefixUsd: true })} (${quoteResult.asset.oracle_state_name})`,
+                    value: `${quoteResult.asset.symbol} · ${formatAssetOraclePrice({
+                      price: quoteResult.asset.oracle_price,
+                      state: quoteResult.asset.oracle_state,
+                      state_name: quoteResult.asset.oracle_state_name,
+                    })} (${quoteResult.asset.oracle_state_name})`,
                   },
                   {
                     label: 'Principal (6 dec)',

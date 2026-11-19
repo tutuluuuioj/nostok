@@ -8,6 +8,7 @@ import {
   fetchMarketsAndLiveContracts,
   fetchRiskSummaryOptional,
   formatApiAmount,
+  formatAssetOraclePrice,
   formatBpsPercent,
 } from '../lib/marketsApi.js';
 import { shortAddress } from '../lib/web3.js';
@@ -136,53 +137,87 @@ export function Risk() {
               : 'No registered assets discovered on-chain or indexed yet.'}
           </p>
         ) : (
-          assets.map((asset) => (
-            <article className="order-row" key={asset.token}>
-              <div>
-                <strong>
-                  {asset.symbol || shortAddress(asset.token)} · {asset.status_name}
-                </strong>
-                <span className="quiet">
-                  {asset.token} · {asset.tier_name ?? `Tier ${asset.tier ?? '—'}`} · Oracle{' '}
-                  {asset.oracle?.state_name ?? '—'} · Recorded mult{' '}
-                  {asset.multiplier?.recorded?.formatted ?? '—'}
-                  {asset.multiplier?.ui
-                    ? ` · uiMultiplier ${asset.multiplier.ui.formatted} (drift ${
-                        asset.multiplier.drift_bps !== null && asset.multiplier.drift_bps !== undefined
-                          ? `${asset.multiplier.drift_bps} bps`
-                          : 'unrecorded'
-                      })`
-                    : ''}
+          assets.map((asset) => {
+            const isApiOnly = asset.source === 'api_only';
+            const isUnavailable = Boolean(asset.unavailable);
+            return (
+              <article className="order-row" key={asset.token}>
+                <div>
+                  <strong>
+                    {asset.symbol || shortAddress(asset.token)} · {asset.status_name || 'unavailable'}
+                  </strong>
+                  {isUnavailable ? (
+                    <span className="quiet">
+                      {asset.token} · Live Base contract read unavailable ({asset.error || 'RPC error'}) — state not shown as valid.
+                    </span>
+                  ) : isApiOnly ? (
+                    <span className="quiet">
+                      {asset.token} · api/ entry is not verified on-chain (Base AssetRegistry/OracleRouter did not confirm this asset).
+                    </span>
+                  ) : (
+                    <>
+                      <span className="quiet">
+                        {asset.token} · {asset.tier_name ?? `Tier ${asset.tier ?? '—'}`} · Oracle{' '}
+                        {asset.oracle?.state_name ?? 'unavailable'} · Recorded mult{' '}
+                        {asset.multiplier?.recorded?.formatted ?? 'unavailable'}
+                        {asset.multiplier?.ui
+                          ? ` · uiMultiplier ${asset.multiplier.ui.formatted} (drift ${
+                              asset.multiplier.drift_bps !== null && asset.multiplier.drift_bps !== undefined
+                                ? `${asset.multiplier.drift_bps} bps`
+                                : 'unrecorded'
+                            })`
+                          : ''}
+                      </span>
+                      <span className="quiet">
+                        Init {asset.ltv ? formatBpsPercent(asset.ltv.max_init_ltv_bps) : 'unavailable'} · Margin{' '}
+                        {asset.ltv ? formatBpsPercent(asset.ltv.margin_call_ltv_bps) : 'unavailable'} · Liq{' '}
+                        {asset.ltv ? formatBpsPercent(asset.ltv.liq_ltv_bps) : 'unavailable'} · Bad debt{' '}
+                        {asset.ltv ? formatBpsPercent(asset.ltv.bad_debt_ltv_bps) : 'unavailable'} · Max disc{' '}
+                        {asset.ltv ? formatBpsPercent(asset.ltv.max_discount_bps) : 'unavailable'} · Haircut{' '}
+                        {asset.ltv ? formatBpsPercent(asset.ltv.closed_market_haircut_bps) : 'unavailable'}
+                      </span>
+                      <span className="quiet">
+                        Per loan{' '}
+                        {asset.caps?.per_loan_cap
+                          ? formatApiAmount(asset.caps.per_loan_cap, { prefixUsd: true })
+                          : 'unavailable'}{' '}
+                        · Outstanding{' '}
+                        {asset.caps?.asset_outstanding_principal
+                          ? formatApiAmount(asset.caps.asset_outstanding_principal, { prefixUsd: true })
+                          : 'unavailable'}{' '}
+                        / Cap{' '}
+                        {asset.caps?.asset_cap
+                          ? formatApiAmount(asset.caps.asset_cap, { prefixUsd: true })
+                          : 'unavailable'}{' '}
+                        · Escrow{' '}
+                        {asset.escrow_balance
+                          ? formatApiAmount(asset.escrow_balance, { maxFractionDigits: 6, showSymbol: true })
+                          : 'unavailable'}{' '}
+                        · Restricted {asset.restricted === null || asset.restricted === undefined ? 'unavailable' : asset.restricted ? 'Yes' : 'No'}
+                      </span>
+                      {asset.oracle ? (
+                        <span className="quiet">
+                          1 {asset.symbol || 'token'} value: gross{' '}
+                          {asset.oracle.gross_unit_value_usdc
+                            ? formatApiAmount(asset.oracle.gross_unit_value_usdc, { prefixUsd: true })
+                            : 'unavailable'}{' '}
+                          / effective{' '}
+                          {asset.oracle.effective_unit_value_usdc
+                            ? formatApiAmount(asset.oracle.effective_unit_value_usdc, { prefixUsd: true })
+                            : 'unavailable'}{' '}
+                          · Feed age {asset.oracle.feed_age_seconds ?? 'unavailable'}s / open max{' '}
+                          {asset.oracle.max_stale_open_secs ?? 'unavailable'}s
+                        </span>
+                      ) : null}
+                    </>
+                  )}
+                </div>
+                <span className="numline">
+                  {formatAssetOraclePrice(asset.oracle, { maxFractionDigits: 2 })}
                 </span>
-                <span className="quiet">
-                  Init {formatBpsPercent(asset.ltv?.max_init_ltv_bps)} · Margin{' '}
-                  {formatBpsPercent(asset.ltv?.margin_call_ltv_bps)} · Liq{' '}
-                  {formatBpsPercent(asset.ltv?.liq_ltv_bps)} · Bad debt{' '}
-                  {formatBpsPercent(asset.ltv?.bad_debt_ltv_bps)} · Max disc{' '}
-                  {formatBpsPercent(asset.ltv?.max_discount_bps)} · Haircut{' '}
-                  {formatBpsPercent(asset.ltv?.closed_market_haircut_bps)}
-                </span>
-                <span className="quiet">
-                  Per loan {formatApiAmount(asset.caps?.per_loan_cap, { prefixUsd: true })} · Outstanding{' '}
-                  {formatApiAmount(asset.caps?.asset_outstanding_principal, { prefixUsd: true })} / Cap{' '}
-                  {formatApiAmount(asset.caps?.asset_cap, { prefixUsd: true })} · Escrow{' '}
-                  {formatApiAmount(asset.escrow_balance, { maxFractionDigits: 6, showSymbol: true })} · Restricted{' '}
-                  {asset.restricted ? 'Yes' : 'No'}
-                </span>
-                {asset.oracle?.gross_unit_value_usdc ? (
-                  <span className="quiet">
-                    1 {asset.symbol || 'token'} value: gross{' '}
-                    {formatApiAmount(asset.oracle.gross_unit_value_usdc, { prefixUsd: true })} / effective{' '}
-                    {formatApiAmount(asset.oracle.effective_unit_value_usdc, { prefixUsd: true })} · Feed age{' '}
-                    {asset.oracle.feed_age_seconds ?? '—'}s / open max {asset.oracle.max_stale_open_secs ?? '—'}s
-                  </span>
-                ) : null}
-              </div>
-              <span className="numline">
-                {formatApiAmount(asset.oracle?.price, { prefixUsd: true, maxFractionDigits: 2 })}
-              </span>
-            </article>
-          ))
+              </article>
+            );
+          })
         )}
         <p className="hint">
           AssetRegistry keys each collateral asset strictly by contract address on Base (

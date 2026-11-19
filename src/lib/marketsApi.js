@@ -3,6 +3,7 @@ import {
   ASSET_STATUS_NAMES,
   ASSET_TIER_NAMES,
   ORACLE_STATE_NAMES,
+  OracleState,
   USDC_DECIMALS,
   aggregatorV3Abi,
   assetRegistryAbi,
@@ -226,10 +227,99 @@ function summarizeEscrowBalances(onChainAssets) {
   return assets
     .map((asset) => {
       const sym = asset.symbol || `${asset.token.slice(0, 6)}…`;
+      if (asset.unavailable || !asset.escrow_balance) return `${sym} unavailable`;
       const bal = formatApiAmount(asset.escrow_balance, { maxFractionDigits: 4, showSymbol: false });
       return `${sym} ${bal}`;
     })
     .join(' · ');
+}
+
+export function formatDurationHuman(seconds) {
+  if (seconds === null || seconds === undefined || !Number.isFinite(Number(seconds))) {
+    return 'unavailable';
+  }
+  const s = Math.max(0, Math.floor(Number(seconds)));
+  if (s >= 3600 && s % 3600 === 0) return `${s}s (${s / 3600}h)`;
+  if (s >= 60 && s % 60 === 0) return `${s}s (${s / 60}m)`;
+  if (s >= 3600) return `${s}s (${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m)`;
+  if (s >= 60) return `${s}s (${Math.floor(s / 60)}m ${s % 60}s)`;
+  return `${s}s`;
+}
+
+export function formatAssetOraclePrice(oracle, { maxFractionDigits = 2 } = {}) {
+  if (!oracle) return 'unavailable';
+  if (oracle.state_name === 'not verified on-chain') return 'not verified on-chain';
+  if (oracle.state_name === 'unavailable' || !oracle.price) return 'unavailable';
+  const base = formatApiAmount(oracle.price, { prefixUsd: true, maxFractionDigits });
+  if (Number(oracle.state) === OracleState.STALE_FEED || oracle.state_name === 'STALE_FEED') {
+    return `${base} (stale)`;
+  }
+  return base;
+}
+
+export function evaluateAssetOriginationStatus(asset, protocol = null) {
+  if (!asset) {
+    return { canOriginate: false, severity: 'err', message: 'No asset selected.' };
+  }
+  if (asset.unavailable || asset.source === 'onchain_unavailable') {
+    return {
+      canOriginate: false,
+      severity: 'err',
+      message: 'Live Base contract read unavailable for this asset; cannot verify origination eligibility.',
+    };
+  }
+  if (asset.source === 'api_only' || asset.onchain_verified === false) {
+    return {
+      canOriginate: false,
+      severity: 'err',
+      message: 'Asset is from api/ only (not verified on-chain); origination status unconfirmed.',
+    };
+  }
+  if (protocol?.paused) {
+    return {
+      canOriginate: false,
+      severity: 'err',
+      message: 'LoanCore is paused (blocks new loans only; repay, top-up & auctions remain open).',
+    };
+  }
+  if (asset.status !== undefined && asset.status !== null && Number(asset.status) !== 0) {
+    return {
+      canOriginate: false,
+      severity: 'err',
+      message: `AssetRegistry status is ${asset.status_name} — new loans blocked.`,
+    };
+  }
+  const oState = asset.oracle?.state;
+  const oName = asset.oracle?.state_name;
+  if (oState === null || oState === undefined || oName === 'unavailable') {
+    return {
+      canOriginate: false,
+      severity: 'err',
+      message: 'OracleRouter state unavailable.',
+    };
+  }
+  if (Number(oState) === OracleState.VALID_OPEN) {
+    return {
+      canOriginate: true,
+      severity: 'ok',
+      message: 'Market open & OracleRouter VALID_OPEN — full origination LTV active.',
+    };
+  }
+  if (Number(oState) === OracleState.VALID_CLOSED) {
+    const hc = formatBpsPercent(asset.ltv?.closed_market_haircut_bps);
+    return {
+      canOriginate: true,
+      severity: 'hint',
+      message: `Equity market closed (VALID_CLOSED) — OracleRouter applies ${hc} closed-market haircut on new loans.`,
+    };
+  }
+  return {
+    canOriginate: false,
+    severity: 'err',
+    message: `OracleRouter state is ${oName}${
+      Number(oState) === OracleState.STALE_FEED ? ' (price is stale)' : ''
+    } — new loans blocked.`,
+  };
 }
 
 export function buildDataMetricRows(summary, data, health, onChain = null) {
@@ -241,17 +331,22 @@ export function buildDataMetricRows(summary, data, health, onChain = null) {
   const auctionsPlus = summary?.auctionsTruncated || summary?.loansTruncated ? '+' : '';
 
   const liveProtocol = hasOnChain ? onChain.protocol : null;
-  const outstandingValue = liveProtocol
+  const outstandingValue = liveProtocol?.totalOutstandingPrincipal
     ? formatApiAmount(liveProtocol.totalOutstandingPrincipal, { prefixUsd: true, showSymbol: true })
-    : unavailable
+    : hasOnChain
       ? 'Unavailable'
-      : `${formatApiAmount(summary.totalOutstandingUsdc, { prefixUsd: true, showSymbol: true })}${loanPlus}`;
+      : unavailable
+        ? 'Unavailable'
+        : `${formatApiAmount(summary.totalOutstandingUsdc, { prefixUsd: true, showSymbol: true })}${loanPlus}`;
 
-  const globalCapValue = liveProtocol
-    ? `${formatApiAmount(liveProtocol.globalUsdcCap, { prefixUsd: true })} / ${formatApiAmount(liveProtocol.globalRemainingUsdc, { prefixUsd: true })}`
-    : unavailable || !summary.globalCapUsdc
-      ? 'Unavailable'
-      : `${formatApiAmount(summary.globalCapUsdc, { prefixUsd: true })} / ${formatApiAmount(summary.globalRemainingUsdc, { prefixUsd: true })}`;
+  const globalCapValue =
+    liveProtocol?.globalUsdcCap && liveProtocol?.globalRemainingUsdc
+      ? `${formatApiAmount(liveProtocol.globalUsdcCap, { prefixUsd: true })} / ${formatApiAmount(liveProtocol.globalRemainingUsdc, { prefixUsd: true })}`
+      : hasOnChain
+        ? 'Unavailable'
+        : unavailable || !summary.globalCapUsdc
+          ? 'Unavailable'
+          : `${formatApiAmount(summary.globalCapUsdc, { prefixUsd: true })} / ${formatApiAmount(summary.globalRemainingUsdc, { prefixUsd: true })}`;
 
   const chainHeadBlock = liveProtocol ? onChain.blockNumber : health?.chain_head_block ?? '—';
   let lagDisplay = health?.lag_blocks ?? '—';
@@ -282,15 +377,35 @@ export function buildDataMetricRows(summary, data, health, onChain = null) {
       ? [
           {
             label: 'Protocol status (LoanCore.paused)',
-            value: liveProtocol.paused ? 'PAUSED' : 'Active',
+            value:
+              liveProtocol.paused === null || liveProtocol.paused === undefined
+                ? 'Unavailable'
+                : liveProtocol.paused
+                  ? 'PAUSED (blocks new loans only)'
+                  : 'Active',
           },
           {
             label: 'Originated loans (LoanCore)',
-            value: `${liveProtocol.originatedLoansCount}`,
+            value:
+              liveProtocol.originatedLoansCount !== null && liveProtocol.originatedLoansCount !== undefined
+                ? `${liveProtocol.originatedLoansCount}`
+                : 'Unavailable',
           },
           {
             label: 'Base market session / Sequencer',
-            value: `${liveProtocol.marketOpen ? 'Open' : 'Closed'} · ${liveProtocol.sequencerValid ? 'Sequencer valid' : 'Sequencer invalid'}`,
+            value: `${
+              liveProtocol.marketOpen === null || liveProtocol.marketOpen === undefined
+                ? 'Market unavailable'
+                : liveProtocol.marketOpen
+                  ? 'Open'
+                  : 'Closed'
+            } · ${
+              liveProtocol.sequencerValid === null || liveProtocol.sequencerValid === undefined
+                ? 'Sequencer unavailable'
+                : liveProtocol.sequencerValid
+                  ? 'Sequencer valid'
+                  : 'Sequencer invalid'
+            }`,
           },
           {
             label: 'Collateral escrowed (CollateralEscrow)',
@@ -397,25 +512,53 @@ export function buildOnChainEnvironmentRows(onChain) {
   const sessionNote = p.useManualMarketSession
     ? ` (manual override: ${p.isMarketOpenManual ? 'open' : 'closed'})`
     : ' (US market hours + calendar)';
+  const graceLabel = formatDurationHuman(p.sequencerGracePeriodSecs);
+  const seqValue =
+    p.sequencerValid === null || p.sequencerValid === undefined
+      ? 'unavailable'
+      : p.sequencerValid
+        ? p.sequencerGracePeriodSecs !== null && p.sequencerGracePeriodSecs !== undefined
+          ? `Valid (grace period ${graceLabel})`
+          : 'Valid (uptime ok)'
+        : `Invalid / within ${graceLabel} grace period`;
+  const capSummary =
+    p.globalUsdcCap && p.totalOutstandingPrincipal && p.globalRemainingUsdc
+      ? `${formatApiAmount(p.globalUsdcCap, { prefixUsd: true })} / ${formatApiAmount(p.totalOutstandingPrincipal, { prefixUsd: true })} / ${formatApiAmount(p.globalRemainingUsdc, { prefixUsd: true })}`
+      : 'unavailable';
+
   return [
     { label: 'Base RPC block / timestamp', value: `#${onChain.blockNumber} · ${blockIso}` },
-    { label: 'LoanCore.paused()', value: p.paused ? 'PAUSED (repay & top-up only)' : 'Active (unpaused)' },
+    {
+      label: 'LoanCore.paused()',
+      value:
+        p.paused === null || p.paused === undefined
+          ? 'unavailable'
+          : p.paused
+            ? 'PAUSED (blocks new loans only)'
+            : 'Active (unpaused)',
+    },
     {
       label: 'Global USDC cap / outstanding / remaining',
-      value: `${formatApiAmount(p.globalUsdcCap, { prefixUsd: true })} / ${formatApiAmount(p.totalOutstandingPrincipal, { prefixUsd: true })} / ${formatApiAmount(p.globalRemainingUsdc, { prefixUsd: true })}`,
+      value: capSummary,
     },
-    { label: 'Originated loans (LoanCore.nextLoanId - 1)', value: `${p.originatedLoansCount}` },
+    {
+      label: 'Originated loans (LoanCore.nextLoanId - 1)',
+      value: p.originatedLoansCount !== null && p.originatedLoansCount !== undefined ? `${p.originatedLoansCount}` : 'unavailable',
+    },
     {
       label: 'OracleRouter.isMarketOpen()',
-      value: `${p.marketOpen ? 'Open' : 'Closed'}${sessionNote}`,
+      value:
+        p.marketOpen === null || p.marketOpen === undefined
+          ? 'unavailable'
+          : `${p.marketOpen ? 'Open' : 'Closed'}${sessionNote}`,
     },
     {
       label: 'OracleRouter.isSequencerValid()',
-      value: p.sequencerValid ? 'Valid (uptime ok)' : 'Invalid / within 1h grace period',
+      value: seqValue,
     },
     {
       label: 'OracleRouter.maxStaleClosedSecs()',
-      value: `${p.maxStaleClosedSecs}s`,
+      value: p.maxStaleClosedSecs !== null && p.maxStaleClosedSecs !== undefined ? `${p.maxStaleClosedSecs}s` : 'unavailable',
     },
   ];
 }
@@ -646,39 +789,87 @@ async function safeRead(promise, fallback = null) {
   }
 }
 
-async function discoverAssetTokensFromLogs(client, assetRegistryAddr, blockNumber) {
+async function tryRead(promise) {
+  try {
+    return { ok: true, value: await promise };
+  } catch (err) {
+    return { ok: false, value: null, error: formatWeb3Error(err) };
+  }
+}
+
+function collectTokenLogs(logs, out, seen) {
+  for (const log of logs) {
+    const rawTok = log?.args?.token;
+    if (!rawTok || !isAddress(rawTok)) continue;
+    const checksummed = getAddress(rawTok);
+    const key = checksummed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(checksummed);
+  }
+}
+
+async function discoverAssetTokensFromLogs(
+  client,
+  assetRegistryAddr,
+  blockNumber,
+  { fromBlock = null, chunkSize = 5_000n } = {}
+) {
   const eventAbi = assetRegistryAbi.find((item) => item.type === 'event' && item.name === 'AssetConfigSet');
   if (!eventAbi) return [];
-  const collect = (logs, out, seen) => {
-    for (const log of logs) {
-      const rawTok = log?.args?.token;
-      if (!rawTok || !isAddress(rawTok)) continue;
-      const checksummed = getAddress(rawTok);
-      const key = checksummed.toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push(checksummed);
+
+  if (fromBlock !== null && fromBlock !== undefined && String(fromBlock).trim() !== '') {
+    let cur = BigInt(fromBlock);
+    if (cur <= blockNumber) {
+      const addrs = [];
+      const seen = new Set();
+      let step = chunkSize > 0n ? BigInt(chunkSize) : 5_000n;
+      let iterations = 0;
+      const MAX_CHUNK_ITERATIONS = 500;
+      while (cur <= blockNumber && iterations < MAX_CHUNK_ITERATIONS) {
+        iterations += 1;
+        let to = cur + step - 1n;
+        if (to > blockNumber) to = blockNumber;
+        try {
+          const logs = await client.getLogs({
+            address: assetRegistryAddr,
+            event: eventAbi,
+            fromBlock: cur,
+            toBlock: to,
+          });
+          collectTokenLogs(logs, addrs, seen);
+          cur = to + 1n;
+        } catch {
+          if (step > 100n) {
+            const nextStep = step / 2n;
+            step = nextStep < 100n ? 100n : nextStep;
+            continue;
+          }
+          break;
+        }
+      }
+      return addrs;
     }
-  };
+    return [];
+  }
 
   for (const windowBlocks of [10_000n, 2_000n, 500n]) {
-    const fromBlock = blockNumber > windowBlocks ? blockNumber - windowBlocks : 0n;
+    const start = blockNumber > windowBlocks ? blockNumber - windowBlocks : 0n;
     try {
       const logs = await client.getLogs({
         address: assetRegistryAddr,
         event: eventAbi,
-        fromBlock,
+        fromBlock: start,
         toBlock: blockNumber,
       });
       const addrs = [];
-      collect(logs, addrs, new Set());
+      collectTokenLogs(logs, addrs, new Set());
       return addrs;
     } catch {
       // Retry with smaller window if RPC limits eth_getLogs block span
     }
   }
 
-  // Fallback for strict small-window RPCs or local fork tail blocks: walk back in 150-block steps
   const addrs = [];
   const seen = new Set();
   let curTo = blockNumber;
@@ -691,7 +882,7 @@ async function discoverAssetTokensFromLogs(client, assetRegistryAddr, blockNumbe
         fromBlock: curFrom,
         toBlock: curTo,
       });
-      collect(logs, addrs, seen);
+      collectTokenLogs(logs, addrs, seen);
     } catch {
       break;
     }
@@ -738,6 +929,43 @@ async function discoverAssetTokensFromRecentLoans(client, loanCoreAddr, nextLoan
   return tokens;
 }
 
+function buildUnavailableOnChainAsset(tokenAddr, blockNumber, blockTimestamp, fallbackAsset, error) {
+  return {
+    source: 'onchain_unavailable',
+    unavailable: true,
+    onchain_verified: false,
+    verification_label: 'unavailable',
+    error: error || 'Live Base contract read unavailable.',
+    token: tokenAddr,
+    symbol: fallbackAsset?.symbol ?? null,
+    decimals: Number.isInteger(fallbackAsset?.decimals) ? fallbackAsset.decimals : null,
+    supported: null,
+    feed: null,
+    tier: null,
+    tier_name: 'unavailable',
+    status: null,
+    status_name: 'unavailable',
+    restricted: null,
+    ltv: null,
+    caps: null,
+    multiplier: null,
+    oracle: {
+      price: null,
+      state: null,
+      state_name: 'unavailable',
+      max_stale_open_secs: null,
+      max_stale_closed_secs: null,
+      feed_updated_at: null,
+      feed_age_seconds: null,
+      gross_unit_value_usdc: null,
+      effective_unit_value_usdc: null,
+    },
+    escrow_balance: null,
+    live_block_number: blockNumber.toString(),
+    live_block_timestamp: Number(blockTimestamp),
+  };
+}
+
 async function readSingleOnChainAssetState({
   tokenAddr,
   client,
@@ -752,229 +980,277 @@ async function readSingleOnChainAssetState({
   maxStaleClosedSecs,
   fallbackAsset = null,
 }) {
-  const [
-    supported,
-    assetCfg,
-    priceTuple,
-    recMultRaw,
-    assetOutstandingRaw,
-    escrowBalanceRaw,
-    symbolRes,
-    decimalsRes,
-    uiMultRes,
-  ] = await Promise.all([
-    client.readContract({
+  try {
+    const supported = await client.readContract({
       address: assetRegistryAddr,
       abi: assetRegistryAbi,
       functionName: 'isAssetSupported',
       args: [tokenAddr],
       blockNumber,
-    }),
-    client.readContract({
-      address: assetRegistryAddr,
-      abi: assetRegistryAbi,
-      functionName: 'getAssetConfig',
-      args: [tokenAddr],
-      blockNumber,
-    }),
-    safeRead(
+    });
+    if (!supported) {
+      return { status: 'unsupported', token: tokenAddr };
+    }
+
+    const [
+      assetCfg,
+      priceRead,
+      recMultRead,
+      assetOutRead,
+      escrowRead,
+      symbolRead,
+      decimalsRead,
+      uiMultRead,
+    ] = await Promise.all([
       client.readContract({
-        address: oracleRouterAddr,
-        abi: oracleRouterAbi,
-        functionName: 'getPrice',
+        address: assetRegistryAddr,
+        abi: assetRegistryAbi,
+        functionName: 'getAssetConfig',
         args: [tokenAddr],
         blockNumber,
       }),
-      null
-    ),
-    safeRead(
-      client.readContract({
-        address: oracleRouterAddr,
-        abi: oracleRouterAbi,
-        functionName: 'recordedMultiplier',
-        args: [tokenAddr],
-        blockNumber,
-      }),
-      0n
-    ),
-    client.readContract({
-      address: loanCoreAddr,
-      abi: loanCoreAbi,
-      functionName: 'assetOutstandingPrincipal',
-      args: [tokenAddr],
-      blockNumber,
-    }),
-    escrowAddr
-      ? safeRead(
-          client.readContract({
-            address: escrowAddr,
-            abi: collateralEscrowAbi,
-            functionName: 'getBalance',
-            args: [tokenAddr],
-            blockNumber,
-          }),
-          0n
-        )
-      : Promise.resolve(0n),
-    safeRead(
-      client.readContract({
-        address: tokenAddr,
-        abi: erc20Abi,
-        functionName: 'symbol',
-        blockNumber,
-      }),
-      null
-    ),
-    safeRead(
-      client.readContract({
-        address: tokenAddr,
-        abi: erc20Abi,
-        functionName: 'decimals',
-        blockNumber,
-      }),
-      null
-    ),
-    safeRead(
-      client.readContract({
-        address: tokenAddr,
-        abi: erc20Abi,
-        functionName: 'uiMultiplier',
-        blockNumber,
-      }),
-      null
-    ),
-  ]);
+      tryRead(
+        client.readContract({
+          address: oracleRouterAddr,
+          abi: oracleRouterAbi,
+          functionName: 'getPrice',
+          args: [tokenAddr],
+          blockNumber,
+        })
+      ),
+      tryRead(
+        client.readContract({
+          address: oracleRouterAddr,
+          abi: oracleRouterAbi,
+          functionName: 'recordedMultiplier',
+          args: [tokenAddr],
+          blockNumber,
+        })
+      ),
+      tryRead(
+        client.readContract({
+          address: loanCoreAddr,
+          abi: loanCoreAbi,
+          functionName: 'assetOutstandingPrincipal',
+          args: [tokenAddr],
+          blockNumber,
+        })
+      ),
+      escrowAddr
+        ? tryRead(
+            client.readContract({
+              address: escrowAddr,
+              abi: collateralEscrowAbi,
+              functionName: 'getBalance',
+              args: [tokenAddr],
+              blockNumber,
+            })
+          )
+        : Promise.resolve({ ok: false, value: null, error: 'Escrow address unavailable' }),
+      tryRead(
+        client.readContract({
+          address: tokenAddr,
+          abi: erc20Abi,
+          functionName: 'symbol',
+          blockNumber,
+        })
+      ),
+      tryRead(
+        client.readContract({
+          address: tokenAddr,
+          abi: erc20Abi,
+          functionName: 'decimals',
+          blockNumber,
+        })
+      ),
+      tryRead(
+        client.readContract({
+          address: tokenAddr,
+          abi: erc20Abi,
+          functionName: 'uiMultiplier',
+          blockNumber,
+        })
+      ),
+    ]);
 
-  const feedAddr = assetCfg?.feed && assetCfg.feed !== zeroAddress ? getAddress(assetCfg.feed) : null;
-  if (!supported && !feedAddr) {
-    return null;
-  }
+    const feedAddr = assetCfg?.feed && assetCfg.feed !== zeroAddress ? getAddress(assetCfg.feed) : null;
+    if (!feedAddr) {
+      return { status: 'unsupported', token: tokenAddr };
+    }
 
-  const tokenDecimals =
-    decimalsRes !== null && decimalsRes !== undefined
-      ? Number(decimalsRes)
-      : Number.isInteger(fallbackAsset?.decimals)
-        ? fallbackAsset.decimals
-        : 18;
-  const symbol =
-    typeof symbolRes === 'string' && symbolRes.trim()
-      ? symbolRes.trim()
-      : fallbackAsset?.symbol ?? null;
+    const tokenDecimals =
+      decimalsRead.ok && decimalsRead.value !== null && decimalsRead.value !== undefined
+        ? Number(decimalsRead.value)
+        : Number.isInteger(fallbackAsset?.decimals)
+          ? fallbackAsset.decimals
+          : 18;
+    const symbol =
+      symbolRead.ok && typeof symbolRead.value === 'string' && symbolRead.value.trim()
+        ? symbolRead.value.trim()
+        : fallbackAsset?.symbol ?? null;
 
-  const oneWholeTokenRaw = 10n ** BigInt(tokenDecimals);
-  const [unitValueTuple, roundData] = await Promise.all([
-    safeRead(
-      client.readContract({
-        address: oracleRouterAddr,
-        abi: oracleRouterAbi,
-        functionName: 'getValue',
-        args: [tokenAddr, oneWholeTokenRaw],
-        blockNumber,
-      }),
-      null
-    ),
-    feedAddr
-      ? safeRead(
-          client.readContract({
-            address: feedAddr,
-            abi: aggregatorV3Abi,
-            functionName: 'latestRoundData',
-            blockNumber,
-          }),
-          null
-        )
-      : Promise.resolve(null),
-  ]);
+    const oneWholeTokenRaw = 10n ** BigInt(tokenDecimals);
+    const [unitValueRead, roundRead] = await Promise.all([
+      tryRead(
+        client.readContract({
+          address: oracleRouterAddr,
+          abi: oracleRouterAbi,
+          functionName: 'getValue',
+          args: [tokenAddr, oneWholeTokenRaw],
+          blockNumber,
+        })
+      ),
+      tryRead(
+        client.readContract({
+          address: feedAddr,
+          abi: aggregatorV3Abi,
+          functionName: 'latestRoundData',
+          blockNumber,
+        })
+      ),
+    ]);
 
-  const priceRaw = priceTuple ? BigInt(priceTuple[0] ?? 0n) : 0n;
-  const priceDecimals = priceTuple
-    ? Number(priceTuple[1])
-    : Number(assetCfg?.feedDecimals ?? FEED_DECIMALS_DEFAULT);
-  const oracleState = priceTuple ? Number(priceTuple[2]) : 3;
-
-  const grossUnitUsdcRaw = unitValueTuple ? BigInt(unitValueTuple[0] ?? 0n) : 0n;
-  const effectiveUnitUsdcRaw = unitValueTuple ? BigInt(unitValueTuple[1] ?? 0n) : 0n;
-
-  const feedUpdatedAt = roundData ? BigInt(roundData[3] ?? 0n) : 0n;
-  const feedAgeSeconds =
-    feedUpdatedAt > 0n
-      ? blockTimestamp >= feedUpdatedAt
-        ? Number(blockTimestamp - feedUpdatedAt)
-        : 0
+    const priceTuple = priceRead.ok ? priceRead.value : null;
+    const priceDecimals = priceTuple
+      ? Number(priceTuple[1])
+      : Number(assetCfg?.feedDecimals ?? FEED_DECIMALS_DEFAULT);
+    const oracleState = priceTuple ? Number(priceTuple[2]) : null;
+    const oracleStateName =
+      oracleState !== null
+        ? ORACLE_STATE_NAMES[oracleState] ?? `UNKNOWN(${oracleState})`
+        : 'unavailable';
+    const priceObj = priceTuple
+      ? formatRawAmountObject(BigInt(priceTuple[0] ?? 0n), priceDecimals, 'USD')
       : null;
 
-  const recMult = BigInt(recMultRaw ?? 0n);
-  const uiMult = uiMultRes !== null && uiMultRes !== undefined ? BigInt(uiMultRes) : null;
-  let multiplierDriftBps = 0;
-  if (uiMult !== null && uiMult > 0n) {
-    if (recMult > 0n) {
-      const diff = uiMult > recMult ? uiMult - recMult : recMult - uiMult;
-      multiplierDriftBps = Number((diff * 10_000n) / recMult);
-    } else {
-      multiplierDriftBps = null;
+    const unitTuple = unitValueRead.ok ? unitValueRead.value : null;
+    const grossUnitUsdcObj = unitTuple
+      ? formatRawAmountObject(BigInt(unitTuple[0] ?? 0n), USDC_DECIMALS, 'USDC')
+      : null;
+    const effectiveUnitUsdcObj = unitTuple
+      ? formatRawAmountObject(BigInt(unitTuple[1] ?? 0n), USDC_DECIMALS, 'USDC')
+      : null;
+
+    const roundData = roundRead.ok ? roundRead.value : null;
+    const feedUpdatedAt = roundData ? BigInt(roundData[3] ?? 0n) : 0n;
+    const feedAgeSeconds =
+      roundData && feedUpdatedAt > 0n
+        ? blockTimestamp >= feedUpdatedAt
+          ? Number(blockTimestamp - feedUpdatedAt)
+          : 0
+        : null;
+
+    const recMult = recMultRead.ok ? BigInt(recMultRead.value ?? 0n) : null;
+    const uiMult =
+      uiMultRead.ok && uiMultRead.value !== null && uiMultRead.value !== undefined
+        ? BigInt(uiMultRead.value)
+        : null;
+    let multiplierDriftBps = null;
+    if (recMult !== null) {
+      multiplierDriftBps = 0;
+      if (uiMult !== null && uiMult > 0n) {
+        if (recMult > 0n) {
+          const diff = uiMult > recMult ? uiMult - recMult : recMult - uiMult;
+          multiplierDriftBps = Number((diff * 10_000n) / recMult);
+        } else {
+          multiplierDriftBps = null;
+        }
+      }
     }
+
+    const perLoanCap = BigInt(assetCfg.perLoanCap ?? 0n);
+    const assetCap = BigInt(assetCfg.assetCap ?? 0n);
+    const assetOutstanding = assetOutRead.ok ? BigInt(assetOutRead.value ?? 0n) : null;
+    const assetRemaining =
+      assetOutstanding === null
+        ? null
+        : assetCap > 0n
+          ? assetCap > assetOutstanding
+            ? assetCap - assetOutstanding
+            : 0n
+          : globalRemaining;
+    const status = Number(assetCfg.status ?? 0);
+    const tier = Number(assetCfg.tier ?? 0);
+
+    return {
+      status: 'ok',
+      asset: {
+        source: 'onchain_rpc',
+        unavailable: false,
+        onchain_verified: true,
+        verification_label: 'verified on-chain',
+        token: tokenAddr,
+        symbol,
+        decimals: tokenDecimals,
+        supported: true,
+        feed: feedAddr,
+        tier,
+        tier_name: ASSET_TIER_NAMES[tier] ?? `Tier ${tier}`,
+        status,
+        status_name: ASSET_STATUS_NAMES[status] ?? `UNKNOWN(${status})`,
+        restricted: Boolean(assetCfg.restricted),
+        ltv: {
+          max_init_ltv_bps: Number(assetCfg.maxInitLtvBps),
+          margin_call_ltv_bps: Number(assetCfg.marginCallLtvBps),
+          liq_ltv_bps: Number(assetCfg.liqLtvBps),
+          bad_debt_ltv_bps: Number(assetCfg.badDebtLtvBps),
+          max_discount_bps: Number(assetCfg.maxDiscountBps),
+          closed_market_haircut_bps: Number(assetCfg.closedMarketHaircutBps),
+        },
+        caps: {
+          per_loan_cap: formatRawAmountObject(perLoanCap, USDC_DECIMALS, 'USDC'),
+          asset_cap: formatRawAmountObject(assetCap, USDC_DECIMALS, 'USDC'),
+          asset_outstanding_principal:
+            assetOutstanding !== null
+              ? formatRawAmountObject(assetOutstanding, USDC_DECIMALS, 'USDC')
+              : null,
+          asset_remaining:
+            assetRemaining !== null
+              ? formatRawAmountObject(assetRemaining, USDC_DECIMALS, 'USDC')
+              : null,
+          global_usdc_cap:
+            globalCap !== null ? formatRawAmountObject(globalCap, USDC_DECIMALS, 'USDC') : null,
+          global_remaining:
+            globalRemaining !== null
+              ? formatRawAmountObject(globalRemaining, USDC_DECIMALS, 'USDC')
+              : null,
+        },
+        multiplier: {
+          recorded: recMult !== null ? formatRawAmountObject(recMult, RATE_DECIMALS) : null,
+          ui: uiMult !== null ? formatRawAmountObject(uiMult, RATE_DECIMALS) : null,
+          drift_bps: multiplierDriftBps,
+        },
+        oracle: {
+          price: priceObj,
+          state: oracleState,
+          state_name: oracleStateName,
+          max_stale_open_secs: Number(assetCfg.maxStaleOpenSecs),
+          max_stale_closed_secs: maxStaleClosedSecs,
+          feed_updated_at: roundData && feedUpdatedAt > 0n ? Number(feedUpdatedAt) : null,
+          feed_age_seconds: feedAgeSeconds,
+          gross_unit_value_usdc: grossUnitUsdcObj,
+          effective_unit_value_usdc: effectiveUnitUsdcObj,
+        },
+        escrow_balance: escrowRead.ok
+          ? formatRawAmountObject(escrowRead.value ?? 0n, tokenDecimals, symbol)
+          : null,
+        live_block_number: blockNumber.toString(),
+        live_block_timestamp: Number(blockTimestamp),
+      },
+    };
+  } catch (err) {
+    return {
+      status: 'unavailable',
+      token: tokenAddr,
+      asset: buildUnavailableOnChainAsset(
+        tokenAddr,
+        blockNumber,
+        blockTimestamp,
+        fallbackAsset,
+        formatWeb3Error(err)
+      ),
+    };
   }
-
-  const perLoanCap = BigInt(assetCfg.perLoanCap ?? 0n);
-  const assetCap = BigInt(assetCfg.assetCap ?? 0n);
-  const assetOutstanding = BigInt(assetOutstandingRaw ?? 0n);
-  const assetRemaining =
-    assetCap > 0n
-      ? assetCap > assetOutstanding
-        ? assetCap - assetOutstanding
-        : 0n
-      : globalRemaining;
-  const status = Number(assetCfg.status ?? 0);
-  const tier = Number(assetCfg.tier ?? 0);
-
-  return {
-    source: 'onchain_rpc',
-    token: tokenAddr,
-    symbol,
-    decimals: tokenDecimals,
-    supported: Boolean(supported),
-    feed: feedAddr,
-    tier,
-    tier_name: ASSET_TIER_NAMES[tier] ?? `Tier ${tier}`,
-    status,
-    status_name: ASSET_STATUS_NAMES[status] ?? `UNKNOWN(${status})`,
-    restricted: Boolean(assetCfg.restricted),
-    ltv: {
-      max_init_ltv_bps: Number(assetCfg.maxInitLtvBps),
-      margin_call_ltv_bps: Number(assetCfg.marginCallLtvBps),
-      liq_ltv_bps: Number(assetCfg.liqLtvBps),
-      bad_debt_ltv_bps: Number(assetCfg.badDebtLtvBps),
-      max_discount_bps: Number(assetCfg.maxDiscountBps),
-      closed_market_haircut_bps: Number(assetCfg.closedMarketHaircutBps),
-    },
-    caps: {
-      per_loan_cap: formatRawAmountObject(perLoanCap, USDC_DECIMALS, 'USDC'),
-      asset_cap: formatRawAmountObject(assetCap, USDC_DECIMALS, 'USDC'),
-      asset_outstanding_principal: formatRawAmountObject(assetOutstanding, USDC_DECIMALS, 'USDC'),
-      asset_remaining: formatRawAmountObject(assetRemaining, USDC_DECIMALS, 'USDC'),
-      global_usdc_cap: formatRawAmountObject(globalCap, USDC_DECIMALS, 'USDC'),
-      global_remaining: formatRawAmountObject(globalRemaining, USDC_DECIMALS, 'USDC'),
-    },
-    multiplier: {
-      recorded: formatRawAmountObject(recMult, RATE_DECIMALS),
-      ui: uiMult !== null ? formatRawAmountObject(uiMult, RATE_DECIMALS) : null,
-      drift_bps: multiplierDriftBps,
-    },
-    oracle: {
-      price: formatRawAmountObject(priceRaw, priceDecimals, 'USD'),
-      state: oracleState,
-      state_name: ORACLE_STATE_NAMES[oracleState] ?? `UNKNOWN(${oracleState})`,
-      max_stale_open_secs: Number(assetCfg.maxStaleOpenSecs),
-      max_stale_closed_secs: maxStaleClosedSecs,
-      feed_updated_at: feedUpdatedAt > 0n ? Number(feedUpdatedAt) : null,
-      feed_age_seconds: feedAgeSeconds,
-      gross_unit_value_usdc: formatRawAmountObject(grossUnitUsdcRaw, USDC_DECIMALS, 'USDC'),
-      effective_unit_value_usdc: formatRawAmountObject(effectiveUnitUsdcRaw, USDC_DECIMALS, 'USDC'),
-    },
-    escrow_balance: formatRawAmountObject(escrowBalanceRaw ?? 0n, tokenDecimals, symbol),
-    live_block_number: blockNumber.toString(),
-    live_block_timestamp: Number(blockTimestamp),
-  };
 }
 
 export async function fetchLiveProtocolContractState({
@@ -983,6 +1259,8 @@ export async function fetchLiveProtocolContractState({
   tokenAddresses = [],
   knownAssets = [],
   includeLogDiscovery = true,
+  fromBlock = cfg?.deployBlock ?? null,
+  logChunkSize = 5_000n,
 } = {}) {
   const fetchedAt = new Date().toISOString();
   const c = cfg?.contracts ?? {};
@@ -996,6 +1274,7 @@ export async function fetchLiveProtocolContractState({
       protocol: null,
       fees: null,
       assets: [],
+      unsupportedTokens: [],
       tokenAddressesUsed: [],
     };
   }
@@ -1012,74 +1291,83 @@ export async function fetchLiveProtocolContractState({
     const blockTimestamp = BigInt(block.timestamp ?? 0n);
 
     const [
-      paused,
-      globalCap,
-      totalOutstanding,
-      nextLoanId,
-      feeCollectorAddrRaw,
-      loanCoreEscrowRaw,
-      marketOpen,
-      sequencerValid,
-      maxStaleClosedSecsRaw,
-      useManualMarketSession,
-      isMarketOpenManual,
+      pausedRead,
+      globalCapRead,
+      totalOutRead,
+      nextLoanRead,
+      feeCollectorRead,
+      loanCoreEscrowRead,
+      marketOpenRead,
+      seqValidRead,
+      seqGraceRead,
+      maxStaleClosedRead,
+      useManualRead,
+      isMarketOpenManualRead,
     ] = await Promise.all([
-      client.readContract({ address: loanCoreAddr, abi: loanCoreAbi, functionName: 'paused', blockNumber }),
-      client.readContract({ address: loanCoreAddr, abi: loanCoreAbi, functionName: 'globalUsdcCap', blockNumber }),
-      client.readContract({
-        address: loanCoreAddr,
-        abi: loanCoreAbi,
-        functionName: 'totalOutstandingPrincipal',
-        blockNumber,
-      }),
-      client.readContract({ address: loanCoreAddr, abi: loanCoreAbi, functionName: 'nextLoanId', blockNumber }),
-      safeRead(
-        client.readContract({ address: loanCoreAddr, abi: loanCoreAbi, functionName: 'feeCollector', blockNumber }),
-        null
+      tryRead(client.readContract({ address: loanCoreAddr, abi: loanCoreAbi, functionName: 'paused', blockNumber })),
+      tryRead(client.readContract({ address: loanCoreAddr, abi: loanCoreAbi, functionName: 'globalUsdcCap', blockNumber })),
+      tryRead(
+        client.readContract({
+          address: loanCoreAddr,
+          abi: loanCoreAbi,
+          functionName: 'totalOutstandingPrincipal',
+          blockNumber,
+        })
       ),
-      safeRead(
-        client.readContract({ address: loanCoreAddr, abi: loanCoreAbi, functionName: 'escrow', blockNumber }),
-        null
+      tryRead(client.readContract({ address: loanCoreAddr, abi: loanCoreAbi, functionName: 'nextLoanId', blockNumber })),
+      tryRead(client.readContract({ address: loanCoreAddr, abi: loanCoreAbi, functionName: 'feeCollector', blockNumber })),
+      tryRead(client.readContract({ address: loanCoreAddr, abi: loanCoreAbi, functionName: 'escrow', blockNumber })),
+      tryRead(client.readContract({ address: oracleRouterAddr, abi: oracleRouterAbi, functionName: 'isMarketOpen', blockNumber })),
+      tryRead(
+        client.readContract({
+          address: oracleRouterAddr,
+          abi: oracleRouterAbi,
+          functionName: 'isSequencerValid',
+          blockNumber,
+        })
       ),
-      client.readContract({ address: oracleRouterAddr, abi: oracleRouterAbi, functionName: 'isMarketOpen', blockNumber }),
-      client.readContract({
-        address: oracleRouterAddr,
-        abi: oracleRouterAbi,
-        functionName: 'isSequencerValid',
-        blockNumber,
-      }),
-      client.readContract({
-        address: oracleRouterAddr,
-        abi: oracleRouterAbi,
-        functionName: 'maxStaleClosedSecs',
-        blockNumber,
-      }),
-      safeRead(
+      tryRead(
+        client.readContract({
+          address: oracleRouterAddr,
+          abi: oracleRouterAbi,
+          functionName: 'sequencerGracePeriod',
+          blockNumber,
+        })
+      ),
+      tryRead(
+        client.readContract({
+          address: oracleRouterAddr,
+          abi: oracleRouterAbi,
+          functionName: 'maxStaleClosedSecs',
+          blockNumber,
+        })
+      ),
+      tryRead(
         client.readContract({
           address: oracleRouterAddr,
           abi: oracleRouterAbi,
           functionName: 'useManualMarketSession',
           blockNumber,
-        }),
-        false
+        })
       ),
-      safeRead(
+      tryRead(
         client.readContract({
           address: oracleRouterAddr,
           abi: oracleRouterAbi,
           functionName: 'isMarketOpenManual',
           blockNumber,
-        }),
-        false
+        })
       ),
     ]);
 
     const escrowAddr =
-      loanCoreEscrowRaw && loanCoreEscrowRaw !== zeroAddress
-        ? getAddress(loanCoreEscrowRaw)
+      loanCoreEscrowRead.ok && loanCoreEscrowRead.value && loanCoreEscrowRead.value !== zeroAddress
+        ? getAddress(loanCoreEscrowRead.value)
         : configuredEscrowAddr;
     const feeCollectorAddr =
-      feeCollectorAddrRaw && feeCollectorAddrRaw !== zeroAddress ? getAddress(feeCollectorAddrRaw) : null;
+      feeCollectorRead.ok && feeCollectorRead.value && feeCollectorRead.value !== zeroAddress
+        ? getAddress(feeCollectorRead.value)
+        : null;
 
     const feePromise = feeCollectorAddr
       ? Promise.all([
@@ -1122,14 +1410,14 @@ export async function fetchLiveProtocolContractState({
       : Promise.resolve(null);
 
     const logDiscoveryPromise = includeLogDiscovery
-      ? discoverAssetTokensFromLogs(client, assetRegistryAddr, blockNumber)
+      ? discoverAssetTokensFromLogs(client, assetRegistryAddr, blockNumber, {
+          fromBlock,
+          chunkSize: logChunkSize,
+        })
       : Promise.resolve([]);
-    const loanDiscoveryPromise = discoverAssetTokensFromRecentLoans(
-      client,
-      loanCoreAddr,
-      nextLoanId,
-      blockNumber
-    );
+    const loanDiscoveryPromise = nextLoanRead.ok
+      ? discoverAssetTokensFromRecentLoans(client, loanCoreAddr, nextLoanRead.value, blockNumber)
+      : Promise.resolve([]);
 
     const [fees, logTokens, loanTokens] = await Promise.all([
       safeRead(feePromise, null),
@@ -1156,10 +1444,15 @@ export async function fetchLiveProtocolContractState({
       tokenSet.set(cs.toLowerCase(), cs);
     }
 
-    const globalCapBig = BigInt(globalCap ?? 0n);
-    const totalOutBig = BigInt(totalOutstanding ?? 0n);
-    const globalRemBig = globalCapBig > totalOutBig ? globalCapBig - totalOutBig : 0n;
-    const maxStaleClosedSecs = Number(maxStaleClosedSecsRaw ?? 0);
+    const globalCapBig = globalCapRead.ok ? BigInt(globalCapRead.value ?? 0n) : null;
+    const totalOutBig = totalOutRead.ok ? BigInt(totalOutRead.value ?? 0n) : null;
+    const globalRemBig =
+      globalCapBig !== null && totalOutBig !== null
+        ? globalCapBig > totalOutBig
+          ? globalCapBig - totalOutBig
+          : 0n
+        : null;
+    const maxStaleClosedSecs = maxStaleClosedRead.ok ? Number(maxStaleClosedRead.value ?? 0) : null;
 
     const candidateList = Array.from(tokenSet.values()).sort((a, b) => a.localeCompare(b));
     const assetResults = await Promise.all(
@@ -1180,8 +1473,13 @@ export async function fetchLiveProtocolContractState({
         })
       )
     );
-    const liveAssets = assetResults.filter(Boolean);
-    const nextLoanBig = BigInt(nextLoanId ?? 1n);
+    const liveAssets = assetResults
+      .filter((r) => r && (r.status === 'ok' || r.status === 'unavailable') && r.asset)
+      .map((r) => r.asset);
+    const unsupportedTokens = assetResults
+      .filter((r) => r && r.status === 'unsupported')
+      .map((r) => r.token);
+    const nextLoanBig = nextLoanRead.ok ? BigInt(nextLoanRead.value ?? 1n) : null;
 
     return {
       ok: true,
@@ -1190,22 +1488,28 @@ export async function fetchLiveProtocolContractState({
       blockNumber: blockNumber.toString(),
       blockTimestamp: Number(blockTimestamp),
       protocol: {
-        paused: Boolean(paused),
-        nextLoanId: nextLoanBig.toString(),
-        originatedLoansCount: (nextLoanBig > 1n ? nextLoanBig - 1n : 0n).toString(),
-        globalUsdcCap: formatRawAmountObject(globalCapBig, USDC_DECIMALS, 'USDC'),
-        totalOutstandingPrincipal: formatRawAmountObject(totalOutBig, USDC_DECIMALS, 'USDC'),
-        globalRemainingUsdc: formatRawAmountObject(globalRemBig, USDC_DECIMALS, 'USDC'),
+        paused: pausedRead.ok ? Boolean(pausedRead.value) : null,
+        nextLoanId: nextLoanBig !== null ? nextLoanBig.toString() : null,
+        originatedLoansCount:
+          nextLoanBig !== null ? (nextLoanBig > 1n ? nextLoanBig - 1n : 0n).toString() : null,
+        globalUsdcCap:
+          globalCapBig !== null ? formatRawAmountObject(globalCapBig, USDC_DECIMALS, 'USDC') : null,
+        totalOutstandingPrincipal:
+          totalOutBig !== null ? formatRawAmountObject(totalOutBig, USDC_DECIMALS, 'USDC') : null,
+        globalRemainingUsdc:
+          globalRemBig !== null ? formatRawAmountObject(globalRemBig, USDC_DECIMALS, 'USDC') : null,
         feeCollector: feeCollectorAddr,
         escrow: escrowAddr,
-        marketOpen: Boolean(marketOpen),
-        sequencerValid: Boolean(sequencerValid),
+        marketOpen: marketOpenRead.ok ? Boolean(marketOpenRead.value) : null,
+        sequencerValid: seqValidRead.ok ? Boolean(seqValidRead.value) : null,
+        sequencerGracePeriodSecs: seqGraceRead.ok ? Number(seqGraceRead.value ?? 0) : null,
         maxStaleClosedSecs,
-        useManualMarketSession: Boolean(useManualMarketSession),
-        isMarketOpenManual: Boolean(isMarketOpenManual),
+        useManualMarketSession: useManualRead.ok ? Boolean(useManualRead.value) : false,
+        isMarketOpenManual: isMarketOpenManualRead.ok ? Boolean(isMarketOpenManualRead.value) : false,
       },
       fees,
       assets: liveAssets,
+      unsupportedTokens,
       tokenAddressesUsed: candidateList,
     };
   } catch (err) {
@@ -1218,6 +1522,7 @@ export async function fetchLiveProtocolContractState({
       protocol: null,
       fees: null,
       assets: [],
+      unsupportedTokens: [],
       tokenAddressesUsed: [],
     };
   }
@@ -1226,10 +1531,28 @@ export async function fetchLiveProtocolContractState({
 export function reconcileLiveAssetsWithApi(apiAssets, onChainSnapshot) {
   const safeApi = Array.isArray(apiAssets) ? apiAssets : [];
   if (!onChainSnapshot?.ok) {
-    return { assets: safeApi, discrepancies: [], usingOnChain: false };
+    const labeledApi = safeApi.map((apiAsset) => ({
+      ...apiAsset,
+      source: 'api_only',
+      onchain_verified: false,
+      verification_label: 'not verified on-chain',
+      status: null,
+      status_name: 'not verified on-chain',
+      oracle: {
+        ...(apiAsset.oracle || {}),
+        price: null,
+        state: null,
+        state_name: 'not verified on-chain',
+        api_state_name: apiAsset.oracle?.state_name ?? null,
+      },
+    }));
+    return { assets: labeledApi, discrepancies: [], usingOnChain: false };
   }
 
   const chainAssets = Array.isArray(onChainSnapshot.assets) ? onChainSnapshot.assets : [];
+  const unsupportedSet = new Set(
+    (onChainSnapshot.unsupportedTokens || []).map((t) => String(t).toLowerCase())
+  );
   const apiByLower = new Map();
   for (const asset of safeApi) {
     if (asset?.token && isAddress(asset.token)) {
@@ -1245,15 +1568,37 @@ export function reconcileLiveAssetsWithApi(apiAssets, onChainSnapshot) {
     const key = chainAsset.token.toLowerCase();
     seen.add(key);
     const apiAsset = apiByLower.get(key) ?? null;
+    const label = chainAsset.symbol || apiAsset?.symbol || chainAsset.token;
+
+    if (chainAsset.unavailable) {
+      discrepancies.push(
+        `${label}: live Base contract read unavailable (${chainAsset.error || 'RPC call failed'})`
+      );
+      merged.push({
+        token: chainAsset.token,
+        symbol: chainAsset.symbol ?? apiAsset?.symbol ?? null,
+        decimals: chainAsset.decimals ?? apiAsset?.decimals ?? null,
+        ...chainAsset,
+        updated_block: apiAsset?.updated_block ?? null,
+      });
+      continue;
+    }
+
     if (apiAsset) {
-      const label = chainAsset.symbol || apiAsset.symbol || chainAsset.token;
-      if (apiAsset.status !== undefined && Number(apiAsset.status) !== Number(chainAsset.status)) {
+      if (
+        apiAsset.status !== undefined &&
+        apiAsset.status !== null &&
+        chainAsset.status !== null &&
+        Number(apiAsset.status) !== Number(chainAsset.status)
+      ) {
         discrepancies.push(
           `${label}: AssetStatus api=${apiAsset.status_name ?? apiAsset.status} vs Base AssetRegistry=${chainAsset.status_name}`
         );
       }
       if (
         apiAsset.oracle?.state !== undefined &&
+        apiAsset.oracle?.state !== null &&
+        chainAsset.oracle?.state !== null &&
         Number(apiAsset.oracle.state) !== Number(chainAsset.oracle.state)
       ) {
         discrepancies.push(
@@ -1262,6 +1607,7 @@ export function reconcileLiveAssetsWithApi(apiAssets, onChainSnapshot) {
       }
       if (
         apiAsset.ltv?.max_init_ltv_bps !== undefined &&
+        chainAsset.ltv?.max_init_ltv_bps !== undefined &&
         Number(apiAsset.ltv.max_init_ltv_bps) !== Number(chainAsset.ltv.max_init_ltv_bps)
       ) {
         discrepancies.push(
@@ -1270,6 +1616,7 @@ export function reconcileLiveAssetsWithApi(apiAssets, onChainSnapshot) {
       }
       if (
         apiAsset.ltv?.liq_ltv_bps !== undefined &&
+        chainAsset.ltv?.liq_ltv_bps !== undefined &&
         Number(apiAsset.ltv.liq_ltv_bps) !== Number(chainAsset.ltv.liq_ltv_bps)
       ) {
         discrepancies.push(
@@ -1278,6 +1625,7 @@ export function reconcileLiveAssetsWithApi(apiAssets, onChainSnapshot) {
       }
       if (
         apiAsset.caps?.asset_cap?.raw !== undefined &&
+        chainAsset.caps?.asset_cap?.raw !== undefined &&
         String(apiAsset.caps.asset_cap.raw) !== String(chainAsset.caps.asset_cap.raw)
       ) {
         discrepancies.push(
@@ -1286,6 +1634,7 @@ export function reconcileLiveAssetsWithApi(apiAssets, onChainSnapshot) {
       }
       if (
         apiAsset.multiplier?.recorded?.raw !== undefined &&
+        chainAsset.multiplier?.recorded?.raw !== undefined &&
         String(apiAsset.multiplier.recorded.raw) !== String(chainAsset.multiplier.recorded.raw)
       ) {
         discrepancies.push(
@@ -1303,11 +1652,29 @@ export function reconcileLiveAssetsWithApi(apiAssets, onChainSnapshot) {
 
   for (const apiAsset of safeApi) {
     if (!apiAsset?.token || !isAddress(apiAsset.token)) continue;
-    const key = getAddress(apiAsset.token).toLowerCase();
+    const cs = getAddress(apiAsset.token);
+    const key = cs.toLowerCase();
     if (seen.has(key)) continue;
+    const label = apiAsset.symbol || cs;
+    const reason = unsupportedSet.has(key)
+      ? 'unsupported in Base AssetRegistry'
+      : 'absent from on-chain discovery';
+    discrepancies.push(`${label}: listed by api/ only (${reason}; not verified on-chain)`);
     merged.push({
       ...apiAsset,
+      token: cs,
       source: 'api_only',
+      onchain_verified: false,
+      verification_label: 'not verified on-chain',
+      status: null,
+      status_name: 'not verified on-chain',
+      oracle: {
+        ...(apiAsset.oracle || {}),
+        price: null,
+        state: null,
+        state_name: 'not verified on-chain',
+        api_state_name: apiAsset.oracle?.state_name ?? null,
+      },
     });
   }
 
@@ -1328,6 +1695,8 @@ export async function fetchMarketsAndLiveContracts({
   includeAuctions = true,
   tokenAddresses = [],
   publicClient = null,
+  fromBlock = cfg?.deployBlock ?? null,
+  logChunkSize = 5_000n,
 } = {}) {
   const [market, initialOnChain] = await Promise.all([
     fetchMarketSnapshot({
@@ -1344,6 +1713,8 @@ export async function fetchMarketsAndLiveContracts({
       publicClient,
       tokenAddresses,
       includeLogDiscovery: true,
+      fromBlock,
+      logChunkSize,
     }),
   ]);
 
@@ -1375,6 +1746,7 @@ export async function fetchMarketsAndLiveContracts({
   if (
     onChain.ok &&
     market.bookSummary?.globalCapUsdc?.raw &&
+    onChain.protocol?.globalUsdcCap?.raw &&
     String(market.bookSummary.globalCapUsdc.raw) !== String(onChain.protocol.globalUsdcCap.raw)
   ) {
     protocolDiscrepancies.push(

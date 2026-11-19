@@ -682,6 +682,7 @@ export const oracleRouterAbi = [
   { type: 'function', name: 'recordedMultiplier', stateMutability: 'view', inputs: [{ name: 'token', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
   { type: 'function', name: 'isMarketOpen', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'bool' }] },
   { type: 'function', name: 'isSequencerValid', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'bool' }] },
+  { type: 'function', name: 'sequencerGracePeriod', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint256' }] },
   { type: 'function', name: 'maxStaleClosedSecs', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint32' }] },
   { type: 'function', name: 'useManualMarketSession', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'bool' }] },
   { type: 'function', name: 'isMarketOpenManual', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'bool' }] },
@@ -935,6 +936,21 @@ export function getFrontendConfig() {
     ),
   };
 
+  const rawDeployBlock =
+    configOverrides.deployBlock ??
+    configOverrides.assetRegistryDeployBlock ??
+    readEnv('VITE_DEPLOY_BLOCK') ??
+    readEnv('VITE_ASSET_REGISTRY_DEPLOY_BLOCK') ??
+    readEnv('VITE_START_BLOCK');
+  let deployBlock;
+  if (rawDeployBlock !== undefined && rawDeployBlock !== null && String(rawDeployBlock).trim() !== '') {
+    const cleanBlock = String(rawDeployBlock).trim();
+    if (!/^\d+$/.test(cleanBlock)) {
+      throw new Error(`Invalid VITE_DEPLOY_BLOCK: "${cleanBlock}" (expected non-negative integer).`);
+    }
+    deployBlock = cleanBlock;
+  }
+
   if (isProd) {
     if (chainId !== BASE_CHAIN_ID) {
       throw new Error(
@@ -972,6 +988,7 @@ export function getFrontendConfig() {
     siweDomain: siweDomain ? String(siweDomain).trim() : undefined,
     siweOrigin: siweOrigin ? stripTrailingSlash(siweOrigin) : undefined,
     usdcAddress,
+    deployBlock,
     contracts,
   };
 }

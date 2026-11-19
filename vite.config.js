@@ -28,6 +28,7 @@ function envToOverrides(env, isProd) {
     assetRegistry: env.VITE_ASSET_REGISTRY_ADDRESS,
     oracleRouter: env.VITE_ORACLE_ROUTER_ADDRESS,
     eligibilityGate: env.VITE_ELIGIBILITY_GATE_ADDRESS,
+    deployBlock: env.VITE_DEPLOY_BLOCK ?? env.VITE_ASSET_REGISTRY_DEPLOY_BLOCK ?? env.VITE_START_BLOCK,
   };
 }
 
