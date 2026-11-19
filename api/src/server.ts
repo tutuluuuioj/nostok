@@ -6,8 +6,10 @@ import {
   type PublicClient,
   type Transport,
   createPublicClient,
+  decodeAbiParameters,
   defineChain,
   getAddress,
+  hashTypedData,
   http as viemHttp,
   recoverAddress,
   zeroAddress,
@@ -17,10 +19,18 @@ import { ZodError } from 'zod/v3';
 import {
   ASSET_STATUS_NAMES,
   AUCTION_STATUS_NAMES,
+  ELIGIBILITY_DECLARATION_DOMAIN_NAME,
+  ELIGIBILITY_DECLARATION_DOMAIN_VERSION,
+  ELIGIBILITY_DECLARATION_EIP712_TYPES,
+  ELIGIBILITY_DECLARATION_STATEMENT,
+  ELIGIBILITY_DECLARATION_STATEMENT_HASH,
   LOAN_STATUS_NAMES,
+  MAX_DECLARATION_TTL_SECS,
+  MIN_DECLARATION_TTL_SECS,
   ORACLE_STATE_NAMES,
   OracleState,
   assetRegistryAbi,
+  eligibilityGateAbi,
   erc20MetaAbi,
   feeCollectorAbi,
   loanCoreAbi,
@@ -36,6 +46,8 @@ import {
   assetsQuerySchema,
   auctionsQuerySchema,
   buildPaginationSchema,
+  eligibilityQuerySchema,
+  eligibilityVerifyBodySchema,
   loansQuerySchema,
   ordersQuerySchema,
   positionsQuerySchema,
@@ -225,6 +237,126 @@ export function resolveClientIp(req: IncomingMessage, trustProxyHops: number): s
   }
   const idx = ips.length >= trustProxyHops ? ips.length - trustProxyHops : 0;
   return ips[idx];
+}
+
+export interface ClientGeoResult {
+  allowed: boolean;
+  verified: boolean;
+  status: 'allowed' | 'blocked' | 'unverified' | 'local_unverified' | 'malformed';
+  country_code: string | null;
+  header_used: string | null;
+  reason: string | null;
+}
+
+export function resolveClientGeo(
+  req: IncomingMessage,
+  config: Pick<ApiConfig, 'trustProxyHops' | 'geoCountryHeader' | 'geoRequireHeader' | 'restrictedCountries'>
+): ClientGeoResult {
+  const headerName = config.geoCountryHeader.trim().toLowerCase();
+  // Never trust client-supplied geo headers when not behind a configured trusted proxy.
+  if (config.trustProxyHops <= 0) {
+    if (config.geoRequireHeader) {
+      return {
+        allowed: false,
+        verified: false,
+        status: 'unverified',
+        country_code: null,
+        header_used: null,
+        reason: 'GEO_UNVERIFIED',
+      };
+    }
+    return {
+      allowed: true,
+      verified: false,
+      status: 'local_unverified',
+      country_code: null,
+      header_used: null,
+      reason: null,
+    };
+  }
+
+  const rawHeader = req.headers[headerName];
+  if (Array.isArray(rawHeader)) {
+    return {
+      allowed: false,
+      verified: false,
+      status: 'malformed',
+      country_code: null,
+      header_used: headerName,
+      reason: 'GEO_HEADER_MALFORMED',
+    };
+  }
+
+  const clean = typeof rawHeader === 'string' ? rawHeader.trim().toUpperCase() : '';
+  if (!clean || clean === 'XX') {
+    if (config.geoRequireHeader) {
+      return {
+        allowed: false,
+        verified: false,
+        status: 'unverified',
+        country_code: null,
+        header_used: headerName,
+        reason: 'GEO_UNVERIFIED',
+      };
+    }
+    return {
+      allowed: true,
+      verified: false,
+      status: 'unverified',
+      country_code: null,
+      header_used: headerName,
+      reason: null,
+    };
+  }
+
+  if (clean === 'T1') {
+    return {
+      allowed: false,
+      verified: true,
+      status: 'blocked',
+      country_code: 'T1',
+      header_used: headerName,
+      reason: 'GEO_TOR_BLOCKED',
+    };
+  }
+
+  if (!/^[A-Z]{2}$/.test(clean)) {
+    return {
+      allowed: false,
+      verified: false,
+      status: 'malformed',
+      country_code: null,
+      header_used: headerName,
+      reason: 'GEO_HEADER_MALFORMED',
+    };
+  }
+
+  const restricted = new Set(config.restrictedCountries.map((c) => c.toUpperCase()));
+  if (restricted.has(clean)) {
+    return {
+      allowed: false,
+      verified: true,
+      status: 'blocked',
+      country_code: clean,
+      header_used: headerName,
+      reason: 'GEO_RESTRICTED',
+    };
+  }
+
+  return {
+    allowed: true,
+    verified: true,
+    status: 'allowed',
+    country_code: clean,
+    header_used: headerName,
+    reason: null,
+  };
+}
+
+export function isWalletSanctioned(account: Address, config: Pick<ApiConfig, 'sanctionedAddresses'>): boolean {
+  if (!config.sanctionedAddresses || config.sanctionedAddresses.length === 0) return false;
+  const target = account.toLowerCase();
+  return config.sanctionedAddresses.some((addr) => addr.toLowerCase() === target);
 }
 
 function validateChainId(chainId: number, config: Pick<ApiConfig, 'isFork' | 'forkChainId'>): void {
@@ -1538,6 +1670,10 @@ async function handlePostOrder(ctx: ApiContext, rawBody: unknown, clientIp = 'un
     } catch (err) {
       throw new RpcUnavailableError(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  if (isWalletSanctioned(maker, ctx.config)) {
+    throw new HttpError(403, 'WALLET_SANCTIONED', `Maker ${maker} is blocked by sanctions screening`);
   }
 
   if (minFill > totalUsdc) {
@@ -3239,6 +3375,385 @@ export async function runRelayBackgroundRefresh(ctx: ApiContext): Promise<number
   return candidates.length;
 }
 
+interface OnChainEligibilityInspection {
+  gate_address: Address;
+  block_timestamp: string;
+  permissionless_mode: boolean;
+  is_revoked: boolean;
+  allowlisted: boolean;
+  user_nonce: string;
+  attestation_signer: Address;
+  is_eligible: boolean;
+  eligibility_reason: 'revoked' | 'permissionless' | 'allowlisted' | 'attested' | 'ineligible';
+  attestation_provided: boolean;
+  attestation_valid_format: boolean;
+  attestation_expiry: string | null;
+  attestation_expired: boolean | null;
+  attestation_error: string | null;
+}
+
+function decodeAttestationContextSafe(attestation: Hex): {
+  provided: boolean;
+  validFormat: boolean;
+  expiry: bigint | null;
+  signature: Hex | null;
+  error: string | null;
+} {
+  if (!attestation || attestation === '0x') {
+    return { provided: false, validFormat: true, expiry: null, signature: null, error: null };
+  }
+  try {
+    const [expiry, sig] = decodeAbiParameters(
+      [{ type: 'uint256' }, { type: 'bytes' }],
+      attestation
+    );
+    if (expiry <= 0n || !sig || sig === '0x' || sig.length < 132) {
+      return {
+        provided: true,
+        validFormat: false,
+        expiry: expiry > 0n ? expiry : null,
+        signature: null,
+        error: 'Decoded attestation has zero expiry or short signature bytes',
+      };
+    }
+    return { provided: true, validFormat: true, expiry, signature: sig as Hex, error: null };
+  } catch {
+    return {
+      provided: true,
+      validFormat: false,
+      expiry: null,
+      signature: null,
+      error: 'Malformed ABI-encoded (uint256 expiry, bytes signature) attestation context',
+    };
+  }
+}
+
+async function inspectEligibilityOnChain(
+  ctx: ApiContext,
+  account: Address,
+  attestation: Hex
+): Promise<OnChainEligibilityInspection> {
+  const gateAddr = getAddress(ctx.config.eligibilityGate);
+  const decoded = decodeAttestationContextSafe(attestation);
+
+  let blkTimestamp: bigint;
+  let permissionlessMode: boolean;
+  let isRevoked: boolean;
+  let allowlisted: boolean;
+  let userNonce: bigint;
+  let attestationSigner: Address;
+  let isEligible: boolean;
+  try {
+    const [blk, perm, revoked, allowed, nonce, signerAddr, eligible] = await Promise.all([
+      ctx.publicClient.getBlock({ blockTag: 'latest' }),
+      ctx.publicClient.readContract({
+        address: gateAddr,
+        abi: eligibilityGateAbi,
+        functionName: 'permissionlessMode',
+      }),
+      ctx.publicClient.readContract({
+        address: gateAddr,
+        abi: eligibilityGateAbi,
+        functionName: 'isRevoked',
+        args: [account],
+      }),
+      ctx.publicClient.readContract({
+        address: gateAddr,
+        abi: eligibilityGateAbi,
+        functionName: 'allowlist',
+        args: [account],
+      }),
+      ctx.publicClient.readContract({
+        address: gateAddr,
+        abi: eligibilityGateAbi,
+        functionName: 'userNonce',
+        args: [account],
+      }),
+      ctx.publicClient.readContract({
+        address: gateAddr,
+        abi: eligibilityGateAbi,
+        functionName: 'attestationSigner',
+      }),
+      ctx.publicClient.readContract({
+        address: gateAddr,
+        abi: eligibilityGateAbi,
+        functionName: 'isEligible',
+        args: [account, attestation],
+      }),
+    ]);
+    blkTimestamp = blk.timestamp;
+    permissionlessMode = Boolean(perm);
+    isRevoked = Boolean(revoked);
+    allowlisted = Boolean(allowed);
+    userNonce = BigInt(nonce);
+    attestationSigner = getAddress(signerAddr);
+    isEligible = Boolean(eligible);
+  } catch (err) {
+    throw new RpcUnavailableError(err instanceof Error ? err.message : String(err));
+  }
+
+  let eligibilityReason: OnChainEligibilityInspection['eligibility_reason'];
+  if (isRevoked) {
+    eligibilityReason = 'revoked';
+  } else if (permissionlessMode) {
+    eligibilityReason = 'permissionless';
+  } else if (allowlisted) {
+    eligibilityReason = 'allowlisted';
+  } else if (isEligible) {
+    eligibilityReason = 'attested';
+  } else {
+    eligibilityReason = 'ineligible';
+  }
+
+  const attestationExpired =
+    decoded.provided && decoded.expiry !== null ? blkTimestamp > decoded.expiry : null;
+
+  return {
+    gate_address: gateAddr,
+    block_timestamp: blkTimestamp.toString(),
+    permissionless_mode: permissionlessMode,
+    is_revoked: isRevoked,
+    allowlisted,
+    user_nonce: userNonce.toString(),
+    attestation_signer: attestationSigner,
+    is_eligible: isEligible,
+    eligibility_reason: eligibilityReason,
+    attestation_provided: decoded.provided,
+    attestation_valid_format: decoded.validFormat,
+    attestation_expiry: decoded.expiry !== null ? decoded.expiry.toString() : null,
+    attestation_expired: attestationExpired,
+    attestation_error: decoded.error,
+  };
+}
+
+function buildDeclarationParams(ctx: ApiContext, geo: ClientGeoResult) {
+  return {
+    domain: {
+      name: ELIGIBILITY_DECLARATION_DOMAIN_NAME,
+      version: ELIGIBILITY_DECLARATION_DOMAIN_VERSION,
+      chainId: ctx.publicClient.chain.id,
+      verifyingContract: getAddress(ctx.config.eligibilityGate),
+    },
+    types: ELIGIBILITY_DECLARATION_EIP712_TYPES,
+    primaryType: 'EligibilityDeclaration' as const,
+    statement: ELIGIBILITY_DECLARATION_STATEMENT,
+    statement_hash: ELIGIBILITY_DECLARATION_STATEMENT_HASH,
+    min_ttl_seconds: Number(MIN_DECLARATION_TTL_SECS),
+    max_ttl_seconds: Number(MAX_DECLARATION_TTL_SECS),
+    restricted_countries: [...ctx.config.restrictedCountries],
+    expected_jurisdiction: geo.verified ? geo.country_code : null,
+  };
+}
+
+async function handleGetEligibility(
+  ctx: ApiContext,
+  queryObj: Record<string, string>,
+  req: IncomingMessage
+) {
+  const input = parseOrThrow(eligibilityQuerySchema, queryObj);
+  const geo = resolveClientGeo(req, ctx.config);
+  const rejectionReasons: Array<{ code: string; message: string }> = [];
+
+  if (!geo.allowed) {
+    rejectionReasons.push({
+      code: geo.reason ?? 'GEO_RESTRICTED',
+      message:
+        geo.reason === 'GEO_TOR_BLOCKED'
+          ? 'Access via Tor exit node is not permitted.'
+          : geo.reason === 'GEO_UNVERIFIED' || geo.reason === 'GEO_HEADER_MALFORMED'
+            ? 'Unable to verify non-US jurisdiction from trusted edge headers.'
+            : `Jurisdiction ${geo.country_code ?? 'unknown'} is restricted under Regulation S.`,
+    });
+  }
+
+  let walletScreening: { account: Address; sanctioned: boolean } | null = null;
+  let onchain: OnChainEligibilityInspection | null = null;
+
+  if (input.account) {
+    const sanctioned = isWalletSanctioned(input.account, ctx.config);
+    walletScreening = { account: input.account, sanctioned };
+    if (sanctioned) {
+      rejectionReasons.push({
+        code: 'WALLET_SANCTIONED',
+        message: `Wallet ${input.account} failed sanctions screening.`,
+      });
+    }
+    onchain = await inspectEligibilityOnChain(ctx, input.account, input.attestation);
+    if (onchain.is_revoked) {
+      rejectionReasons.push({
+        code: 'WALLET_REVOKED',
+        message: `Wallet ${input.account} is revoked on EligibilityGate.`,
+      });
+    }
+  }
+
+  return {
+    statusCode: 200,
+    body: {
+      allowed: rejectionReasons.length === 0,
+      geo,
+      wallet: walletScreening,
+      onchain,
+      declaration_params: buildDeclarationParams(ctx, geo),
+      rejection_reasons: rejectionReasons,
+    },
+  };
+}
+
+async function handlePostEligibilityVerify(
+  ctx: ApiContext,
+  rawBody: unknown,
+  req: IncomingMessage
+) {
+  const input = parseOrThrow(eligibilityVerifyBodySchema, rawBody);
+  const geo = resolveClientGeo(req, ctx.config);
+
+  if (!geo.allowed) {
+    throw new HttpError(
+      403,
+      geo.reason ?? 'GEO_RESTRICTED',
+      geo.reason === 'GEO_TOR_BLOCKED'
+        ? 'Access via Tor exit node is not permitted.'
+        : geo.reason === 'GEO_UNVERIFIED' || geo.reason === 'GEO_HEADER_MALFORMED'
+          ? 'Unable to verify non-US jurisdiction from trusted edge headers.'
+          : `Jurisdiction ${geo.country_code ?? 'unknown'} is restricted under Regulation S.`
+    );
+  }
+
+  const decl = input.declaration;
+  if (isWalletSanctioned(decl.account, ctx.config)) {
+    throw new HttpError(403, 'WALLET_SANCTIONED', `Wallet ${decl.account} is blocked by sanctions screening.`);
+  }
+
+  const restrictedSet = new Set(ctx.config.restrictedCountries.map((c) => c.toUpperCase()));
+  if (decl.jurisdiction === 'T1' || decl.jurisdiction === 'XX' || restrictedSet.has(decl.jurisdiction)) {
+    throw new HttpError(
+      403,
+      'JURISDICTION_RESTRICTED',
+      `Declared jurisdiction "${decl.jurisdiction}" is restricted under Regulation S.`
+    );
+  }
+  if (geo.verified && geo.country_code && decl.jurisdiction !== geo.country_code) {
+    throw new HttpError(
+      403,
+      'JURISDICTION_MISMATCH',
+      `Declared jurisdiction (${decl.jurisdiction}) does not match verified IP country (${geo.country_code}).`
+    );
+  }
+
+  const onchain = await inspectEligibilityOnChain(ctx, decl.account, input.attestation);
+  if (onchain.is_revoked) {
+    throw new HttpError(403, 'WALLET_REVOKED', `Wallet ${decl.account} is revoked on EligibilityGate.`);
+  }
+
+  if (decl.statementHash.toLowerCase() !== ELIGIBILITY_DECLARATION_STATEMENT_HASH.toLowerCase()) {
+    throw new HttpError(
+      400,
+      'INVALID_STATEMENT_HASH',
+      'Declaration statementHash does not match canonical Regulation S statement.'
+    );
+  }
+
+  const nonceBig = BigInt(decl.nonce);
+  const onchainNonceBig = BigInt(onchain.user_nonce);
+  if (nonceBig !== onchainNonceBig) {
+    throw new HttpError(
+      400,
+      'NONCE_MISMATCH',
+      `Declaration nonce (${nonceBig.toString()}) does not match on-chain EligibilityGate userNonce (${onchainNonceBig.toString()}).`
+    );
+  }
+
+  const blockTs = BigInt(onchain.block_timestamp);
+  const issuedAt = BigInt(decl.issuedAt);
+  const expiresAt = BigInt(decl.expiresAt);
+  if (issuedAt > blockTs + 300n) {
+    throw new HttpError(
+      400,
+      'DECLARATION_FUTURE_TIMESTAMP',
+      `Declaration issuedAt (${issuedAt.toString()}) is too far ahead of block timestamp (${blockTs.toString()}).`
+    );
+  }
+  if (expiresAt <= blockTs) {
+    throw new HttpError(
+      400,
+      'DECLARATION_EXPIRED',
+      `Declaration expired at ${expiresAt.toString()} (block timestamp ${blockTs.toString()}).`
+    );
+  }
+  if (expiresAt <= issuedAt) {
+    throw new HttpError(400, 'DECLARATION_TTL_OUT_OF_RANGE', 'Declaration expiresAt must be after issuedAt.');
+  }
+  const ttl = expiresAt - issuedAt;
+  if (ttl < MIN_DECLARATION_TTL_SECS || ttl > MAX_DECLARATION_TTL_SECS) {
+    throw new HttpError(
+      400,
+      'DECLARATION_TTL_OUT_OF_RANGE',
+      `Declaration TTL (${ttl.toString()}s) must be between ${MIN_DECLARATION_TTL_SECS.toString()}s and ${MAX_DECLARATION_TTL_SECS.toString()}s (24h max).`
+    );
+  }
+
+  const domain = {
+    name: ELIGIBILITY_DECLARATION_DOMAIN_NAME,
+    version: ELIGIBILITY_DECLARATION_DOMAIN_VERSION,
+    chainId: ctx.publicClient.chain.id,
+    verifyingContract: getAddress(ctx.config.eligibilityGate),
+  };
+  const message = {
+    account: decl.account,
+    nonce: nonceBig,
+    issuedAt,
+    expiresAt,
+    jurisdiction: decl.jurisdiction,
+    statementHash: decl.statementHash,
+  };
+
+  let sigValid = false;
+  try {
+    sigValid = await ctx.publicClient.verifyTypedData({
+      address: decl.account,
+      domain,
+      types: ELIGIBILITY_DECLARATION_EIP712_TYPES,
+      primaryType: 'EligibilityDeclaration',
+      message,
+      signature: input.signature,
+    });
+  } catch {
+    sigValid = false;
+  }
+  if (!sigValid) {
+    throw new HttpError(
+      400,
+      'INVALID_DECLARATION_SIGNATURE',
+      'EIP-712 EligibilityDeclaration signature verification failed (EOA / ERC-1271).'
+    );
+  }
+
+  const declarationDigest = hashTypedData({
+    domain,
+    types: ELIGIBILITY_DECLARATION_EIP712_TYPES,
+    primaryType: 'EligibilityDeclaration',
+    message,
+  });
+
+  return {
+    statusCode: 200,
+    body: {
+      verified: true,
+      allowed: true,
+      declaration_digest: declarationDigest,
+      account: decl.account,
+      nonce: decl.nonce,
+      issued_at: decl.issuedAt,
+      expires_at: decl.expiresAt,
+      jurisdiction: decl.jurisdiction,
+      geo,
+      wallet: { account: decl.account, sanctioned: false },
+      onchain,
+    },
+  };
+}
+
 export function createApiServer(ctx: ApiContext): http.Server {
   const rateLimiter = new IpRateLimiter(
     ctx.config.rateLimitMax,
@@ -3307,8 +3822,29 @@ export function createApiServer(ctx: ApiContext): http.Server {
       }
 
       if (pathname === '/orders' && req.method === 'POST') {
+        const geo = resolveClientGeo(req, ctx.config);
+        if (!geo.allowed) {
+          throw new HttpError(
+            403,
+            geo.reason ?? 'GEO_RESTRICTED',
+            `Order submission blocked from restricted or unverified jurisdiction (${geo.country_code ?? 'unknown'}).`
+          );
+        }
         const rawBody = await readJsonBody(req, Math.min(ctx.config.maxBodyBytes, 16_384));
         const result = await handlePostOrder(ctx, rawBody, clientIp);
+        sendJson(res, result.statusCode, result.body);
+        return;
+      }
+
+      if (pathname === '/eligibility' && req.method === 'GET') {
+        const result = await handleGetEligibility(ctx, queryObj, req);
+        sendJson(res, result.statusCode, result.body);
+        return;
+      }
+
+      if (pathname === '/eligibility/verify' && req.method === 'POST') {
+        const rawBody = await readJsonBody(req, Math.min(ctx.config.maxBodyBytes, 16_384));
+        const result = await handlePostEligibilityVerify(ctx, rawBody, req);
         sendJson(res, result.statusCode, result.body);
         return;
       }
@@ -3357,7 +3893,18 @@ export function createApiServer(ctx: ApiContext): http.Server {
         return;
       }
 
-      const knownPaths = new Set(['/health', '/orders', '/loans', '/positions', '/auctions', '/assets', '/fees', '/quote']);
+      const knownPaths = new Set([
+        '/health',
+        '/orders',
+        '/loans',
+        '/positions',
+        '/auctions',
+        '/assets',
+        '/fees',
+        '/quote',
+        '/eligibility',
+        '/eligibility/verify',
+      ]);
       if (knownPaths.has(pathname)) {
         throw new HttpError(405, 'METHOD_NOT_ALLOWED', `Method ${req.method ?? 'UNKNOWN'} not allowed on ${pathname}`);
       }

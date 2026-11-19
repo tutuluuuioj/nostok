@@ -1,9 +1,12 @@
 import {
+  decodeAbiParameters,
   decodeErrorResult,
   decodeEventLog,
+  encodeAbiParameters,
   encodeFunctionData,
   formatUnits,
   getAddress,
+  hashMessage,
   hashTypedData,
   isAddress,
   keccak256,
@@ -16,16 +19,26 @@ import {
   BASE_CHAIN_ID,
   BORROW_ORDER_EIP712_TYPES,
   DEFAULT_B20_DECIMALS,
+  DEFAULT_DECLARATION_TTL_SECS,
+  ELIGIBILITY_ATTESTATION_TYPEHASH_STRING,
+  ELIGIBILITY_DECLARATION_DOMAIN_NAME,
+  ELIGIBILITY_DECLARATION_DOMAIN_VERSION,
+  ELIGIBILITY_DECLARATION_EIP712_TYPES,
+  ELIGIBILITY_DECLARATION_STATEMENT,
+  ELIGIBILITY_DECLARATION_STATEMENT_HASH,
   ETH_DECIMALS,
   EXTEND_ORDER_EIP712_TYPES,
   LEND_OFFER_EIP712_TYPES,
   LOAN_CORE_DOMAIN_NAME,
   LOAN_CORE_DOMAIN_VERSION,
   LOAN_STATUS_NAMES,
+  MAX_DECLARATION_TTL_SECS,
+  MIN_DECLARATION_TTL_SECS,
   ORACLE_STATE_NAMES,
   ORDER_SETTLEMENT_DOMAIN_NAME,
   ORDER_SETTLEMENT_DOMAIN_VERSION,
   PROTOCOL_ERROR_ABI,
+  RESTRICTED_JURISDICTIONS,
   USDC_DECIMALS,
   createProtocolPublicClient,
   eligibilityGateAbi,
@@ -5538,4 +5551,619 @@ export async function executeLoanExtend({
     preview,
   };
 }
+
+// ============================================================================
+// WS3.6: EligibilityGate, Attestation Inspection, Nonce Bump & EIP-712 Reg S Declaration
+// ============================================================================
+
+const MAX_ATTESTATION_HEX_CHARS = 4098; // '0x' + 2048 bytes
+
+export function decodeEligibilityAttestation(attestationHex = '0x') {
+  const clean = typeof attestationHex === 'string' ? attestationHex.trim() : '';
+  if (!clean || clean === '0x') {
+    return { provided: false, validFormat: true, expiry: null, signature: null, error: '' };
+  }
+  if (!/^0x([0-9a-fA-F]{2})+$/.test(clean) || clean.length > MAX_ATTESTATION_HEX_CHARS) {
+    return {
+      provided: true,
+      validFormat: false,
+      expiry: null,
+      signature: null,
+      error: 'Attestation must be an even-length 0x hex string up to 2048 bytes.',
+    };
+  }
+  try {
+    const [expiry, sig] = decodeAbiParameters(
+      [{ type: 'uint256' }, { type: 'bytes' }],
+      clean
+    );
+    if (expiry <= 0n || typeof sig !== 'string' || sig.length < 132) {
+      return {
+        provided: true,
+        validFormat: false,
+        expiry: expiry > 0n ? expiry.toString() : null,
+        signature: null,
+        error: 'Decoded attestation has zero expiry or short signature bytes.',
+      };
+    }
+    return {
+      provided: true,
+      validFormat: true,
+      expiry: expiry.toString(),
+      signature: sig,
+      error: '',
+    };
+  } catch {
+    return {
+      provided: true,
+      validFormat: false,
+      expiry: null,
+      signature: null,
+      error: 'Malformed ABI-encoded (uint256 expiry, bytes signature) attestation context.',
+    };
+  }
+}
+
+export function encodeEligibilityAttestation({ expiry, signature }) {
+  const expiryBig = parseStrictRawBigInt(expiry, 'expiry', { min: 1n });
+  const sigClean = typeof signature === 'string' ? signature.trim() : '';
+  if (!/^0x[0-9a-fA-F]{130,}$/.test(sigClean) || sigClean.length % 2 !== 0) {
+    throw new Error('Attestation signature must be a valid even-length hex signature (>= 65 bytes).');
+  }
+  return encodeAbiParameters([{ type: 'uint256' }, { type: 'bytes' }], [expiryBig, sigClean]);
+}
+
+export function computeEligibilityAttestationDigest({
+  chainId = BASE_CHAIN_ID,
+  gateAddress,
+  account,
+  nonce,
+  expiry,
+}) {
+  if (!gateAddress || !isAddress(gateAddress) || getAddress(gateAddress) === zeroAddress) {
+    throw new Error('Valid non-zero EligibilityGate address required.');
+  }
+  if (!account || !isAddress(account) || getAddress(account) === zeroAddress) {
+    throw new Error('Valid non-zero account address required.');
+  }
+  const chainIdBig = parseStrictRawBigInt(chainId, 'chainId', { min: 1n });
+  const nonceBig = parseStrictRawBigInt(nonce, 'nonce', { min: 0n });
+  const expiryBig = parseStrictRawBigInt(expiry, 'expiry', { min: 1n });
+  const typeHash = keccak256(stringToBytes(ELIGIBILITY_ATTESTATION_TYPEHASH_STRING));
+  const structHash = keccak256(
+    encodeAbiParameters(
+      [
+        { type: 'bytes32' },
+        { type: 'uint256' },
+        { type: 'address' },
+        { type: 'address' },
+        { type: 'uint256' },
+        { type: 'uint256' },
+      ],
+      [typeHash, chainIdBig, getAddress(gateAddress), getAddress(account), nonceBig, expiryBig]
+    )
+  );
+  const digest = hashMessage({ raw: structHash });
+  return { typeHash, structHash, digest };
+}
+
+export async function readEligibilityStatus(
+  address,
+  {
+    attestationHex = '0x',
+    cfg = getFrontendConfig(),
+    publicClient = createProtocolPublicClient(cfg),
+  } = {}
+) {
+  if (!address || !isAddress(address) || getAddress(address) === zeroAddress) {
+    throw new Error('Valid non-zero wallet address required.');
+  }
+  if (!cfg?.contracts?.eligibilityGate) {
+    throw new Error('EligibilityGate contract address is not configured.');
+  }
+  const account = getAddress(address);
+  const gateAddr = getAddress(cfg.contracts.eligibilityGate);
+  const cleanAtt = normalizeAttestationHex(attestationHex);
+  const decoded = decodeEligibilityAttestation(attestationHex);
+
+  const [block, permissionlessMode, allowlisted, isRevoked, userNonce, attestationSigner, isEligible] =
+    await Promise.all([
+      publicClient.getBlock({ blockTag: 'latest' }),
+      publicClient.readContract({
+        address: gateAddr,
+        abi: eligibilityGateAbi,
+        functionName: 'permissionlessMode',
+      }),
+      publicClient.readContract({
+        address: gateAddr,
+        abi: eligibilityGateAbi,
+        functionName: 'allowlist',
+        args: [account],
+      }),
+      publicClient.readContract({
+        address: gateAddr,
+        abi: eligibilityGateAbi,
+        functionName: 'isRevoked',
+        args: [account],
+      }),
+      publicClient.readContract({
+        address: gateAddr,
+        abi: eligibilityGateAbi,
+        functionName: 'userNonce',
+        args: [account],
+      }),
+      publicClient.readContract({
+        address: gateAddr,
+        abi: eligibilityGateAbi,
+        functionName: 'attestationSigner',
+      }),
+      publicClient.readContract({
+        address: gateAddr,
+        abi: eligibilityGateAbi,
+        functionName: 'isEligible',
+        args: [account, cleanAtt],
+      }),
+    ]);
+
+  const blockTimestamp = BigInt(block.timestamp);
+  const nonceBig = BigInt(userNonce);
+  const signerChecksum = getAddress(attestationSigner);
+  const revokedBool = Boolean(isRevoked);
+  const permBool = Boolean(permissionlessMode);
+  const allowBool = Boolean(allowlisted);
+  const eligibleBool = Boolean(isEligible);
+
+  let isExpired = null;
+  let recoveredSigner = null;
+  let matchesAttestationSigner = null;
+  if (decoded.provided && decoded.validFormat && decoded.expiry && decoded.signature) {
+    const expiryBig = BigInt(decoded.expiry);
+    isExpired = blockTimestamp > expiryBig;
+    if (signerChecksum !== zeroAddress) {
+      const { digest } = computeEligibilityAttestationDigest({
+        chainId: Number(cfg.chainId || BASE_CHAIN_ID),
+        gateAddress: gateAddr,
+        account,
+        nonce: nonceBig,
+        expiry: expiryBig,
+      });
+      try {
+        recoveredSigner = getAddress(await recoverAddress({ hash: digest, signature: decoded.signature }));
+        matchesAttestationSigner = recoveredSigner.toLowerCase() === signerChecksum.toLowerCase();
+      } catch {
+        recoveredSigner = null;
+        matchesAttestationSigner = null;
+      }
+    }
+  }
+
+  let eligibilityReason;
+  if (revokedBool) {
+    eligibilityReason = 'revoked';
+  } else if (permBool) {
+    eligibilityReason = 'permissionless';
+  } else if (allowBool) {
+    eligibilityReason = 'allowlisted';
+  } else if (eligibleBool) {
+    eligibilityReason = 'attested';
+  } else {
+    eligibilityReason = 'ineligible';
+  }
+
+  return {
+    gateAddress: gateAddr,
+    account,
+    blockTimestamp: blockTimestamp.toString(),
+    permissionlessMode: permBool,
+    isRevoked: revokedBool,
+    allowlisted: allowBool,
+    userNonce: nonceBig.toString(),
+    attestationSigner: signerChecksum,
+    isEligible: eligibleBool,
+    eligibilityReason,
+    attestation: {
+      provided: decoded.provided,
+      validFormat: decoded.validFormat,
+      expiry: decoded.expiry,
+      isExpired,
+      recoveredSigner,
+      matchesAttestationSigner,
+      error: decoded.error,
+    },
+  };
+}
+
+/**
+ * Calls EligibilityGate.bumpMyNonce() on-chain to invalidate all prior KYC attestations
+ * and signed EIP-712 EligibilityDeclarations for the connected wallet. Zero token approvals.
+ */
+export async function bumpEligibilityNonce({
+  address,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!cfg?.contracts?.eligibilityGate) {
+    throw new Error('EligibilityGate contract address is not configured.');
+  }
+  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
+  const gateAddr = getAddress(cfg.contracts.eligibilityGate);
+
+  const previousNonce = BigInt(
+    await publicClient.readContract({
+      address: gateAddr,
+      abi: eligibilityGateAbi,
+      functionName: 'userNonce',
+      args: [wallet],
+    })
+  );
+
+  const callData = encodeFunctionData({
+    abi: eligibilityGateAbi,
+    functionName: 'bumpMyNonce',
+    args: [],
+  });
+
+  try {
+    await publicClient.call({
+      account: wallet,
+      to: gateAddr,
+      data: callData,
+    });
+  } catch (simErr) {
+    const decoded = decodeContractRevert(simErr);
+    throw new Error(decoded ? decoded.message : formatWeb3Error(simErr));
+  }
+
+  const { txHash, receipt } = await sendWalletTransaction(provider, publicClient, {
+    from: wallet,
+    to: gateAddr,
+    data: callData,
+  });
+
+  let eventNewNonce = null;
+  for (const log of receipt?.logs ?? []) {
+    if (log.address?.toLowerCase() !== gateAddr.toLowerCase()) continue;
+    try {
+      const decoded = decodeEventLog({
+        abi: eligibilityGateAbi,
+        data: log.data,
+        topics: log.topics,
+      });
+      if (decoded.eventName === 'UserNonceBumped' && decoded.args?.newNonce !== undefined) {
+        eventNewNonce = BigInt(decoded.args.newNonce);
+        break;
+      }
+    } catch {
+      // ignore non-matching logs
+    }
+  }
+
+  const postNonce = BigInt(
+    await publicClient.readContract({
+      address: gateAddr,
+      abi: eligibilityGateAbi,
+      functionName: 'userNonce',
+      args: [wallet],
+    })
+  );
+  if (postNonce <= previousNonce) {
+    throw new Error('EligibilityGate userNonce did not increment after bumpMyNonce().');
+  }
+
+  return {
+    txHash,
+    receipt,
+    account: wallet,
+    gateAddress: gateAddr,
+    previousNonce: previousNonce.toString(),
+    newNonce: (eventNewNonce ?? postNonce).toString(),
+  };
+}
+
+export function normalizeJurisdictionCode(
+  raw,
+  { restrictedList = RESTRICTED_JURISDICTIONS } = {}
+) {
+  const clean = typeof raw === 'string' ? raw.trim().toUpperCase() : '';
+  const restricted = new Set(restrictedList.map((c) => String(c).toUpperCase()));
+  if (clean === 'T1' || clean === 'XX' || restricted.has(clean)) {
+    throw new Error(`Jurisdiction "${clean}" is restricted under Regulation S.`);
+  }
+  if (!/^(?:[A-Z]{2}|NON_US_SELF_DECLARED)$/.test(clean)) {
+    throw new Error('Jurisdiction must be an ISO-3166 alpha-2 country code or NON_US_SELF_DECLARED.');
+  }
+  return clean;
+}
+
+export function normalizeEligibilityDeclarationStruct(declaration) {
+  if (!declaration || typeof declaration !== 'object') {
+    throw new Error('EligibilityDeclaration payload is required.');
+  }
+  if (!declaration.account || !isAddress(declaration.account) || getAddress(declaration.account) === zeroAddress) {
+    throw new Error('EligibilityDeclaration requires a valid non-zero account address.');
+  }
+  const account = getAddress(declaration.account);
+  const nonce = parseStrictRawBigInt(declaration.nonce, 'declaration.nonce', { min: 0n });
+  const issuedAt = parseStrictRawBigInt(declaration.issuedAt, 'declaration.issuedAt', { min: 0n });
+  const expiresAt = parseStrictRawBigInt(declaration.expiresAt, 'declaration.expiresAt', { min: 1n });
+  if (expiresAt <= issuedAt) {
+    throw new Error('EligibilityDeclaration expiresAt must be strictly greater than issuedAt.');
+  }
+  const ttl = expiresAt - issuedAt;
+  if (ttl < MIN_DECLARATION_TTL_SECS || ttl > MAX_DECLARATION_TTL_SECS) {
+    throw new Error(
+      `EligibilityDeclaration TTL (${ttl.toString()}s) must be between ${MIN_DECLARATION_TTL_SECS.toString()}s and ${MAX_DECLARATION_TTL_SECS.toString()}s (24h max).`
+    );
+  }
+  const jurisdiction = normalizeJurisdictionCode(declaration.jurisdiction);
+  const statementHash =
+    typeof declaration.statementHash === 'string' ? declaration.statementHash.trim().toLowerCase() : '';
+  if (!/^0x[0-9a-f]{64}$/.test(statementHash)) {
+    throw new Error('EligibilityDeclaration statementHash must be a 32-byte 0x hex hash.');
+  }
+  if (statementHash !== ELIGIBILITY_DECLARATION_STATEMENT_HASH.toLowerCase()) {
+    throw new Error('EligibilityDeclaration statementHash does not match canonical Regulation S statement.');
+  }
+  return {
+    account,
+    nonce,
+    issuedAt,
+    expiresAt,
+    jurisdiction,
+    statementHash,
+  };
+}
+
+export function eligibilityDeclarationToJson(declaration) {
+  const n = normalizeEligibilityDeclarationStruct(declaration);
+  return {
+    account: n.account,
+    nonce: n.nonce.toString(),
+    issuedAt: n.issuedAt.toString(),
+    expiresAt: n.expiresAt.toString(),
+    jurisdiction: n.jurisdiction,
+    statementHash: n.statementHash,
+  };
+}
+
+export function buildEligibilityDeclarationTypedData({ declaration, cfg = getFrontendConfig() }) {
+  if (!cfg?.contracts?.eligibilityGate) {
+    throw new Error('EligibilityGate contract address is not configured.');
+  }
+  const message = normalizeEligibilityDeclarationStruct(declaration);
+  return {
+    domain: {
+      name: ELIGIBILITY_DECLARATION_DOMAIN_NAME,
+      version: ELIGIBILITY_DECLARATION_DOMAIN_VERSION,
+      chainId: Number(cfg.chainId || BASE_CHAIN_ID),
+      verifyingContract: getAddress(cfg.contracts.eligibilityGate),
+    },
+    types: ELIGIBILITY_DECLARATION_EIP712_TYPES,
+    primaryType: 'EligibilityDeclaration',
+    message,
+  };
+}
+
+export async function fetchEligibilityScreening({
+  account = null,
+  attestationHex = '0x',
+  cfg = getFrontendConfig(),
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  if (!cfg?.apiUrl) {
+    throw new Error('API URL is not configured.');
+  }
+  const params = new URLSearchParams();
+  if (account !== null && account !== undefined && String(account).trim() !== '') {
+    if (!isAddress(account) || getAddress(account) === zeroAddress) {
+      throw new Error('Valid non-zero account address required for eligibility screening.');
+    }
+    params.set('account', getAddress(account));
+  }
+  const cleanAtt = normalizeAttestationHex(attestationHex);
+  if (cleanAtt && cleanAtt !== '0x') {
+    params.set('attestation', cleanAtt);
+  }
+  const qs = params.toString();
+  const url = `${cfg.apiUrl}/eligibility${qs ? `?${qs}` : ''}`;
+  return fetchJsonStrict(url, { method: 'GET' }, 8000, fetchImpl);
+}
+
+export async function submitEligibilityDeclaration({
+  declaration,
+  signature,
+  attestationHex = '0x',
+  cfg = getFrontendConfig(),
+  fetchImpl = globalThis.fetch,
+}) {
+  if (!cfg?.apiUrl) {
+    throw new Error('API URL is not configured.');
+  }
+  const declJson = eligibilityDeclarationToJson(declaration);
+  const sigClean = typeof signature === 'string' ? signature.trim() : '';
+  if (!/^0x[0-9a-fA-F]{130,}$/.test(sigClean) || sigClean.length % 2 !== 0) {
+    throw new Error('Valid EIP-712 declaration signature required.');
+  }
+  const cleanAtt = normalizeAttestationHex(attestationHex);
+  const body = {
+    declaration: declJson,
+    signature: sigClean,
+    ...(cleanAtt && cleanAtt !== '0x' ? { attestation: cleanAtt } : {}),
+  };
+  return fetchJsonStrict(
+    `${cfg.apiUrl}/eligibility/verify`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+    8000,
+    fetchImpl
+  );
+}
+
+/**
+ * Signs an EIP-712 Non-US / Reg S EligibilityDeclaration bound to the wallet's live
+ * EligibilityGate.userNonce(wallet) and Base block timestamp (max 24h TTL, zero token approvals).
+ */
+export async function signEligibilityDeclaration({
+  address,
+  jurisdiction = null,
+  ttlSeconds = DEFAULT_DECLARATION_TTL_SECS,
+  requireServerScreening = true,
+  submitToApi = false,
+  attestationHex = '0x',
+  fetchImpl = globalThis.fetch,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
+  const ttlBig = parseStrictRawBigInt(ttlSeconds, 'ttlSeconds', {
+    min: MIN_DECLARATION_TTL_SECS,
+    max: MAX_DECLARATION_TTL_SECS,
+  });
+
+  const status = await readEligibilityStatus(wallet, { attestationHex, cfg, publicClient });
+  if (status.isRevoked) {
+    throw new Error(`Wallet ${wallet} is revoked on EligibilityGate and cannot sign an eligibility declaration.`);
+  }
+
+  let screening = null;
+  let resolvedJurisdiction = null;
+  if (requireServerScreening && cfg?.apiUrl) {
+    screening = await fetchEligibilityScreening({
+      account: wallet,
+      attestationHex,
+      cfg,
+      fetchImpl,
+    });
+    if (!screening.allowed) {
+      const reasons = (screening.rejection_reasons ?? [])
+        .map((r) => `${r.code}: ${r.message}`)
+        .join('; ');
+      throw new Error(reasons || 'Eligibility screening rejected access.');
+    }
+    if (screening.geo?.verified && screening.geo?.country_code) {
+      const serverCode = normalizeJurisdictionCode(screening.geo.country_code);
+      if (jurisdiction !== null && jurisdiction !== undefined && String(jurisdiction).trim() !== '') {
+        const callerCode = normalizeJurisdictionCode(jurisdiction);
+        if (callerCode !== serverCode) {
+          throw new Error(
+            `Declared jurisdiction (${callerCode}) does not match verified IP jurisdiction (${serverCode}).`
+          );
+        }
+      }
+      resolvedJurisdiction = serverCode;
+    }
+  }
+
+  if (!resolvedJurisdiction) {
+    resolvedJurisdiction = normalizeJurisdictionCode(jurisdiction ?? 'NON_US_SELF_DECLARED');
+  }
+
+  const issuedAt = BigInt(status.blockTimestamp);
+  const expiresAt = issuedAt + ttlBig;
+  const declaration = normalizeEligibilityDeclarationStruct({
+    account: wallet,
+    nonce: status.userNonce,
+    issuedAt,
+    expiresAt,
+    jurisdiction: resolvedJurisdiction,
+    statementHash: ELIGIBILITY_DECLARATION_STATEMENT_HASH,
+  });
+
+  const typedData = buildEligibilityDeclarationTypedData({ declaration, cfg });
+  const digest = hashTypedData(typedData);
+  const signature = await provider.request({
+    method: 'eth_signTypedData_v4',
+    params: [wallet, serializeTypedDataForRpc(typedData)],
+  });
+  if (typeof signature !== 'string' || !/^0x[0-9a-fA-F]{130,}$/.test(signature)) {
+    throw new Error('Wallet returned an invalid EIP-712 EligibilityDeclaration signature.');
+  }
+
+  let serverVerification = null;
+  if (submitToApi) {
+    serverVerification = await submitEligibilityDeclaration({
+      declaration,
+      signature,
+      attestationHex,
+      cfg,
+      fetchImpl,
+    });
+  }
+
+  return {
+    signer: wallet,
+    statement: ELIGIBILITY_DECLARATION_STATEMENT,
+    declaration,
+    declarationJson: eligibilityDeclarationToJson(declaration),
+    typedData,
+    digest,
+    signature,
+    status,
+    screening,
+    serverVerification,
+  };
+}
+
+export async function verifyEligibilityDeclaration({
+  declaration,
+  signature,
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!cfg?.contracts?.eligibilityGate) {
+    throw new Error('EligibilityGate contract address is not configured.');
+  }
+  const sigClean = typeof signature === 'string' ? signature.trim() : '';
+  if (!/^0x[0-9a-fA-F]{130,}$/.test(sigClean) || sigClean.length % 2 !== 0) {
+    throw new Error('Valid EIP-712 declaration signature required.');
+  }
+
+  const normalized = normalizeEligibilityDeclarationStruct(declaration);
+  const status = await readEligibilityStatus(normalized.account, { cfg, publicClient });
+  if (status.isRevoked) {
+    throw new Error(`Wallet ${normalized.account} is revoked on EligibilityGate.`);
+  }
+  const chainNonce = BigInt(status.userNonce);
+  if (normalized.nonce !== chainNonce) {
+    throw new Error(
+      `Declaration nonce (${normalized.nonce.toString()}) does not match on-chain EligibilityGate userNonce (${chainNonce.toString()}).`
+    );
+  }
+  const blockTs = BigInt(status.blockTimestamp);
+  if (normalized.issuedAt > blockTs + 300n) {
+    throw new Error(`Declaration issuedAt (${normalized.issuedAt.toString()}) is too far ahead of block timestamp (${blockTs.toString()}).`);
+  }
+  if (normalized.expiresAt <= blockTs) {
+    throw new Error(`Declaration expired at ${normalized.expiresAt.toString()} (block timestamp ${blockTs.toString()}).`);
+  }
+
+  const typedData = buildEligibilityDeclarationTypedData({ declaration: normalized, cfg });
+  const digest = hashTypedData(typedData);
+  const valid = await publicClient.verifyTypedData({
+    address: normalized.account,
+    domain: typedData.domain,
+    types: typedData.types,
+    primaryType: typedData.primaryType,
+    message: typedData.message,
+    signature: sigClean,
+  });
+  if (!valid) {
+    throw new Error('EIP-712 EligibilityDeclaration signature verification failed.');
+  }
+
+  return {
+    verified: true,
+    account: normalized.account,
+    digest,
+    declaration: normalized,
+    declarationJson: eligibilityDeclarationToJson(normalized),
+    status,
+  };
+}
+
 

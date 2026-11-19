@@ -1,4 +1,4 @@
-import { createPublicClient, defineChain, getAddress, http, isAddress } from 'viem';
+import { createPublicClient, defineChain, getAddress, http, isAddress, keccak256, stringToBytes } from 'viem';
 import { base } from 'viem/chains';
 
 export const BASE_CHAIN_ID = 8453;
@@ -91,10 +91,34 @@ export const erc20Abi = [
 ];
 
 export const eligibilityGateAbi = [
+  { type: 'function', name: 'ATTESTATION_TYPEHASH', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'bytes32' }] },
+  { type: 'function', name: 'attestationSigner', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'address' }] },
   { type: 'function', name: 'permissionlessMode', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'bool' }] },
   { type: 'function', name: 'allowlist', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ name: '', type: 'bool' }] },
+  { type: 'function', name: 'isOperator', stateMutability: 'view', inputs: [{ name: 'operator', type: 'address' }], outputs: [{ name: '', type: 'bool' }] },
   { type: 'function', name: 'isRevoked', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ name: '', type: 'bool' }] },
   { type: 'function', name: 'userNonce', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
+  {
+    type: 'function',
+    name: 'getAttestationDigest',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'account', type: 'address' },
+      { name: 'nonce', type: 'uint256' },
+      { name: 'expiry', type: 'uint256' },
+    ],
+    outputs: [{ name: '', type: 'bytes32' }],
+  },
+  {
+    type: 'function',
+    name: 'decodeAttestation',
+    stateMutability: 'pure',
+    inputs: [{ name: 'context', type: 'bytes' }],
+    outputs: [
+      { name: 'expiry', type: 'uint256' },
+      { name: 'signature', type: 'bytes' },
+    ],
+  },
   {
     type: 'function',
     name: 'isEligible',
@@ -105,10 +129,83 @@ export const eligibilityGateAbi = [
     ],
     outputs: [{ name: '', type: 'bool' }],
   },
+  { type: 'function', name: 'bumpMyNonce', stateMutability: 'nonpayable', inputs: [], outputs: [] },
+  {
+    type: 'event',
+    name: 'AccountEligibilityUpdated',
+    inputs: [
+      { name: 'account', type: 'address', indexed: true },
+      { name: 'isAllowed', type: 'bool', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'UserRevocationUpdated',
+    inputs: [
+      { name: 'account', type: 'address', indexed: true },
+      { name: 'isRevoked', type: 'bool', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'UserNonceBumped',
+    inputs: [
+      { name: 'account', type: 'address', indexed: true },
+      { name: 'newNonce', type: 'uint256', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'AttestationSignerUpdated',
+    inputs: [{ name: 'newSigner', type: 'address', indexed: true }],
+  },
+  {
+    type: 'event',
+    name: 'PermissionlessModeUpdated',
+    inputs: [{ name: 'enabled', type: 'bool', indexed: false }],
+  },
+  {
+    type: 'event',
+    name: 'OperatorUpdated',
+    inputs: [
+      { name: 'operator', type: 'address', indexed: true },
+      { name: 'isAllowed', type: 'bool', indexed: false },
+    ],
+  },
   { type: 'error', name: 'ZeroAddress', inputs: [] },
   { type: 'error', name: 'Unauthorized', inputs: [] },
   { type: 'error', name: 'InvalidSignature', inputs: [] },
 ];
+
+export const ELIGIBILITY_ATTESTATION_TYPEHASH_STRING =
+  'Attestation(uint256 chainId,address gate,address account,uint256 nonce,uint256 expiry)';
+
+export const ELIGIBILITY_DECLARATION_DOMAIN_NAME = 'NOSTOK Eligibility Declaration';
+export const ELIGIBILITY_DECLARATION_DOMAIN_VERSION = '1';
+
+export const ELIGIBILITY_DECLARATION_EIP712_TYPES = {
+  EligibilityDeclaration: [
+    { name: 'account', type: 'address' },
+    { name: 'nonce', type: 'uint256' },
+    { name: 'issuedAt', type: 'uint256' },
+    { name: 'expiresAt', type: 'uint256' },
+    { name: 'jurisdiction', type: 'string' },
+    { name: 'statementHash', type: 'bytes32' },
+  ],
+};
+
+export const RESTRICTED_JURISDICTIONS = ['US', 'CU', 'IR', 'KP', 'SY', 'RU', 'BY', 'MM'];
+
+export const ELIGIBILITY_DECLARATION_STATEMENT =
+  'I declare under Regulation S that I am an eligible non-US person located outside the United States and outside any sanctioned or restricted jurisdiction; I understand collateral sits in CollateralEscrow, lenders receive a PositionNFT debt claim, liquidation auctions return borrower surplus, liquidations pause when markets are closed or feeds are stale/frozen, and orders interact with NOSTOK contracts on Base.';
+
+export const ELIGIBILITY_DECLARATION_STATEMENT_HASH = keccak256(
+  stringToBytes(ELIGIBILITY_DECLARATION_STATEMENT)
+);
+
+export const DEFAULT_DECLARATION_TTL_SECS = 86_400n; // 24 hours
+export const MAX_DECLARATION_TTL_SECS = 86_400n; // 24 hours max
+export const MIN_DECLARATION_TTL_SECS = 60n; // 1 minute min
 
 export const loanCoreAbi = [
   { type: 'function', name: 'paused', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'bool' }] },

@@ -44,13 +44,17 @@ import { createNotificationsServer } from '../notifications/src/server.js';
 import {
   BASE_CHAIN_ID,
   BASE_USDC_ADDRESS,
+  ELIGIBILITY_DECLARATION_DOMAIN_NAME,
+  ELIGIBILITY_DECLARATION_STATEMENT_HASH,
   EXTEND_ORDER_EIP712_TYPES,
   LEND_OFFER_EIP712_TYPES,
   LOAN_CORE_DOMAIN_NAME,
   LOAN_CORE_DOMAIN_VERSION,
+  MAX_DECLARATION_TTL_SECS,
   ORDER_SETTLEMENT_DOMAIN_NAME,
   ORDER_SETTLEMENT_DOMAIN_VERSION,
   USDC_DECIMALS,
+  eligibilityGateAbi,
   erc20Abi,
   getFrontendConfig,
   loanCoreAbi,
@@ -124,11 +128,20 @@ import {
   signOutSiwe,
   sumRawBigints,
   validateLendPartialFillPlan,
+  bumpEligibilityNonce,
+  computeEligibilityAttestationDigest,
+  decodeEligibilityAttestation,
+  encodeEligibilityAttestation,
+  fetchEligibilityScreening,
+  readEligibilityStatus,
+  signEligibilityDeclaration,
+  submitEligibilityDeclaration,
   verifyAndPreviewBorrowOrderFill,
   verifyAndPreviewLendOfferFill,
   verifyAndPreviewLoanExtend,
   verifyAndPreviewLoanRepay,
   verifyAndPreviewLoanTopUp,
+  verifyEligibilityDeclaration,
 } from '../src/lib/web3.js';
 import { App } from '../src/App.jsx';
 import { Shell } from '../src/components/Shell.jsx';
@@ -5991,7 +6004,436 @@ async function runTests(): Promise<void> {
 
       console.log('PASS WS3.5 Piece 2: Loans.jsx / Loan.jsx live UI, Low 1/2, & Info 1/2 verified.');
 
-      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 FORK TESTS PASSED.');
+      // 3.11 WS3.6 Piece 1: EligibilityGate ABIs, attestation inspection, bumpMyNonce,
+      // server IP geoblock (proxy-spoof resistant + fail-closed), wallet sanctions screening,
+      // and EIP-712 Non-US / Reg S Declaration signing & verification (EOA + nonce invalidation)
+      console.log('\n=== WS3.6 Piece 1: EligibilityGate, IP geoblock, sanctions screening & EIP-712 declaration ===');
+
+      // 1) Canonical statement hash parity & on-chain getAttestationDigest parity
+      const screeningBase = await fetchEligibilityScreening({ account: ADDRESSES.borrower, cfg });
+      assert.equal(screeningBase.allowed, true);
+      assert.equal(
+        screeningBase.declaration_params.statement_hash.toLowerCase(),
+        ELIGIBILITY_DECLARATION_STATEMENT_HASH.toLowerCase(),
+        'API and frontend canonical Regulation S statement hashes must match identically'
+      );
+      assert.equal(screeningBase.declaration_params.domain.name, ELIGIBILITY_DECLARATION_DOMAIN_NAME);
+      assert.equal(screeningBase.geo.verified, false);
+      assert.equal(screeningBase.geo.status, 'local_unverified');
+
+      // Spoof-resistance check: when trustProxyHops === 0, client-sent cf-ipcountry headers MUST be ignored
+      const spoofedUsResp = await fetch(`${apiUrl}/eligibility?account=${ADDRESSES.borrower}`, {
+        headers: { 'cf-ipcountry': 'US' },
+      });
+      assert.equal(spoofedUsResp.status, 200);
+      const spoofedUsJson = (await spoofedUsResp.json()) as {
+        geo: { verified: boolean; country_code: string | null; status: string };
+      };
+      assert.equal(spoofedUsJson.geo.verified, false, 'Untrusted direct cf-ipcountry header must be ignored when trustProxyHops=0');
+      assert.equal(spoofedUsJson.geo.country_code, null);
+
+      // 2) readEligibilityStatus + on-chain attestation digest parity + encode/decode + bumpEligibilityNonce
+      const ws36UserKey = generatePrivateKey();
+      const ws36UserAddr = getAddress(privateKeyToAccount(ws36UserKey).address);
+      await rpcCall('anvil_setBalance', [ws36UserAddr, '0x56bc75e2d63100000']);
+
+      const statusAllowlisted = await readEligibilityStatus(ADDRESSES.borrower, { cfg });
+      assert.equal(statusAllowlisted.isEligible, true);
+      assert.equal(statusAllowlisted.eligibilityReason, 'allowlisted');
+      assert.equal(statusAllowlisted.attestationSigner.toLowerCase(), ADDRESSES.attestationSigner.toLowerCase());
+
+      const statusUnallowlisted = await readEligibilityStatus(ws36UserAddr, { cfg });
+      assert.equal(statusUnallowlisted.isEligible, false);
+      assert.equal(statusUnallowlisted.eligibilityReason, 'ineligible');
+      assert.equal(statusUnallowlisted.userNonce, '0');
+
+      const ws36Block = await publicClient.getBlock({ blockTag: 'latest' });
+      const ws36Expiry = ws36Block.timestamp + 3600n;
+      const computedDigest = computeEligibilityAttestationDigest({
+        chainId: BASE_CHAIN_ID,
+        gateAddress: deployed.eligibilityGate,
+        account: ws36UserAddr,
+        nonce: 0n,
+        expiry: ws36Expiry,
+      });
+      const onchainDigest = await publicClient.readContract({
+        address: deployed.eligibilityGate,
+        abi: eligibilityGateAbi,
+        functionName: 'getAttestationDigest',
+        args: [ws36UserAddr, 0n, ws36Expiry],
+      });
+      assert.equal(
+        computedDigest.digest.toLowerCase(),
+        (onchainDigest as string).toLowerCase(),
+        'computeEligibilityAttestationDigest must match EligibilityGate.getAttestationDigest() on-chain'
+      );
+
+      const ws36AttSig = await attSignerAccount.signMessage({ message: { raw: computedDigest.structHash } });
+      const ws36AttHex = encodeEligibilityAttestation({ expiry: ws36Expiry, signature: ws36AttSig });
+      const decodedAtt = decodeEligibilityAttestation(ws36AttHex);
+      assert.equal(decodedAtt.validFormat, true);
+      assert.equal(decodedAtt.expiry, ws36Expiry.toString());
+      assert.equal(decodeEligibilityAttestation('0x1234').validFormat, false);
+      assert.equal(decodeEligibilityAttestation('0xabc').validFormat, false);
+
+      const statusAttested = await readEligibilityStatus(ws36UserAddr, { attestationHex: ws36AttHex, cfg });
+      assert.equal(statusAttested.isEligible, true);
+      assert.equal(statusAttested.eligibilityReason, 'attested');
+      assert.equal(statusAttested.attestation.validFormat, true);
+      assert.equal(statusAttested.attestation.isExpired, false);
+      assert.equal(statusAttested.attestation.matchesAttestationSigner, true);
+
+      // Expired & wrong-signer & garbage attestation inspections must fail cleanly without throwing
+      const expiredExpiry = ws36Block.timestamp - 10n;
+      const expDigest = computeEligibilityAttestationDigest({
+        chainId: BASE_CHAIN_ID,
+        gateAddress: deployed.eligibilityGate,
+        account: ws36UserAddr,
+        nonce: 0n,
+        expiry: expiredExpiry,
+      });
+      const expSig = await attSignerAccount.signMessage({ message: { raw: expDigest.structHash } });
+      const expAttHex = encodeEligibilityAttestation({ expiry: expiredExpiry, signature: expSig });
+      const statusExpiredAtt = await readEligibilityStatus(ws36UserAddr, { attestationHex: expAttHex, cfg });
+      assert.equal(statusExpiredAtt.isEligible, false);
+      assert.equal(statusExpiredAtt.attestation.isExpired, true);
+
+      const wrongSig = await privateKeyToAccount(KEYS.borrower).signMessage({
+        message: { raw: computedDigest.structHash },
+      });
+      const wrongAttHex = encodeEligibilityAttestation({ expiry: ws36Expiry, signature: wrongSig });
+      const statusWrongSigner = await readEligibilityStatus(ws36UserAddr, { attestationHex: wrongAttHex, cfg });
+      assert.equal(statusWrongSigner.isEligible, false);
+      assert.equal(statusWrongSigner.attestation.matchesAttestationSigner, false);
+
+      const statusGarbageAtt = await readEligibilityStatus(ws36UserAddr, { attestationHex: '0x1234', cfg });
+      assert.equal(statusGarbageAtt.isEligible, false);
+      assert.equal(statusGarbageAtt.attestation.validFormat, false);
+
+      // bumpEligibilityNonce invalidates previously valid KYC attestation on-chain (zero ERC-20 approvals)
+      walletProvider.setAccount(ws36UserKey);
+      const ws36BumpRes = await bumpEligibilityNonce({
+        address: ws36UserAddr,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(ws36BumpRes.previousNonce, '0');
+      assert.equal(ws36BumpRes.newNonce, '1');
+      const statusAfterBump = await readEligibilityStatus(ws36UserAddr, { attestationHex: ws36AttHex, cfg });
+      assert.equal(statusAfterBump.userNonce, '1');
+      assert.equal(statusAfterBump.isEligible, false, 'Old nonce=0 KYC attestation must fail after bumpMyNonce()');
+
+      // 3) EIP-712 Non-US Declaration signing, API verification, attack guards, nonce invalidation & revocation
+      await assert.rejects(
+        () =>
+          signEligibilityDeclaration({
+            address: ws36UserAddr,
+            jurisdiction: 'US',
+            provider: walletProvider,
+            cfg,
+          }),
+        /restricted under Regulation S/
+      );
+      await assert.rejects(
+        () =>
+          signEligibilityDeclaration({
+            address: ws36UserAddr,
+            jurisdiction: 'T1',
+            provider: walletProvider,
+            cfg,
+          }),
+        /restricted under Regulation S/
+      );
+      await assert.rejects(
+        () =>
+          signEligibilityDeclaration({
+            address: ws36UserAddr,
+            jurisdiction: 'SG',
+            ttlSeconds: MAX_DECLARATION_TTL_SECS + 1n,
+            provider: walletProvider,
+            cfg,
+          }),
+        /exceeds maximum/
+      );
+      await assert.rejects(
+        () =>
+          signEligibilityDeclaration({
+            address: ws36UserAddr,
+            jurisdiction: 'SG',
+            ttlSeconds: '3600.5' as unknown as bigint,
+            provider: walletProvider,
+            cfg,
+          }),
+        /unsigned integer/
+      );
+
+      const signedDecl = await signEligibilityDeclaration({
+        address: ws36UserAddr,
+        jurisdiction: 'SG',
+        ttlSeconds: 3600n,
+        submitToApi: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(signedDecl.declarationJson.nonce, '1');
+      assert.equal(signedDecl.declarationJson.jurisdiction, 'SG');
+      assert.equal(signedDecl.serverVerification?.verified, true);
+      assert.equal(signedDecl.serverVerification?.allowed, true);
+
+      const clientVerifyRes = await verifyEligibilityDeclaration({
+        declaration: signedDecl.declarationJson,
+        signature: signedDecl.signature,
+        cfg,
+      });
+      assert.equal(clientVerifyRes.verified, true);
+      assert.equal(
+        clientVerifyRes.digest.toLowerCase(),
+        signedDecl.serverVerification.declaration_digest.toLowerCase()
+      );
+
+      // Tampered statementHash, wrong signature, & >24h TTL must fail both client and API verification
+      const tamperedHashResp = await fetch(`${apiUrl}/eligibility/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          declaration: {
+            ...signedDecl.declarationJson,
+            statementHash: `0x${'11'.repeat(32)}`,
+          },
+          signature: signedDecl.signature,
+        }),
+      });
+      assert.equal(tamperedHashResp.status, 400);
+      assert.equal(((await tamperedHashResp.json()) as { error: { code: string } }).error.code, 'INVALID_STATEMENT_HASH');
+
+      const badSigResp = await fetch(`${apiUrl}/eligibility/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          declaration: signedDecl.declarationJson,
+          signature: `0x${'aa'.repeat(65)}`,
+        }),
+      });
+      assert.equal(badSigResp.status, 400);
+      assert.equal(((await badSigResp.json()) as { error: { code: string } }).error.code, 'INVALID_DECLARATION_SIGNATURE');
+
+      const longTtlResp = await fetch(`${apiUrl}/eligibility/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          declaration: {
+            ...signedDecl.declarationJson,
+            expiresAt: (BigInt(signedDecl.declarationJson.issuedAt) + 365n * 86_400n).toString(),
+          },
+          signature: signedDecl.signature,
+        }),
+      });
+      assert.equal(longTtlResp.status, 400);
+      assert.equal(((await longTtlResp.json()) as { error: { code: string } }).error.code, 'DECLARATION_TTL_OUT_OF_RANGE');
+
+      // Nonce bump invalidates previously valid signed EIP-712 declaration BOTH client-side and server-side
+      const bumpRes2 = await bumpEligibilityNonce({
+        address: ws36UserAddr,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(bumpRes2.newNonce, '2');
+      await assert.rejects(
+        () =>
+          verifyEligibilityDeclaration({
+            declaration: signedDecl.declarationJson,
+            signature: signedDecl.signature,
+            cfg,
+          }),
+        /does not match on-chain EligibilityGate userNonce/
+      );
+      await assert.rejects(
+        () =>
+          submitEligibilityDeclaration({
+            declaration: signedDecl.declarationJson,
+            signature: signedDecl.signature,
+            cfg,
+          }),
+        /NONCE_MISMATCH|does not match on-chain EligibilityGate userNonce/
+      );
+
+      // Revocation on EligibilityGate blocks readEligibilityStatus, signEligibilityDeclaration, GET /eligibility, & POST /eligibility/verify
+      await publicClient.waitForTransactionReceipt({
+        hash: await ownerClient.writeContract({
+          address: deployed.eligibilityGate,
+          abi: parseAbi(['function revokeUser(address account, bool revoked)']),
+          functionName: 'revokeUser',
+          args: [ws36UserAddr, true],
+        }),
+      });
+      try {
+        const revStatus = await readEligibilityStatus(ws36UserAddr, { cfg });
+        assert.equal(revStatus.isRevoked, true);
+        assert.equal(revStatus.eligibilityReason, 'revoked');
+        const revScreening = await fetchEligibilityScreening({ account: ws36UserAddr, cfg });
+        assert.equal(revScreening.allowed, false);
+        assert.ok(revScreening.rejection_reasons.some((r: { code: string }) => r.code === 'WALLET_REVOKED'));
+        await assert.rejects(
+          () =>
+            signEligibilityDeclaration({
+              address: ws36UserAddr,
+              jurisdiction: 'SG',
+              provider: walletProvider,
+              cfg,
+            }),
+          /revoked on EligibilityGate/
+        );
+        const revVerifyResp = await fetch(`${apiUrl}/eligibility/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            declaration: { ...signedDecl.declarationJson, nonce: '2' },
+            signature: signedDecl.signature,
+          }),
+        });
+        assert.equal(revVerifyResp.status, 403);
+        assert.equal(((await revVerifyResp.json()) as { error: { code: string } }).error.code, 'WALLET_REVOKED');
+      } finally {
+        await publicClient.waitForTransactionReceipt({
+          hash: await ownerClient.writeContract({
+            address: deployed.eligibilityGate,
+            abi: parseAbi(['function revokeUser(address account, bool revoked)']),
+            functionName: 'revokeUser',
+            args: [ws36UserAddr, false],
+          }),
+        });
+      }
+
+      // 4) Trusted Proxy IP Geoblock (fail-closed) + Sanctions Screening on ephemeral API instance
+      const sanctionedKey = generatePrivateKey();
+      const sanctionedAddr = getAddress(privateKeyToAccount(sanctionedKey).address);
+      const geoApiCfg = loadApiConfig({
+        rpcUrl: LOCAL_RPC_URL,
+        isFork: true,
+        forkChainId: BASE_CHAIN_ID,
+        databaseUrl: 'memory://',
+        corsOrigins: ['https://app.nostok.xyz'],
+        rateLimitMax: 2000,
+        rateLimitWindowMs: 60_000,
+        trustProxyHops: 1,
+        geoCountryHeader: 'cf-ipcountry',
+        geoRequireHeader: true,
+        sanctionedAddresses: [sanctionedAddr],
+        maxBodyBytes: 4096,
+        maxPageLimit: 100,
+        loanCore: deployed.loanCore,
+        orderSettlement: deployed.orderSettlement,
+        liquidationAuction: deployed.liquidationAuction,
+        positionNft: deployed.positionNFT,
+        collateralEscrow: deployed.collateralEscrow,
+        assetRegistry: deployed.assetRegistry,
+        oracleRouter: deployed.oracleRouter,
+        feeCollector: deployed.feeCollector,
+        eligibilityGate: deployed.eligibilityGate,
+        usdc: BASE_USDC,
+      });
+      const geoApiCtx = await createApiContext(geoApiCfg, wrapApiReadOnly(idxCtx.db));
+      const geoApiServer = createApiServer(geoApiCtx);
+      await new Promise<void>((r) => geoApiServer.listen(0, '127.0.0.1', r));
+      const geoApiUrl = `http://127.0.0.1:${(geoApiServer.address() as net.AddressInfo).port}`;
+      const geoCfg = { ...cfg, apiUrl: geoApiUrl };
+
+      try {
+        // Missing geo header -> fail closed (GEO_UNVERIFIED) on GET /eligibility, POST /eligibility/verify, & POST /orders
+        const noGeoGet = await fetch(`${geoApiUrl}/eligibility?account=${ADDRESSES.borrower}`);
+        const noGeoJson = (await noGeoGet.json()) as { allowed: boolean; geo: { reason: string } };
+        assert.equal(noGeoJson.allowed, false);
+        assert.equal(noGeoJson.geo.reason, 'GEO_UNVERIFIED');
+
+        const noGeoOrder = await fetch(`${geoApiUrl}/orders`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        });
+        assert.equal(noGeoOrder.status, 403);
+        assert.equal(((await noGeoOrder.json()) as { error: { code: string } }).error.code, 'GEO_UNVERIFIED');
+
+        // US, lowercase us, IR, Tor T1, unknown XX, & malformed comma-separated header MUST all fail closed
+        for (const [hdrVal, expectedCode] of [
+          ['US', 'GEO_RESTRICTED'],
+          ['us', 'GEO_RESTRICTED'],
+          ['IR', 'GEO_RESTRICTED'],
+          ['T1', 'GEO_TOR_BLOCKED'],
+          ['XX', 'GEO_UNVERIFIED'],
+          ['CH, US', 'GEO_HEADER_MALFORMED'],
+        ] as const) {
+          const r = await fetch(`${geoApiUrl}/eligibility?account=${ADDRESSES.borrower}`, {
+            headers: { 'cf-ipcountry': hdrVal },
+          });
+          const j = (await r.json()) as { allowed: boolean; geo: { reason: string } };
+          assert.equal(j.allowed, false, `cf-ipcountry="${hdrVal}" must be blocked`);
+          assert.equal(j.geo.reason, expectedCode);
+        }
+
+        // Sanctioned wallet from allowed country CH -> blocked on GET /eligibility & POST /eligibility/verify
+        const sancGet = await fetch(`${geoApiUrl}/eligibility?account=${sanctionedAddr}`, {
+          headers: { 'cf-ipcountry': 'CH' },
+        });
+        const sancJson = (await sancGet.json()) as {
+          allowed: boolean;
+          wallet: { sanctioned: boolean };
+          rejection_reasons: Array<{ code: string }>;
+        };
+        assert.equal(sancJson.allowed, false);
+        assert.equal(sancJson.wallet.sanctioned, true);
+        assert.ok(sancJson.rejection_reasons.some((r) => r.code === 'WALLET_SANCTIONED'));
+
+        // Non-sanctioned borrower from CH: mismatching declared jurisdiction (GB != CH) rejected; matching CH passes!
+        const chFetch: typeof fetch = (input, init) =>
+          fetch(input, {
+            ...init,
+            headers: {
+              ...(init?.headers ?? {}),
+              'cf-ipcountry': 'CH',
+            },
+          });
+        walletProvider.setAccount(KEYS.borrower);
+        await assert.rejects(
+          () =>
+            signEligibilityDeclaration({
+              address: ADDRESSES.borrower,
+              jurisdiction: 'GB',
+              provider: walletProvider,
+              cfg: geoCfg,
+              fetchImpl: chFetch,
+            }),
+          /does not match verified IP jurisdiction \(CH\)/
+        );
+
+        const chDecl = await signEligibilityDeclaration({
+          address: ADDRESSES.borrower,
+          submitToApi: true,
+          provider: walletProvider,
+          cfg: geoCfg,
+          fetchImpl: chFetch,
+        });
+        assert.equal(chDecl.declarationJson.jurisdiction, 'CH');
+        assert.equal(chDecl.serverVerification?.verified, true);
+        assert.equal(chDecl.serverVerification?.geo?.country_code, 'CH');
+
+        // Replaying valid CH signature while edge header says US -> 403 GEO_RESTRICTED
+        const usReplayResp = await fetch(`${geoApiUrl}/eligibility/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'cf-ipcountry': 'US' },
+          body: JSON.stringify({
+            declaration: chDecl.declarationJson,
+            signature: chDecl.signature,
+          }),
+        });
+        assert.equal(usReplayResp.status, 403);
+        assert.equal(((await usReplayResp.json()) as { error: { code: string } }).error.code, 'GEO_RESTRICTED');
+      } finally {
+        await new Promise<void>((r) => geoApiServer.close(() => r()));
+      }
+
+      console.log('PASS WS3.6 Piece 1: EligibilityGate, IP geoblock, sanctions screening & EIP-712 declaration verified.');
+
+      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 + WS3.6 PIECE 1 FORK TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
       await new Promise<void>((r) => apiServer.close(() => r()));

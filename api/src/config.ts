@@ -20,6 +20,10 @@ export interface ApiConfig {
   maxBodyBytes: number;
   maxPageLimit: number;
   maxHealthyLagBlocks: number;
+  geoCountryHeader: string;
+  geoRequireHeader: boolean;
+  restrictedCountries: string[];
+  sanctionedAddresses: Address[];
   loanCore: Address;
   orderSettlement: Address;
   liquidationAuction: Address;
@@ -67,6 +71,48 @@ function parseCorsOrigins(raw: string | undefined): string[] {
     .filter(Boolean);
 }
 
+function parseBoolEnv(raw: string | undefined, fallback: boolean): boolean {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const val = raw.trim().toLowerCase();
+  return val === 'true' || val === '1' || val === 'yes';
+}
+
+function parseCountryCodes(raw: string | undefined, fallback: readonly string[]): string[] {
+  if (!raw || raw.trim() === '') return [...fallback];
+  const out: string[] = [];
+  for (const part of raw.split(',')) {
+    const code = part.trim().toUpperCase();
+    if (!code) continue;
+    if (!/^[A-Z]{2}$/.test(code)) {
+      throw new Error(`Invalid ISO-3166 alpha-2 country code in GEO_RESTRICTED_COUNTRIES: "${part}"`);
+    }
+    if (!out.includes(code)) out.push(code);
+  }
+  return out;
+}
+
+function parseAddressList(raw: string | undefined, name: string): Address[] {
+  if (!raw || raw.trim() === '') return [];
+  const out: Address[] = [];
+  const seen = new Set<string>();
+  for (const part of raw.split(',')) {
+    const clean = part.trim();
+    if (!clean) continue;
+    if (!isAddress(clean)) {
+      throw new Error(`Invalid EVM address in ${name}: "${clean}"`);
+    }
+    const checksummed = getAddress(clean);
+    const key = checksummed.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(checksummed);
+    }
+  }
+  return out;
+}
+
+const DEFAULT_GEO_RESTRICTED_COUNTRIES = ['US', 'CU', 'IR', 'KP', 'SY', 'RU', 'BY', 'MM'] as const;
+
 export function loadApiConfig(overrides: ApiConfigOverrides = {}): ApiConfig {
   const port = overrides.port ?? parsePositiveInt(process.env.PORT, 3001, 'PORT');
   const host = overrides.host ?? (process.env.HOST?.trim() || '127.0.0.1');
@@ -108,6 +154,30 @@ export function loadApiConfig(overrides: ApiConfigOverrides = {}): ApiConfig {
     overrides.maxHealthyLagBlocks ??
     parsePositiveInt(process.env.MAX_HEALTHY_LAG_BLOCKS, 20, 'MAX_HEALTHY_LAG_BLOCKS');
 
+  const rawGeoHeader = (overrides.geoCountryHeader ?? process.env.GEO_COUNTRY_HEADER ?? 'cf-ipcountry')
+    .trim()
+    .toLowerCase();
+  if (!/^[a-z0-9-]+$/.test(rawGeoHeader)) {
+    throw new Error(`Invalid GEO_COUNTRY_HEADER name: "${rawGeoHeader}"`);
+  }
+  const geoRequireHeader =
+    overrides.geoRequireHeader ??
+    parseBoolEnv(process.env.GEO_REQUIRE_HEADER, !isFork && trustProxyHops > 0);
+  const restrictedCountries =
+    overrides.restrictedCountries !== undefined
+      ? overrides.restrictedCountries.map((c) => {
+          const code = c.trim().toUpperCase();
+          if (!/^[A-Z]{2}$/.test(code)) {
+            throw new Error(`Invalid ISO-3166 alpha-2 country code in restrictedCountries: "${c}"`);
+          }
+          return code;
+        })
+      : parseCountryCodes(process.env.GEO_RESTRICTED_COUNTRIES, DEFAULT_GEO_RESTRICTED_COUNTRIES);
+  const sanctionedAddresses =
+    overrides.sanctionedAddresses !== undefined
+      ? overrides.sanctionedAddresses.map((a) => requireAddress(a, 'sanctionedAddresses'))
+      : parseAddressList(process.env.SANCTIONED_ADDRESSES, 'SANCTIONED_ADDRESSES');
+
   return {
     port,
     host,
@@ -123,6 +193,10 @@ export function loadApiConfig(overrides: ApiConfigOverrides = {}): ApiConfig {
     maxBodyBytes,
     maxPageLimit,
     maxHealthyLagBlocks,
+    geoCountryHeader: rawGeoHeader,
+    geoRequireHeader,
+    restrictedCountries,
+    sanctionedAddresses,
     loanCore: overrides.loanCore ?? requireAddress(process.env.LOAN_CORE_ADDRESS, 'LOAN_CORE_ADDRESS'),
     orderSettlement:
       overrides.orderSettlement ?? requireAddress(process.env.ORDER_SETTLEMENT_ADDRESS, 'ORDER_SETTLEMENT_ADDRESS'),

@@ -1,4 +1,4 @@
-import { type Address, type Hex, getAddress, isAddress } from 'viem';
+import { type Address, type Hex, getAddress, isAddress, zeroAddress } from 'viem';
 import { z } from 'zod/v3';
 
 /**
@@ -367,3 +367,53 @@ export const quoteRequestSchema = z
   });
 
 export type QuoteInput = z.infer<typeof quoteRequestSchema>;
+
+const nonZeroChecksumAddressSchema = checksumAddressSchema.refine(
+  (addr) => addr.toLowerCase() !== zeroAddress,
+  'Zero address is not allowed for eligibility screening'
+);
+
+export const eligibilityQuerySchema = z
+  .object({
+    account: nonZeroChecksumAddressSchema.optional(),
+    attestation: hexBytesSchema.optional(),
+  })
+  .transform((val) => ({
+    account: val.account,
+    attestation: (val.attestation ?? '0x') as Hex,
+  }));
+
+export const eligibilityDeclarationSchema = z
+  .object({
+    account: nonZeroChecksumAddressSchema,
+    nonce: unsignedBigIntStringSchema,
+    issuedAt: unsignedBigIntStringSchema,
+    expiresAt: positiveBigIntStringSchema,
+    jurisdiction: z
+      .string()
+      .trim()
+      .regex(/^(?:[A-Za-z]{2}|NON_US_SELF_DECLARED)$/, 'jurisdiction must be an ISO-3166 alpha-2 code or NON_US_SELF_DECLARED')
+      .transform((v) => v.toUpperCase()),
+    statementHash: z
+      .string()
+      .trim()
+      .regex(/^0x[0-9a-fA-F]{64}$/, 'statementHash must be a 32-byte 0x hex string')
+      .transform((v) => v.toLowerCase() as Hex),
+  })
+  .strict();
+
+export const eligibilityVerifyBodySchema = z
+  .object({
+    declaration: eligibilityDeclarationSchema,
+    signature: hexBytesSchema.refine(
+      (s) => s.length >= 132,
+      'signature must be at least 65 bytes (0x + 130 hex chars)'
+    ),
+    attestation: hexBytesSchema.optional(),
+  })
+  .strict()
+  .transform((val) => ({
+    declaration: val.declaration,
+    signature: val.signature,
+    attestation: (val.attestation ?? '0x') as Hex,
+  }));

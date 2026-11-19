@@ -1,3 +1,5 @@
+import { keccak256, stringToBytes } from 'viem';
+
 export const OracleState = {
   VALID_OPEN: 0,
   VALID_CLOSED: 1,
@@ -259,10 +261,38 @@ export const liquidationAuctionAbi = [
 export const eligibilityGateAbi = [
   {
     type: 'function',
+    name: 'attestationSigner',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'address' }],
+  },
+  {
+    type: 'function',
     name: 'permissionlessMode',
     stateMutability: 'view',
     inputs: [],
     outputs: [{ name: '', type: 'bool' }],
+  },
+  {
+    type: 'function',
+    name: 'allowlist',
+    stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+  {
+    type: 'function',
+    name: 'isRevoked',
+    stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+  {
+    type: 'function',
+    name: 'userNonce',
+    stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ name: '', type: 'uint256' }],
   },
   {
     type: 'function',
@@ -275,6 +305,32 @@ export const eligibilityGateAbi = [
     outputs: [{ name: '', type: 'bool' }],
   },
 ] as const;
+
+export const ELIGIBILITY_DECLARATION_DOMAIN_NAME = 'NOSTOK Eligibility Declaration';
+export const ELIGIBILITY_DECLARATION_DOMAIN_VERSION = '1';
+
+export const ELIGIBILITY_DECLARATION_EIP712_TYPES = {
+  EligibilityDeclaration: [
+    { name: 'account', type: 'address' },
+    { name: 'nonce', type: 'uint256' },
+    { name: 'issuedAt', type: 'uint256' },
+    { name: 'expiresAt', type: 'uint256' },
+    { name: 'jurisdiction', type: 'string' },
+    { name: 'statementHash', type: 'bytes32' },
+  ],
+} as const;
+
+export const DEFAULT_RESTRICTED_COUNTRIES = ['US', 'CU', 'IR', 'KP', 'SY', 'RU', 'BY', 'MM'] as const;
+
+export const ELIGIBILITY_DECLARATION_STATEMENT =
+  'I declare under Regulation S that I am an eligible non-US person located outside the United States and outside any sanctioned or restricted jurisdiction; I understand collateral sits in CollateralEscrow, lenders receive a PositionNFT debt claim, liquidation auctions return borrower surplus, liquidations pause when markets are closed or feeds are stale/frozen, and orders interact with NOSTOK contracts on Base.';
+
+export const ELIGIBILITY_DECLARATION_STATEMENT_HASH = keccak256(
+  stringToBytes(ELIGIBILITY_DECLARATION_STATEMENT)
+);
+
+export const MAX_DECLARATION_TTL_SECS = 86_400n;
+export const MIN_DECLARATION_TTL_SECS = 60n;
 
 export const erc20MetaAbi = [
   {
