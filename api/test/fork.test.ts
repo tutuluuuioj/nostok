@@ -829,11 +829,26 @@ async function runTests(): Promise<void> {
       // -----------------------------------------------------------------------
       // TEST 1: Config & Read-only DB enforcement
       // -----------------------------------------------------------------------
-      console.log('\n=== TEST 1: Read-only DB & FORK=false DATABASE_URL enforcement ===');
+      console.log('\n=== TEST 1: Read-only DB & FORK=false fail-closed startup enforcement ===');
       const prevEnv = process.env.DATABASE_URL;
       const prevFork = process.env.FORK;
+      const prevTrustProxy = process.env.TRUST_PROXY;
+      const prevGeoReq = process.env.GEO_REQUIRE_HEADER;
+      const prevGeoDis = process.env.GEO_DISABLED;
+      const prevTrustedCidrs = process.env.TRUSTED_PROXY_CIDRS;
+      const prevSanctioned = process.env.SANCTIONED_ADDRESSES;
+      const prevWarn = console.warn;
+      const warnings: string[] = [];
+      console.warn = (...args: unknown[]) => {
+        warnings.push(args.map((a) => String(a)).join(' '));
+      };
       delete process.env.DATABASE_URL;
       delete process.env.FORK;
+      delete process.env.TRUST_PROXY;
+      delete process.env.GEO_REQUIRE_HEADER;
+      delete process.env.GEO_DISABLED;
+      delete process.env.TRUSTED_PROXY_CIDRS;
+      delete process.env.SANCTIONED_ADDRESSES;
       try {
         assert.throws(
           () =>
@@ -844,9 +859,115 @@ async function runTests(): Promise<void> {
             }),
           /postgres:\/\/ or postgresql:\/\//i
         );
+
+        // M1: FORK=false with default env (TRUST_PROXY=0, GEO_REQUIRE_HEADER unset, GEO_DISABLED unset) MUST refuse to start
+        process.env.FORK = 'false';
+        process.env.DATABASE_URL = 'postgres://user:pass@127.0.0.1:5432/nostok';
+        assert.throws(
+          () =>
+            loadApiConfig({
+              rpcUrl: apiCfg.rpcUrl,
+              loanCore: apiCfg.loanCore,
+              orderSettlement: apiCfg.orderSettlement,
+              liquidationAuction: apiCfg.liquidationAuction,
+              positionNft: apiCfg.positionNft,
+              collateralEscrow: apiCfg.collateralEscrow,
+              assetRegistry: apiCfg.assetRegistry,
+              oracleRouter: apiCfg.oracleRouter,
+              feeCollector: apiCfg.feeCollector,
+              eligibilityGate: apiCfg.eligibilityGate,
+              usdc: apiCfg.usdc,
+            }),
+          /refuses to start without verified edge geoblock/i
+        );
+        // Partial configs must also refuse to start when FORK=false
+        assert.throws(
+          () =>
+            loadApiConfig({
+              ...apiCfg,
+              isFork: false,
+              databaseUrl: 'postgres://user:pass@127.0.0.1:5432/nostok',
+              trustProxyHops: 1,
+              geoRequireHeader: false,
+              geoDisabled: false,
+            }),
+          /refuses to start without verified edge geoblock/i
+        );
+        assert.throws(
+          () =>
+            loadApiConfig({
+              ...apiCfg,
+              isFork: false,
+              databaseUrl: 'postgres://user:pass@127.0.0.1:5432/nostok',
+              trustProxyHops: 0,
+              geoRequireHeader: true,
+              geoDisabled: false,
+            }),
+          /refuses to start without verified edge geoblock/i
+        );
+
+        // Production config with TRUST_PROXY>=1 + GEO_REQUIRE_HEADER=true succeeds and logs loud warning if SANCTIONED_ADDRESSES is empty
+        warnings.length = 0;
+        const prodCfg = loadApiConfig({
+          ...apiCfg,
+          isFork: false,
+          databaseUrl: 'postgres://user:pass@127.0.0.1:5432/nostok',
+          trustProxyHops: 1,
+          geoRequireHeader: true,
+          geoDisabled: false,
+          sanctionedAddresses: [],
+        });
+        assert.equal(prodCfg.isFork, false);
+        assert.equal(prodCfg.trustProxyHops, 1);
+        assert.equal(prodCfg.geoRequireHeader, true);
+        assert.ok(
+          warnings.some((w) => /\[API_SECURITY_WARNING\].*SANCTIONED_ADDRESSES is empty/i.test(w)),
+          'Expected loud SANCTIONED_ADDRESSES warning'
+        );
+
+        // Explicit GEO_DISABLED=true override allows startup when FORK=false and emits loud warning
+        warnings.length = 0;
+        const overrideCfg = loadApiConfig({
+          ...apiCfg,
+          isFork: false,
+          databaseUrl: 'postgres://user:pass@127.0.0.1:5432/nostok',
+          trustProxyHops: 0,
+          geoRequireHeader: false,
+          geoDisabled: true,
+        });
+        assert.equal(overrideCfg.geoDisabled, true);
+        assert.ok(
+          warnings.some((w) => /\[API_SECURITY_WARNING\].*GEO_DISABLED=true/i.test(w)),
+          'Expected loud GEO_DISABLED=true override warning'
+        );
+
+        // Invalid TRUSTED_PROXY_CIDRS fails fast at config load
+        assert.throws(
+          () =>
+            loadApiConfig({
+              ...apiCfg,
+              trustProxyHops: 1,
+              geoRequireHeader: true,
+              trustedProxyCidrs: ['not-a-valid-cidr'],
+            }),
+          /Invalid IP or CIDR entry/i
+        );
       } finally {
+        console.warn = prevWarn;
         if (prevEnv !== undefined) process.env.DATABASE_URL = prevEnv;
+        else delete process.env.DATABASE_URL;
         if (prevFork !== undefined) process.env.FORK = prevFork;
+        else delete process.env.FORK;
+        if (prevTrustProxy !== undefined) process.env.TRUST_PROXY = prevTrustProxy;
+        else delete process.env.TRUST_PROXY;
+        if (prevGeoReq !== undefined) process.env.GEO_REQUIRE_HEADER = prevGeoReq;
+        else delete process.env.GEO_REQUIRE_HEADER;
+        if (prevGeoDis !== undefined) process.env.GEO_DISABLED = prevGeoDis;
+        else delete process.env.GEO_DISABLED;
+        if (prevTrustedCidrs !== undefined) process.env.TRUSTED_PROXY_CIDRS = prevTrustedCidrs;
+        else delete process.env.TRUSTED_PROXY_CIDRS;
+        if (prevSanctioned !== undefined) process.env.SANCTIONED_ADDRESSES = prevSanctioned;
+        else delete process.env.SANCTIONED_ADDRESSES;
       }
 
       assert.throws(() => assertReadOnlySql('DELETE FROM loans'), /SELECT/i);
@@ -931,7 +1052,18 @@ async function runTests(): Promise<void> {
       assert.equal(healthRes.body.lag_blocks, '0');
       assert.ok(typeof healthRes.body.block_number === 'string');
       assert.ok(typeof healthRes.body.freshness_timestamp === 'string');
-      console.log('PASS TEST 2: /health reports db_ok=true, rpc_ok=true, lag_blocks=0.');
+      const healthGeo = healthRes.body.geo as Record<string, unknown>;
+      const healthSanctions = healthRes.body.sanctions as Record<string, unknown>;
+      assert.ok(healthGeo && typeof healthGeo === 'object', '/health must include geo mode object');
+      assert.equal(healthGeo.mode, 'local_unverified');
+      assert.equal(healthGeo.enabled, false);
+      assert.equal(healthGeo.trust_proxy_hops, 0);
+      assert.equal(healthGeo.require_header, false);
+      assert.equal(healthGeo.trusted_proxy_cidrs_count, 0);
+      assert.ok(healthSanctions && typeof healthSanctions === 'object', '/health must include sanctions mode object');
+      assert.equal(healthSanctions.mode, 'empty_list');
+      assert.equal(healthSanctions.sanctioned_addresses_count, 0);
+      console.log('PASS TEST 2: /health reports db_ok=true, rpc_ok=true, lag_blocks=0, geo & sanctions modes.');
 
       // -----------------------------------------------------------------------
       // TEST 3: /orders, /loans, /positions, /auctions, /assets + filters & pagination
@@ -3751,6 +3883,119 @@ async function runTests(): Promise<void> {
       }
 
       console.log('PASS TEST 7: POST /orders verification, anti-spam caps, symbol sanitization, 2000-order multicall GET benchmark, bumpNonce sync, and security headers verified.');
+
+      // -----------------------------------------------------------------------
+      // TEST 8: L1 Trusted Proxy Origin Verification (TRUSTED_PROXY_CIDRS) & /health geo/sanctions reporting
+      // -----------------------------------------------------------------------
+      console.log('\n=== TEST 8: L1 TRUSTED_PROXY_CIDRS origin verification & /health reporting ===');
+      const testAcct = privateKeyToAccount(KEYS.borrower).address;
+      const sanctionedAcct: Address = '0x000000000000000000000000000000000000dEaD';
+
+      // Server A: TRUST_PROXY=1, GEO_REQUIRE_HEADER=true, TRUSTED_PROXY_CIDRS=['10.0.0.0/8'] (127.0.0.1 is UNTRUSTED)
+      const untrustedProxyCfg = loadApiConfig({
+        ...apiCfg,
+        trustProxyHops: 1,
+        geoRequireHeader: true,
+        geoDisabled: false,
+        trustedProxyCidrs: ['10.0.0.0/8'],
+        sanctionedAddresses: [sanctionedAcct],
+        rateLimitMax: 3,
+        rateLimitWindowMs: 60_000,
+      });
+      const untrustedCtx = await createApiContext(untrustedProxyCfg, wrapQueryableAsReadOnly(idxCtx.db));
+      const untrustedServer = createApiServer(untrustedCtx);
+      await new Promise<void>((r) => untrustedServer.listen(0, '127.0.0.1', r));
+      const untrustedUrl = `http://127.0.0.1:${(untrustedServer.address() as net.AddressInfo).port}`;
+      try {
+        const hRes = await getJson<{
+          geo: { mode: string; enabled: boolean; trusted_proxy_cidrs_count: number };
+          sanctions: { mode: string; sanctioned_addresses_count: number };
+        }>(`${untrustedUrl}/health`);
+        assert.equal(hRes.status, 200);
+        assert.equal(hRes.body.geo.mode, 'enforced');
+        assert.equal(hRes.body.geo.enabled, true);
+        assert.equal(hRes.body.geo.trusted_proxy_cidrs_count, 1);
+        assert.equal(hRes.body.sanctions.mode, 'configured');
+        assert.equal(hRes.body.sanctions.sanctioned_addresses_count, 1);
+
+        // Req 1: Spoofed cf-ipcountry: CH & X-Forwarded-For from direct peer 127.0.0.1 (outside 10.0.0.0/8) -> GEO_UNTRUSTED_PROXY
+        const eligResp = await fetch(`${untrustedUrl}/eligibility?account=${testAcct}`, {
+          headers: { 'cf-ipcountry': 'CH', 'X-Forwarded-For': '198.51.100.1' },
+        });
+        assert.equal(eligResp.status, 200);
+        const eligBody = (await eligResp.json()) as {
+          allowed: boolean;
+          geo: { status: string; reason: string | null };
+        };
+        assert.equal(eligBody.allowed, false);
+        assert.equal(eligBody.geo.status, 'untrusted_proxy');
+        assert.equal(eligBody.geo.reason, 'GEO_UNTRUSTED_PROXY');
+
+        // Req 2: Spoofed cf-ipcountry: CH on POST /orders -> 403 GEO_UNTRUSTED_PROXY
+        const orderResp = await fetch(`${untrustedUrl}/orders`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'cf-ipcountry': 'CH',
+            'X-Forwarded-For': '198.51.100.2',
+          },
+          body: '{}',
+        });
+        assert.equal(orderResp.status, 403);
+        assert.equal(((await orderResp.json()) as { error: { code: string } }).error.code, 'GEO_UNTRUSTED_PROXY');
+
+        // Req 4: Different spoofed X-Forwarded-For still shares the 127.0.0.1 rate-limit bucket (rateLimitMax=3 -> 429!)
+        const rlResp = await fetch(`${untrustedUrl}/orders`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'cf-ipcountry': 'CH',
+            'X-Forwarded-For': '198.51.100.3',
+          },
+          body: '{}',
+        });
+        assert.equal(rlResp.status, 429, 'Spoofed X-Forwarded-For from untrusted peer must NOT bypass rate limiting');
+      } finally {
+        await new Promise<void>((r) => untrustedServer.close(() => r()));
+      }
+
+      // Server B: TRUSTED_PROXY_CIDRS=['127.0.0.1/32'] trusts direct loopback peer -> honors cf-ipcountry & X-Forwarded-For
+      const trustedProxyCfg = loadApiConfig({
+        ...apiCfg,
+        trustProxyHops: 1,
+        geoRequireHeader: true,
+        geoDisabled: false,
+        trustedProxyCidrs: ['127.0.0.1/32'],
+        sanctionedAddresses: [sanctionedAcct],
+        rateLimitMax: 3,
+        rateLimitWindowMs: 60_000,
+      });
+      const trustedCtx = await createApiContext(trustedProxyCfg, wrapQueryableAsReadOnly(idxCtx.db));
+      const trustedServer = createApiServer(trustedCtx);
+      await new Promise<void>((r) => trustedServer.listen(0, '127.0.0.1', r));
+      const trustedUrl = `http://127.0.0.1:${(trustedServer.address() as net.AddressInfo).port}`;
+      try {
+        for (const clientIp of ['198.51.100.11', '198.51.100.12', '198.51.100.13']) {
+          const okResp = await fetch(`${trustedUrl}/eligibility?account=${testAcct}`, {
+            headers: { 'cf-ipcountry': 'CH', 'X-Forwarded-For': clientIp },
+          });
+          assert.equal(okResp.status, 200);
+          const okBody = (await okResp.json()) as { allowed: boolean; geo: { country_code: string | null } };
+          assert.equal(okBody.allowed, true);
+          assert.equal(okBody.geo.country_code, 'CH');
+        }
+        // US still blocked from trusted proxy
+        const usResp = await fetch(`${trustedUrl}/eligibility?account=${testAcct}`, {
+          headers: { 'cf-ipcountry': 'US', 'X-Forwarded-For': '198.51.100.14' },
+        });
+        const usBody = (await usResp.json()) as { allowed: boolean; geo: { reason: string | null } };
+        assert.equal(usBody.allowed, false);
+        assert.equal(usBody.geo.reason, 'GEO_RESTRICTED');
+      } finally {
+        await new Promise<void>((r) => trustedServer.close(() => r()));
+      }
+      console.log('PASS TEST 8: TRUSTED_PROXY_CIDRS origin enforcement, X-Forwarded-For spoofing defense, & /health verified.');
+
       console.log('\nALL API WS2.3 BASE MAINNET FORK INTEGRATION TESTS PASSED.');
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));

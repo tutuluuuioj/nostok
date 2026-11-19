@@ -37,7 +37,7 @@ import {
   oracleRouterAbi,
   orderSettlementAbi,
 } from './abi.js';
-import type { ApiConfig } from './config.js';
+import { type ApiConfig, isIpInCidrList } from './config.js';
 import { type ReadOnlyDatabase, openReadOnlyDatabase, toBigInt } from './db.js';
 import { formatAmount, formatRawString } from './format.js';
 import { RpcUnavailableError, computeLoanQuote } from './quote.js';
@@ -218,9 +218,17 @@ class IpRateLimiter {
   }
 }
 
-export function resolveClientIp(req: IncomingMessage, trustProxyHops: number): string {
+export function resolveClientIp(
+  req: IncomingMessage,
+  trustProxyHops: number,
+  trustedProxyCidrs: readonly string[] = []
+): string {
   const remote = req.socket.remoteAddress ?? 'unknown';
   if (trustProxyHops <= 0) {
+    return remote;
+  }
+  // Ignore spoofed X-Forwarded-For headers from peers outside TRUSTED_PROXY_CIDRS when configured.
+  if (trustedProxyCidrs.length > 0 && !isIpInCidrList(req.socket.remoteAddress, trustedProxyCidrs)) {
     return remote;
   }
   const xff = req.headers['x-forwarded-for'];
@@ -242,7 +250,7 @@ export function resolveClientIp(req: IncomingMessage, trustProxyHops: number): s
 export interface ClientGeoResult {
   allowed: boolean;
   verified: boolean;
-  status: 'allowed' | 'blocked' | 'unverified' | 'local_unverified' | 'malformed';
+  status: 'allowed' | 'blocked' | 'unverified' | 'local_unverified' | 'malformed' | 'untrusted_proxy' | 'disabled';
   country_code: string | null;
   header_used: string | null;
   reason: string | null;
@@ -250,8 +258,22 @@ export interface ClientGeoResult {
 
 export function resolveClientGeo(
   req: IncomingMessage,
-  config: Pick<ApiConfig, 'trustProxyHops' | 'geoCountryHeader' | 'geoRequireHeader' | 'restrictedCountries'>
+  config: Pick<
+    ApiConfig,
+    'trustProxyHops' | 'geoCountryHeader' | 'geoRequireHeader' | 'restrictedCountries'
+  > &
+    Partial<Pick<ApiConfig, 'geoDisabled' | 'trustedProxyCidrs'>>
 ): ClientGeoResult {
+  if (config.geoDisabled) {
+    return {
+      allowed: true,
+      verified: false,
+      status: 'disabled',
+      country_code: null,
+      header_used: null,
+      reason: null,
+    };
+  }
   const headerName = config.geoCountryHeader.trim().toLowerCase();
   // Never trust client-supplied geo headers when not behind a configured trusted proxy.
   if (config.trustProxyHops <= 0) {
@@ -272,6 +294,19 @@ export function resolveClientGeo(
       country_code: null,
       header_used: null,
       reason: null,
+    };
+  }
+
+  // If TRUSTED_PROXY_CIDRS is configured, reject geo headers unless direct TCP peer matches an allowed proxy CIDR.
+  const proxyCidrs = config.trustedProxyCidrs ?? [];
+  if (proxyCidrs.length > 0 && !isIpInCidrList(req.socket.remoteAddress, proxyCidrs)) {
+    return {
+      allowed: false,
+      verified: false,
+      status: 'untrusted_proxy',
+      country_code: null,
+      header_used: null,
+      reason: 'GEO_UNTRUSTED_PROXY',
     };
   }
 
@@ -657,6 +692,18 @@ async function handleHealth(ctx: ApiContext) {
     withinLagThreshold = lag <= BigInt(ctx.config.maxHealthyLagBlocks);
   }
 
+  const geoMode = ctx.config.geoDisabled
+    ? 'disabled'
+    : ctx.config.trustProxyHops > 0 && ctx.config.geoRequireHeader
+      ? 'enforced'
+      : ctx.config.trustProxyHops > 0
+        ? 'best_effort'
+        : ctx.config.geoRequireHeader
+          ? 'fail_closed_no_proxy'
+          : 'local_unverified';
+  const sanctionsMode =
+    ctx.config.sanctionedAddresses.length > 0 ? 'configured' : 'empty_list';
+
   const healthy = dbOk && rpcOk;
   return {
     statusCode: healthy ? 200 : 503,
@@ -674,6 +721,20 @@ async function handleHealth(ctx: ApiContext) {
       indexed_at: indexedAt,
       block_timestamp: blockTimestamp,
       freshness_timestamp: freshnessTimestamp,
+      geo: {
+        mode: geoMode,
+        enabled: !ctx.config.geoDisabled && (ctx.config.trustProxyHops > 0 || ctx.config.geoRequireHeader),
+        disabled_override: ctx.config.geoDisabled,
+        require_header: ctx.config.geoRequireHeader,
+        trust_proxy_hops: ctx.config.trustProxyHops,
+        country_header: ctx.config.geoCountryHeader,
+        restricted_countries_count: ctx.config.restrictedCountries.length,
+        trusted_proxy_cidrs_count: ctx.config.trustedProxyCidrs.length,
+      },
+      sanctions: {
+        mode: sanctionsMode,
+        sanctioned_addresses_count: ctx.config.sanctionedAddresses.length,
+      },
     },
   };
 }
@@ -3545,6 +3606,19 @@ function buildDeclarationParams(ctx: ApiContext, geo: ClientGeoResult) {
   };
 }
 
+function formatGeoRejectionMessage(geo: ClientGeoResult): string {
+  if (geo.reason === 'GEO_UNTRUSTED_PROXY') {
+    return 'Request did not originate from an allowlisted trusted proxy / Cloudflare IP range.';
+  }
+  if (geo.reason === 'GEO_TOR_BLOCKED') {
+    return 'Access via Tor exit node is not permitted.';
+  }
+  if (geo.reason === 'GEO_UNVERIFIED' || geo.reason === 'GEO_HEADER_MALFORMED') {
+    return 'Unable to verify non-US jurisdiction from trusted edge headers.';
+  }
+  return `Jurisdiction ${geo.country_code ?? 'unknown'} is restricted under Regulation S.`;
+}
+
 async function handleGetEligibility(
   ctx: ApiContext,
   queryObj: Record<string, string>,
@@ -3557,12 +3631,7 @@ async function handleGetEligibility(
   if (!geo.allowed) {
     rejectionReasons.push({
       code: geo.reason ?? 'GEO_RESTRICTED',
-      message:
-        geo.reason === 'GEO_TOR_BLOCKED'
-          ? 'Access via Tor exit node is not permitted.'
-          : geo.reason === 'GEO_UNVERIFIED' || geo.reason === 'GEO_HEADER_MALFORMED'
-            ? 'Unable to verify non-US jurisdiction from trusted edge headers.'
-            : `Jurisdiction ${geo.country_code ?? 'unknown'} is restricted under Regulation S.`,
+      message: formatGeoRejectionMessage(geo),
     });
   }
 
@@ -3609,15 +3678,7 @@ async function handlePostEligibilityVerify(
   const geo = resolveClientGeo(req, ctx.config);
 
   if (!geo.allowed) {
-    throw new HttpError(
-      403,
-      geo.reason ?? 'GEO_RESTRICTED',
-      geo.reason === 'GEO_TOR_BLOCKED'
-        ? 'Access via Tor exit node is not permitted.'
-        : geo.reason === 'GEO_UNVERIFIED' || geo.reason === 'GEO_HEADER_MALFORMED'
-          ? 'Unable to verify non-US jurisdiction from trusted edge headers.'
-          : `Jurisdiction ${geo.country_code ?? 'unknown'} is restricted under Regulation S.`
-    );
+    throw new HttpError(403, geo.reason ?? 'GEO_RESTRICTED', formatGeoRejectionMessage(geo));
   }
 
   const decl = input.declaration;
@@ -3785,7 +3846,11 @@ export function createApiServer(ctx: ApiContext): http.Server {
       return;
     }
 
-    const clientIp = resolveClientIp(req, ctx.config.trustProxyHops);
+    const clientIp = resolveClientIp(
+      req,
+      ctx.config.trustProxyHops,
+      ctx.config.trustedProxyCidrs
+    );
     const rl = rateLimiter.check(clientIp);
     res.setHeader('X-RateLimit-Limit', String(ctx.config.rateLimitMax));
     res.setHeader('X-RateLimit-Remaining', String(rl.remaining));
@@ -3827,7 +3892,7 @@ export function createApiServer(ctx: ApiContext): http.Server {
           throw new HttpError(
             403,
             geo.reason ?? 'GEO_RESTRICTED',
-            `Order submission blocked from restricted or unverified jurisdiction (${geo.country_code ?? 'unknown'}).`
+            formatGeoRejectionMessage(geo)
           );
         }
         const rawBody = await readJsonBody(req, Math.min(ctx.config.maxBodyBytes, 16_384));

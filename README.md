@@ -126,6 +126,16 @@ npm test
 
 ---
 
+## 🔒 Read-Only API & Geoblock Configuration (`api/`)
+
+The off-chain API (`api/`) enforces jurisdiction geoblocking, sanctions screening, and origin trust controls. See [`api/README.md`](api/README.md) and [`api/.env.example`](api/.env.example) for full operator documentation.
+
+- **Production fail-closed startup (`FORK=false`)**: The API refuses to start unless `TRUST_PROXY>=1` **and** `GEO_REQUIRE_HEADER=true` (or an explicit `GEO_DISABLED=true` override is set). When `SANCTIONED_ADDRESSES` is empty, the API logs a loud `[API_SECURITY_WARNING]` startup warning.
+- **Edge proxy origin restriction (`TRUST_PROXY>=1`)**: When trusting proxy headers (`cf-ipcountry`, `X-Forwarded-For`), the server **must** only accept direct network traffic from Cloudflare / your trusted reverse proxy (enforced at the host firewall / security group / tunnel AND/OR configured in-process via `TRUSTED_PROXY_CIDRS`). Untrusted callers spoofing proxy headers are rejected (`403 GEO_UNTRUSTED_PROXY`) and rate-limited by direct socket peer IP.
+- **Health inspection**: `GET /health` reports both `geo` (`mode`, `enabled`, `disabled_override`, `require_header`, `trust_proxy_hops`, `country_header`, `restricted_countries_count`, `trusted_proxy_cidrs_count`) and `sanctions` (`mode`, `sanctioned_addresses_count`).
+
+---
+
 ## 🚀 Deployment to Base
 
 > [!IMPORTANT]

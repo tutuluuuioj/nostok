@@ -6337,6 +6337,7 @@ async function runTests(): Promise<void> {
       await new Promise<void>((r) => geoApiServer.listen(0, '127.0.0.1', r));
       const geoApiUrl = `http://127.0.0.1:${(geoApiServer.address() as net.AddressInfo).port}`;
       const geoCfg = { ...cfg, apiUrl: geoApiUrl };
+      let validChDeclPayload: { declaration: unknown; signature: string } | undefined;
 
       try {
         // Missing geo header -> fail closed (GEO_UNVERIFIED) on GET /eligibility, POST /eligibility/verify, & POST /orders
@@ -6415,6 +6416,10 @@ async function runTests(): Promise<void> {
         assert.equal(chDecl.declarationJson.jurisdiction, 'CH');
         assert.equal(chDecl.serverVerification?.verified, true);
         assert.equal(chDecl.serverVerification?.geo?.country_code, 'CH');
+        validChDeclPayload = {
+          declaration: chDecl.declarationJson,
+          signature: chDecl.signature,
+        };
 
         // Replaying valid CH signature while edge header says US -> 403 GEO_RESTRICTED
         const usReplayResp = await fetch(`${geoApiUrl}/eligibility/verify`, {
@@ -6427,11 +6432,136 @@ async function runTests(): Promise<void> {
         });
         assert.equal(usReplayResp.status, 403);
         assert.equal(((await usReplayResp.json()) as { error: { code: string } }).error.code, 'GEO_RESTRICTED');
+
+        // M1: /health reports geo + sanctions mode accurately on both geo-enforced and local fork servers
+        const [geoHealthResp, forkHealthResp] = await Promise.all([
+          fetch(`${geoApiUrl}/health`),
+          fetch(`${apiUrl}/health`),
+        ]);
+        assert.equal(geoHealthResp.status, 200);
+        assert.equal(forkHealthResp.status, 200);
+        const geoHealth = (await geoHealthResp.json()) as {
+          geo: { mode: string; enabled: boolean; require_header: boolean; trust_proxy_hops: number };
+          sanctions: { mode: string; sanctioned_addresses_count: number };
+        };
+        const forkHealth = (await forkHealthResp.json()) as {
+          geo: { mode: string; enabled: boolean };
+          sanctions: { mode: string; sanctioned_addresses_count: number };
+        };
+        assert.equal(geoHealth.geo.mode, 'enforced');
+        assert.equal(geoHealth.geo.enabled, true);
+        assert.equal(geoHealth.geo.require_header, true);
+        assert.equal(geoHealth.geo.trust_proxy_hops, 1);
+        assert.equal(geoHealth.sanctions.mode, 'configured');
+        assert.equal(geoHealth.sanctions.sanctioned_addresses_count, 1);
+        assert.equal(forkHealth.geo.mode, 'local_unverified');
+        assert.equal(forkHealth.geo.enabled, false);
+        assert.equal(forkHealth.sanctions.mode, 'empty_list');
+        assert.equal(forkHealth.sanctions.sanctioned_addresses_count, 0);
       } finally {
         await new Promise<void>((r) => geoApiServer.close(() => r()));
       }
 
-      console.log('PASS WS3.6 Piece 1: EligibilityGate, IP geoblock, sanctions screening & EIP-712 declaration verified.');
+      // 5) M1: FORK=false default env fails closed; SANCTIONED_ADDRESSES empty emits loud warning
+      {
+        const prevWarn = console.warn;
+        const capturedWarnings: string[] = [];
+        console.warn = (...args: unknown[]) => {
+          capturedWarnings.push(args.map((a) => String(a)).join(' '));
+        };
+        try {
+          const baseProdFields = {
+            rpcUrl: LOCAL_RPC_URL,
+            isFork: false,
+            databaseUrl: 'postgres://user:pass@127.0.0.1:5432/nostok',
+            corsOrigins: ['https://app.nostok.xyz'],
+            loanCore: deployed.loanCore,
+            orderSettlement: deployed.orderSettlement,
+            liquidationAuction: deployed.liquidationAuction,
+            positionNft: deployed.positionNFT,
+            collateralEscrow: deployed.collateralEscrow,
+            assetRegistry: deployed.assetRegistry,
+            oracleRouter: deployed.oracleRouter,
+            feeCollector: deployed.feeCollector,
+            eligibilityGate: deployed.eligibilityGate,
+            usdc: BASE_USDC,
+          };
+          assert.throws(
+            () => loadApiConfig({ ...baseProdFields, trustProxyHops: 0, geoRequireHeader: false, geoDisabled: false }),
+            /refuses to start without verified edge geoblock/i
+          );
+          capturedWarnings.length = 0;
+          const okProd = loadApiConfig({
+            ...baseProdFields,
+            trustProxyHops: 1,
+            geoRequireHeader: true,
+            geoDisabled: false,
+            sanctionedAddresses: [],
+          });
+          assert.equal(okProd.geoRequireHeader, true);
+          assert.ok(
+            capturedWarnings.some((w) => /\[API_SECURITY_WARNING\].*SANCTIONED_ADDRESSES is empty/i.test(w)),
+            'Expected loud SANCTIONED_ADDRESSES warning on empty sanctions list'
+          );
+          capturedWarnings.length = 0;
+          const overrideProd = loadApiConfig({ ...baseProdFields, geoDisabled: true });
+          assert.equal(overrideProd.geoDisabled, true);
+          assert.ok(
+            capturedWarnings.some((w) => /\[API_SECURITY_WARNING\].*GEO_DISABLED=true/i.test(w)),
+            'Expected loud GEO_DISABLED=true warning'
+          );
+        } finally {
+          console.warn = prevWarn;
+        }
+      }
+
+      // 6) L1: TRUSTED_PROXY_CIDRS rejects spoofed cf-ipcountry & X-Forwarded-For from untrusted direct peers
+      {
+        const l1UntrustedCfg = loadApiConfig({
+          ...apiCfg,
+          trustProxyHops: 1,
+          geoRequireHeader: true,
+          trustedProxyCidrs: ['10.0.0.0/8'],
+          rateLimitMax: 2,
+          rateLimitWindowMs: 60_000,
+        });
+        const l1UntrustedServer = createApiServer(await createApiContext(l1UntrustedCfg, wrapApiReadOnly(idxCtx.db)));
+        await new Promise<void>((r) => l1UntrustedServer.listen(0, '127.0.0.1', r));
+        const l1Url = `http://127.0.0.1:${(l1UntrustedServer.address() as net.AddressInfo).port}`;
+        try {
+          const spoofGet = await fetch(`${l1Url}/eligibility?account=${ADDRESSES.borrower}`, {
+            headers: { 'cf-ipcountry': 'CH', 'X-Forwarded-For': '198.51.100.1' },
+          });
+          const spoofGetJson = (await spoofGet.json()) as {
+            allowed: boolean;
+            geo: { status: string; reason: string | null };
+          };
+          assert.equal(spoofGetJson.allowed, false);
+          assert.equal(spoofGetJson.geo.status, 'untrusted_proxy');
+          assert.equal(spoofGetJson.geo.reason, 'GEO_UNTRUSTED_PROXY');
+
+          const spoofVerify = await fetch(`${l1Url}/eligibility/verify`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'cf-ipcountry': 'CH',
+              'X-Forwarded-For': '198.51.100.2',
+            },
+            body: JSON.stringify(validChDeclPayload),
+          });
+          assert.equal(spoofVerify.status, 403);
+          assert.equal(((await spoofVerify.json()) as { error: { code: string } }).error.code, 'GEO_UNTRUSTED_PROXY');
+
+          const spoofRateLimit = await fetch(`${l1Url}/orders`, {
+            headers: { 'X-Forwarded-For': '198.51.100.3' },
+          });
+          assert.equal(spoofRateLimit.status, 429);
+        } finally {
+          await new Promise<void>((r) => l1UntrustedServer.close(() => r()));
+        }
+      }
+
+      console.log('PASS WS3.6 Piece 1: EligibilityGate, IP geoblock, sanctions screening, M1/L1 hardening & EIP-712 declaration verified.');
 
       console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 + WS3.6 PIECE 1 FORK TESTS PASSED.');
     } finally {
