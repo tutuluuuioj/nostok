@@ -19,6 +19,17 @@ import { Terms } from './pages/Terms.jsx';
 import { Wallet } from './pages/Wallet.jsx';
 import { StoreProvider, useStore } from './store.jsx';
 
+function isSafetyOrExitRoute(pathname) {
+  return (
+    pathname === '/loans' ||
+    pathname.startsWith('/loans/') ||
+    pathname.startsWith('/loan/') ||
+    pathname === '/borrow' ||
+    pathname === '/lend' ||
+    pathname === '/wallet'
+  );
+}
+
 export function Frame() {
   const { state, web3 } = useStore();
   const location = useLocation();
@@ -27,9 +38,10 @@ export function Frame() {
     location.pathname === '/subscriptions/block' ||
     location.pathname === '/subscriptions/unblock' ||
     location.pathname === '/subscriptions/manage';
+  const allowExitBypass = isSubscriptionAction || isSafetyOrExitRoute(location.pathname);
   const screening = web3?.eligibilityScreening;
-  if (web3?.hardRestricted || state.gate === 'restricted') return <Restricted />;
-  if (!isSubscriptionAction) {
+  if (!allowExitBypass && (web3?.hardRestricted || state.gate === 'restricted')) return <Restricted />;
+  if (!allowExitBypass) {
     if (state.gate === 'accepted' && !screening?.checkedOnce && !screening?.error) {
       return <GateChecking />;
     }

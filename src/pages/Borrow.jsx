@@ -717,13 +717,28 @@ export function Borrow() {
     }
   }
 
-  async function refreshPostCancelCollateralAllowance(cancelledHash = null, allInvalidated = false) {
-    if (!web3?.address || !assetObj?.token) return;
+  async function refreshPostCancelCollateralAllowance(cancelledHash = null, allInvalidated = false, fallbackToken = null) {
     const stored = loadPersistedSignedOrders();
+    const persistedTok = stored.find((item) => {
+      const o = item?.orderJson ?? item?.order;
+      return o?.collateralToken;
+    });
+    const tokenAddr =
+      fallbackToken ||
+      assetObj?.token ||
+      persistedTok?.orderJson?.collateralToken ||
+      persistedTok?.order?.collateralToken ||
+      null;
+    if (!web3?.address || !tokenAddr) return;
     const exclude = cancelledHash ? new Set([String(cancelledHash).toLowerCase()]) : null;
     let makerOpenErr = '';
     const [freshMeta, freshPersisted, makerResolvedRaw] = await Promise.all([
-      loadAllowanceAndNonce(),
+      assetObj?.token && assetObj.token.toLowerCase() === tokenAddr.toLowerCase()
+        ? loadAllowanceAndNonce()
+        : readBorrowAllowanceAndNonce(web3.address, tokenAddr, {
+            cfg: web3?.config,
+            attestationHex: web3?.attestationHex,
+          }).catch(() => null),
       stored.length > 0
         ? refreshSignedBorrowOrdersState({ orders: stored, cfg: web3?.config }).then((enriched) => {
             setPersistedOrders(enriched);
@@ -737,7 +752,7 @@ export function Borrow() {
         ? Promise.resolve(0n)
         : resolveOpenBorrowOrdersCollateralSumRaw({
             borrowerAddress: web3.address,
-            collateralToken: assetObj.token,
+            collateralToken: tokenAddr,
             existingOpenCollateralRaw: null,
             excludeHashes: exclude,
             cfg: web3?.config,
@@ -750,7 +765,7 @@ export function Borrow() {
 
     const fallbackSummary = computeOpenBorrowOrdersCollateralTotal(
       web3.address,
-      assetObj.token,
+      tokenAddr,
       freshPersisted,
       [],
       exclude
@@ -774,9 +789,9 @@ export function Borrow() {
       (blockedByUnknown && liveAllowanceRaw > 0n)
     ) {
       setCollateralReductionState({
-        collateralToken: assetObj.token,
-        symbol: assetObj.symbol ?? 'collateral',
-        decimals: Number(assetObj.decimals ?? 18),
+        collateralToken: tokenAddr,
+        symbol: freshMeta?.symbol ?? assetObj?.symbol ?? 'collateral',
+        decimals: Number(freshMeta?.decimals ?? assetObj?.decimals ?? 18),
         currentAllowanceRaw: liveAllowanceRaw.toString(),
         targetAllowanceRaw: targetRaw.toString(),
         blockedByUnknown,
@@ -799,7 +814,6 @@ export function Borrow() {
     txBusyRef.current = true;
     setTxBusy('reduce-collateral-allowance');
     try {
-      await web3.ensureDeclarationVerifiedForTx();
       const targetRaw = collateralReductionState.targetAllowanceRaw;
       const res = await setCollateralAllowanceForBorrow({
         address: web3.address,
@@ -832,13 +846,12 @@ export function Borrow() {
     txBusyRef.current = true;
     setTxBusy('cancel');
     try {
-      await web3.ensureDeclarationVerifiedForTx();
       const res = await cancelSignedBorrowOrder({
         address: web3.address,
         order: orderObj,
         cfg: web3.config,
       });
-      await refreshPostCancelCollateralAllowance(res.orderHash, false);
+      await refreshPostCancelCollateralAllowance(res.orderHash, false, orderObj?.collateralToken ?? null);
       setCancelNotice(`Cancelled order ${res.orderHash} on-chain (tx ${res.txHash}).`);
     } catch (err) {
       setCancelError(formatWeb3Error(err));
@@ -868,13 +881,12 @@ export function Borrow() {
     txBusyRef.current = true;
     setTxBusy('cancel-paste');
     try {
-      await web3.ensureDeclarationVerifiedForTx();
       const res = await cancelSignedBorrowOrder({
         address: web3.address,
         order: parsed.order,
         cfg: web3.config,
       });
-      await refreshPostCancelCollateralAllowance(res.orderHash, false);
+      await refreshPostCancelCollateralAllowance(res.orderHash, false, parsed.order?.collateralToken ?? null);
       setCancelNotice(`Cancelled pasted BorrowOrder ${res.orderHash} on-chain (tx ${res.txHash}).`);
     } catch (err) {
       setCancelError(formatWeb3Error(err));
@@ -896,7 +908,6 @@ export function Borrow() {
     txBusyRef.current = true;
     setTxBusy('bump-nonce');
     try {
-      await web3.ensureDeclarationVerifiedForTx();
       const res = await bumpMakerNonceOnChain({
         address: web3.address,
         cfg: web3.config,
@@ -1078,7 +1089,7 @@ export function Borrow() {
         </div>
       ) : null}
 
-      <ComplianceTxGateBanner actionLabel="approve collateral, publish BorrowOrders, fill LendOffers, or cancel orders" />
+      <ComplianceTxGateBanner actionLabel="approve collateral, publish BorrowOrders, or fill LendOffers (cancelling orders, bumping maker nonce, and reducing allowances remain open)" />
 
       <form className="form-layout" onSubmit={handleSignBorrowOrder}>
         <div className="fields">
@@ -1443,7 +1454,7 @@ export function Borrow() {
             className="btn secondary"
             type="button"
             onClick={() => void handleBumpAllNonces()}
-            disabled={!web3?.connected || web3?.wrongNetwork || !web3?.eligibilityDeclarationValid || Boolean(txBusy)}
+            disabled={!web3?.connected || web3?.wrongNetwork || Boolean(txBusy)}
           >
             {txBusy === 'bump-nonce'
               ? 'Bumping maker nonce…'
@@ -1481,7 +1492,7 @@ export function Borrow() {
                 className="btn secondary"
                 type="button"
                 onClick={() => void handleReduceCollateralAfterCancel()}
-                disabled={!web3?.eligibilityDeclarationValid || Boolean(txBusy) || Boolean(collateralReductionState.blockedByUnknown)}
+                disabled={Boolean(txBusy) || Boolean(collateralReductionState.blockedByUnknown)}
               >
                 {collateralReductionState.blockedByUnknown
                   ? 'Reduction blocked (unknown order status)'
@@ -1536,7 +1547,7 @@ export function Borrow() {
                         className="btn secondary"
                         type="button"
                         onClick={() => void handleCancelOrder(ord)}
-                        disabled={!web3?.eligibilityDeclarationValid || Boolean(txBusy)}
+                        disabled={Boolean(txBusy)}
                       >
                         {txBusy === 'cancel' ? 'Cancelling…' : 'Cancel on-chain'}
                       </button>
@@ -1598,7 +1609,7 @@ export function Borrow() {
             <button
               className="btn secondary"
               type="submit"
-              disabled={!web3?.connected || web3?.wrongNetwork || !web3?.eligibilityDeclarationValid || Boolean(txBusy) || !pasteCancelJson.trim()}
+              disabled={!web3?.connected || web3?.wrongNetwork || Boolean(txBusy) || !pasteCancelJson.trim()}
             >
               {txBusy === 'cancel-paste' ? 'Cancelling pasted order…' : 'Cancel pasted BorrowOrder on-chain'}
             </button>

@@ -7063,7 +7063,553 @@ async function runTests(): Promise<void> {
 
       console.log('PASS WS3.6 Piece 2b: Low 1, Info 1, Wallet.jsx declaration UI & Borrow/Lend/Loan Reg S gating verified.');
 
-      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 + WS3.6 PIECE 1 & 2 FORK TESTS PASSED.');
+      // ---------------------------------------------------------------------
+      // 3.14 M1 Fix: Safety / Exit Actions Never Blocked Under US IP, Revoked Wallet or API Outage
+      // ---------------------------------------------------------------------
+      console.log('\n=== WS3.6 Piece 2b M1 Fix: Manage existing positions & exit actions under US IP / revoked / API outage ===');
+
+      // 1) Restricted & Gate expose "Manage existing positions" links to /loans, /loan/:id, /borrow, /lend, /wallet
+      assert.ok(restrictedHtml.includes('Manage existing positions (/loans)'));
+      assert.ok(restrictedHtml.includes('/loans'));
+      assert.ok(restrictedHtml.includes('/loan/&lt;id&gt;') || restrictedHtml.includes('/loan/'));
+      assert.ok(gateHtml.includes('Manage existing positions (/loans)'));
+
+      // With restricted gate persisted, /markets stays behind Restricted while safety/exit routes bypass Restricted
+      const m1StorageMap = new Map<string, string>();
+      const origM1SessionStorage = (globalThis as Record<string, unknown>).sessionStorage;
+      (globalThis as Record<string, unknown>).sessionStorage = {
+        getItem: (k: string) => m1StorageMap.get(k) ?? null,
+        setItem: (k: string, v: string) => { m1StorageMap.set(k, String(v)); },
+        removeItem: (k: string) => { m1StorageMap.delete(k); },
+      };
+      try {
+        m1StorageMap.set(
+          'nostok-store-v1',
+          JSON.stringify({ v: 2, gate: 'restricted', orders: [], loans: [], listings: [], claims: [], dismissed: [], nextId: 4000 })
+        );
+        const blockedMarketsHtml = renderToStaticMarkup(
+          createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: ['/markets'] }, createElement(Frame)))
+        );
+        assert.ok(blockedMarketsHtml.includes('This interface is not available here.'));
+        assert.ok(blockedMarketsHtml.includes('Manage existing positions (/loans)'));
+
+        for (const exitRoute of ['/loans', '/loans/1', '/loan/1', '/borrow', '/lend', '/wallet']) {
+          const exitHtml = renderToStaticMarkup(
+            createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: [exitRoute] }, createElement(Frame)))
+          );
+          assert.ok(
+            !exitHtml.includes('This interface is not available here.'),
+            `${exitRoute} must remain reachable even when Restricted`
+          );
+          assert.ok(!exitHtml.includes('<h1>Verifying eligibility.</h1>'), `${exitRoute} must not hold behind GateChecking`);
+        }
+
+        const restrictedWithRouter = renderToStaticMarkup(
+          createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: ['/'] }, createElement(Restricted)))
+        );
+        assert.ok(restrictedWithRouter.includes('href="/loans"'));
+        assert.ok(restrictedWithRouter.includes('Open /loan/:id'));
+      } finally {
+        if (origM1SessionStorage === undefined) delete (globalThis as Record<string, unknown>).sessionStorage;
+        else (globalThis as Record<string, unknown>).sessionStorage = origM1SessionStorage;
+      }
+
+      // 2) Verify source separation: safety/exit handlers NEVER call ensureDeclarationVerifiedForTx(), new-risk handlers DO
+      const extractHandlerBody = (src: string, fnHeader: string) => {
+        const start = src.indexOf(fnHeader);
+        assert.ok(start >= 0, `Missing handler ${fnHeader}`);
+        const braceStart = src.indexOf('{', start);
+        let depth = 0;
+        for (let i = braceStart; i < src.length; i++) {
+          if (src[i] === '{') depth++;
+          else if (src[i] === '}') {
+            depth--;
+            if (depth === 0) return src.slice(start, i + 1);
+          }
+        }
+        return src.slice(start);
+      };
+      const loanPageSource = fs.readFileSync(path.join(REPO_ROOT, 'src', 'pages', 'Loan.jsx'), 'utf8');
+      assert.ok(!extractHandlerBody(loanPageSource, 'async function handleConfirmRepay(').includes('ensureDeclarationVerifiedForTx'));
+      assert.ok(!extractHandlerBody(loanPageSource, 'async function handleConfirmTopUp(').includes('ensureDeclarationVerifiedForTx'));
+      assert.ok(extractHandlerBody(loanPageSource, 'async function handleSignExtend(').includes('ensureDeclarationVerifiedForTx'));
+      assert.ok(extractHandlerBody(loanPageSource, 'async function handleConfirmExtend(').includes('ensureDeclarationVerifiedForTx'));
+
+      const borrowPageSource = fs.readFileSync(path.join(REPO_ROOT, 'src', 'pages', 'Borrow.jsx'), 'utf8');
+      for (const exitFn of [
+        'async function handleReduceCollateralAfterCancel(',
+        'async function handleCancelOrder(',
+        'async function handleCancelPastedJson(',
+        'async function handleBumpAllNonces(',
+      ]) {
+        assert.ok(!extractHandlerBody(borrowPageSource, exitFn).includes('ensureDeclarationVerifiedForTx'), `${exitFn} must NOT require Reg S declaration`);
+      }
+      for (const riskFn of [
+        'async function handleApproveCollateral(',
+        'async function handleSignBorrowOrder(',
+        'async function handleConfirmFillLendOffer(',
+      ]) {
+        assert.ok(extractHandlerBody(borrowPageSource, riskFn).includes('ensureDeclarationVerifiedForTx'), `${riskFn} MUST enforce Reg S declaration`);
+      }
+
+      const lendPageSource = fs.readFileSync(path.join(REPO_ROOT, 'src', 'pages', 'Lend.jsx'), 'utf8');
+      for (const exitFn of [
+        'async function handleReduceAllowanceAfterCancel(',
+        'async function handleCancelOffer(',
+        'async function handleCancelPastedJson(',
+        'async function handleBumpAllNonces(',
+      ]) {
+        assert.ok(!extractHandlerBody(lendPageSource, exitFn).includes('ensureDeclarationVerifiedForTx'), `${exitFn} must NOT require Reg S declaration`);
+      }
+      for (const riskFn of [
+        'async function handleApproveUsdc(',
+        'async function handleSignLendOffer(',
+        'async function handleConfirmFillBorrowOrder(',
+      ]) {
+        assert.ok(extractHandlerBody(lendPageSource, riskFn).includes('ensureDeclarationVerifiedForTx'), `${riskFn} MUST enforce Reg S declaration`);
+      }
+
+      // 3) Live fork setup: open an active loan + open BorrowOrder + open LendOffer on clean chain
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdaFeed,
+          abi: mockAggArtifact.abi,
+          functionName: 'setPrice',
+          args: [140_00000000n],
+        }),
+      });
+      const m1Store = new Map<string, string>();
+      const m1Storage = {
+        getItem: (k: string) => m1Store.get(k) ?? null,
+        setItem: (k: string, v: string) => { m1Store.set(k, String(v)); },
+        removeItem: (k: string) => { m1Store.delete(k); },
+      };
+
+      walletProvider.setAccount(KEYS.borrower);
+      const m1Quote = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '700000000',
+        termDays: 14,
+        aprBps: 800,
+        maxLtvBps: 6000,
+        borrower: ADDRESSES.borrower,
+      });
+      const m1FillBorrowOrd = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '700000000',
+        expectedQuote: m1Quote,
+        requireExpectedQuote: true,
+        maxRateBps: 800,
+        termDays: 14,
+        maxLtvBps: 6000,
+        minFillRaw: '700000000',
+        existingOpenCollateralRaw: 0n,
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: false,
+        storage: m1Storage,
+        provider: walletProvider,
+        cfg,
+      });
+      walletProvider.setAccount(KEYS.lender);
+      const m1OpenedLoan = await fillBorrowOrderAsLender({
+        address: ADDRESSES.lender,
+        order: m1FillBorrowOrd.order,
+        signature: m1FillBorrowOrd.signature,
+        fillUsdcRaw: '700000000',
+        existingOpenSumRaw: 0n,
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      const m1LoanId = m1OpenedLoan.loanId;
+      assert.ok(m1LoanId, 'M1 test loan must open cleanly');
+
+      // Also create an open BorrowOrder + open LendOffer to test cancelling, bumping nonce, and reducing allowances under restrictions
+      m1Store.clear();
+      walletProvider.setAccount(KEYS.borrower);
+      const m1OpenBorrowOrd = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '600000000',
+        expectedQuote: await fetchLoanQuote({
+          cfg,
+          asset: nvdac,
+          principalRaw: '600000000',
+          termDays: 14,
+          aprBps: 800,
+          maxLtvBps: 6000,
+          borrower: ADDRESSES.borrower,
+        }),
+        requireExpectedQuote: true,
+        maxRateBps: 800,
+        termDays: 14,
+        maxLtvBps: 6000,
+        minFillRaw: '600000000',
+        existingOpenCollateralRaw: 0n,
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: false,
+        storage: m1Storage,
+        provider: walletProvider,
+        cfg,
+      });
+
+      walletProvider.setAccount(KEYS.lender);
+      const m1OpenLendOffer = await prepareAndSignLendOffer({
+        address: ADDRESSES.lender,
+        principalRaw: '600000000',
+        allowedCollateral: nvdac,
+        expectedQuote: await fetchLoanQuote({
+          cfg,
+          asset: nvdac,
+          principalRaw: '600000000',
+          termDays: 14,
+          aprBps: 800,
+          maxLtvBps: 6000,
+        }),
+        requireExpectedQuote: true,
+        minRateBps: 800,
+        termDays: 14,
+        maxLtvBps: 6000,
+        minFillRaw: '600000000',
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: false,
+        storage: m1Storage,
+        provider: walletProvider,
+        cfg,
+      });
+
+      // Sign a valid borrower CH declaration at current state for testing blocked re-verify under US IP / revoked / API outage
+      walletProvider.setAccount(KEYS.borrower);
+      const borrowerValidDecl = await signEligibilityDeclaration({
+        address: ADDRESSES.borrower,
+        jurisdiction: 'CH',
+        ttlSeconds: 3600n,
+        submitToApi: true,
+        provider: walletProvider,
+        cfg,
+      });
+      const borrowerDeclRecord = {
+        account: borrowerValidDecl.declarationJson.account,
+        chainId: BASE_CHAIN_ID,
+        gateAddress: deployed.eligibilityGate,
+        declarationJson: borrowerValidDecl.declarationJson,
+        signature: borrowerValidDecl.signature,
+        digest: borrowerValidDecl.digest,
+        serverVerification: null,
+      };
+
+      // Mode A: US IP (GEO_RESTRICTED) -> cannot sign/verify/post-order/extend, BUT CAN topUp, partialRepay, cancel & reduce allowance!
+      const usGeoApiCfg = loadApiConfig({
+        rpcUrl: LOCAL_RPC_URL,
+        isFork: true,
+        forkChainId: BASE_CHAIN_ID,
+        databaseUrl: 'memory://',
+        corsOrigins: ['https://app.nostok.xyz'],
+        rateLimitMax: 2000,
+        rateLimitWindowMs: 60_000,
+        trustProxyHops: 1,
+        geoCountryHeader: 'cf-ipcountry',
+        geoRequireHeader: true,
+        sanctionedAddresses: [],
+        maxBodyBytes: 4096,
+        maxPageLimit: 100,
+        loanCore: deployed.loanCore,
+        orderSettlement: deployed.orderSettlement,
+        liquidationAuction: deployed.liquidationAuction,
+        positionNft: deployed.positionNFT,
+        collateralEscrow: deployed.collateralEscrow,
+        assetRegistry: deployed.assetRegistry,
+        oracleRouter: deployed.oracleRouter,
+        feeCollector: deployed.feeCollector,
+        eligibilityGate: deployed.eligibilityGate,
+        usdc: BASE_USDC,
+      });
+      const usGeoApiServer = createApiServer(await createApiContext(usGeoApiCfg, wrapApiReadOnly(idxCtx.db)));
+      await new Promise<void>((r) => usGeoApiServer.listen(0, '127.0.0.1', r));
+      const usGeoApiUrl = `http://127.0.0.1:${(usGeoApiServer.address() as net.AddressInfo).port}`;
+      const usCfg = { ...cfg, apiUrl: usGeoApiUrl };
+      const usFetch: typeof fetch = (input, init) =>
+        fetch(input, { ...init, headers: { ...(init?.headers ?? {}), 'cf-ipcountry': 'US' } });
+      try {
+        await assert.rejects(
+          () =>
+            signEligibilityDeclaration({
+              address: ADDRESSES.borrower,
+              provider: walletProvider,
+              cfg: usCfg,
+              fetchImpl: usFetch,
+            }),
+          /GEO_RESTRICTED|restricted/i
+        );
+        await assert.rejects(
+          () =>
+            verifyStoredDeclarationOnServer({
+              declaration: borrowerDeclRecord,
+              address: ADDRESSES.borrower,
+              cfg: usCfg,
+              submitImpl: (args: any) => submitEligibilityDeclaration({ ...args, fetchImpl: usFetch }),
+            }),
+          /GEO_RESTRICTED|restricted/i
+        );
+        const usPostOrder = await usFetch(`${usGeoApiUrl}/orders`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        });
+        assert.equal(usPostOrder.status, 403);
+        assert.equal(((await usPostOrder.json()) as { error: { code: string } }).error.code, 'GEO_RESTRICTED');
+
+        // Safety actions from US IP MUST still succeed
+        walletProvider.setAccount(KEYS.borrower);
+        const usTopUpPrev = await verifyAndPreviewLoanTopUp({
+          loanId: m1LoanId,
+          additionalCollateralRaw: '100000000000000000', // 0.1 NVDAc
+          payerAddress: ADDRESSES.borrower,
+          storage: m1Storage,
+          cfg: usCfg,
+        });
+        const usTopUpRes = await executeLoanTopUp({
+          address: ADDRESSES.borrower,
+          loanId: m1LoanId,
+          additionalCollateralRaw: '100000000000000000',
+          expectedPreview: usTopUpPrev,
+          autoApprove: true,
+          storage: m1Storage,
+          provider: walletProvider,
+          cfg: usCfg,
+        });
+        assert.ok(usTopUpRes.txHash, 'US IP borrower must still be able to top up collateral');
+
+        const usPartialPrev = await verifyAndPreviewLoanRepay({
+          loanId: m1LoanId,
+          payerAddress: ADDRESSES.borrower,
+          principalRepayRaw: '100000000', // $100 partial repay
+          storage: m1Storage,
+          cfg: usCfg,
+        });
+        const usPartialRes = await executeLoanRepay({
+          address: ADDRESSES.borrower,
+          loanId: m1LoanId,
+          principalRepayRaw: '100000000',
+          expectedPreview: usPartialPrev,
+          autoApprove: true,
+          storage: m1Storage,
+          provider: walletProvider,
+          cfg: usCfg,
+        });
+        assert.equal(usPartialRes.isPartial, true);
+
+        const usCancelBorrow = await cancelSignedBorrowOrder({
+          address: ADDRESSES.borrower,
+          order: m1OpenBorrowOrd.order,
+          storage: m1Storage,
+          provider: walletProvider,
+          cfg: usCfg,
+        });
+        assert.ok(usCancelBorrow.txHash, 'US IP maker must still be able to cancel BorrowOrder');
+        const usReduceColl = await setCollateralAllowanceForBorrow({
+          address: ADDRESSES.borrower,
+          collateralToken: nvdac,
+          targetAllowanceRaw: '0',
+          provider: walletProvider,
+          cfg: usCfg,
+        });
+        assert.equal(usReduceColl.allowanceRaw, '0');
+      } finally {
+        await new Promise<void>((r) => usGeoApiServer.close(() => r()));
+      }
+
+      // Mode B: Revoked wallet -> cannot sign/verify declaration or fill new orders, BUT CAN topUp, partialRepay, bumpNonce, reduce allowance!
+      await publicClient.waitForTransactionReceipt({
+        hash: await ownerClient.writeContract({
+          address: deployed.eligibilityGate,
+          abi: parseAbi(['function revokeUser(address account, bool revoked)']),
+          functionName: 'revokeUser',
+          args: [ADDRESSES.borrower, true],
+        }),
+      });
+      try {
+        await assert.rejects(
+          () =>
+            verifyStoredDeclarationOnServer({
+              declaration: borrowerDeclRecord,
+              address: ADDRESSES.borrower,
+              cfg,
+            }),
+          /WALLET_REVOKED|revoked/i
+        );
+        const revScreen = await fetchEligibilityScreening({ account: ADDRESSES.borrower, cfg });
+        assert.equal(isHardRestrictionScreening(revScreen, null), true);
+
+        walletProvider.setAccount(KEYS.borrower);
+        const revTopUpPrev = await verifyAndPreviewLoanTopUp({
+          loanId: m1LoanId,
+          additionalCollateralRaw: '100000000000000000',
+          payerAddress: ADDRESSES.borrower,
+          storage: m1Storage,
+          cfg,
+        });
+        const revTopUpRes = await executeLoanTopUp({
+          address: ADDRESSES.borrower,
+          loanId: m1LoanId,
+          additionalCollateralRaw: '100000000000000000',
+          expectedPreview: revTopUpPrev,
+          autoApprove: true,
+          storage: m1Storage,
+          provider: walletProvider,
+          cfg,
+        });
+        assert.ok(revTopUpRes.txHash, 'Revoked borrower must still be able to topUp collateral');
+
+        const revPartialPrev = await verifyAndPreviewLoanRepay({
+          loanId: m1LoanId,
+          payerAddress: ADDRESSES.borrower,
+          principalRepayRaw: '50000000',
+          storage: m1Storage,
+          cfg,
+        });
+        const revPartialRes = await executeLoanRepay({
+          address: ADDRESSES.borrower,
+          loanId: m1LoanId,
+          principalRepayRaw: '50000000',
+          expectedPreview: revPartialPrev,
+          autoApprove: true,
+          storage: m1Storage,
+          provider: walletProvider,
+          cfg,
+        });
+        assert.equal(revPartialRes.isPartial, true);
+
+        const revBump = await bumpMakerNonceOnChain({
+          address: ADDRESSES.borrower,
+          storage: m1Storage,
+          provider: walletProvider,
+          cfg,
+        });
+        assert.ok(BigInt(revBump.newNonce) > 0n);
+        const revReduceColl = await setCollateralAllowanceForBorrow({
+          address: ADDRESSES.borrower,
+          collateralToken: nvdac,
+          targetAllowanceRaw: '0',
+          provider: walletProvider,
+          cfg,
+        });
+        assert.equal(revReduceColl.allowanceRaw, '0');
+      } finally {
+        await publicClient.waitForTransactionReceipt({
+          hash: await ownerClient.writeContract({
+            address: deployed.eligibilityGate,
+            abi: parseAbi(['function revokeUser(address account, bool revoked)']),
+            functionName: 'revokeUser',
+            args: [ADDRESSES.borrower, false],
+          }),
+        });
+      }
+
+      // Mode C: API down (dead port) -> cannot screen/quote/verify/sign-for-order/extend, BUT CAN topUp, full repay, cancel, bumpNonce, reduce allowance!
+      const deadApiCfg = { ...cfg, apiUrl: 'http://127.0.0.1:59999' };
+      await assert.rejects(
+        () => fetchEligibilityScreening({ account: ADDRESSES.borrower, cfg: deadApiCfg }),
+        /fetch|ECONNREFUSED|failed/i
+      );
+      await assert.rejects(
+        () =>
+          verifyStoredDeclarationOnServer({
+            declaration: borrowerDeclRecord,
+            address: ADDRESSES.borrower,
+            cfg: deadApiCfg,
+          }),
+        /fetch|ECONNREFUSED|failed/i
+      );
+      await assert.rejects(
+        () =>
+          fetchLoanQuote({
+            cfg: deadApiCfg,
+            asset: nvdac,
+            principalRaw: '500000000',
+            termDays: 14,
+            aprBps: 800,
+            maxLtvBps: 6000,
+            borrower: ADDRESSES.borrower,
+          }),
+        /fetch|ECONNREFUSED|failed/i
+      );
+
+      // Lender cancel + bumpNonce + reduce USDC allowance with dead API
+      walletProvider.setAccount(KEYS.lender);
+      const deadApiCancelLend = await cancelSignedLendOffer({
+        address: ADDRESSES.lender,
+        offer: m1OpenLendOffer.offer,
+        storage: m1Storage,
+        provider: walletProvider,
+        cfg: deadApiCfg,
+      });
+      assert.ok(deadApiCancelLend.txHash, 'Lender cancel must succeed during API outage');
+      const deadApiBumpLend = await bumpMakerNonceOnChain({
+        address: ADDRESSES.lender,
+        storage: m1Storage,
+        provider: walletProvider,
+        cfg: deadApiCfg,
+      });
+      assert.ok(BigInt(deadApiBumpLend.newNonce) > 0n);
+      const deadApiReduceUsdc = await setUsdcAllowanceForLend({
+        address: ADDRESSES.lender,
+        targetAllowanceRaw: '0',
+        provider: walletProvider,
+        cfg: deadApiCfg,
+      });
+      assert.equal(deadApiReduceUsdc.allowanceRaw, '0');
+
+      // Borrower topUp + full repay with dead API
+      walletProvider.setAccount(KEYS.borrower);
+      const deadApiTopUpPrev = await verifyAndPreviewLoanTopUp({
+        loanId: m1LoanId,
+        additionalCollateralRaw: '100000000000000000',
+        payerAddress: ADDRESSES.borrower,
+        storage: m1Storage,
+        cfg: deadApiCfg,
+      });
+      assert.ok(deadApiTopUpPrev.openOrdersWarning.includes('api/ open-orders query unavailable'));
+      const deadApiTopUpRes = await executeLoanTopUp({
+        address: ADDRESSES.borrower,
+        loanId: m1LoanId,
+        additionalCollateralRaw: '100000000000000000',
+        expectedPreview: deadApiTopUpPrev,
+        autoApprove: true,
+        storage: m1Storage,
+        provider: walletProvider,
+        cfg: deadApiCfg,
+      });
+      assert.ok(deadApiTopUpRes.txHash, 'Borrower topUp must succeed during API outage');
+
+      const deadApiRepayPrev = await verifyAndPreviewLoanRepay({
+        loanId: m1LoanId,
+        payerAddress: ADDRESSES.borrower,
+        storage: m1Storage,
+        cfg: deadApiCfg,
+      });
+      assert.ok(deadApiRepayPrev.openOrdersWarning.includes('api/ open-orders query unavailable'));
+      const deadApiRepayRes = await executeLoanRepay({
+        address: ADDRESSES.borrower,
+        loanId: m1LoanId,
+        expectedPreview: deadApiRepayPrev,
+        autoApprove: true,
+        storage: m1Storage,
+        provider: walletProvider,
+        cfg: deadApiCfg,
+      });
+      assert.ok(deadApiRepayRes.txHash, 'Borrower full repay must succeed during API outage');
+      const m1SettledState = await readLoanOnChainState(m1LoanId, { cfg: deadApiCfg });
+      assert.equal(m1SettledState.isSettled, true);
+
+      console.log('PASS WS3.6 Piece 2b M1 Fix: Safety/exit paths open & new-risk actions blocked across US IP, revoked wallet & API outage.');
+
+      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 + WS3.6 PIECE 1 & 2 (WITH M1 FIX) FORK TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
       await new Promise<void>((r) => apiServer.close(() => r()));

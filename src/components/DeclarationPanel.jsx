@@ -87,9 +87,13 @@ export function ComplianceTxGateBanner({ actionLabel = 'approve, sign, or execut
   }
 
   const activeError = localError || web3.declarationError || screening?.error || '';
-  const statusReason = web3.verifyingDeclaration
-    ? 'Re-verifying stored EIP-712 declaration via api/ POST /eligibility/verify…'
-    : web3.eligibilityDeclarationStatus?.reason || 'Sign an EIP-712 Regulation S declaration for this wallet.';
+  const statusReason = web3.hardRestricted
+    ? 'Access to new-risk actions is restricted for this IP/wallet, while safety & exit actions (repay, partial repay, collateral top-up, cancelling orders, bumping maker nonce, and reducing allowances) remain open.'
+    : screening?.error
+      ? `Compliance API unreachable (${screening.error}). New-risk actions are paused; safety & exit actions remain open directly on Base.`
+      : web3.verifyingDeclaration
+        ? 'Re-verifying stored EIP-712 declaration via api/ POST /eligibility/verify…'
+        : web3.eligibilityDeclarationStatus?.reason || 'Sign an EIP-712 Regulation S declaration for this wallet.';
 
   return (
     <div className="err block" role="region" aria-label="Regulation S compliance gate">
@@ -99,14 +103,16 @@ export function ComplianceTxGateBanner({ actionLabel = 'approve, sign, or execut
       <p className="hint" style={{ marginTop: 6 }}>
         <strong>IP screening:</strong>{' '}
         {geo?.verified
-          ? `Edge verified ${geo.country_code}`
+          ? `Edge verified ${geo.country_code}${geo.allowed ? '' : ` (${geo.reason ?? 'blocked'})`}`
           : geo?.status === 'disabled'
             ? 'Server geoblock override enabled'
             : geo?.status === 'local_unverified'
               ? 'Local fork (self-declared jurisdiction permitted)'
-              : screening?.loading
-                ? 'Checking api/ GET /eligibility…'
-                : 'Awaiting screening'}
+              : screening?.error
+                ? 'API unreachable (exit actions stay open)'
+                : screening?.loading
+                  ? 'Checking api/ GET /eligibility…'
+                  : 'Awaiting screening'}
       </p>
       <div className="block" style={{ marginTop: 10 }}>
         <Field

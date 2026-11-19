@@ -4725,15 +4725,38 @@ export async function verifyAndPreviewLoanRepay({
     hasPartial ? 'partially repay' : 'repay'
   );
 
-  const openLendSum = payer
-    ? await resolveOpenLendOffersSumRaw({
+  let openLendSum = 0n;
+  let openOrdersWarning = '';
+  if (payer) {
+    try {
+      openLendSum = await resolveOpenLendOffersSumRaw({
         lenderAddress: payer,
         existingOpenSumRaw,
         storage,
         cfg,
         publicClient,
-      })
-    : parseStrictRawBigInt(existingOpenSumRaw ?? 0n, 'existingOpenSumRaw', { min: 0n });
+      });
+    } catch (openErr) {
+      if (
+        existingOpenSumRaw !== null ||
+        !cfg?.apiUrl ||
+        /truncated|Cannot verify open LendOffer/i.test(String(openErr?.message ?? openErr))
+      ) {
+        throw openErr;
+      }
+      // M1 safety: repay / partialRepay MUST NOT block during an api/ outage; fall back to local persisted + RPC-checked orders.
+      openOrdersWarning = `api/ open-orders query unavailable (${formatWeb3Error(openErr)}); using local open LendOffers only.`;
+      openLendSum = await resolveOpenLendOffersSumRaw({
+        lenderAddress: payer,
+        existingOpenSumRaw: null,
+        storage,
+        cfg: { ...cfg, apiUrl: '' },
+        publicClient,
+      });
+    }
+  } else {
+    openLendSum = parseStrictRawBigInt(existingOpenSumRaw ?? 0n, 'existingOpenSumRaw', { min: 0n });
+  }
 
   const exact = hasPartial
     ? computeExactPartialRepayAmounts(loanState, principalRepayRaw, {
@@ -4792,6 +4815,7 @@ export async function verifyAndPreviewLoanRepay({
     isPartial: hasPartial,
     loanId: loanState.loanId,
     loanState,
+    openOrdersWarning,
     payerAddress: payer,
     payerIsBorrower: payerRole.payerIsBorrower,
     payerIsHolder: payerRole.payerIsHolder,
@@ -5031,16 +5055,40 @@ export async function verifyAndPreviewLoanTopUp({
   }
   const payerRole = classifyLoanPayerRole(loanState, payer, 'top up collateral on');
 
-  const openCollateralSum = payer
-    ? await resolveOpenBorrowOrdersCollateralSumRaw({
+  let openCollateralSum = 0n;
+  let openOrdersWarning = '';
+  if (payer) {
+    try {
+      openCollateralSum = await resolveOpenBorrowOrdersCollateralSumRaw({
         borrowerAddress: payer,
         collateralToken: loanState.collateralToken,
         existingOpenCollateralRaw,
         storage,
         cfg,
         publicClient,
-      })
-    : parseStrictRawBigInt(existingOpenCollateralRaw ?? 0n, 'existingOpenCollateralRaw', { min: 0n });
+      });
+    } catch (openErr) {
+      if (
+        existingOpenCollateralRaw !== null ||
+        !cfg?.apiUrl ||
+        /truncated|Cannot verify open BorrowOrder/i.test(String(openErr?.message ?? openErr))
+      ) {
+        throw openErr;
+      }
+      // M1 safety: topUp MUST NOT block during an api/ outage; fall back to local persisted + RPC-checked orders.
+      openOrdersWarning = `api/ open-orders query unavailable (${formatWeb3Error(openErr)}); using local open BorrowOrders only.`;
+      openCollateralSum = await resolveOpenBorrowOrdersCollateralSumRaw({
+        borrowerAddress: payer,
+        collateralToken: loanState.collateralToken,
+        existingOpenCollateralRaw: null,
+        storage,
+        cfg: { ...cfg, apiUrl: '' },
+        publicClient,
+      });
+    }
+  } else {
+    openCollateralSum = parseStrictRawBigInt(existingOpenCollateralRaw ?? 0n, 'existingOpenCollateralRaw', { min: 0n });
+  }
 
   const exact = computeExactTopUpAmounts(loanState, additionalCollateralRaw, {
     existingOpenCollateralRaw: openCollateralSum,
@@ -5097,6 +5145,7 @@ export async function verifyAndPreviewLoanTopUp({
     kind: 'top_up',
     loanId: loanState.loanId,
     loanState,
+    openOrdersWarning,
     payerAddress: payer,
     payerIsBorrower: payerRole.payerIsBorrower,
     payerIsHolder: payerRole.payerIsHolder,

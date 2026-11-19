@@ -294,7 +294,6 @@ export function Loan() {
     setRepayError('');
     setRepayBusy((p) => ({ ...p, submit: true }));
     try {
-      await web3.ensureDeclarationVerifiedForTx();
       const res = await executeLoanRepay({
         address: web3.address,
         loanId: repayPreview.loanId,
@@ -363,7 +362,6 @@ export function Loan() {
     setTopUpError('');
     setTopUpBusy((p) => ({ ...p, submit: true }));
     try {
-      await web3.ensureDeclarationVerifiedForTx();
       const res = await executeLoanTopUp({
         address: web3.address,
         loanId: topUpPreview.loanId,
@@ -559,7 +557,7 @@ export function Loan() {
         </div>
       ) : null}
 
-      <ComplianceTxGateBanner actionLabel="repay, top up collateral, or co-sign/submit extensions" />
+      <ComplianceTxGateBanner actionLabel="co-sign or submit loan extensions (repay, partial repay, and collateral top-up remain open)" />
 
       {loanState ? (
         <>
@@ -814,7 +812,6 @@ export function Loan() {
                       disabled={
                         repayBusy.submit ||
                         !walletOnBase ||
-                        !web3?.eligibilityDeclarationValid ||
                         walletIsHolderNotBorrower ||
                         (repayPreview.isThirdPartyPayer && !confirmThirdPartyRepay)
                       }
@@ -929,7 +926,6 @@ export function Loan() {
                       disabled={
                         topUpBusy.submit ||
                         !walletOnBase ||
-                        !web3?.eligibilityDeclarationValid ||
                         walletIsHolderNotBorrower ||
                         (topUpPreview.isThirdPartyPayer && !confirmThirdPartyTopUp)
                       }

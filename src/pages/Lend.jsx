@@ -771,7 +771,6 @@ export function Lend() {
     txBusyRef.current = true;
     setTxBusy('reduce-allowance');
     try {
-      await web3.ensureDeclarationVerifiedForTx();
       const targetRaw = allowanceReductionState.targetAllowanceRaw;
       const res = await setUsdcAllowanceForLend({
         address: web3.address,
@@ -801,7 +800,6 @@ export function Lend() {
     txBusyRef.current = true;
     setTxBusy('cancel');
     try {
-      await web3.ensureDeclarationVerifiedForTx();
       const res = await cancelSignedLendOffer({
         address: web3.address,
         offer: offerObj,
@@ -837,7 +835,6 @@ export function Lend() {
     txBusyRef.current = true;
     setTxBusy('cancel-paste');
     try {
-      await web3.ensureDeclarationVerifiedForTx();
       const res = await cancelSignedLendOffer({
         address: web3.address,
         offer: parsed.order,
@@ -865,7 +862,6 @@ export function Lend() {
     txBusyRef.current = true;
     setTxBusy('bump-nonce');
     try {
-      await web3.ensureDeclarationVerifiedForTx();
       const res = await bumpMakerNonceOnChain({
         address: web3.address,
         cfg: web3.config,
@@ -1022,7 +1018,7 @@ export function Lend() {
         </div>
       ) : null}
 
-      <ComplianceTxGateBanner actionLabel="approve USDC, publish LendOffers, fill BorrowOrders, or cancel offers" />
+      <ComplianceTxGateBanner actionLabel="approve USDC, publish LendOffers, or fill BorrowOrders (cancelling offers, bumping maker nonce, and reducing USDC allowance remain open)" />
 
       <form className="form-layout" onSubmit={handleSignLendOffer}>
         <div className="fields">
@@ -1326,7 +1322,7 @@ export function Lend() {
                 className="btn secondary"
                 type="button"
                 onClick={() => void handleReduceAllowanceAfterCancel()}
-                disabled={!web3?.eligibilityDeclarationValid || Boolean(txBusy) || Boolean(allowanceReductionState.blockedByUnknown)}
+                disabled={Boolean(txBusy) || Boolean(allowanceReductionState.blockedByUnknown)}
               >
                 {allowanceReductionState.blockedByUnknown
                   ? 'Reduction blocked (unknown offer status)'
@@ -1350,7 +1346,7 @@ export function Lend() {
             className="btn secondary"
             type="button"
             onClick={() => void handleBumpAllNonces()}
-            disabled={!web3?.connected || web3?.wrongNetwork || !web3?.eligibilityDeclarationValid || Boolean(txBusy)}
+            disabled={!web3?.connected || web3?.wrongNetwork || Boolean(txBusy)}
           >
             {txBusy === 'bump-nonce' ? 'Bumping maker nonce…' : 'Bump maker nonce (invalidate all open orders)'}
           </button>
@@ -1390,7 +1386,7 @@ export function Lend() {
                         className="btn secondary"
                         type="button"
                         onClick={() => void handleCancelOffer(item.offerJson)}
-                        disabled={!web3?.eligibilityDeclarationValid || Boolean(txBusy)}
+                        disabled={Boolean(txBusy)}
                       >
                         Cancel on-chain
                       </button>
@@ -1445,7 +1441,7 @@ export function Lend() {
             <button
               className="btn secondary"
               type="submit"
-              disabled={!web3?.connected || web3?.wrongNetwork || !web3?.eligibilityDeclarationValid || Boolean(txBusy) || !pasteCancelJson.trim()}
+              disabled={!web3?.connected || web3?.wrongNetwork || Boolean(txBusy) || !pasteCancelJson.trim()}
             >
               {txBusy === 'cancel-paste' ? 'Cancelling offer…' : 'Cancel pasted LendOffer'}
             </button>

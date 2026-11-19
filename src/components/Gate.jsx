@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { Link, useInRouterContext, useNavigate } from 'react-router-dom';
 import {
   ELIGIBILITY_DECLARATION_STATEMENT,
 } from '../lib/contracts.js';
@@ -6,6 +7,87 @@ import { formatWeb3Error, shortAddress } from '../lib/web3.js';
 import { useStore } from '../store.jsx';
 import { resolveJurisdictionSelection } from './DeclarationPanel.jsx';
 import { Choice, Field } from './ui.jsx';
+
+function SafeRouteLink({ to, className, children }) {
+  const inRouter = useInRouterContext();
+  if (inRouter) {
+    return (
+      <Link className={className} to={to}>
+        {children}
+      </Link>
+    );
+  }
+  return (
+    <a className={className} href={to}>
+      {children}
+    </a>
+  );
+}
+
+function LoanJumpForm() {
+  const navigate = useNavigate();
+  const [loanIdInput, setLoanIdInput] = useState('');
+  const cleanId = loanIdInput.trim();
+  const isValid = /^[1-9]\d*$/.test(cleanId);
+
+  return (
+    <form
+      className="actions"
+      style={{ marginTop: 10, alignItems: 'flex-end' }}
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (isValid) navigate(`/loan/${cleanId}`);
+      }}
+    >
+      <div className="field" style={{ marginBottom: 0, maxWidth: 220 }}>
+        <label htmlFor="restricted-loan-id">Direct Loan ID (Base RPC)</label>
+        <input
+          id="restricted-loan-id"
+          type="text"
+          inputMode="numeric"
+          placeholder="e.g. 1"
+          value={loanIdInput}
+          onChange={(e) => setLoanIdInput(e.target.value)}
+        />
+      </div>
+      <button className="btn secondary" type="submit" disabled={!isValid}>
+        Open /loan/:id
+      </button>
+    </form>
+  );
+}
+
+function ManageExistingPositionsPanel() {
+  const inRouter = useInRouterContext();
+  return (
+    <section className="note block" aria-label="Manage existing positions">
+      <p className="hint">
+        <strong>Manage existing positions &amp; cancel open orders:</strong> Repay, partial-repay, collateral top-up, cancelling signed orders, bumping maker nonce, and reducing allowances never require a Regulation S declaration and remain available regardless of IP region, gate revocation, or compliance API downtime.
+      </p>
+      <div className="actions" style={{ marginTop: 10 }}>
+        <SafeRouteLink className="btn secondary" to="/loans">
+          Manage existing positions (/loans)
+        </SafeRouteLink>
+        <SafeRouteLink className="btn secondary" to="/borrow">
+          Cancel BorrowOrders (/borrow)
+        </SafeRouteLink>
+        <SafeRouteLink className="btn secondary" to="/lend">
+          Cancel LendOffers (/lend)
+        </SafeRouteLink>
+        <SafeRouteLink className="btn secondary" to="/wallet">
+          Wallet
+        </SafeRouteLink>
+      </div>
+      {inRouter ? (
+        <LoanJumpForm />
+      ) : (
+        <p className="hint" style={{ marginTop: 8 }}>
+          Open any loan directly at <code>/loan/&lt;id&gt;</code> or <code>/loans/&lt;id&gt;</code>.
+        </p>
+      )}
+    </section>
+  );
+}
 
 const CHECKS = [
   ['person', 'I am an eligible non-US person, and I am not in a sanctioned or restricted jurisdiction.'],
@@ -285,6 +367,7 @@ export function Gate() {
           ) : null}
         </div>
       </form>
+      <ManageExistingPositionsPanel />
     </main>
   );
 }
@@ -349,6 +432,7 @@ export function Restricted() {
           {screening?.loading ? 'Re-checking…' : 'Re-check IP & wallet eligibility'}
         </button>
       </div>
+      <ManageExistingPositionsPanel />
     </main>
   );
 }
