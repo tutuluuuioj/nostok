@@ -1659,6 +1659,62 @@ function savePersistedOrderRecord(storageKey, record, storage = null) {
   return nextList;
 }
 
+function persistedEntryIdentity(entry) {
+  if (entry === null || entry === undefined || typeof entry !== 'object') {
+    return JSON.stringify(entry ?? null);
+  }
+  const ord = entry.orderJson ?? entry.order ?? null;
+  const off = entry.offerJson ?? entry.offer ?? null;
+  return JSON.stringify({
+    orderHash: entry.orderHash ?? null,
+    signature: entry.signature ?? null,
+    orderJson: ord,
+    offerJson: off,
+    updatedAt: entry.updatedAt ?? null,
+    savedAt: entry.savedAt ?? null,
+  });
+}
+
+export function classifyPersistedOrderRemoval(item, kind = 'borrow') {
+  if (!item || typeof item !== 'object') {
+    return { showRemove: true, isCorrupt: true, isFinal: false, requiresConfirm: false };
+  }
+  const ord = kind === 'lend' ? item.offerJson ?? item.offer : item.orderJson ?? item.order;
+  const maker = kind === 'lend' ? ord?.lender : ord?.borrower;
+  const primaryAmount = kind === 'lend' ? ord?.usdcAmount : ord?.collateralAmount;
+  const hasValidHash = /^0x[0-9a-fA-F]{64}$/.test(String(item.orderHash ?? '').trim());
+  const hasValidAmounts =
+    /^\d+$/.test(String(primaryAmount ?? '')) &&
+    BigInt(primaryAmount) > 0n &&
+    (kind === 'lend' || (/^\d+$/.test(String(ord?.minUsdc ?? '')) && BigInt(ord.minUsdc) > 0n));
+  const hasValidMaker = typeof maker === 'string' && isAddress(maker);
+  const hasValidToken =
+    kind === 'lend'
+      ? !ord?.allowedCollateral ||
+        (typeof ord.allowedCollateral === 'string' && isAddress(ord.allowedCollateral))
+      : typeof ord?.collateralToken === 'string' && isAddress(ord.collateralToken);
+  const structurallyCorrupt =
+    !ord ||
+    typeof ord !== 'object' ||
+    !hasValidHash ||
+    !hasValidMaker ||
+    !hasValidToken ||
+    !hasValidAmounts;
+
+  const st = item.onchainStatus ?? (item.cancelledTxHash ? 'cancelled' : 'saved');
+  const isFinal = st !== 'saved' && !isNonFinalOrderStatus(st);
+  if (isFinal) {
+    return { showRemove: true, isCorrupt: structurallyCorrupt, isFinal: true, requiresConfirm: false };
+  }
+  if (structurallyCorrupt) {
+    return { showRemove: true, isCorrupt: true, isFinal: false, requiresConfirm: false };
+  }
+  if (st === 'unknown') {
+    return { showRemove: true, isCorrupt: false, isFinal: false, requiresConfirm: true };
+  }
+  return { showRemove: false, isCorrupt: false, isFinal: false, requiresConfirm: false };
+}
+
 function removePersistedOrderRecord(storageKey, match, storage = null) {
   const store = resolveStorage(storage);
   const existing = store ? loadPersistedOrderList(storageKey, store) : [];
@@ -1668,17 +1724,57 @@ function removePersistedOrderRecord(storageKey, match, storage = null) {
       : typeof match?.orderHash === 'string' && match.orderHash.trim()
         ? match.orderHash.trim().toLowerCase()
         : null;
-  const targetIndex =
-    typeof match === 'number'
-      ? match
-      : typeof match?.index === 'number'
-        ? match.index
-        : null;
-  const nextList = existing.filter((item, idx) => {
-    if (targetIndex !== null && idx === targetIndex) return false;
-    if (targetHash && String(item?.orderHash ?? '').toLowerCase() === targetHash) return false;
-    return true;
-  });
+
+  let nextList;
+  if (targetHash) {
+    // Remove strictly by orderHash so prepending new records in another tab cannot shift indices onto the wrong entry.
+    nextList = existing.filter(
+      (item) => String(item?.orderHash ?? '').trim().toLowerCase() !== targetHash
+    );
+  } else {
+    const targetIndex =
+      typeof match === 'number'
+        ? match
+        : typeof match?.index === 'number'
+          ? match.index
+          : null;
+    const expectedEntry =
+      match && typeof match === 'object' && 'expectedEntry' in match
+        ? match.expectedEntry
+        : undefined;
+    const expectedKey =
+      expectedEntry !== undefined ? persistedEntryIdentity(expectedEntry) : null;
+
+    let removeIdx = -1;
+    if (expectedKey !== null) {
+      if (
+        targetIndex !== null &&
+        targetIndex >= 0 &&
+        targetIndex < existing.length &&
+        !String(existing[targetIndex]?.orderHash ?? '').trim() &&
+        persistedEntryIdentity(existing[targetIndex]) === expectedKey
+      ) {
+        removeIdx = targetIndex;
+      } else {
+        removeIdx = existing.findIndex(
+          (item) =>
+            !String(item?.orderHash ?? '').trim() &&
+            persistedEntryIdentity(item) === expectedKey
+        );
+      }
+    } else if (
+      targetIndex !== null &&
+      targetIndex >= 0 &&
+      targetIndex < existing.length &&
+      !String(existing[targetIndex]?.orderHash ?? '').trim()
+    ) {
+      removeIdx = targetIndex;
+    }
+
+    nextList =
+      removeIdx >= 0 ? existing.filter((_, idx) => idx !== removeIdx) : existing;
+  }
+
   if (store) {
     try {
       store.setItem(storageKey, JSON.stringify(nextList));
@@ -2407,7 +2503,7 @@ export async function resolveOpenBorrowOrdersCollateralSumRaw({
 
   if (cfg?.apiUrl) {
     const relayRes = await fetchPaginatedApiRows(
-      `${cfg.apiUrl}/orders?order_type=borrow&maker=${targetChecksum}&asset=${tokenChecksum}&include_inactive=true`,
+      `${cfg.apiUrl}/orders?order_type=borrow&maker=${targetChecksum}&asset=${tokenChecksum}&include_inactive=true&exclude_final=true`,
       { cfg }
     );
     if (relayRes.truncated) {
@@ -3088,7 +3184,7 @@ export async function resolveOpenLendOffersSumRaw({
 
   if (cfg?.apiUrl) {
     const relayRes = await fetchPaginatedApiRows(
-      `${cfg.apiUrl}/orders?order_type=lend&maker=${targetChecksum}&include_inactive=true`,
+      `${cfg.apiUrl}/orders?order_type=lend&maker=${targetChecksum}&include_inactive=true&exclude_final=true`,
       { cfg }
     );
     if (relayRes.truncated) {

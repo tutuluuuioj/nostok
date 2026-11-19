@@ -15,6 +15,7 @@ import {
   approveUsdcForLend,
   bumpMakerNonceOnChain,
   cancelSignedLendOffer,
+  classifyPersistedOrderRemoval,
   fillBorrowOrderAsLender,
   formatTokenUnitsDisplay,
   formatWeb3Error,
@@ -1270,53 +1271,73 @@ export function Lend() {
           <p className="hint">No locally persisted signed LendOffers yet.</p>
         ) : (
           <div className="fields">
-            {persistedOffers.map((item, idx) => (
-              <div className="note" key={item?.orderHash || `corrupt-${idx}`} style={{ marginBottom: 8 }}>
-                <div>
-                  <strong>LendOffer {item?.orderHash ? shortAddress(item.orderHash) : '(corrupt entry)'}</strong> · Status:{' '}
-                  <code>{item?.onchainStatus ?? 'open'}</code> · Offered:{' '}
-                  <code>
-                    ${safeFormatUnits(item?.offerJson?.usdcAmount ?? 0n, USDC_DECIMALS, 2)}
-                  </code>{' '}
-                  · Remaining:{' '}
-                  <code>
-                    ${safeFormatUnits(item?.remainingRaw ?? item?.offerJson?.usdcAmount ?? 0n, USDC_DECIMALS, 2)}
-                  </code>
+            {persistedOffers.map((item, idx) => {
+              const removalInfo = classifyPersistedOrderRemoval(item, 'lend');
+              return (
+                <div className="note" key={item?.orderHash || `corrupt-${idx}`} style={{ marginBottom: 8 }}>
+                  <div>
+                    <strong>LendOffer {item?.orderHash ? shortAddress(item.orderHash) : '(corrupt entry)'}</strong> · Status:{' '}
+                    <code>{item?.onchainStatus ?? 'open'}</code> · Offered:{' '}
+                    <code>
+                      ${safeFormatUnits(item?.offerJson?.usdcAmount ?? 0n, USDC_DECIMALS, 2)}
+                    </code>{' '}
+                    · Remaining:{' '}
+                    <code>
+                      ${safeFormatUnits(item?.remainingRaw ?? item?.offerJson?.usdcAmount ?? 0n, USDC_DECIMALS, 2)}
+                    </code>
+                  </div>
+                  <div className="actions" style={{ marginTop: 8 }}>
+                    {item?.offerJson && !removalInfo.isCorrupt ? (
+                      <button className="btn secondary" type="button" onClick={() => void copyOfferPayload(item)}>
+                        {copiedHash === item.orderHash ? 'Copied JSON' : 'Copy LendOffer JSON'}
+                      </button>
+                    ) : null}
+                    {item?.offerJson &&
+                    !removalInfo.isCorrupt &&
+                    isNonFinalOrderStatus(item.onchainStatus) &&
+                    item.onchainStatus !== 'unknown' &&
+                    web3?.address?.toLowerCase() === String(item.offerJson?.lender ?? '').toLowerCase() ? (
+                      <button
+                        className="btn secondary"
+                        type="button"
+                        onClick={() => void handleCancelOffer(item.offerJson)}
+                        disabled={Boolean(txBusy)}
+                      >
+                        Cancel on-chain
+                      </button>
+                    ) : null}
+                    {removalInfo.showRemove ? (
+                      <button
+                        className="btn secondary"
+                        type="button"
+                        onClick={() => {
+                          if (
+                            removalInfo.requiresConfirm &&
+                            typeof window !== 'undefined' &&
+                            typeof window.confirm === 'function' &&
+                            !window.confirm(
+                              'On-chain status could not be verified. If this LendOffer is open and not on api/, removing it drops its USDC from local allowance checks. Remove saved entry anyway?'
+                            )
+                          ) {
+                            return;
+                          }
+                          const hashStr = typeof item?.orderHash === 'string' ? item.orderHash.trim() : '';
+                          const updated = removeSignedLendOffer(
+                            hashStr ? hashStr : { index: idx, expectedEntry: item }
+                          );
+                          setPersistedOffers(updated);
+                          void syncPersistedOffers();
+                          void loadMakerOpenOffers();
+                        }}
+                        disabled={Boolean(txBusy)}
+                      >
+                        Remove saved entry
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
-                <div className="actions" style={{ marginTop: 8 }}>
-                  {item?.offerJson ? (
-                    <button className="btn secondary" type="button" onClick={() => void copyOfferPayload(item)}>
-                      {copiedHash === item.orderHash ? 'Copied JSON' : 'Copy LendOffer JSON'}
-                    </button>
-                  ) : null}
-                  {item?.offerJson &&
-                  isNonFinalOrderStatus(item.onchainStatus) &&
-                  item.onchainStatus !== 'unknown' &&
-                  web3?.address?.toLowerCase() === String(item.offerJson?.lender ?? '').toLowerCase() ? (
-                    <button
-                      className="btn secondary"
-                      type="button"
-                      onClick={() => void handleCancelOffer(item.offerJson)}
-                      disabled={Boolean(txBusy)}
-                    >
-                      Cancel on-chain
-                    </button>
-                  ) : null}
-                  <button
-                    className="btn secondary"
-                    type="button"
-                    onClick={() => {
-                      removeSignedLendOffer(item?.orderHash || idx);
-                      setPersistedOffers(loadPersistedSignedLendOffers());
-                      void loadMakerOpenOffers();
-                    }}
-                    disabled={Boolean(txBusy)}
-                  >
-                    Remove saved entry
-                  </button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
 

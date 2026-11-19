@@ -2136,6 +2136,10 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
     conditions.push('o.cancelled = FALSE AND o.min_usdc = 0');
   }
 
+  if (filters.exclude_final) {
+    conditions.push('o.cancelled = FALSE AND (o.min_usdc = 0 OR o.filled_usdc < o.min_usdc)');
+  }
+
   if (filters.maker) {
     params.push(filters.maker);
     conditions.push(`LOWER(o.maker) = LOWER($${params.length})`);
@@ -2314,18 +2318,31 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
   // If the filtered candidate list is small (<= 100), refresh them all in one multicall so status filters & counts are exact.
   // If > 100 (e.g. 2000 relayed orders), refresh the requested page slice PLUS a capped oldest-refreshed slice
   // of cached-unfunded records so recovered orders return to open automatically without unbounded RPC work.
+  const matchesRelayVisibility = (live: LiveRelayOrderState) => {
+    if (filters.status && live.status !== filters.status) return false;
+    if (
+      filters.exclude_final &&
+      live.status !== 'open' &&
+      live.status !== 'partially_filled' &&
+      live.status !== 'unfunded'
+    ) {
+      return false;
+    }
+    if (filters.status || filters.exclude_final || filters.include_inactive) {
+      return true;
+    }
+    return live.status === 'open' || live.status === 'partially_filled';
+  };
+
   let relayRefreshStale = blk.rpcFailed;
   if (relayOnlyCandidates.length <= 100) {
     if (await batchRefreshRelayRecords(ctx, relayOnlyCandidates, blk.timestamp, blk.number, blk.rpcFailed)) {
       relayRefreshStale = true;
     }
   } else {
-    const tentativeActive = relayOnlyCandidates.filter((rec) => {
-      const st = deriveRelayLiveState(ctx, rec, blk.timestamp, blk.number);
-      if (filters.status) return st.status === filters.status;
-      if (filters.include_inactive) return true;
-      return st.status === 'open' || st.status === 'partially_filled';
-    });
+    const tentativeActive = relayOnlyCandidates.filter((rec) =>
+      matchesRelayVisibility(deriveRelayLiveState(ctx, rec, blk.timestamp, blk.number))
+    );
     const pageCandidates = tentativeActive.slice(pag.offset, pag.offset + pag.limit);
     const pageHashSet = new Set(pageCandidates.map((r) => r.orderHash.toLowerCase()));
     const cachedUnfundedSlice = relayOnlyCandidates
@@ -2346,11 +2363,7 @@ async function handleOrders(ctx: ApiContext, queryObj: Record<string, string>) {
 
   const relayOnlyStates = relayOnlyCandidates
     .map((rec) => deriveRelayLiveState(ctx, rec, blk.timestamp, blk.number))
-    .filter((live) => {
-      if (filters.status) return live.status === filters.status;
-      if (filters.include_inactive) return true;
-      return live.status === 'open' || live.status === 'partially_filled';
-    });
+    .filter(matchesRelayVisibility);
 
   const relayCount = relayOnlyStates.length;
   const total = relayCount + dbTotal;

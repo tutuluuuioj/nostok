@@ -3641,6 +3641,88 @@ async function runTests(): Promise<void> {
           } finally {
             await new Promise<void>((r) => timerSrv.close(() => r()));
           }
+
+          // Low 2 (busy maker >1000 final orders): exclude_final=true drops expired/cancelled/nonce_bumped while keeping open & unfunded
+          const busyMaker = realMakers[0].address;
+          const busySubset = Array.from(spamSignedMap.values()).slice(0, 1102);
+          for (let k = 0; k < busySubset.length; k++) {
+            const rec = busySubset[k];
+            rec.maker = busyMaker;
+            rec.orderType = 'borrow';
+            rec.collateralToken = nvdac;
+            rec.cachedOracleStale = false;
+            rec.cachedUndercollateralized = false;
+            rec.cachedClosedHaircutShortfall = false;
+            rec.cachedFundingChecked = true;
+            rec.cachedMakerBalance = 100n * 10n ** 18n;
+            rec.cachedMakerAllowance = 100n * 10n ** 18n;
+            if (k < 400) {
+              rec.expiry = '1'; // expired (final)
+              rec.cachedCancelled = false;
+              rec.cachedFundingOverBudget = false;
+              rec.cachedMakerNonce = BigInt(rec.nonce);
+              rec.cachedStatus = 'expired';
+            } else if (k < 800) {
+              rec.expiry = sevenDaysExpStr;
+              rec.cachedCancelled = true; // cancelled (final)
+              rec.cachedFundingOverBudget = false;
+              rec.cachedMakerNonce = BigInt(rec.nonce);
+              rec.cachedStatus = 'cancelled';
+            } else if (k < 1100) {
+              rec.expiry = sevenDaysExpStr;
+              rec.cachedCancelled = false;
+              rec.cachedFundingOverBudget = false;
+              rec.cachedMakerNonce = BigInt(rec.nonce) + 1n; // nonce_bumped (final)
+              rec.cachedStatus = 'nonce_bumped';
+            } else if (k === 1100) {
+              rec.nonce = '0';
+              rec.expiry = sevenDaysExpStr;
+              rec.cachedCancelled = false;
+              rec.cachedFundingOverBudget = true; // unfunded (non-final!)
+              rec.cachedMakerNonce = 0n;
+              rec.cachedStatus = 'unfunded';
+            } else {
+              rec.nonce = '0';
+              rec.expiry = sevenDaysExpStr;
+              rec.cachedCancelled = false;
+              rec.cachedFundingOverBudget = false; // open (non-final!)
+              rec.cachedMakerNonce = 0n;
+              rec.cachedStatus = 'open';
+            }
+          }
+          const busyAllRes = await getJson<{
+            pagination: { total: number; has_more: boolean };
+            data: Array<{ status: string }>;
+          }>(`${spamUrl}/orders?order_type=borrow&maker=${busyMaker}&include_inactive=true&limit=50`);
+          assert.equal(busyAllRes.status, 200);
+          assert.ok(busyAllRes.body.pagination.total >= 1102, 'Without exclude_final, maker query exceeds 1000 rows');
+          assert.equal(busyAllRes.body.pagination.has_more, true);
+
+          const busyNonFinalRes = await getJson<{
+            pagination: { total: number; has_more: boolean };
+            data: Array<{ status: string }>;
+          }>(
+            `${spamUrl}/orders?order_type=borrow&maker=${busyMaker}&include_inactive=true&exclude_final=true&limit=50`
+          );
+          assert.equal(busyNonFinalRes.status, 200);
+          assert.equal(busyNonFinalRes.body.pagination.has_more, false);
+          assert.ok(busyNonFinalRes.body.data.length >= 2);
+          for (const row of busyNonFinalRes.body.data) {
+            assert.ok(
+              row.status === 'open' || row.status === 'partially_filled' || row.status === 'unfunded',
+              `exclude_final=true must only return non-final statuses (got ${row.status})`
+            );
+          }
+
+          // Also check SQL DB orders with exclude_final=true on main server: no filled/cancelled rows returned
+          const dbNonFinalRes = await getJson<{ data: Array<{ status: string }> }>(
+            `${baseUrl}/orders?include_inactive=true&exclude_final=true&limit=50`
+          );
+          assert.equal(dbNonFinalRes.status, 200);
+          for (const row of dbNonFinalRes.body.data) {
+            assert.notEqual(row.status, 'filled');
+            assert.notEqual(row.status, 'cancelled');
+          }
         } finally {
           spamSignedMap.clear();
           for (const [k, v] of savedMapBackup.entries()) spamSignedMap.set(k, v);

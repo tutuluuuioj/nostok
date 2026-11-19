@@ -66,6 +66,7 @@ import {
   bumpMakerNonceOnChain,
   cancelSignedBorrowOrder,
   cancelSignedLendOffer,
+  classifyPersistedOrderRemoval,
   computeBorrowApprovalAmountRaw,
   computeBorrowCollateralForFill,
   computeLendApprovalAmountRaw,
@@ -4209,6 +4210,8 @@ async function runTests(): Promise<void> {
       const m2Cfg = { ...cfg, apiUrl: m2ApiUrl };
       const origGlobalFetch = globalThis.fetch;
       let simulateMakerTruncated = false;
+      let seenBorrowMakerUrl = '';
+      let seenLendMakerUrl = '';
       try {
         globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
           const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
@@ -4228,7 +4231,12 @@ async function runTests(): Promise<void> {
             const parsedUrl = new URL(urlStr);
             const makerParam = parsedUrl.searchParams.get('maker');
             const orderTypeParam = parsedUrl.searchParams.get('order_type');
+            const excludeFinalParam = parsedUrl.searchParams.get('exclude_final');
             const offsetParam = Number(parsedUrl.searchParams.get('offset') ?? '0');
+            if (makerParam) {
+              if (orderTypeParam === 'borrow') seenBorrowMakerUrl = urlStr;
+              if (orderTypeParam === 'lend') seenLendMakerUrl = urlStr;
+            }
             if (!makerParam) {
               // Global book: 1,101 dummy orders of other makers -> hits maxPages=10 -> ordersTruncated: true, stale: false!
               const dummyRows = Array.from({ length: 100 }, (_, idx) => ({
@@ -4274,6 +4282,24 @@ async function runTests(): Promise<void> {
                 JSON.stringify({
                   data: overLimitRows,
                   pagination: { limit: 100, offset: offsetParam, total: 1101, has_more: true },
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+              );
+            }
+            // Low 2 check: without exclude_final=true, pretend maker would hit >1000 historical rows; with exclude_final=true, only 1 non-final row returns
+            if (excludeFinalParam !== 'true') {
+              const oldRows = Array.from({ length: 100 }, (_, idx) => ({
+                order_hash: `0x${(offsetParam + idx + 9000).toString(16).padStart(64, '0')}`,
+                order_type: orderTypeParam ?? 'borrow',
+                maker: makerParam,
+                status: 'filled',
+                collateral_token: nvdac,
+                signature: '0x01',
+              }));
+              return new Response(
+                JSON.stringify({
+                  data: oldRows,
+                  pagination: { limit: 100, offset: offsetParam, total: 1500, has_more: true },
                 }),
                 { status: 200, headers: { 'Content-Type': 'application/json' } }
               );
@@ -4352,6 +4378,7 @@ async function runTests(): Promise<void> {
           ),
           'Maker-scoped borrow query must find maker order despite 1101-row global book truncation'
         );
+        assert.ok(seenBorrowMakerUrl.includes('exclude_final=true') && seenBorrowMakerUrl.includes('include_inactive=true'));
         assert.equal(
           await resolveOpenLendOffersSumRaw({
             lenderAddress: ADDRESSES.lender,
@@ -4362,6 +4389,7 @@ async function runTests(): Promise<void> {
           750000000n,
           'Maker-scoped lend query must find maker order despite 1101-row global book truncation'
         );
+        assert.ok(seenLendMakerUrl.includes('exclude_final=true') && seenLendMakerUrl.includes('include_inactive=true'));
 
         simulateMakerTruncated = true;
         await assert.rejects(
@@ -4389,8 +4417,123 @@ async function runTests(): Promise<void> {
         globalThis.fetch = origGlobalFetch;
       }
 
+      // Low 1: multi-tab safe saved-order removal & Remove visibility classification
+      const low1Map = new Map<string, string>();
+      const low1Store = {
+        getItem: (k: string) => low1Map.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          low1Map.set(k, v);
+        },
+      };
+      const hashA = '0x' + '1a'.repeat(32);
+      const hashB = '0x' + '2b'.repeat(32);
+      const hashC = '0x' + '3c'.repeat(32);
+      const itemA = {
+        orderHash: hashA,
+        orderJson: { borrower: ADDRESSES.borrower, collateralToken: nvdac, collateralAmount: '100', minUsdc: '500000000' },
+        signature: '0xaa',
+      };
+      const itemB = {
+        orderHash: hashB,
+        orderJson: { borrower: ADDRESSES.borrower, collateralToken: nvdac, collateralAmount: '200', minUsdc: '500000000' },
+        signature: '0xbb',
+      };
+      // Simulate Tab A saw [itemA] at index 0, then Tab B prepended itemB -> [itemB, itemA]
+      low1Store.setItem(SIGNED_BORROW_ORDERS_STORAGE_KEY, JSON.stringify([itemB, itemA]));
+      const afterRemoveHashed = removeSignedBorrowOrder(
+        { orderHash: hashA, index: 0, expectedEntry: itemA },
+        low1Store
+      );
+      assert.deepEqual(
+        afterRemoveHashed.map((x: { orderHash?: string }) => x.orderHash),
+        [hashB],
+        'Removing hashA when index 0 shifted must NOT delete newly prepended itemB'
+      );
+
+      // Hashless corrupt entry shifted from index 0 -> 1 by Tab B prepending itemC
+      const bad1 = { orderHash: '', orderJson: { collateralAmount: 'bad-1' }, signature: '0x01' };
+      const bad2 = { orderHash: '', orderJson: { collateralAmount: 'bad-2' }, signature: '0x02' };
+      const itemC = { orderHash: hashC, offerJson: { lender: ADDRESSES.lender, usdcAmount: '500000000' }, signature: '0xcc' };
+      low1Store.setItem(SIGNED_LEND_OFFERS_STORAGE_KEY, JSON.stringify([itemC, bad1]));
+      const afterRemoveHashless = removeSignedLendOffer(
+        { orderHash: '', index: 0, expectedEntry: bad1 },
+        low1Store
+      );
+      assert.deepEqual(
+        afterRemoveHashless.map((x: { orderHash?: string }) => x.orderHash),
+        [hashC],
+        'Removing hashless entry after another tab shifted index must delete ONLY matching bad1, not index 0 itemC'
+      );
+      // If Tab B already removed bad1 leaving only bad2 at index 0, stale Tab A click removes nothing
+      low1Store.setItem(SIGNED_LEND_OFFERS_STORAGE_KEY, JSON.stringify([bad2]));
+      const afterStaleHashless = removeSignedLendOffer(
+        { orderHash: '', index: 0, expectedEntry: bad1 },
+        low1Store
+      );
+      assert.equal(afterStaleHashless.length, 1, 'Stale index click must NOT delete a different hashless entry');
+
+      // Remove button policy: hidden for open/partially_filled/unfunded/saved, direct for corrupt or final, confirm for RPC unknown
+      assert.equal(
+        classifyPersistedOrderRemoval(
+          {
+            orderHash: hashA,
+            orderJson: { borrower: ADDRESSES.borrower, collateralToken: nvdac, collateralAmount: '100', minUsdc: '500000000' },
+            onchainStatus: 'open',
+          },
+          'borrow'
+        ).showRemove,
+        false
+      );
+      assert.equal(
+        classifyPersistedOrderRemoval(
+          {
+            orderHash: hashA,
+            offerJson: { lender: ADDRESSES.lender, usdcAmount: '500000000' },
+            onchainStatus: 'unfunded',
+          },
+          'lend'
+        ).showRemove,
+        false
+      );
+      const finalPolicy = classifyPersistedOrderRemoval(
+        {
+          orderHash: hashA,
+          orderJson: { borrower: ADDRESSES.borrower, collateralToken: nvdac, collateralAmount: '100', minUsdc: '500000000' },
+          onchainStatus: 'cancelled',
+        },
+        'borrow'
+      );
+      assert.equal(finalPolicy.showRemove, true);
+      assert.equal(finalPolicy.requiresConfirm, false);
+      const corruptPolicy = classifyPersistedOrderRemoval(
+        { orderHash: '', orderJson: { collateralAmount: 'not-a-bigint' }, onchainStatus: 'unknown' },
+        'borrow'
+      );
+      assert.equal(corruptPolicy.showRemove, true);
+      assert.equal(corruptPolicy.isCorrupt, true);
+      assert.equal(corruptPolicy.requiresConfirm, false);
+      const unknownValidPolicy = classifyPersistedOrderRemoval(
+        {
+          orderHash: hashA,
+          orderJson: { borrower: ADDRESSES.borrower, collateralToken: nvdac, collateralAmount: '100', minUsdc: '500000000' },
+          onchainStatus: 'unknown',
+        },
+        'borrow'
+      );
+      assert.equal(unknownValidPolicy.showRemove, true);
+      assert.equal(unknownValidPolicy.requiresConfirm, true);
+
+      const low1BorrowSrc = fs.readFileSync(path.join(process.cwd(), 'src/pages/Borrow.jsx'), 'utf8');
+      const low1LendSrc = fs.readFileSync(path.join(process.cwd(), 'src/pages/Lend.jsx'), 'utf8');
+      assert.ok(
+        low1BorrowSrc.includes('classifyPersistedOrderRemoval') &&
+          low1BorrowSrc.includes('expectedEntry: item') &&
+          low1LendSrc.includes('classifyPersistedOrderRemoval') &&
+          low1LendSrc.includes('expectedEntry: item')
+      );
+
       console.log(
-        'PASS WS3.4 Piece 3 + M1 + M2 + Info: Borrower/Lender unfunded allowance retention, 1101-row global truncation safety, bad checksum fail-closed & corrupt storage removal verified.'
+        'PASS WS3.4 Piece 3 + M1 + M2 + Low 1 + Low 2 + Info: All checks verified cleanly.'
       );
 
       console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1, PIECE 2 & PIECE 3 FORK TESTS PASSED.');

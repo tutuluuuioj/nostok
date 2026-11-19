@@ -16,6 +16,7 @@ import {
   approveCollateralForBorrow,
   bumpMakerNonceOnChain,
   cancelSignedBorrowOrder,
+  classifyPersistedOrderRemoval,
   computeRemainingBorrowCollateralRequirement,
   fillLendOfferAsBorrower,
   formatTokenUnitsDisplay,
@@ -1389,7 +1390,8 @@ export function Borrow() {
             {persistedOrders.map((item, idx) => {
               const ord = item?.orderJson ?? item?.order ?? {};
               const statusLabel = item?.onchainStatus ?? (item?.cancelledTxHash ? 'cancelled' : 'saved');
-              const isCorrupt = statusLabel === 'unknown' || !ord || !ord.borrower;
+              const removalInfo = classifyPersistedOrderRemoval(item, 'borrow');
+              const isCorrupt = statusLabel === 'unknown' || removalInfo.isCorrupt;
               const isCancelable =
                 !isCorrupt &&
                 (statusLabel === 'open' || statusLabel === 'partially_filled' || statusLabel === 'saved');
@@ -1429,22 +1431,34 @@ export function Borrow() {
                         {txBusy === 'cancel' ? 'Cancelling…' : 'Cancel on-chain'}
                       </button>
                     ) : null}
-                    <button
-                      className="btn secondary"
-                      type="button"
-                      onClick={() => {
-                        const updated = removeSignedBorrowOrder({
-                          orderHash: item?.orderHash,
-                          index: idx,
-                        });
-                        setPersistedOrders(updated);
-                        void syncPersistedOrders();
-                        void loadMakerOpenCollateral();
-                      }}
-                      disabled={Boolean(txBusy)}
-                    >
-                      Remove saved entry
-                    </button>
+                    {removalInfo.showRemove ? (
+                      <button
+                        className="btn secondary"
+                        type="button"
+                        onClick={() => {
+                          if (
+                            removalInfo.requiresConfirm &&
+                            typeof window !== 'undefined' &&
+                            typeof window.confirm === 'function' &&
+                            !window.confirm(
+                              'On-chain status could not be verified. If this BorrowOrder is open and not on api/, removing it drops its collateral from local allowance checks. Remove saved entry anyway?'
+                            )
+                          ) {
+                            return;
+                          }
+                          const hashStr = typeof item?.orderHash === 'string' ? item.orderHash.trim() : '';
+                          const updated = removeSignedBorrowOrder(
+                            hashStr ? hashStr : { index: idx, expectedEntry: item }
+                          );
+                          setPersistedOrders(updated);
+                          void syncPersistedOrders();
+                          void loadMakerOpenCollateral();
+                        }}
+                        disabled={Boolean(txBusy)}
+                      >
+                        Remove saved entry
+                      </button>
+                    ) : null}
                   </div>
                 </article>
               );

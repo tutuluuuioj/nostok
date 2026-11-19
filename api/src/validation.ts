@@ -94,6 +94,7 @@ export const ordersQuerySchema = z.object({
   asset: checksumAddressSchema.optional(),
   order_type: z.enum(['borrow', 'lend']).optional(),
   include_inactive: z.enum(['true', 'false']).transform((v) => v === 'true').optional(),
+  exclude_final: z.enum(['true', 'false']).transform((v) => v === 'true').optional(),
 });
 
 const addressLikeSchema = z
