@@ -44,11 +44,16 @@ import { createNotificationsServer } from '../notifications/src/server.js';
 import {
   BASE_CHAIN_ID,
   BASE_USDC_ADDRESS,
+  EXTEND_ORDER_EIP712_TYPES,
   LEND_OFFER_EIP712_TYPES,
+  LOAN_CORE_DOMAIN_NAME,
+  LOAN_CORE_DOMAIN_VERSION,
   ORDER_SETTLEMENT_DOMAIN_NAME,
   ORDER_SETTLEMENT_DOMAIN_VERSION,
   USDC_DECIMALS,
+  erc20Abi,
   getFrontendConfig,
+  loanCoreAbi,
   orderSettlementAbi,
   positionNftAbi,
   setFrontendConfigOverrides,
@@ -102,12 +107,25 @@ import {
   setCollateralAllowanceForBorrow,
   setInjectedProvider,
   setUsdcAllowanceForLend,
+  buildExtendOrderTypedData,
+  computeExactPartialRepayAmounts,
+  computeExactRepayAmounts,
+  computeExactTopUpAmounts,
+  computeLoanProjectedInterestDueRaw,
+  executeLoanExtend,
+  executeLoanRepay,
+  executeLoanTopUp,
+  readLoanOnChainState,
   signInWithSiwe,
+  signLoanExtension,
   signOutSiwe,
   sumRawBigints,
   validateLendPartialFillPlan,
   verifyAndPreviewBorrowOrderFill,
   verifyAndPreviewLendOfferFill,
+  verifyAndPreviewLoanExtend,
+  verifyAndPreviewLoanRepay,
+  verifyAndPreviewLoanTopUp,
 } from '../src/lib/web3.js';
 import { App } from '../src/App.jsx';
 import { Shell } from '../src/components/Shell.jsx';
@@ -4798,7 +4816,718 @@ async function runTests(): Promise<void> {
       );
       console.log('PASS WS3.4 Piece 4: Orderbook fill links, deep-link lookup, Any-B20 LendOffer & TOCTOU approval guards verified.');
 
-      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 FORK TESTS PASSED.');
+      // 3.9 WS3.5 Piece 1: Loan Management Primitives (repay, partialRepay, topUp, extend EIP-712)
+      console.log('\n=== WS3.5 Piece 1: LoanCore repay, partialRepay, topUp, extend EIP-712 & Grace math ===');
+      const ws35LoanId = p4AnyFill.loanId;
+
+      // Top up borrower & lender USDC + borrower NVDAc for multi-step loan lifecycle assertions
+      await rpcCall('anvil_impersonateAccount', [BASE_USDC_WHALE]);
+      await rpcCall('anvil_setBalance', [BASE_USDC_WHALE, '0x56bc75e2d63100000']);
+      for (const recipient of [ADDRESSES.borrower, ADDRESSES.lender]) {
+        await publicClient.waitForTransactionReceipt({
+          hash: await rawWalletClient.sendTransaction({
+            account: BASE_USDC_WHALE,
+            to: BASE_USDC,
+            data: encodeFunctionData({
+              abi: parseAbi(['function transfer(address to, uint256 value) returns (bool)']),
+              functionName: 'transfer',
+              args: [recipient, 10_000_000_000n],
+            }),
+          }),
+        });
+      }
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdac,
+          abi: mockB20Artifact.abi,
+          functionName: 'mint',
+          args: [ADDRESSES.borrower, 25n * 10n ** 18n],
+        }),
+      });
+
+      const ws35InitialState = await readLoanOnChainState(ws35LoanId, { cfg });
+      assert.equal(ws35InitialState.loanId, ws35LoanId);
+      assert.equal(ws35InitialState.borrower.toLowerCase(), ADDRESSES.borrower.toLowerCase());
+      assert.equal(ws35InitialState.positionOwner?.toLowerCase(), ADDRESSES.lender.toLowerCase());
+      assert.equal(ws35InitialState.isActive, true);
+      assert.equal(ws35InitialState.extensionNonce, '0');
+      assert.equal(
+        computeLoanProjectedInterestDueRaw(ws35InitialState, ws35InitialState.blockTimestamp),
+        BigInt(ws35InitialState.dueInterestRaw),
+        'Projected spot interest must match LoanCore.getDueInterest() at loan start'
+      );
+
+      // Strict input validation: reject floats, zeros, and oversized partial principal
+      assert.throws(() => computeExactTopUpAmounts(ws35InitialState, '1.5'), /unsigned integer/);
+      assert.throws(() => computeExactTopUpAmounts(ws35InitialState, '0'), /must be >= 1/);
+      assert.throws(() => computeExactRepayAmounts(ws35InitialState, { bufferSeconds: 9999n }), /exceeds maximum/);
+      assert.throws(() => computeExactPartialRepayAmounts(ws35InitialState, '250.25'), /unsigned integer/);
+      assert.throws(
+        () => computeExactPartialRepayAmounts(ws35InitialState, ws35InitialState.remainingPrincipalRaw),
+        /use full repay\(\) instead/
+      );
+
+      // 1) topUp: preserves open p4BorrowOrder CollateralEscrow allowance and approves ONLY CollateralEscrow
+      const openBorrowBeforeTopUp = await resolveOpenBorrowOrdersCollateralSumRaw({
+        borrowerAddress: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        cfg,
+      });
+      assert.ok(openBorrowBeforeTopUp > 0n, 'p4BorrowOrder should still be open before topUp test');
+      walletProvider.setAccount(KEYS.borrower);
+      await setCollateralAllowanceForBorrow({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        targetAllowanceRaw: '0',
+        provider: walletProvider,
+        cfg,
+      });
+      const topUpAdditionalRaw = '1000000000000000000'; // +1 NVDAc
+      const topUpPreview = await verifyAndPreviewLoanTopUp({
+        loanId: ws35LoanId,
+        additionalCollateralRaw: topUpAdditionalRaw,
+        payerAddress: ADDRESSES.borrower,
+        cfg,
+      });
+      assert.equal(topUpPreview.needsApproval, true);
+      assert.equal(topUpPreview.spender.toLowerCase(), deployed.collateralEscrow.toLowerCase());
+      assert.equal(
+        BigInt(topUpPreview.requiredApprovalRaw),
+        openBorrowBeforeTopUp + BigInt(topUpAdditionalRaw)
+      );
+      await assert.rejects(
+        () =>
+          executeLoanTopUp({
+            address: ADDRESSES.borrower,
+            loanId: ws35LoanId,
+            additionalCollateralRaw: topUpAdditionalRaw,
+            expectedPreview: topUpPreview,
+            autoApprove: false,
+            provider: walletProvider,
+            cfg,
+          }),
+        /CollateralEscrow allowance is below required/
+      );
+      await assert.rejects(
+        () =>
+          executeLoanTopUp({
+            address: ADDRESSES.borrower,
+            loanId: ws35LoanId,
+            additionalCollateralRaw: topUpAdditionalRaw,
+            expectedPreview: { ...topUpPreview, requiredApprovalRaw: '1' },
+            autoApprove: true,
+            provider: walletProvider,
+            cfg,
+          }),
+        /Required CollateralEscrow approval increased since preview/
+      );
+      const topUpRes = await executeLoanTopUp({
+        address: ADDRESSES.borrower,
+        loanId: ws35LoanId,
+        additionalCollateralRaw: topUpAdditionalRaw,
+        expectedPreview: topUpPreview,
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(topUpRes.approvalTxHash, 'topUp should approve CollateralEscrow');
+      assert.equal(topUpRes.addedCollateralRaw, topUpAdditionalRaw);
+      assert.equal(
+        BigInt(topUpRes.newCollateralRaw),
+        BigInt(ws35InitialState.collateralRaw) + BigInt(topUpAdditionalRaw)
+      );
+      const stateAfterTopUp = await readLoanOnChainState(ws35LoanId, { cfg });
+      assert.equal(stateAfterTopUp.collateralRaw, topUpRes.newCollateralRaw);
+
+      // Spender isolation on topUp + open BorrowOrder allowance preserved
+      const escrowAllowAfterTopUp = BigInt(
+        await publicClient.readContract({
+          address: nvdac,
+          abi: erc20Abi,
+          functionName: 'allowance',
+          args: [ADDRESSES.borrower, deployed.collateralEscrow],
+        })
+      );
+      const settlementCollatAllow = BigInt(
+        await publicClient.readContract({
+          address: nvdac,
+          abi: erc20Abi,
+          functionName: 'allowance',
+          args: [ADDRESSES.borrower, deployed.orderSettlement],
+        })
+      );
+      const loanCoreCollatAllow = BigInt(
+        await publicClient.readContract({
+          address: nvdac,
+          abi: erc20Abi,
+          functionName: 'allowance',
+          args: [ADDRESSES.borrower, deployed.loanCore],
+        })
+      );
+      assert.ok(
+        escrowAllowAfterTopUp >= openBorrowBeforeTopUp,
+        'CollateralEscrow allowance remaining after topUp must still cover open BorrowOrder'
+      );
+      assert.equal(settlementCollatAllow, 0n, 'OrderSettlement must never receive collateral approval');
+      assert.equal(loanCoreCollatAllow, 0n, 'LoanCore must never receive collateral approval');
+
+      // 2) Warp +10 days (T0 + 10d), open a 30-day $500 LendOffer as borrower (valid through T0 + 40d),
+      // and execute partialRepay ($200) proving exact pro-rata math, TOCTOU buffer cap & LoanCore spender isolation.
+      await rpcCall('evm_increaseTime', [10 * 86_400]);
+      await rpcCall('evm_mine', []);
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdaFeed,
+          abi: mockAggArtifact.abi,
+          functionName: 'setPrice',
+          args: [140_00000000n],
+        }),
+      });
+      const stateDay10 = await readLoanOnChainState(ws35LoanId, { cfg });
+      assert.ok(BigInt(stateDay10.dueInterestRaw) > 0n, 'Loan must have accrued interest by Day 10');
+      assert.equal(
+        computeLoanProjectedInterestDueRaw(stateDay10, stateDay10.blockTimestamp),
+        BigInt(stateDay10.dueInterestRaw),
+        'Projected interest must match LoanCore.getDueInterest() after +10d warp'
+      );
+
+      const ws35Store = new Map<string, string>();
+      const ws35Storage = {
+        getItem: (k: string) => ws35Store.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          ws35Store.set(k, v);
+        },
+        removeItem: (k: string) => {
+          ws35Store.delete(k);
+        },
+      };
+      const quoteDay10 = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '500000000',
+        termDays: 30,
+        aprBps: 850,
+        maxLtvBps: 6000,
+        lender: ADDRESSES.borrower,
+      });
+      walletProvider.setAccount(KEYS.borrower);
+      const borrowerOpenLendOffer = await prepareAndSignLendOffer({
+        address: ADDRESSES.borrower,
+        principalRaw: '500000000',
+        allowedCollateral: nvdac,
+        expectedQuote: quoteDay10,
+        minRateBps: 850,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '500000000',
+        existingOpenUsdcSumRaw: 0n,
+        expiryDays: 30,
+        autoApprove: true,
+        publishToApi: true,
+        storage: ws35Storage,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(borrowerOpenLendOffer.publishedToApi, true);
+
+      // Reset LoanCore USDC allowance to 0 to force pre-approval simulation + exact approval path
+      await setUsdcAllowanceForLend({
+        address: ADDRESSES.borrower,
+        targetAllowanceRaw: '0',
+        provider: walletProvider,
+        cfg,
+      });
+
+      const partialPrincipalRaw = '200000000'; // $200 of $500
+      const partialPreview = await verifyAndPreviewLoanRepay({
+        loanId: ws35LoanId,
+        payerAddress: ADDRESSES.borrower,
+        principalRepayRaw: partialPrincipalRaw,
+        cfg,
+      });
+      assert.equal(partialPreview.isPartial, true);
+      assert.equal(partialPreview.needsApproval, true);
+      assert.equal(partialPreview.spender.toLowerCase(), deployed.loanCore.toLowerCase());
+      assert.equal(partialPreview.existingOpenSumRaw, '500000000');
+      assert.equal(
+        BigInt(partialPreview.requiredApprovalRaw),
+        500_000_000n + BigInt(partialPreview.maxPaymentRaw)
+      );
+      assert.ok(
+        BigInt(partialPreview.maxPaymentRaw) >= BigInt(partialPreview.spotTotalPaymentRaw),
+        'Buffered maxPaymentRaw must cover spot total'
+      );
+
+      // Advance 10s between preview and execute to test sliding 300s buffer + expectedPreview ceiling cap
+      await rpcCall('evm_increaseTime', [10]);
+      await rpcCall('evm_mine', []);
+
+      const borNvdacBeforePartial = BigInt(
+        await publicClient.readContract({
+          address: nvdac,
+          abi: erc20Abi,
+          functionName: 'balanceOf',
+          args: [ADDRESSES.borrower],
+        })
+      );
+      await assert.rejects(
+        () =>
+          executeLoanRepay({
+            address: ADDRESSES.borrower,
+            loanId: ws35LoanId,
+            principalRepayRaw: partialPrincipalRaw,
+            expectedPreview: partialPreview,
+            autoApprove: false,
+            provider: walletProvider,
+            cfg,
+          }),
+        /LoanCore USDC allowance is below required/
+      );
+      const partialRes = await executeLoanRepay({
+        address: ADDRESSES.borrower,
+        loanId: ws35LoanId,
+        principalRepayRaw: partialPrincipalRaw,
+        expectedPreview: partialPreview,
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(partialRes.approvalTxHash, 'partialRepay should approve LoanCore');
+      assert.equal(partialRes.principalPaidRaw, partialPrincipalRaw);
+      assert.equal(partialRes.collateralReleasedRaw, partialPreview.exact.collateralReleasedRaw);
+      assert.equal(partialRes.requiredApprovalRaw, partialPreview.requiredApprovalRaw);
+
+      const borNvdacAfterPartial = BigInt(
+        await publicClient.readContract({
+          address: nvdac,
+          abi: erc20Abi,
+          functionName: 'balanceOf',
+          args: [ADDRESSES.borrower],
+        })
+      );
+      assert.equal(
+        borNvdacAfterPartial - borNvdacBeforePartial,
+        BigInt(partialRes.collateralReleasedRaw),
+        'partialRepay must release pro-rata collateral back to borrower'
+      );
+
+      const loanCoreUsdcAfterPartial = BigInt(
+        await publicClient.readContract({
+          address: BASE_USDC,
+          abi: erc20Abi,
+          functionName: 'allowance',
+          args: [ADDRESSES.borrower, deployed.loanCore],
+        })
+      );
+      const settlementUsdcAllow = BigInt(
+        await publicClient.readContract({
+          address: BASE_USDC,
+          abi: erc20Abi,
+          functionName: 'allowance',
+          args: [ADDRESSES.borrower, deployed.orderSettlement],
+        })
+      );
+      const escrowUsdcAllow = BigInt(
+        await publicClient.readContract({
+          address: BASE_USDC,
+          abi: erc20Abi,
+          functionName: 'allowance',
+          args: [ADDRESSES.borrower, deployed.collateralEscrow],
+        })
+      );
+      assert.ok(
+        loanCoreUsdcAfterPartial >= 500_000_000n,
+        'Open LendOffer $500 USDC allowance on LoanCore must survive partialRepay'
+      );
+      assert.equal(settlementUsdcAllow, 0n, 'OrderSettlement must never receive USDC approval');
+      assert.equal(escrowUsdcAllow, 0n, 'CollateralEscrow must never receive USDC approval');
+
+      const stateAfterPartial = await readLoanOnChainState(ws35LoanId, { cfg });
+      assert.equal(stateAfterPartial.remainingPrincipalRaw, '300000000');
+      assert.equal(
+        computeLoanProjectedInterestDueRaw(stateAfterPartial, stateAfterPartial.blockTimestamp),
+        BigInt(stateAfterPartial.dueInterestRaw),
+        'Projected interest must match LoanCore.getDueInterest() after partialRepay'
+      );
+
+      // 3) extend: verify LoanCore EIP-712 domain, rejection guards & bidirectional counterparty signing (zero approvals)
+      const nowDay10 = BigInt(stateAfterPartial.blockTimestamp);
+      const sampleExtendTd = buildExtendOrderTypedData({
+        extendOrder: {
+          loanId: ws35LoanId,
+          newMaturity: BigInt(stateAfterPartial.maturity) + 2n * 86_400n,
+          newRateBps: 1100,
+          nonce: stateAfterPartial.extensionNonce,
+          deadline: nowDay10 + 3600n,
+        },
+        cfg,
+      });
+      assert.equal(sampleExtendTd.domain.name, LOAN_CORE_DOMAIN_NAME);
+      assert.equal(sampleExtendTd.domain.version, LOAN_CORE_DOMAIN_VERSION);
+      assert.equal(sampleExtendTd.domain.verifyingContract.toLowerCase(), deployed.loanCore.toLowerCase());
+      assert.notEqual(
+        sampleExtendTd.domain.name,
+        ORDER_SETTLEMENT_DOMAIN_NAME,
+        'ExtendOrder must use LoanCore EIP-712 domain, not OrderSettlement'
+      );
+      assert.ok(Array.isArray(EXTEND_ORDER_EIP712_TYPES.ExtendOrder));
+
+      walletProvider.setAccount(KEYS.lender);
+      await assert.rejects(
+        () =>
+          signLoanExtension({
+            address: ADDRESSES.lender,
+            loanId: ws35LoanId,
+            newMaturity: BigInt(stateAfterPartial.maturity) + 2n * 86_400n,
+            newRateBps: 4001,
+            deadline: nowDay10 + 3600n,
+            provider: walletProvider,
+            cfg,
+          }),
+        /exceeds maximum/
+      );
+      await assert.rejects(
+        () =>
+          signLoanExtension({
+            address: ADDRESSES.lender,
+            loanId: ws35LoanId,
+            newMaturity: BigInt(stateAfterPartial.maturity),
+            newRateBps: 1100,
+            deadline: nowDay10 + 3600n,
+            provider: walletProvider,
+            cfg,
+          }),
+        /strictly after current maturity/
+      );
+      await assert.rejects(
+        () =>
+          signLoanExtension({
+            address: ADDRESSES.lender,
+            loanId: ws35LoanId,
+            newMaturity: BigInt(stateAfterPartial.maxExtendMaturity) + 1n,
+            newRateBps: 1100,
+            deadline: nowDay10 + 3600n,
+            provider: walletProvider,
+            cfg,
+          }),
+        /exceeds protocol maximum 90 days/
+      );
+
+      // Direction 1: Lender (PositionNFT holder) signs -> Borrower submits
+      const extMaturity1 = BigInt(stateAfterPartial.maturity) + 2n * 86_400n;
+      const extSig1 = await signLoanExtension({
+        address: ADDRESSES.lender,
+        loanId: ws35LoanId,
+        newMaturity: extMaturity1,
+        newRateBps: 1100,
+        deadline: nowDay10 + 7200n,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(extSig1.signerRole, 'holder');
+      assert.equal(extSig1.expectedSubmitter.toLowerCase(), ADDRESSES.borrower.toLowerCase());
+
+      // Self-extension must reject cleanly
+      await assert.rejects(
+        () =>
+          verifyAndPreviewLoanExtend({
+            ...extSig1.extendOrder,
+            signature: extSig1.signature,
+            callerAddress: ADDRESSES.lender,
+            cfg,
+          }),
+        /self-extension rejected/
+      );
+
+      const extPreview1 = await verifyAndPreviewLoanExtend({
+        ...extSig1.extendOrder,
+        signature: extSig1.signature,
+        callerAddress: ADDRESSES.borrower,
+        cfg,
+      });
+      assert.equal(extPreview1.needsApproval, false);
+
+      walletProvider.setAccount(KEYS.borrower);
+      await assert.rejects(
+        () =>
+          executeLoanExtend({
+            address: ADDRESSES.borrower,
+            ...extSig1.extendOrder,
+            newRateBps: 1200,
+            signature: extSig1.signature,
+            expectedPreview: extPreview1,
+            provider: walletProvider,
+            cfg,
+          }),
+        /Extension parameters changed since preview|signer.*does not match/
+      );
+
+      const extRes1 = await executeLoanExtend({
+        address: ADDRESSES.borrower,
+        ...extSig1.extendOrder,
+        signature: extSig1.signature,
+        expectedPreview: extPreview1,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(extRes1.newMaturity, extMaturity1.toString());
+      assert.equal(extRes1.newRateBps, 1100);
+
+      const stateAfterExt1 = await readLoanOnChainState(ws35LoanId, { cfg });
+      assert.equal(stateAfterExt1.maturity, extMaturity1.toString());
+      assert.equal(stateAfterExt1.rateBps, 1100);
+      assert.equal(stateAfterExt1.extensionNonce, '1');
+      assert.equal(
+        computeLoanProjectedInterestDueRaw(stateAfterExt1, stateAfterExt1.blockTimestamp),
+        BigInt(stateAfterExt1.dueInterestRaw),
+        'Projected interest must match LoanCore.getDueInterest() after extension rate/maturity lock'
+      );
+
+      // Replay with old maturity or stale extension nonce must fail
+      await assert.rejects(
+        () =>
+          verifyAndPreviewLoanExtend({
+            ...extSig1.extendOrder,
+            nonce: '0',
+            signature: extSig1.signature,
+            callerAddress: ADDRESSES.borrower,
+            cfg,
+          }),
+        /strictly after current maturity/
+      );
+      await assert.rejects(
+        () =>
+          verifyAndPreviewLoanExtend({
+            ...extSig1.extendOrder,
+            newMaturity: extMaturity1 + 86_400n,
+            nonce: '0',
+            signature: extSig1.signature,
+            callerAddress: ADDRESSES.borrower,
+            cfg,
+          }),
+        /Extension nonce mismatch/
+      );
+      await assert.rejects(
+        () =>
+          verifyAndPreviewLoanExtend({
+            ...extSig1.extendOrder,
+            newMaturity: extMaturity1 + 86_400n,
+            nonce: stateAfterExt1.extensionNonce,
+            signature: extSig1.signature,
+            callerAddress: ADDRESSES.borrower,
+            cfg,
+          }),
+        /signer.*does not match expected counterparty/
+      );
+
+      // Direction 2: Borrower signs -> PositionNFT holder executes
+      const extMaturity2 = BigInt(stateAfterExt1.maturity) + 3n * 86_400n;
+      const extSig2 = await signLoanExtension({
+        address: ADDRESSES.borrower,
+        loanId: ws35LoanId,
+        newMaturity: extMaturity2,
+        newRateBps: 900,
+        deadline: nowDay10 + 7200n,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(extSig2.signerRole, 'borrower');
+      walletProvider.setAccount(KEYS.lender);
+      const extRes2 = await executeLoanExtend({
+        address: ADDRESSES.lender,
+        ...extSig2.extendOrder,
+        signature: extSig2.signature,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(extRes2.newMaturity, extMaturity2.toString());
+      assert.equal(extRes2.newRateBps, 900);
+
+      const stateAfterExt2 = await readLoanOnChainState(ws35LoanId, { cfg });
+      assert.equal(stateAfterExt2.extensionNonce, '2');
+
+      // 4) Warp past maturity + 12h into Grace WITHOUT refreshing oracle -> test Grace penalty math,
+      // partialRepay/extend rejections in Grace, and full repay() preserving open $500 LendOffer allowance
+      const warpIntoGraceSecs = Number(extMaturity2 - BigInt(stateAfterExt2.blockTimestamp) + 43_200n);
+      await rpcCall('evm_increaseTime', [warpIntoGraceSecs]);
+      await rpcCall('evm_mine', []);
+
+      const graceState = await readLoanOnChainState(ws35LoanId, { cfg });
+      assert.equal(graceState.isPastMaturity, true);
+      assert.equal(graceState.isGrace, true);
+      assert.equal(graceState.status, 1);
+      assert.equal(graceState.statusName, 'Grace');
+      assert.equal(
+        computeLoanProjectedInterestDueRaw(graceState, graceState.blockTimestamp),
+        BigInt(graceState.dueInterestRaw),
+        'Grace-period projected interest (regular + penaltySpreadBps) must match LoanCore.getDueInterest()'
+      );
+
+      await assert.rejects(
+        () =>
+          verifyAndPreviewLoanRepay({
+            loanId: ws35LoanId,
+            payerAddress: ADDRESSES.borrower,
+            principalRepayRaw: '100000000',
+            cfg,
+          }),
+        /Partial repay is only available while Loan #\d+ is Active before maturity/
+      );
+      walletProvider.setAccount(KEYS.borrower);
+      await assert.rejects(
+        () =>
+          signLoanExtension({
+            address: ADDRESSES.borrower,
+            loanId: ws35LoanId,
+            newMaturity: extMaturity2 + 86_400n,
+            newRateBps: 900,
+            deadline: BigInt(graceState.blockTimestamp) + 3600n,
+            provider: walletProvider,
+            cfg,
+          }),
+        /cannot be extended/
+      );
+
+      // Force allowance down to 0 again so full repay proves cumulative LoanCore approval with open $500 LendOffer
+      await setUsdcAllowanceForLend({
+        address: ADDRESSES.borrower,
+        targetAllowanceRaw: '0',
+        provider: walletProvider,
+        cfg,
+      });
+
+      const fullRepayPreview = await verifyAndPreviewLoanRepay({
+        loanId: ws35LoanId,
+        payerAddress: ADDRESSES.borrower,
+        cfg,
+      });
+      assert.equal(fullRepayPreview.isPartial, false);
+      assert.equal(fullRepayPreview.needsApproval, true);
+      assert.equal(fullRepayPreview.existingOpenSumRaw, '500000000');
+      assert.equal(
+        BigInt(fullRepayPreview.requiredApprovalRaw),
+        500_000_000n + BigInt(fullRepayPreview.maxPaymentRaw)
+      );
+
+      // Simulate block ticks (+30s) inside bufferSeconds during Grace penalty accrual
+      await rpcCall('evm_increaseTime', [30]);
+      await rpcCall('evm_mine', []);
+
+      const claimableBefore = BigInt(
+        await publicClient.readContract({
+          address: deployed.loanCore,
+          abi: loanCoreAbi,
+          functionName: 'getClaimable',
+          args: [ADDRESSES.lender],
+        })
+      );
+      const treasuryBefore = BigInt(
+        await publicClient.readContract({
+          address: BASE_USDC,
+          abi: erc20Abi,
+          functionName: 'balanceOf',
+          args: [ADDRESSES.treasury],
+        })
+      );
+      const reserveBefore = BigInt(
+        await publicClient.readContract({
+          address: BASE_USDC,
+          abi: erc20Abi,
+          functionName: 'balanceOf',
+          args: [ADDRESSES.reserve],
+        })
+      );
+      const repayRes = await executeLoanRepay({
+        address: ADDRESSES.borrower,
+        loanId: ws35LoanId,
+        expectedPreview: fullRepayPreview,
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.ok(repayRes.approvalTxHash, 'full repay should approve LoanCore');
+      assert.equal(repayRes.principalPaidRaw, '300000000');
+      assert.equal(repayRes.collateralReleasedRaw, graceState.collateralRaw);
+      assert.ok(
+        BigInt(repayRes.totalPaidRaw) >= BigInt(fullRepayPreview.spotTotalPaymentRaw) &&
+          BigInt(repayRes.totalPaidRaw) <= BigInt(fullRepayPreview.maxPaymentRaw),
+        'Actual Grace repay must sit inside [spot, maxPaymentRaw]'
+      );
+
+      const stateAfterRepay = await readLoanOnChainState(ws35LoanId, { cfg });
+      assert.equal(stateAfterRepay.storedStatus, 3);
+      assert.equal(stateAfterRepay.statusName, 'Repaid');
+      assert.equal(stateAfterRepay.isSettled, true);
+      assert.equal(stateAfterRepay.positionOwner, null);
+      await assert.rejects(
+        () =>
+          publicClient.readContract({
+            address: deployed.positionNFT,
+            abi: positionNftAbi,
+            functionName: 'ownerOf',
+            args: [BigInt(ws35LoanId)],
+          }),
+        /ERC721NonexistentToken|reverted/i
+      );
+
+      const claimableAfter = BigInt(
+        await publicClient.readContract({
+          address: deployed.loanCore,
+          abi: loanCoreAbi,
+          functionName: 'getClaimable',
+          args: [ADDRESSES.lender],
+        })
+      );
+      const treasuryAfter = BigInt(
+        await publicClient.readContract({
+          address: BASE_USDC,
+          abi: erc20Abi,
+          functionName: 'balanceOf',
+          args: [ADDRESSES.treasury],
+        })
+      );
+      const reserveAfter = BigInt(
+        await publicClient.readContract({
+          address: BASE_USDC,
+          abi: erc20Abi,
+          functionName: 'balanceOf',
+          args: [ADDRESSES.reserve],
+        })
+      );
+      const claimableDelta = claimableAfter - claimableBefore;
+      const feeDelta = (treasuryAfter - treasuryBefore) + (reserveAfter - reserveBefore);
+      assert.ok(feeDelta > 0n, 'Treasury + reserve must receive protocol interest share on repay');
+      assert.ok(claimableDelta > BigInt(repayRes.principalPaidRaw), 'Holder must receive net interest + principal');
+      assert.equal(
+        claimableDelta + feeDelta,
+        BigInt(repayRes.totalPaidRaw),
+        'Repay USDC conservation: holder claimable + treasury/reserve fee delta must equal totalPaidRaw'
+      );
+
+      const loanCoreUsdcAfterFull = BigInt(
+        await publicClient.readContract({
+          address: BASE_USDC,
+          abi: erc20Abi,
+          functionName: 'allowance',
+          args: [ADDRESSES.borrower, deployed.loanCore],
+        })
+      );
+      assert.ok(
+        loanCoreUsdcAfterFull >= 500_000_000n,
+        'Open $500 LendOffer allowance on LoanCore must remain intact after full repay'
+      );
+
+      await cancelSignedLendOffer({
+        address: ADDRESSES.borrower,
+        offer: borrowerOpenLendOffer.offer,
+        storage: ws35Storage,
+        provider: walletProvider,
+        cfg,
+      });
+
+      console.log('PASS WS3.5 Piece 1: LoanCore repay, partialRepay, topUp, extend EIP-712 & Grace math verified.');
+
+      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1 FORK TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
       await new Promise<void>((r) => apiServer.close(() => r()));

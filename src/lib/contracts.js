@@ -150,6 +150,12 @@ export const loanCoreAbi = [
   },
   { type: 'function', name: 'getDueInterest', stateMutability: 'view', inputs: [{ name: 'loanId', type: 'uint256' }], outputs: [{ name: 'interestOwed', type: 'uint128' }] },
   { type: 'function', name: 'getClaimable', stateMutability: 'view', inputs: [{ name: 'account', type: 'address' }], outputs: [{ name: 'amount', type: 'uint128' }] },
+  { type: 'function', name: 'loanExtensionNonce', stateMutability: 'view', inputs: [{ name: 'loanId', type: 'uint256' }], outputs: [{ name: '', type: 'uint256' }] },
+  { type: 'function', name: 'loanActiveAuction', stateMutability: 'view', inputs: [{ name: 'loanId', type: 'uint256' }], outputs: [{ name: '', type: 'uint256' }] },
+  { type: 'function', name: 'loanLastInterestAccruedTime', stateMutability: 'view', inputs: [{ name: 'loanId', type: 'uint256' }], outputs: [{ name: '', type: 'uint64' }] },
+  { type: 'function', name: 'loanTotalRealInterestAccrued', stateMutability: 'view', inputs: [{ name: 'loanId', type: 'uint256' }], outputs: [{ name: '', type: 'uint128' }] },
+  { type: 'function', name: 'loanInitialRateBps', stateMutability: 'view', inputs: [{ name: 'loanId', type: 'uint256' }], outputs: [{ name: '', type: 'uint32' }] },
+  { type: 'function', name: 'GRACE_PERIOD_SECONDS', stateMutability: 'view', inputs: [], outputs: [{ name: '', type: 'uint64' }] },
   { type: 'function', name: 'repay', stateMutability: 'nonpayable', inputs: [{ name: 'loanId', type: 'uint256' }], outputs: [{ name: 'totalPaid', type: 'uint128' }] },
   {
     type: 'function',
@@ -171,7 +177,67 @@ export const loanCoreAbi = [
     ],
     outputs: [],
   },
+  {
+    type: 'function',
+    name: 'extend',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'loanId', type: 'uint256' },
+      { name: 'newMaturity', type: 'uint64' },
+      { name: 'newRateBps', type: 'uint32' },
+      { name: 'deadline', type: 'uint64' },
+      { name: 'counterpartySig', type: 'bytes' },
+    ],
+    outputs: [],
+  },
   { type: 'function', name: 'claim', stateMutability: 'nonpayable', inputs: [{ name: 'to', type: 'address' }], outputs: [{ name: 'claimedAmount', type: 'uint128' }] },
+  {
+    type: 'event',
+    name: 'Repaid',
+    inputs: [
+      { name: 'loanId', type: 'uint256', indexed: true },
+      { name: 'payer', type: 'address', indexed: true },
+      { name: 'principalPaid', type: 'uint128', indexed: false },
+      { name: 'interestPaid', type: 'uint128', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'PartialRepaid',
+    inputs: [
+      { name: 'loanId', type: 'uint256', indexed: true },
+      { name: 'payer', type: 'address', indexed: true },
+      { name: 'principalPaid', type: 'uint128', indexed: false },
+      { name: 'interestPaid', type: 'uint128', indexed: false },
+      { name: 'collateralReleased', type: 'uint128', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'ToppedUp',
+    inputs: [
+      { name: 'loanId', type: 'uint256', indexed: true },
+      { name: 'funder', type: 'address', indexed: true },
+      { name: 'additionalCollateral', type: 'uint128', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'Extended',
+    inputs: [
+      { name: 'loanId', type: 'uint256', indexed: true },
+      { name: 'newMaturity', type: 'uint64', indexed: false },
+      { name: 'newRateBps', type: 'uint32', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'StatusSynced',
+    inputs: [
+      { name: 'loanId', type: 'uint256', indexed: true },
+      { name: 'status', type: 'uint8', indexed: false },
+    ],
+  },
   { type: 'error', name: 'UnauthorizedCaller', inputs: [] },
   { type: 'error', name: 'ZeroAddress', inputs: [] },
   { type: 'error', name: 'ProtocolPaused', inputs: [] },
@@ -189,6 +255,19 @@ export const loanCoreAbi = [
   { type: 'error', name: 'OrderExpired', inputs: [] },
   { type: 'error', name: 'InvalidSignature', inputs: [] },
 ];
+
+export const LOAN_CORE_DOMAIN_NAME = 'NOSTOK Loan Core';
+export const LOAN_CORE_DOMAIN_VERSION = '1';
+
+export const EXTEND_ORDER_EIP712_TYPES = {
+  ExtendOrder: [
+    { name: 'loanId', type: 'uint256' },
+    { name: 'newMaturity', type: 'uint64' },
+    { name: 'newRateBps', type: 'uint32' },
+    { name: 'nonce', type: 'uint256' },
+    { name: 'deadline', type: 'uint64' },
+  ],
+};
 
 export const ORDER_SETTLEMENT_DOMAIN_NAME = 'NOSTOK Order Settlement';
 export const ORDER_SETTLEMENT_DOMAIN_VERSION = '1';

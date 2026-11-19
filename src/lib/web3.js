@@ -4,6 +4,7 @@ import {
   encodeFunctionData,
   formatUnits,
   getAddress,
+  hashTypedData,
   isAddress,
   keccak256,
   recoverAddress,
@@ -16,7 +17,12 @@ import {
   BORROW_ORDER_EIP712_TYPES,
   DEFAULT_B20_DECIMALS,
   ETH_DECIMALS,
+  EXTEND_ORDER_EIP712_TYPES,
   LEND_OFFER_EIP712_TYPES,
+  LOAN_CORE_DOMAIN_NAME,
+  LOAN_CORE_DOMAIN_VERSION,
+  LOAN_STATUS_NAMES,
+  ORACLE_STATE_NAMES,
   ORDER_SETTLEMENT_DOMAIN_NAME,
   ORDER_SETTLEMENT_DOMAIN_VERSION,
   PROTOCOL_ERROR_ABI,
@@ -27,6 +33,7 @@ import {
   getFrontendConfig,
   getMissingContractAddresses,
   loanCoreAbi,
+  oracleRouterAbi,
   orderSettlementAbi,
   positionNftAbi,
 } from './contracts.js';
@@ -4028,3 +4035,1368 @@ export async function fillBorrowOrderAsLender({
     requiredApprovalRaw: requiredApprovalRaw.toString(),
   };
 }
+
+// ============================================================================
+// WS3.5: LoanCore Loan Management Primitives (repay, partialRepay, topUp, extend)
+// ============================================================================
+
+export const DEFAULT_REPAY_INTEREST_BUFFER_SECS = 300n;
+export const MAX_REPAY_INTEREST_BUFFER_SECS = 3600n;
+export const LOAN_CORE_SECONDS_PER_YEAR = 365n * 86_400n;
+export const LOAN_CORE_GRACE_PERIOD_SECS = 86_400n;
+export const LOAN_CORE_MAX_EXTENSION_WINDOW_SECS = 90n * 86_400n;
+export const LOAN_CORE_MAX_RATE_BPS = 4000;
+
+const LOAN_CORE_BPS_YEAR_DENOM = 10_000n * LOAN_CORE_SECONDS_PER_YEAR;
+const MAX_UINT128_RAW = (1n << 128n) - 1n;
+
+function parseStrictRawBigInt(raw, label, { min = 0n, max = null } = {}) {
+  let val;
+  if (typeof raw === 'bigint') {
+    val = raw;
+  } else if (typeof raw === 'number') {
+    if (!Number.isSafeInteger(raw)) {
+      throw new Error(`${label} must be an integer raw amount (no floats).`);
+    }
+    val = BigInt(raw);
+  } else if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!/^[0-9]+$/.test(trimmed)) {
+      throw new Error(`${label} must be an unsigned integer raw string.`);
+    }
+    val = BigInt(trimmed);
+  } else {
+    throw new Error(`${label} must be provided as an integer raw amount.`);
+  }
+  if (val < min) {
+    throw new Error(`${label} must be >= ${min.toString()}.`);
+  }
+  if (max !== null && val > max) {
+    throw new Error(`${label} exceeds maximum (${max.toString()}).`);
+  }
+  return val;
+}
+
+function mulDivUp(a, b, denom) {
+  const x = BigInt(a);
+  const y = BigInt(b);
+  const d = BigInt(denom);
+  if (d <= 0n) throw new Error('Denominator must be positive.');
+  if (x <= 0n || y <= 0n) return 0n;
+  return (x * y + (d - 1n)) / d;
+}
+
+function decodeLoanCoreEvent(receipt, loanCoreAddr, eventName) {
+  for (const log of receipt?.logs ?? []) {
+    if (log.address?.toLowerCase() !== loanCoreAddr.toLowerCase()) continue;
+    try {
+      const decoded = decodeEventLog({
+        abi: loanCoreAbi,
+        data: log.data,
+        topics: log.topics,
+      });
+      if (decoded.eventName === eventName) {
+        return decoded.args ?? {};
+      }
+    } catch {
+      // ignore non-matching logs
+    }
+  }
+  return null;
+}
+
+async function simulateLoanCoreCallOrPreApproval({
+  publicClient,
+  account,
+  to,
+  data,
+  needsApproval,
+  expectedSpender,
+}) {
+  try {
+    await publicClient.call({ account, to, data });
+  } catch (simErr) {
+    if (!needsApproval || !isExpectedPreApprovalError(simErr, expectedSpender)) {
+      const decoded = decodeContractRevert(simErr);
+      throw new Error(decoded ? decoded.message : formatWeb3Error(simErr));
+    }
+  }
+}
+
+function resolveExtendCounterparties(loanState, address) {
+  const wallet = getAddress(address);
+  const borrower = getAddress(loanState.borrower);
+  if (!loanState.positionOwner) {
+    throw new Error(`PositionNFT owner unavailable for Loan #${loanState.loanId} (${loanState.statusName}).`);
+  }
+  const holder = getAddress(loanState.positionOwner);
+  const isBorrower = wallet.toLowerCase() === borrower.toLowerCase();
+  const isHolder = wallet.toLowerCase() === holder.toLowerCase();
+  if (!isBorrower && !isHolder) {
+    throw new Error(
+      `Wallet ${wallet} is neither borrower (${borrower}) nor PositionNFT holder (${holder}) for Loan #${loanState.loanId}.`
+    );
+  }
+  if (borrower.toLowerCase() === holder.toLowerCase()) {
+    throw new Error(
+      `Borrower and PositionNFT holder are the same address (${wallet}); self-extension cannot produce a valid counterparty signature.`
+    );
+  }
+  return {
+    wallet,
+    borrower,
+    holder,
+    role: isBorrower ? 'borrower' : 'holder',
+    counterparty: isBorrower ? holder : borrower,
+  };
+}
+
+function normalizeExtendOrderStruct(extendOrder) {
+  if (!extendOrder || typeof extendOrder !== 'object') {
+    throw new Error('ExtendOrder payload is required.');
+  }
+  const loanId = parseStrictRawBigInt(extendOrder.loanId, 'extendOrder.loanId', { min: 1n });
+  const newMaturity = parseStrictRawBigInt(extendOrder.newMaturity, 'extendOrder.newMaturity', { min: 1n });
+  const rateRaw = parseStrictRawBigInt(extendOrder.newRateBps, 'extendOrder.newRateBps', {
+    min: 0n,
+    max: BigInt(LOAN_CORE_MAX_RATE_BPS),
+  });
+  const nonce = parseStrictRawBigInt(extendOrder.nonce, 'extendOrder.nonce', { min: 0n });
+  const deadline = parseStrictRawBigInt(extendOrder.deadline, 'extendOrder.deadline', { min: 1n });
+  return {
+    loanId,
+    newMaturity,
+    newRateBps: Number(rateRaw),
+    nonce,
+    deadline,
+  };
+}
+
+export function extendOrderToJson(extendOrder) {
+  const n = normalizeExtendOrderStruct(extendOrder);
+  return {
+    loanId: n.loanId.toString(),
+    newMaturity: n.newMaturity.toString(),
+    newRateBps: n.newRateBps,
+    nonce: n.nonce.toString(),
+    deadline: n.deadline.toString(),
+  };
+}
+
+export function buildExtendOrderTypedData({ extendOrder, cfg = getFrontendConfig() }) {
+  if (!cfg?.contracts?.loanCore) {
+    throw new Error('LoanCore contract address is not configured.');
+  }
+  const message = normalizeExtendOrderStruct(extendOrder);
+  return {
+    domain: {
+      name: LOAN_CORE_DOMAIN_NAME,
+      version: LOAN_CORE_DOMAIN_VERSION,
+      chainId: Number(cfg.chainId || BASE_CHAIN_ID),
+      verifyingContract: getAddress(cfg.contracts.loanCore),
+    },
+    types: EXTEND_ORDER_EIP712_TYPES,
+    primaryType: 'ExtendOrder',
+    message,
+  };
+}
+
+/**
+ * Computes exact projected total due interest (in raw USDC 6-decimal units) matching
+ * LoanCore._getMinInterestFloor + LoanCore._calculateInterestAccrual at `targetTimestampSec`.
+ */
+export function computeLoanProjectedInterestDueRaw(loanState, targetTimestampSec) {
+  if (!loanState) {
+    throw new Error('loanState is required.');
+  }
+  const principal = BigInt(loanState.principalRaw ?? loanState.principal ?? 0n);
+  const principalRepaid = BigInt(loanState.principalRepaidRaw ?? loanState.principalRepaid ?? 0n);
+  const activePrincipal = principal > principalRepaid ? principal - principalRepaid : 0n;
+  const interestPaid = BigInt(loanState.interestPaidRaw ?? loanState.interestPaid ?? 0n);
+  const totalRealAccruedSoFar = BigInt(
+    loanState.loanTotalRealInterestAccruedRaw ?? loanState.loanTotalRealInterestAccrued ?? 0n
+  );
+  const startTime = BigInt(loanState.startTime ?? 0n);
+  const rawLastAccrued = BigInt(loanState.loanLastInterestAccruedTime ?? 0n);
+  const lastAccrued = rawLastAccrued === 0n ? startTime : rawLastAccrued;
+  const maturity = BigInt(loanState.maturity ?? 0n);
+  const toTs = parseStrictRawBigInt(
+    targetTimestampSec ?? loanState.blockTimestamp ?? lastAccrued,
+    'targetTimestampSec',
+    { min: 0n }
+  );
+
+  const rateBps = BigInt(loanState.rateBps ?? 0n);
+  const initialRateRaw = BigInt(loanState.loanInitialRateBps ?? 0n);
+  const minFloorRateBps = initialRateRaw > 0n ? initialRateRaw : rateBps;
+  const penaltySpreadBps = BigInt(loanState.penaltySpreadBps ?? 0n);
+  const minInterestDays = BigInt(loanState.minInterestDays ?? 0n);
+
+  const minFloor =
+    minInterestDays > 0n
+      ? mulDivUp(principal * minFloorRateBps, minInterestDays * 86_400n, LOAN_CORE_BPS_YEAR_DENOM)
+      : 0n;
+
+  let newAccrual = 0n;
+  if (toTs > lastAccrued && activePrincipal > 0n) {
+    if (toTs <= maturity) {
+      const elapsed = toTs - lastAccrued;
+      const termLeft = maturity > lastAccrued ? maturity - lastAccrued : 0n;
+      const regInterest = mulDivUp(activePrincipal * rateBps, elapsed, LOAN_CORE_BPS_YEAR_DENOM);
+      const maxRegInterest = mulDivUp(activePrincipal * rateBps, termLeft, LOAN_CORE_BPS_YEAR_DENOM);
+      newAccrual = regInterest < maxRegInterest ? regInterest : maxRegInterest;
+    } else {
+      const regInterest =
+        lastAccrued < maturity
+          ? mulDivUp(activePrincipal * rateBps, maturity - lastAccrued, LOAN_CORE_BPS_YEAR_DENOM)
+          : 0n;
+      const penaltyStart = lastAccrued > maturity ? lastAccrued : maturity;
+      const penaltyElapsed = toTs > penaltyStart ? toTs - penaltyStart : 0n;
+      const penaltyInterest = mulDivUp(
+        activePrincipal * (rateBps + penaltySpreadBps),
+        penaltyElapsed,
+        LOAN_CORE_BPS_YEAR_DENOM
+      );
+      newAccrual = regInterest + penaltyInterest;
+    }
+  }
+
+  const totalReal = totalRealAccruedSoFar + newAccrual;
+  const totalRequired = totalReal > minFloor ? totalReal : minFloor;
+  return totalRequired > interestPaid ? totalRequired - interestPaid : 0n;
+}
+
+export async function readLoanOnChainState(
+  loanId,
+  { cfg = getFrontendConfig(), publicClient = createProtocolPublicClient(cfg) } = {}
+) {
+  if (!cfg?.contracts?.loanCore || !cfg?.contracts?.positionNft) {
+    throw new Error('LoanCore or PositionNFT contract address is not configured.');
+  }
+  const id = parseStrictRawBigInt(loanId, 'loanId', { min: 1n });
+  const loanCoreAddr = getAddress(cfg.contracts.loanCore);
+  const positionNftAddr = getAddress(cfg.contracts.positionNft);
+
+  const [
+    block,
+    loan,
+    dueInterest,
+    extensionNonce,
+    activeAuctionId,
+    lastAccruedTime,
+    totalRealAccrued,
+    initialRateBps,
+    gracePeriodRes,
+  ] = await Promise.all([
+    publicClient.getBlock({ blockTag: 'latest' }),
+    publicClient.readContract({
+      address: loanCoreAddr,
+      abi: loanCoreAbi,
+      functionName: 'getLoan',
+      args: [id],
+    }),
+    publicClient.readContract({
+      address: loanCoreAddr,
+      abi: loanCoreAbi,
+      functionName: 'getDueInterest',
+      args: [id],
+    }),
+    publicClient.readContract({
+      address: loanCoreAddr,
+      abi: loanCoreAbi,
+      functionName: 'loanExtensionNonce',
+      args: [id],
+    }),
+    publicClient.readContract({
+      address: loanCoreAddr,
+      abi: loanCoreAbi,
+      functionName: 'loanActiveAuction',
+      args: [id],
+    }),
+    publicClient.readContract({
+      address: loanCoreAddr,
+      abi: loanCoreAbi,
+      functionName: 'loanLastInterestAccruedTime',
+      args: [id],
+    }),
+    publicClient.readContract({
+      address: loanCoreAddr,
+      abi: loanCoreAbi,
+      functionName: 'loanTotalRealInterestAccrued',
+      args: [id],
+    }),
+    publicClient.readContract({
+      address: loanCoreAddr,
+      abi: loanCoreAbi,
+      functionName: 'loanInitialRateBps',
+      args: [id],
+    }),
+    publicClient
+      .readContract({
+        address: loanCoreAddr,
+        abi: loanCoreAbi,
+        functionName: 'GRACE_PERIOD_SECONDS',
+      })
+      .catch(() => LOAN_CORE_GRACE_PERIOD_SECS),
+  ]);
+
+  const principalRaw = BigInt(loan.principal ?? 0n);
+  if (principalRaw <= 0n || !loan.borrower || loan.borrower === zeroAddress) {
+    throw new Error(`Loan #${id.toString()} does not exist on-chain.`);
+  }
+
+  const borrower = getAddress(loan.borrower);
+  const collateralToken = getAddress(loan.collateralToken);
+  const collateralRaw = BigInt(loan.collateralRaw ?? 0n);
+  const principalRepaidRaw = BigInt(loan.principalRepaid ?? 0n);
+  const remainingPrincipalRaw = principalRaw > principalRepaidRaw ? principalRaw - principalRepaidRaw : 0n;
+  const interestPaidRaw = BigInt(loan.interestPaid ?? 0n);
+  const dueInterestRaw = BigInt(dueInterest ?? 0n);
+
+  const startTime = BigInt(loan.startTime ?? 0n);
+  const maturity = BigInt(loan.maturity ?? 0n);
+  const gracePeriodSeconds = BigInt(gracePeriodRes ?? LOAN_CORE_GRACE_PERIOD_SECS);
+  const graceEndTimestamp = maturity + gracePeriodSeconds;
+  const blockTimestamp = BigInt(block.timestamp);
+  const blockNumber = BigInt(block.number ?? 0n);
+  const storedStatus = Number(loan.status);
+  const isPastMaturity = blockTimestamp > maturity;
+  const isPastGraceWindow = blockTimestamp > graceEndTimestamp;
+  const effectiveStatus = storedStatus === 0 && isPastMaturity ? 1 : storedStatus;
+
+  const isLiveLifecycle = storedStatus <= 2;
+  const [symRes, decRes, ownerRes, lockedRes, oracleRes] = await Promise.allSettled([
+    publicClient.readContract({ address: collateralToken, abi: erc20Abi, functionName: 'symbol' }),
+    publicClient.readContract({ address: collateralToken, abi: erc20Abi, functionName: 'decimals' }),
+    isLiveLifecycle
+      ? publicClient.readContract({
+          address: positionNftAddr,
+          abi: positionNftAbi,
+          functionName: 'ownerOf',
+          args: [id],
+        })
+      : Promise.resolve(null),
+    isLiveLifecycle
+      ? publicClient.readContract({
+          address: positionNftAddr,
+          abi: positionNftAbi,
+          functionName: 'isAuctionLocked',
+          args: [id],
+        })
+      : Promise.resolve(false),
+    cfg?.contracts?.oracleRouter && collateralRaw > 0n
+      ? publicClient.readContract({
+          address: getAddress(cfg.contracts.oracleRouter),
+          abi: oracleRouterAbi,
+          functionName: 'getValue',
+          args: [collateralToken, collateralRaw],
+        })
+      : Promise.resolve(null),
+  ]);
+
+  const collateralSymbol = symRes.status === 'fulfilled' && symRes.value ? String(symRes.value) : 'TOKEN';
+  const collateralDecimals = decRes.status === 'fulfilled' ? Number(decRes.value) : DEFAULT_B20_DECIMALS;
+  const positionOwner = ownerRes.status === 'fulfilled' && ownerRes.value ? getAddress(ownerRes.value) : null;
+  const auctionLocked = lockedRes.status === 'fulfilled' ? Boolean(lockedRes.value) : false;
+
+  let collateralGrossValueUsdcRaw = null;
+  let collateralEffectiveValueUsdcRaw = null;
+  let oracleState = null;
+  let oracleStateName = null;
+  let currentLtvBps = null;
+  let currentLtvWithInterestBps = null;
+  if (oracleRes.status === 'fulfilled' && Array.isArray(oracleRes.value)) {
+    const gross = BigInt(oracleRes.value[0] ?? 0n);
+    const effective = BigInt(oracleRes.value[1] ?? 0n);
+    const stateNum = Number(oracleRes.value[2]);
+    collateralGrossValueUsdcRaw = gross.toString();
+    collateralEffectiveValueUsdcRaw = effective.toString();
+    oracleState = stateNum;
+    oracleStateName = ORACLE_STATE_NAMES[stateNum] ?? `STATE_${stateNum}`;
+    if (effective > 0n) {
+      currentLtvBps = Number((remainingPrincipalRaw * 10_000n) / effective);
+      currentLtvWithInterestBps = Number(((remainingPrincipalRaw + dueInterestRaw) * 10_000n) / effective);
+    }
+  }
+
+  return {
+    loanId: id.toString(),
+    borrower,
+    positionOwner,
+    collateralToken,
+    collateralSymbol,
+    collateralDecimals,
+    collateralRaw: collateralRaw.toString(),
+    collateralFormatted: formatTokenUnitsDisplay(collateralRaw, collateralDecimals, 4),
+    principalRaw: principalRaw.toString(),
+    principalRepaidRaw: principalRepaidRaw.toString(),
+    remainingPrincipalRaw: remainingPrincipalRaw.toString(),
+    remainingPrincipalFormatted: formatTokenUnitsDisplay(remainingPrincipalRaw, USDC_DECIMALS, 2),
+    interestPaidRaw: interestPaidRaw.toString(),
+    dueInterestRaw: dueInterestRaw.toString(),
+    dueInterestFormatted: formatTokenUnitsDisplay(dueInterestRaw, USDC_DECIMALS, 6),
+    spotTotalDebtRaw: (remainingPrincipalRaw + dueInterestRaw).toString(),
+    spotTotalDebtFormatted: formatTokenUnitsDisplay(remainingPrincipalRaw + dueInterestRaw, USDC_DECIMALS, 6),
+    loanTotalRealInterestAccruedRaw: BigInt(totalRealAccrued ?? 0n).toString(),
+    loanLastInterestAccruedTime: BigInt(lastAccruedTime ?? 0n).toString(),
+    loanInitialRateBps: Number(initialRateBps ?? 0n),
+    startTime: startTime.toString(),
+    maturity: maturity.toString(),
+    maxExtendMaturity: (startTime + LOAN_CORE_MAX_EXTENSION_WINDOW_SECS).toString(),
+    gracePeriodSeconds: gracePeriodSeconds.toString(),
+    graceEndTimestamp: graceEndTimestamp.toString(),
+    blockTimestamp: blockTimestamp.toString(),
+    blockNumber: blockNumber.toString(),
+    rateBps: Number(loan.rateBps),
+    penaltySpreadBps: Number(loan.penaltySpreadBps),
+    initLtvBps: Number(loan.initLtvBps),
+    marginCallLtvBps: Number(loan.marginCallLtvBps),
+    liqLtvBps: Number(loan.liqLtvBps),
+    minInterestDays: Number(loan.minInterestDays),
+    storedStatus,
+    storedStatusName: LOAN_STATUS_NAMES[storedStatus] ?? `Status_${storedStatus}`,
+    status: effectiveStatus,
+    statusName: LOAN_STATUS_NAMES[effectiveStatus] ?? `Status_${effectiveStatus}`,
+    yieldMode: Number(loan.yieldMode),
+    coreVersion: Number(loan.coreVersion),
+    extensionNonce: BigInt(extensionNonce ?? 0n).toString(),
+    activeAuctionId: BigInt(activeAuctionId ?? 0n).toString(),
+    auctionLocked,
+    isActive: effectiveStatus === 0,
+    isGrace: effectiveStatus === 1,
+    isAuction: effectiveStatus === 2,
+    isSettled: storedStatus >= 3,
+    isPastMaturity,
+    isPastGraceWindow,
+    collateralGrossValueUsdcRaw,
+    collateralEffectiveValueUsdcRaw,
+    oracleState,
+    oracleStateName,
+    currentLtvBps,
+    currentLtvWithInterestBps,
+  };
+}
+
+/**
+ * Exact + buffer-projected raw USDC requirements for full `LoanCore.repay(loanId)`.
+ * Never uses MaxUint256; projection applies LoanCore's exact mulDivUp regular + Grace penalty formula.
+ */
+export function computeExactRepayAmounts(
+  loanState,
+  { bufferSeconds = DEFAULT_REPAY_INTEREST_BUFFER_SECS, existingOpenSumRaw = 0n } = {}
+) {
+  if (!loanState) throw new Error('loanState is required.');
+  const remainingPrincipal = BigInt(loanState.remainingPrincipalRaw ?? 0n);
+  if (remainingPrincipal <= 0n || loanState.isSettled) {
+    throw new Error(`Loan #${loanState.loanId ?? ''} has no remaining principal to repay.`);
+  }
+  const bufferSec = parseStrictRawBigInt(bufferSeconds, 'bufferSeconds', {
+    min: 0n,
+    max: MAX_REPAY_INTEREST_BUFFER_SECS,
+  });
+  const existingSum = parseStrictRawBigInt(existingOpenSumRaw ?? 0n, 'existingOpenSumRaw', { min: 0n });
+
+  const spotTs = BigInt(loanState.blockTimestamp ?? loanState.startTime ?? 0n);
+  const spotInterest = BigInt(loanState.dueInterestRaw ?? computeLoanProjectedInterestDueRaw(loanState, spotTs));
+  const projectedTs = spotTs + bufferSec;
+  const projectedDue = computeLoanProjectedInterestDueRaw(loanState, projectedTs);
+  const maxInterest = projectedDue > spotInterest ? projectedDue : spotInterest;
+
+  const spotTotalPayment = remainingPrincipal + spotInterest;
+  const maxPayment = remainingPrincipal + maxInterest;
+  const requiredApproval = existingSum + maxPayment;
+
+  return {
+    isPartial: false,
+    principalRepayRaw: remainingPrincipal.toString(),
+    spotInterestRaw: spotInterest.toString(),
+    maxInterestRaw: maxInterest.toString(),
+    bufferInterestDeltaRaw: (maxInterest - spotInterest).toString(),
+    bufferSeconds: bufferSec.toString(),
+    projectedTimestamp: projectedTs.toString(),
+    spotTotalPaymentRaw: spotTotalPayment.toString(),
+    maxPaymentRaw: maxPayment.toString(),
+    existingOpenSumRaw: existingSum.toString(),
+    requiredApprovalRaw: requiredApproval.toString(),
+    collateralReleasedRaw: BigInt(loanState.collateralRaw ?? 0n).toString(),
+    collateralRemainingRaw: '0',
+    principalRemainingAfterRaw: '0',
+  };
+}
+
+/**
+ * Exact + buffer-projected raw USDC and pro-rata collateral release for `LoanCore.partialRepay(loanId, amount)`.
+ * Mirrors LoanCore's truncating integer division `(totalDue * amount) / remainingPrincipal`
+ * and `(collateralRaw * amount) / remainingPrincipal`.
+ */
+export function computeExactPartialRepayAmounts(
+  loanState,
+  principalRepayAmountRaw,
+  { bufferSeconds = DEFAULT_REPAY_INTEREST_BUFFER_SECS, existingOpenSumRaw = 0n } = {}
+) {
+  if (!loanState) throw new Error('loanState is required.');
+  const remainingPrincipal = BigInt(loanState.remainingPrincipalRaw ?? 0n);
+  if (remainingPrincipal <= 0n || loanState.isSettled) {
+    throw new Error(`Loan #${loanState.loanId ?? ''} has no remaining principal.`);
+  }
+  const principalRepay = parseStrictRawBigInt(principalRepayAmountRaw, 'principalRepayAmountRaw', {
+    min: 1n,
+  });
+  if (principalRepay >= remainingPrincipal) {
+    throw new Error(
+      `Partial repay principal (${principalRepay.toString()}) must be strictly less than remaining principal (${remainingPrincipal.toString()}); use full repay() instead.`
+    );
+  }
+  const bufferSec = parseStrictRawBigInt(bufferSeconds, 'bufferSeconds', {
+    min: 0n,
+    max: MAX_REPAY_INTEREST_BUFFER_SECS,
+  });
+  const existingSum = parseStrictRawBigInt(existingOpenSumRaw ?? 0n, 'existingOpenSumRaw', { min: 0n });
+
+  const spotTs = BigInt(loanState.blockTimestamp ?? loanState.startTime ?? 0n);
+  const spotDue = BigInt(loanState.dueInterestRaw ?? computeLoanProjectedInterestDueRaw(loanState, spotTs));
+  const projectedTs = spotTs + bufferSec;
+  const projectedDue = computeLoanProjectedInterestDueRaw(loanState, projectedTs);
+  const boundedDue = projectedDue > spotDue ? projectedDue : spotDue;
+
+  const spotInterestOnRepaid = (spotDue * principalRepay) / remainingPrincipal;
+  const maxInterestOnRepaid = (boundedDue * principalRepay) / remainingPrincipal;
+  const spotTotalPayment = principalRepay + spotInterestOnRepaid;
+  const maxPayment = principalRepay + maxInterestOnRepaid;
+  const requiredApproval = existingSum + maxPayment;
+
+  const totalCollateral = BigInt(loanState.collateralRaw ?? 0n);
+  const collateralReleased = (totalCollateral * principalRepay) / remainingPrincipal;
+  const collateralRemaining = totalCollateral - collateralReleased;
+  const principalRemainingAfter = remainingPrincipal - principalRepay;
+
+  return {
+    isPartial: true,
+    principalRepayRaw: principalRepay.toString(),
+    spotInterestRaw: spotInterestOnRepaid.toString(),
+    maxInterestRaw: maxInterestOnRepaid.toString(),
+    bufferInterestDeltaRaw: (maxInterestOnRepaid - spotInterestOnRepaid).toString(),
+    bufferSeconds: bufferSec.toString(),
+    projectedTimestamp: projectedTs.toString(),
+    spotTotalPaymentRaw: spotTotalPayment.toString(),
+    maxPaymentRaw: maxPayment.toString(),
+    existingOpenSumRaw: existingSum.toString(),
+    requiredApprovalRaw: requiredApproval.toString(),
+    collateralReleasedRaw: collateralReleased.toString(),
+    collateralRemainingRaw: collateralRemaining.toString(),
+    principalRemainingAfterRaw: principalRemainingAfter.toString(),
+  };
+}
+
+/**
+ * Exact raw collateral & cumulative CollateralEscrow approval sizing for `LoanCore.topUp(loanId, additional)`.
+ */
+export function computeExactTopUpAmounts(
+  loanState,
+  additionalCollateralRaw,
+  { existingOpenCollateralRaw = 0n } = {}
+) {
+  if (!loanState) throw new Error('loanState is required.');
+  const additional = parseStrictRawBigInt(additionalCollateralRaw, 'additionalCollateralRaw', {
+    min: 1n,
+  });
+  const existingOpen = parseStrictRawBigInt(existingOpenCollateralRaw ?? 0n, 'existingOpenCollateralRaw', {
+    min: 0n,
+  });
+  const currentCollateral = BigInt(loanState.collateralRaw ?? 0n);
+  const newCollateral = currentCollateral + additional;
+  if (newCollateral > MAX_UINT128_RAW) {
+    throw new Error('New total loan collateral exceeds uint128 maximum.');
+  }
+
+  let projectedLtvBps = null;
+  if (
+    loanState.collateralEffectiveValueUsdcRaw &&
+    currentCollateral > 0n &&
+    BigInt(loanState.collateralEffectiveValueUsdcRaw) > 0n
+  ) {
+    const newEffective =
+      (BigInt(loanState.collateralEffectiveValueUsdcRaw) * newCollateral) / currentCollateral;
+    if (newEffective > 0n) {
+      projectedLtvBps = Number((BigInt(loanState.remainingPrincipalRaw) * 10_000n) / newEffective);
+    }
+  }
+
+  return {
+    additionalCollateralRaw: additional.toString(),
+    currentCollateralRaw: currentCollateral.toString(),
+    newCollateralRaw: newCollateral.toString(),
+    existingOpenCollateralRaw: existingOpen.toString(),
+    requiredApprovalRaw: (existingOpen + additional).toString(),
+    projectedLtvBps,
+  };
+}
+
+export async function verifyAndPreviewLoanRepay({
+  loanId,
+  payerAddress = null,
+  principalRepayRaw = null,
+  bufferSeconds = DEFAULT_REPAY_INTEREST_BUFFER_SECS,
+  existingOpenSumRaw = null,
+  storage = null,
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!cfg?.usdcAddress || !cfg?.contracts?.loanCore) {
+    throw new Error('USDC or LoanCore contract address is not configured.');
+  }
+  const loanCoreAddr = getAddress(cfg.contracts.loanCore);
+  const usdcAddr = getAddress(cfg.usdcAddress);
+  const payer = payerAddress && isAddress(payerAddress) ? getAddress(payerAddress) : null;
+  if (payerAddress && !payer) {
+    throw new Error('Invalid payerAddress.');
+  }
+
+  const loanState = await readLoanOnChainState(loanId, { cfg, publicClient });
+  if (loanState.isSettled) {
+    throw new Error(`Loan #${loanState.loanId} is already ${loanState.statusName} and cannot be repaid.`);
+  }
+
+  const hasPartial =
+    principalRepayRaw !== null && principalRepayRaw !== undefined && String(principalRepayRaw).trim() !== '';
+  if (hasPartial && (!loanState.isActive || loanState.isPastMaturity)) {
+    throw new Error(
+      `Partial repay is only available while Loan #${loanState.loanId} is Active before maturity (current state: ${loanState.statusName}); use full repay() instead.`
+    );
+  }
+
+  const openLendSum = payer
+    ? await resolveOpenLendOffersSumRaw({
+        lenderAddress: payer,
+        existingOpenSumRaw,
+        storage,
+        cfg,
+        publicClient,
+      })
+    : parseStrictRawBigInt(existingOpenSumRaw ?? 0n, 'existingOpenSumRaw', { min: 0n });
+
+  const exact = hasPartial
+    ? computeExactPartialRepayAmounts(loanState, principalRepayRaw, {
+        bufferSeconds,
+        existingOpenSumRaw: openLendSum,
+      })
+    : computeExactRepayAmounts(loanState, {
+        bufferSeconds,
+        existingOpenSumRaw: openLendSum,
+      });
+
+  const requiredApproval = BigInt(exact.requiredApprovalRaw);
+  const maxPayment = BigInt(exact.maxPaymentRaw);
+  let payerBalanceRaw = null;
+  let payerAllowanceRaw = null;
+  let sufficientBalance = null;
+  let needsApproval = true;
+
+  if (payer) {
+    const [bal, allowance] = await Promise.all([
+      publicClient.readContract({ address: usdcAddr, abi: erc20Abi, functionName: 'balanceOf', args: [payer] }),
+      publicClient.readContract({
+        address: usdcAddr,
+        abi: erc20Abi,
+        functionName: 'allowance',
+        args: [payer, loanCoreAddr],
+      }),
+    ]);
+    const balBig = BigInt(bal);
+    const allowBig = BigInt(allowance);
+    payerBalanceRaw = balBig.toString();
+    payerAllowanceRaw = allowBig.toString();
+    sufficientBalance = balBig >= maxPayment;
+    needsApproval = allowBig < requiredApproval;
+  }
+
+  const callData = encodeFunctionData({
+    abi: loanCoreAbi,
+    functionName: hasPartial ? 'partialRepay' : 'repay',
+    args: hasPartial ? [BigInt(loanState.loanId), BigInt(exact.principalRepayRaw)] : [BigInt(loanState.loanId)],
+  });
+
+  if (payer) {
+    await simulateLoanCoreCallOrPreApproval({
+      publicClient,
+      account: payer,
+      to: loanCoreAddr,
+      data: callData,
+      needsApproval,
+      expectedSpender: loanCoreAddr,
+    });
+  }
+
+  return {
+    kind: hasPartial ? 'partial_repay' : 'repay',
+    isPartial: hasPartial,
+    loanId: loanState.loanId,
+    loanState,
+    payerAddress: payer,
+    token: usdcAddr,
+    spender: loanCoreAddr,
+    exact,
+    spotTotalPaymentRaw: exact.spotTotalPaymentRaw,
+    maxPaymentRaw: exact.maxPaymentRaw,
+    existingOpenSumRaw: exact.existingOpenSumRaw,
+    requiredApprovalRaw: exact.requiredApprovalRaw,
+    payerBalanceRaw,
+    payerAllowanceRaw,
+    sufficientBalance,
+    needsApproval,
+    callData,
+  };
+}
+
+export async function executeLoanRepay({
+  address,
+  loanId,
+  principalRepayRaw = null,
+  bufferSeconds = DEFAULT_REPAY_INTEREST_BUFFER_SECS,
+  existingOpenSumRaw = null,
+  expectedPreview = null,
+  autoApprove = false,
+  storage = null,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
+  const loanCoreAddr = getAddress(cfg.contracts.loanCore);
+  const preview = await verifyAndPreviewLoanRepay({
+    loanId,
+    payerAddress: wallet,
+    principalRepayRaw,
+    bufferSeconds,
+    existingOpenSumRaw,
+    storage,
+    cfg,
+    publicClient,
+  });
+
+  let approvalTargetRaw = BigInt(preview.requiredApprovalRaw);
+  if (expectedPreview) {
+    if (String(expectedPreview.loanId) !== String(preview.loanId)) {
+      throw new Error('Loan ID changed since repay preview; re-verify before submitting.');
+    }
+    if (Boolean(expectedPreview.isPartial) !== Boolean(preview.isPartial)) {
+      throw new Error('Repay mode (full vs partial) changed since preview.');
+    }
+    if (
+      preview.isPartial &&
+      expectedPreview.exact?.principalRepayRaw !== undefined &&
+      String(expectedPreview.exact.principalRepayRaw) !== String(preview.exact.principalRepayRaw)
+    ) {
+      throw new Error('Partial repay principal changed since preview.');
+    }
+    if (
+      expectedPreview.loanState?.maturity !== undefined &&
+      String(expectedPreview.loanState.maturity) !== String(preview.loanState.maturity)
+    ) {
+      throw new Error('Loan maturity changed since repay preview; re-verify before submitting.');
+    }
+    if (
+      expectedPreview.loanState?.rateBps !== undefined &&
+      Number(expectedPreview.loanState.rateBps) !== Number(preview.loanState.rateBps)
+    ) {
+      throw new Error('Loan interest rate changed since repay preview; re-verify before submitting.');
+    }
+    if (
+      expectedPreview.existingOpenSumRaw !== undefined &&
+      expectedPreview.existingOpenSumRaw !== null &&
+      BigInt(preview.existingOpenSumRaw) > BigInt(expectedPreview.existingOpenSumRaw)
+    ) {
+      throw new Error(
+        `Open LendOffer sum increased since preview (${expectedPreview.existingOpenSumRaw} -> ${preview.existingOpenSumRaw} raw); re-verify before approving.`
+      );
+    }
+    if (
+      expectedPreview.maxPaymentRaw !== undefined &&
+      expectedPreview.maxPaymentRaw !== null &&
+      BigInt(preview.spotTotalPaymentRaw) > BigInt(expectedPreview.maxPaymentRaw)
+    ) {
+      throw new Error(
+        `On-chain repay total (${preview.spotTotalPaymentRaw} raw) exceeded preview ceiling (${expectedPreview.maxPaymentRaw} raw); re-verify before submitting.`
+      );
+    }
+    if (expectedPreview.requiredApprovalRaw !== undefined && expectedPreview.requiredApprovalRaw !== null) {
+      const reviewedCap = BigInt(expectedPreview.requiredApprovalRaw);
+      const minNeededNow = BigInt(preview.existingOpenSumRaw) + BigInt(preview.spotTotalPaymentRaw);
+      if (minNeededNow > reviewedCap) {
+        throw new Error(
+          `Required LoanCore approval exceeded previewed ceiling (${reviewedCap.toString()} raw); re-verify before approving.`
+        );
+      }
+      if (approvalTargetRaw > reviewedCap) {
+        approvalTargetRaw = reviewedCap;
+      }
+    }
+  }
+
+  const effectiveSufficientBalance = BigInt(preview.payerBalanceRaw) >= BigInt(preview.spotTotalPaymentRaw);
+  if (!effectiveSufficientBalance) {
+    throw new Error(
+      `Insufficient USDC balance for loan repayment (need at least ${preview.spotTotalPaymentRaw} raw).`
+    );
+  }
+
+  const effectiveNeedsApproval = BigInt(preview.payerAllowanceRaw) < approvalTargetRaw;
+  let approvalTxHash = null;
+  if (effectiveNeedsApproval) {
+    if (!autoApprove) {
+      throw new Error(
+        `LoanCore USDC allowance is below required ${approvalTargetRaw.toString()} raw units (covers open LendOffers + repay); approve USDC to LoanCore first.`
+      );
+    }
+    const appRes = await approveUsdcForLend({
+      address: wallet,
+      requiredUsdcRaw: approvalTargetRaw,
+      provider,
+      cfg,
+      publicClient,
+    });
+    approvalTxHash = appRes.txHash;
+  }
+
+  try {
+    await publicClient.call({
+      account: wallet,
+      to: loanCoreAddr,
+      data: preview.callData,
+    });
+  } catch (simErr) {
+    const decoded = decodeContractRevert(simErr);
+    throw new Error(decoded ? decoded.message : formatWeb3Error(simErr));
+  }
+
+  const { txHash, receipt } = await sendWalletTransaction(provider, publicClient, {
+    from: wallet,
+    to: loanCoreAddr,
+    data: preview.callData,
+  });
+
+  const eventName = preview.isPartial ? 'PartialRepaid' : 'Repaid';
+  const evArgs = decodeLoanCoreEvent(receipt, loanCoreAddr, eventName);
+  if (!evArgs) {
+    throw new Error(`${eventName} event missing in transaction receipt for Loan #${preview.loanId}.`);
+  }
+
+  return {
+    txHash,
+    approvalTxHash,
+    receipt,
+    kind: preview.kind,
+    isPartial: preview.isPartial,
+    loanId: preview.loanId,
+    principalPaidRaw: (evArgs.principalPaid ?? evArgs.principal ?? preview.exact.principalRepayRaw).toString(),
+    interestPaidRaw: (evArgs.interestPaid ?? evArgs.interest ?? preview.exact.spotInterestRaw).toString(),
+    collateralReleasedRaw: (evArgs.collateralReleased ?? preview.exact.collateralReleasedRaw).toString(),
+    totalPaidRaw: (
+      BigInt(evArgs.principalPaid ?? evArgs.principal ?? preview.exact.principalRepayRaw) +
+      BigInt(evArgs.interestPaid ?? evArgs.interest ?? preview.exact.spotInterestRaw)
+    ).toString(),
+    existingOpenSumRaw: preview.existingOpenSumRaw,
+    requiredApprovalRaw: approvalTargetRaw.toString(),
+    spender: loanCoreAddr,
+    preview,
+  };
+}
+
+export async function verifyAndPreviewLoanTopUp({
+  loanId,
+  additionalCollateralRaw,
+  payerAddress = null,
+  existingOpenCollateralRaw = null,
+  storage = null,
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!cfg?.contracts?.loanCore || !cfg?.contracts?.collateralEscrow) {
+    throw new Error('LoanCore or CollateralEscrow contract address is not configured.');
+  }
+  const loanCoreAddr = getAddress(cfg.contracts.loanCore);
+  const escrowAddr = getAddress(cfg.contracts.collateralEscrow);
+  const payer = payerAddress && isAddress(payerAddress) ? getAddress(payerAddress) : null;
+  if (payerAddress && !payer) {
+    throw new Error('Invalid payerAddress.');
+  }
+
+  const loanState = await readLoanOnChainState(loanId, { cfg, publicClient });
+  if (loanState.isSettled || loanState.isAuction || Number(loanState.storedStatus) >= 2) {
+    throw new Error(
+      `Loan #${loanState.loanId} is in ${loanState.statusName}; collateral top-up is only allowed in Active or Grace before auction.`
+    );
+  }
+
+  const openCollateralSum = payer
+    ? await resolveOpenBorrowOrdersCollateralSumRaw({
+        borrowerAddress: payer,
+        collateralToken: loanState.collateralToken,
+        existingOpenCollateralRaw,
+        storage,
+        cfg,
+        publicClient,
+      })
+    : parseStrictRawBigInt(existingOpenCollateralRaw ?? 0n, 'existingOpenCollateralRaw', { min: 0n });
+
+  const exact = computeExactTopUpAmounts(loanState, additionalCollateralRaw, {
+    existingOpenCollateralRaw: openCollateralSum,
+  });
+
+  const additionalBig = BigInt(exact.additionalCollateralRaw);
+  const requiredApproval = BigInt(exact.requiredApprovalRaw);
+  let payerBalanceRaw = null;
+  let payerAllowanceRaw = null;
+  let sufficientBalance = null;
+  let needsApproval = true;
+
+  if (payer) {
+    const [bal, allowance] = await Promise.all([
+      publicClient.readContract({
+        address: loanState.collateralToken,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [payer],
+      }),
+      publicClient.readContract({
+        address: loanState.collateralToken,
+        abi: erc20Abi,
+        functionName: 'allowance',
+        args: [payer, escrowAddr],
+      }),
+    ]);
+    const balBig = BigInt(bal);
+    const allowBig = BigInt(allowance);
+    payerBalanceRaw = balBig.toString();
+    payerAllowanceRaw = allowBig.toString();
+    sufficientBalance = balBig >= additionalBig;
+    needsApproval = allowBig < requiredApproval;
+  }
+
+  const callData = encodeFunctionData({
+    abi: loanCoreAbi,
+    functionName: 'topUp',
+    args: [BigInt(loanState.loanId), additionalBig],
+  });
+
+  if (payer) {
+    await simulateLoanCoreCallOrPreApproval({
+      publicClient,
+      account: payer,
+      to: loanCoreAddr,
+      data: callData,
+      needsApproval,
+      expectedSpender: escrowAddr,
+    });
+  }
+
+  return {
+    kind: 'top_up',
+    loanId: loanState.loanId,
+    loanState,
+    payerAddress: payer,
+    token: loanState.collateralToken,
+    spender: escrowAddr,
+    loanCoreTarget: loanCoreAddr,
+    exact,
+    additionalCollateralRaw: exact.additionalCollateralRaw,
+    newCollateralRaw: exact.newCollateralRaw,
+    existingOpenCollateralRaw: exact.existingOpenCollateralRaw,
+    requiredApprovalRaw: exact.requiredApprovalRaw,
+    payerBalanceRaw,
+    payerAllowanceRaw,
+    sufficientBalance,
+    needsApproval,
+    callData,
+  };
+}
+
+export async function executeLoanTopUp({
+  address,
+  loanId,
+  additionalCollateralRaw,
+  existingOpenCollateralRaw = null,
+  expectedPreview = null,
+  autoApprove = false,
+  storage = null,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
+  const loanCoreAddr = getAddress(cfg.contracts.loanCore);
+  const preview = await verifyAndPreviewLoanTopUp({
+    loanId,
+    additionalCollateralRaw,
+    payerAddress: wallet,
+    existingOpenCollateralRaw,
+    storage,
+    cfg,
+    publicClient,
+  });
+
+  if (expectedPreview) {
+    if (String(expectedPreview.loanId) !== String(preview.loanId)) {
+      throw new Error('Loan ID changed since top-up preview.');
+    }
+    if (String(expectedPreview.additionalCollateralRaw) !== String(preview.additionalCollateralRaw)) {
+      throw new Error('Top-up collateral amount changed since preview.');
+    }
+    if (
+      expectedPreview.requiredApprovalRaw !== undefined &&
+      expectedPreview.requiredApprovalRaw !== null &&
+      BigInt(preview.requiredApprovalRaw) > BigInt(expectedPreview.requiredApprovalRaw)
+    ) {
+      throw new Error(
+        `Required CollateralEscrow approval increased since preview (${expectedPreview.requiredApprovalRaw} -> ${preview.requiredApprovalRaw} raw); re-verify before approving.`
+      );
+    }
+  }
+
+  if (!preview.sufficientBalance) {
+    throw new Error(
+      `Insufficient ${preview.loanState.collateralSymbol} balance for top-up (need ${preview.additionalCollateralRaw} raw).`
+    );
+  }
+
+  let approvalTxHash = null;
+  if (preview.needsApproval) {
+    if (!autoApprove) {
+      throw new Error(
+        `CollateralEscrow allowance is below required ${preview.requiredApprovalRaw} raw units (covers open BorrowOrders + top-up); approve collateral to CollateralEscrow first.`
+      );
+    }
+    const appRes = await approveCollateralForBorrow({
+      address: wallet,
+      collateralToken: preview.token,
+      requiredCollateralRaw: preview.requiredApprovalRaw,
+      provider,
+      cfg,
+      publicClient,
+    });
+    approvalTxHash = appRes.txHash;
+  }
+
+  try {
+    await publicClient.call({
+      account: wallet,
+      to: loanCoreAddr,
+      data: preview.callData,
+    });
+  } catch (simErr) {
+    const decoded = decodeContractRevert(simErr);
+    throw new Error(decoded ? decoded.message : formatWeb3Error(simErr));
+  }
+
+  const { txHash, receipt } = await sendWalletTransaction(provider, publicClient, {
+    from: wallet,
+    to: loanCoreAddr,
+    data: preview.callData,
+  });
+
+  const evArgs = decodeLoanCoreEvent(receipt, loanCoreAddr, 'ToppedUp');
+  if (!evArgs) {
+    throw new Error(`ToppedUp event missing in transaction receipt for Loan #${preview.loanId}.`);
+  }
+
+  return {
+    txHash,
+    approvalTxHash,
+    receipt,
+    loanId: preview.loanId,
+    addedCollateralRaw: (evArgs.addedCollateral ?? preview.additionalCollateralRaw).toString(),
+    newCollateralRaw: (evArgs.newTotalCollateral ?? preview.newCollateralRaw).toString(),
+    existingOpenCollateralRaw: preview.existingOpenCollateralRaw,
+    requiredApprovalRaw: preview.requiredApprovalRaw,
+    spender: preview.spender,
+    preview,
+  };
+}
+
+function assertValidExtendTerms(loanState, normalizedOrder) {
+  if (!loanState.isActive || loanState.isPastMaturity || Number(loanState.storedStatus) !== 0) {
+    throw new Error(
+      `Loan #${loanState.loanId} cannot be extended (must be Active before maturity; current state: ${loanState.statusName}).`
+    );
+  }
+  const currentMaturity = BigInt(loanState.maturity);
+  const maxMaturity = BigInt(loanState.maxExtendMaturity);
+  if (normalizedOrder.newMaturity <= currentMaturity) {
+    throw new Error(
+      `New maturity (${normalizedOrder.newMaturity.toString()}) must be strictly after current maturity (${currentMaturity.toString()}).`
+    );
+  }
+  if (normalizedOrder.newMaturity > maxMaturity) {
+    throw new Error(
+      `New maturity (${normalizedOrder.newMaturity.toString()}) exceeds protocol maximum 90 days from loan start (${maxMaturity.toString()}).`
+    );
+  }
+  if (normalizedOrder.newRateBps < 0 || normalizedOrder.newRateBps > LOAN_CORE_MAX_RATE_BPS) {
+    throw new Error(`Extension APR (${normalizedOrder.newRateBps} bps) exceeds protocol maximum (${LOAN_CORE_MAX_RATE_BPS} bps).`);
+  }
+  const currentTs = BigInt(loanState.blockTimestamp);
+  if (normalizedOrder.deadline < currentTs) {
+    throw new Error(
+      `Extension signature deadline (${normalizedOrder.deadline.toString()}) is already in the past (block timestamp ${currentTs.toString()}).`
+    );
+  }
+  const chainNonce = BigInt(loanState.extensionNonce);
+  if (normalizedOrder.nonce !== chainNonce) {
+    throw new Error(
+      `Extension nonce mismatch (order nonce ${normalizedOrder.nonce.toString()}, on-chain nonce ${chainNonce.toString()}).`
+    );
+  }
+}
+
+/**
+ * Signs an EIP-712 ExtendOrder in the "NOSTOK Loan Core" domain by either borrower or PositionNFT holder.
+ * Zero token approvals are needed to extend a loan.
+ */
+export async function signLoanExtension({
+  address,
+  loanId,
+  newMaturity,
+  newRateBps,
+  deadline,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
+  const loanState = await readLoanOnChainState(loanId, { cfg, publicClient });
+  const parties = resolveExtendCounterparties(loanState, wallet);
+
+  const extendOrder = normalizeExtendOrderStruct({
+    loanId: loanState.loanId,
+    newMaturity,
+    newRateBps,
+    nonce: loanState.extensionNonce,
+    deadline,
+  });
+  assertValidExtendTerms(loanState, extendOrder);
+
+  const typedData = buildExtendOrderTypedData({ extendOrder, cfg });
+  const digest = hashTypedData(typedData);
+  const signature = await provider.request({
+    method: 'eth_signTypedData_v4',
+    params: [wallet, serializeTypedDataForRpc(typedData)],
+  });
+  if (typeof signature !== 'string' || !/^0x[0-9a-fA-F]+$/.test(signature)) {
+    throw new Error('Wallet returned an invalid EIP-712 extension signature.');
+  }
+
+  return {
+    loanId: loanState.loanId,
+    loanState,
+    signer: wallet,
+    signerRole: parties.role,
+    expectedSubmitter: parties.counterparty,
+    extendOrder,
+    extendOrderJson: extendOrderToJson(extendOrder),
+    typedData,
+    digest,
+    signature,
+  };
+}
+
+export async function verifyAndPreviewLoanExtend({
+  loanId,
+  newMaturity,
+  newRateBps,
+  deadline,
+  nonce = null,
+  signature,
+  callerAddress = null,
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  if (!cfg?.contracts?.loanCore) {
+    throw new Error('LoanCore contract address is not configured.');
+  }
+  if (typeof signature !== 'string' || !/^0x[0-9a-fA-F]+$/.test(signature)) {
+    throw new Error('Valid counterparty ExtendOrder signature (hex) is required.');
+  }
+  const loanCoreAddr = getAddress(cfg.contracts.loanCore);
+  const loanState = await readLoanOnChainState(loanId, { cfg, publicClient });
+
+  const resolvedNonce = nonce !== null && nonce !== undefined ? nonce : loanState.extensionNonce;
+  const extendOrder = normalizeExtendOrderStruct({
+    loanId: loanState.loanId,
+    newMaturity,
+    newRateBps,
+    nonce: resolvedNonce,
+    deadline,
+  });
+  assertValidExtendTerms(loanState, extendOrder);
+
+  const typedData = buildExtendOrderTypedData({ extendOrder, cfg });
+  const digest = hashTypedData(typedData);
+
+  let recoveredSigner = null;
+  try {
+    recoveredSigner = getAddress(await recoverAddress({ hash: digest, signature }));
+  } catch {
+    recoveredSigner = null;
+  }
+
+  let caller = null;
+  let counterparty = null;
+  let callerRole = null;
+  if (callerAddress) {
+    const parties = resolveExtendCounterparties(loanState, callerAddress);
+    caller = parties.wallet;
+    callerRole = parties.role;
+    counterparty = parties.counterparty;
+
+    if (recoveredSigner && recoveredSigner.toLowerCase() === caller.toLowerCase()) {
+      throw new Error(
+        `Counterparty signature cannot come from the submitting caller (${caller}); self-extension rejected.`
+      );
+    }
+    const code = await publicClient.getCode({ address: counterparty }).catch(() => '0x');
+    const isEoaCounterparty = !code || code === '0x';
+    if (isEoaCounterparty) {
+      if (!recoveredSigner || recoveredSigner.toLowerCase() !== counterparty.toLowerCase()) {
+        throw new Error(
+          `ExtendOrder signature signer (${recoveredSigner ?? 'invalid'}) does not match expected counterparty (${counterparty}).`
+        );
+      }
+    }
+  } else if (recoveredSigner) {
+    const isBorrower = recoveredSigner.toLowerCase() === loanState.borrower.toLowerCase();
+    const isHolder =
+      loanState.positionOwner &&
+      recoveredSigner.toLowerCase() === loanState.positionOwner.toLowerCase();
+    if (!isBorrower && !isHolder) {
+      throw new Error(
+        `ExtendOrder signature signer (${recoveredSigner}) is neither borrower nor PositionNFT holder.`
+      );
+    }
+    counterparty = recoveredSigner;
+    caller = isBorrower ? loanState.positionOwner : loanState.borrower;
+    callerRole = isBorrower ? 'holder' : 'borrower';
+  }
+
+  const callData = encodeFunctionData({
+    abi: loanCoreAbi,
+    functionName: 'extend',
+    args: [
+      extendOrder.loanId,
+      extendOrder.newMaturity,
+      extendOrder.newRateBps,
+      extendOrder.deadline,
+      signature,
+    ],
+  });
+
+  if (caller) {
+    try {
+      await publicClient.call({
+        account: caller,
+        to: loanCoreAddr,
+        data: callData,
+      });
+    } catch (simErr) {
+      const decoded = decodeContractRevert(simErr);
+      throw new Error(decoded ? decoded.message : formatWeb3Error(simErr));
+    }
+  }
+
+  return {
+    kind: 'extend',
+    loanId: loanState.loanId,
+    loanState,
+    callerAddress: caller,
+    callerRole,
+    counterpartySigner: recoveredSigner ?? counterparty,
+    extendOrder,
+    extendOrderJson: extendOrderToJson(extendOrder),
+    typedData,
+    digest,
+    signature,
+    needsApproval: false,
+    callData,
+  };
+}
+
+export async function executeLoanExtend({
+  address,
+  loanId,
+  newMaturity,
+  newRateBps,
+  deadline,
+  nonce = null,
+  signature,
+  expectedPreview = null,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+}) {
+  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
+  const loanCoreAddr = getAddress(cfg.contracts.loanCore);
+  const preview = await verifyAndPreviewLoanExtend({
+    loanId,
+    newMaturity,
+    newRateBps,
+    deadline,
+    nonce,
+    signature,
+    callerAddress: wallet,
+    cfg,
+    publicClient,
+  });
+
+  if (expectedPreview) {
+    const exp = expectedPreview.extendOrderJson ?? expectedPreview.extendOrder;
+    const cur = preview.extendOrderJson;
+    if (String(expectedPreview.loanId) !== String(preview.loanId)) {
+      throw new Error('Loan ID changed since extension preview.');
+    }
+    if (
+      exp &&
+      (String(exp.newMaturity) !== String(cur.newMaturity) ||
+        Number(exp.newRateBps) !== Number(cur.newRateBps) ||
+        String(exp.nonce) !== String(cur.nonce) ||
+        String(exp.deadline) !== String(cur.deadline))
+    ) {
+      throw new Error('Extension parameters changed since preview; re-verify before submitting.');
+    }
+    if (expectedPreview.signature && expectedPreview.signature.toLowerCase() !== signature.toLowerCase()) {
+      throw new Error('Extension signature changed since preview.');
+    }
+  }
+
+  try {
+    await publicClient.call({
+      account: wallet,
+      to: loanCoreAddr,
+      data: preview.callData,
+    });
+  } catch (simErr) {
+    const decoded = decodeContractRevert(simErr);
+    throw new Error(decoded ? decoded.message : formatWeb3Error(simErr));
+  }
+
+  const { txHash, receipt } = await sendWalletTransaction(provider, publicClient, {
+    from: wallet,
+    to: loanCoreAddr,
+    data: preview.callData,
+  });
+
+  const evArgs = decodeLoanCoreEvent(receipt, loanCoreAddr, 'Extended');
+  if (!evArgs) {
+    throw new Error(`Extended event missing in transaction receipt for Loan #${preview.loanId}.`);
+  }
+
+  return {
+    txHash,
+    receipt,
+    loanId: preview.loanId,
+    newMaturity: (evArgs.newMaturity ?? preview.extendOrder.newMaturity).toString(),
+    newRateBps: Number(evArgs.newRateBps ?? preview.extendOrder.newRateBps),
+    previousMaturity: preview.loanState.maturity,
+    previousRateBps: preview.loanState.rateBps,
+    preview,
+  };
+}
+
