@@ -66,6 +66,8 @@ import {
 } from '../src/lib/marketsApi.js';
 import {
   DEFAULT_COLLATERAL_BUFFER_BPS,
+  DEFAULT_EXTEND_DEADLINE_SECS,
+  MAX_EXTEND_DEADLINE_SECS,
   SIGNED_BORROW_ORDERS_STORAGE_KEY,
   SIGNED_LEND_OFFERS_STORAGE_KEY,
   approveUsdcForLend,
@@ -91,6 +93,7 @@ import {
   loadPersistedSignedLendOffers,
   loadPersistedSignedOrders,
   parseBorrowOrderFromJson,
+  parseExtendPayloadFromJson,
   parseLendOfferFromJson,
   prepareAndSignBorrowOrder,
   prepareAndSignLendOffer,
@@ -1192,13 +1195,8 @@ async function runTests(): Promise<void> {
       const forbiddenDemoActionRe =
         /<button[^>]*>\s*(Open|Download my records|Claim|List this claim|Cancel listing|Buy claim|Dismiss|Repay all|Repay part|Add collateral|Extend|Roll|Post lend offer)\s*<\/button>/i;
       const demoRoutes: Array<{ route: string; el: ReturnType<typeof createElement> }> = [
-        { route: '/loans', el: createElement(Loans) },
         { route: '/positions', el: createElement(Positions) },
         { route: '/alerts', el: createElement(Alerts) },
-        {
-          route: '/loan/L-1',
-          el: createElement(Routes, null, createElement(Route, { path: '/loan/:id', element: createElement(Loan) })),
-        },
         { route: '/builders', el: createElement(Builders) },
       ];
       for (const { route, el } of demoRoutes) {
@@ -5527,7 +5525,473 @@ async function runTests(): Promise<void> {
 
       console.log('PASS WS3.5 Piece 1: LoanCore repay, partialRepay, topUp, extend EIP-712 & Grace math verified.');
 
-      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1 FORK TESTS PASSED.');
+      // 3.10 WS3.5 Piece 2: Loans.jsx / Loan.jsx Live UI Wiring + Low 1 (payer role), Low 2 (1h default / 24h max extend deadline),
+      // Info 1 (optional post-repay buffer allowance trim), & Info 2 ("Overdue - default pending" past maturity+24h)
+      console.log('\n=== WS3.5 Piece 2: Loans.jsx / Loan.jsx live UI, Low 1/2, & Info 1/2 verification ===');
+
+      // Refresh oracle price cleanly and open a dedicated 7-day $600 loan (borrower -> lender) for Piece 2 tests
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdaFeed,
+          abi: mockAggArtifact.abi,
+          functionName: 'setPrice',
+          args: [140_00000000n],
+        }),
+      });
+      const quoteP2 = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '600000000',
+        termDays: 7,
+        aprBps: 850,
+        maxLtvBps: 6000,
+        borrower: ADDRESSES.borrower,
+      });
+      walletProvider.setAccount(KEYS.borrower);
+      ws35Store.clear();
+      const p2BorrowOrd = await prepareAndSignBorrowOrder({
+        address: ADDRESSES.borrower,
+        collateralToken: nvdac,
+        principalRaw: '600000000',
+        expectedQuote: quoteP2,
+        requireExpectedQuote: true,
+        maxRateBps: 850,
+        termDays: 7,
+        maxLtvBps: 6000,
+        minFillRaw: '600000000',
+        existingOpenCollateralRaw: null,
+        expiryDays: 7,
+        autoApprove: true,
+        publishToApi: false,
+        storage: ws35Storage,
+        provider: walletProvider,
+        cfg,
+      });
+      walletProvider.setAccount(KEYS.lender);
+      const p2OpenFill = await fillBorrowOrderAsLender({
+        address: ADDRESSES.lender,
+        order: p2BorrowOrd.order,
+        signature: p2BorrowOrd.signature,
+        fillUsdcRaw: '600000000',
+        existingOpenSumRaw: 0n,
+        autoApprove: true,
+        provider: walletProvider,
+        cfg,
+      });
+      const p2LoanId = p2OpenFill.loanId;
+      assert.ok(p2LoanId, 'Piece 2 loan must open on-chain');
+      ws35Store.clear();
+      await runIndexerSync(idxCtx);
+
+      // Low 1a: PositionNFT holder MUST be blocked from previewing or executing repay/partialRepay/topUp on its own loan
+      await assert.rejects(
+        () =>
+          verifyAndPreviewLoanRepay({
+            loanId: p2LoanId,
+            payerAddress: ADDRESSES.lender,
+            cfg,
+          }),
+        /PositionNFT lender\/holder.*cannot repay/
+      );
+      await assert.rejects(
+        () =>
+          verifyAndPreviewLoanTopUp({
+            loanId: p2LoanId,
+            additionalCollateralRaw: '100000000000000000',
+            payerAddress: ADDRESSES.lender,
+            cfg,
+          }),
+        /PositionNFT lender\/holder.*cannot top up collateral/
+      );
+
+      // Low 1b: Third-party / outsider gets payerIsBorrower=false + warning; execute requires allowThirdPartyPayer=true
+      const outsiderKey = generatePrivateKey();
+      const outsiderAddr = getAddress(privateKeyToAccount(outsiderKey).address);
+      await rpcCall('anvil_setBalance', [outsiderAddr, '0x56bc75e2d63100000']);
+      await rpcCall('anvil_impersonateAccount', [BASE_USDC_WHALE]);
+      await rpcCall('anvil_setBalance', [BASE_USDC_WHALE, '0x56bc75e2d63100000']);
+      await publicClient.waitForTransactionReceipt({
+        hash: await rawWalletClient.sendTransaction({
+          account: BASE_USDC_WHALE,
+          to: BASE_USDC,
+          data: encodeFunctionData({
+            abi: parseAbi(['function transfer(address to, uint256 value) returns (bool)']),
+            functionName: 'transfer',
+            args: [outsiderAddr, 2_000_000_000n],
+          }),
+        }),
+      });
+      await publicClient.waitForTransactionReceipt({
+        hash: await deployerClient.writeContract({
+          address: nvdac,
+          abi: mockB20Artifact.abi,
+          functionName: 'mint',
+          args: [outsiderAddr, 2n * 10n ** 18n],
+        }),
+      });
+
+      const outsiderTopUpPreview = await verifyAndPreviewLoanTopUp({
+        loanId: p2LoanId,
+        additionalCollateralRaw: '500000000000000000', // 0.5 NVDAc
+        payerAddress: outsiderAddr,
+        cfg,
+      });
+      assert.equal(outsiderTopUpPreview.payerIsBorrower, false);
+      assert.equal(outsiderTopUpPreview.payerIsHolder, false);
+      assert.equal(outsiderTopUpPreview.isThirdPartyPayer, true);
+      assert.match(outsiderTopUpPreview.thirdPartyWarning, /not the loan borrower/);
+
+      walletProvider.setAccount(outsiderKey);
+      await assert.rejects(
+        () =>
+          executeLoanTopUp({
+            address: outsiderAddr,
+            loanId: p2LoanId,
+            additionalCollateralRaw: '500000000000000000',
+            expectedPreview: outsiderTopUpPreview,
+            autoApprove: true,
+            provider: walletProvider,
+            cfg,
+          }),
+        /Third-party collateral top-up confirmation required/
+      );
+      const outsiderTopUpRes = await executeLoanTopUp({
+        address: outsiderAddr,
+        loanId: p2LoanId,
+        additionalCollateralRaw: '500000000000000000',
+        expectedPreview: outsiderTopUpPreview,
+        autoApprove: true,
+        allowThirdPartyPayer: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(outsiderTopUpRes.payerIsBorrower, false);
+
+      const outsiderRepayPreview = await verifyAndPreviewLoanRepay({
+        loanId: p2LoanId,
+        payerAddress: outsiderAddr,
+        principalRepayRaw: '200000000', // $200 partial repay by outsider
+        cfg,
+      });
+      assert.equal(outsiderRepayPreview.payerIsBorrower, false);
+      assert.equal(outsiderRepayPreview.payerIsHolder, false);
+      assert.equal(outsiderRepayPreview.isThirdPartyPayer, true);
+      assert.match(outsiderRepayPreview.thirdPartyWarning, /not the loan borrower/);
+
+      await assert.rejects(
+        () =>
+          executeLoanRepay({
+            address: outsiderAddr,
+            loanId: p2LoanId,
+            principalRepayRaw: '200000000',
+            expectedPreview: outsiderRepayPreview,
+            autoApprove: true,
+            provider: walletProvider,
+            cfg,
+          }),
+        /Third-party repay confirmation required/
+      );
+
+      // Info 1 (outsider, 0 open offers): trimBufferAllowance=true resets LoanCore allowance back to exact 0n after repay!
+      const borNvdacBeforeOutsider = BigInt(
+        await publicClient.readContract({
+          address: nvdac,
+          abi: erc20Abi,
+          functionName: 'balanceOf',
+          args: [ADDRESSES.borrower],
+        })
+      );
+      const outsiderPartialRes = await executeLoanRepay({
+        address: outsiderAddr,
+        loanId: p2LoanId,
+        principalRepayRaw: '200000000',
+        expectedPreview: outsiderRepayPreview,
+        autoApprove: true,
+        allowThirdPartyPayer: true,
+        trimBufferAllowance: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(outsiderPartialRes.payerIsBorrower, false);
+      assert.equal(outsiderPartialRes.postTrimAllowanceRaw, '0');
+      const outsiderAllowAfterTrim = BigInt(
+        await publicClient.readContract({
+          address: BASE_USDC,
+          abi: erc20Abi,
+          functionName: 'allowance',
+          args: [outsiderAddr, deployed.loanCore],
+        })
+      );
+      assert.equal(outsiderAllowAfterTrim, 0n, 'trimBufferAllowance must leave 0 leftover LoanCore USDC allowance');
+      const borNvdacAfterOutsider = BigInt(
+        await publicClient.readContract({
+          address: nvdac,
+          abi: erc20Abi,
+          functionName: 'balanceOf',
+          args: [ADDRESSES.borrower],
+        })
+      );
+      assert.equal(
+        borNvdacAfterOutsider - borNvdacBeforeOutsider,
+        BigInt(outsiderPartialRes.collateralReleasedRaw),
+        'Third-party partialRepay must return released collateral to borrower'
+      );
+
+      // Low 2: Extend signature deadline defaults to 1h (DEFAULT_EXTEND_DEADLINE_SECS) and caps at 24h (MAX_EXTEND_DEADLINE_SECS)
+      const p2ActiveState = await readLoanOnChainState(p2LoanId, { cfg });
+      walletProvider.setAccount(KEYS.lender);
+      const p2SignedDefault = await signLoanExtension({
+        address: ADDRESSES.lender,
+        loanId: p2LoanId,
+        newMaturity: BigInt(p2ActiveState.maturity) + 2n * 86_400n,
+        newRateBps: 900,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(
+        BigInt(p2SignedDefault.deadline),
+        BigInt(p2ActiveState.blockTimestamp) + DEFAULT_EXTEND_DEADLINE_SECS,
+        'Omitted extend deadline must default to blockTimestamp + 1h'
+      );
+      const reparsedExt = parseExtendPayloadFromJson(
+        JSON.stringify({
+          extendOrder: p2SignedDefault.extendOrderJson,
+          signature: p2SignedDefault.signature,
+        })
+      );
+      assert.equal(reparsedExt.extendOrder.loanId.toString(), p2LoanId);
+
+      // Reject >24h & 365-day deadlines in BOTH signing and verification
+      await assert.rejects(
+        () =>
+          signLoanExtension({
+            address: ADDRESSES.lender,
+            loanId: p2LoanId,
+            newMaturity: BigInt(p2ActiveState.maturity) + 2n * 86_400n,
+            newRateBps: 900,
+            deadline: BigInt(p2ActiveState.blockTimestamp) + MAX_EXTEND_DEADLINE_SECS + 1n,
+            provider: walletProvider,
+            cfg,
+          }),
+        /exceeds maximum 24 hours/
+      );
+      await assert.rejects(
+        () =>
+          signLoanExtension({
+            address: ADDRESSES.lender,
+            loanId: p2LoanId,
+            newMaturity: BigInt(p2ActiveState.maturity) + 2n * 86_400n,
+            newRateBps: 900,
+            deadline: BigInt(p2ActiveState.blockTimestamp) + 365n * 86_400n,
+            provider: walletProvider,
+            cfg,
+          }),
+        /exceeds maximum 24 hours/
+      );
+      await assert.rejects(
+        () =>
+          verifyAndPreviewLoanExtend({
+            loanId: p2LoanId,
+            newMaturity: BigInt(p2ActiveState.maturity) + 2n * 86_400n,
+            newRateBps: 900,
+            deadline: BigInt(p2ActiveState.blockTimestamp) + MAX_EXTEND_DEADLINE_SECS + 60n,
+            nonce: p2ActiveState.extensionNonce,
+            signature: p2SignedDefault.signature,
+            callerAddress: ADDRESSES.borrower,
+            cfg,
+          }),
+        /exceeds maximum 24 hours/
+      );
+
+      // Open a $500 30-day LendOffer as borrower before warping past maturity+24h so we verify Info 1 + Info 2 together
+      const quoteP2Offer = await fetchLoanQuote({
+        cfg,
+        asset: nvdac,
+        principalRaw: '500000000',
+        termDays: 30,
+        aprBps: 850,
+        maxLtvBps: 6000,
+        lender: ADDRESSES.borrower,
+      });
+      walletProvider.setAccount(KEYS.borrower);
+      const p2BorrowerLendOffer = await prepareAndSignLendOffer({
+        address: ADDRESSES.borrower,
+        principalRaw: '500000000',
+        allowedCollateral: nvdac,
+        expectedQuote: quoteP2Offer,
+        minRateBps: 850,
+        termDays: 30,
+        maxLtvBps: 6000,
+        minFillRaw: '500000000',
+        existingOpenUsdcSumRaw: 0n,
+        expiryDays: 30,
+        autoApprove: true,
+        publishToApi: true,
+        storage: ws35Storage,
+        provider: walletProvider,
+        cfg,
+      });
+
+      // Info 2: Warp past maturity + 24h (leaving stored contract status = Active while grace period has expired)
+      const warpPastGraceSecs = Number(BigInt(p2ActiveState.maturity) - BigInt(p2ActiveState.blockTimestamp) + 86_400n + 120n);
+      await rpcCall('evm_increaseTime', [warpPastGraceSecs]);
+      await rpcCall('evm_mine', []);
+
+      const overdueState = await readLoanOnChainState(p2LoanId, { cfg });
+      assert.equal(overdueState.storedStatus, 0, 'Underlying LoanCore storedStatus remains Active before syncStatus');
+      assert.equal(overdueState.isPastMaturity, true);
+      assert.equal(overdueState.isPastGraceWindow, true);
+      assert.equal(overdueState.isGrace, false, 'isGrace must be false once maturity+24h ends');
+      assert.equal(overdueState.isOverdueDefaultPending, true);
+      assert.equal(overdueState.statusName, 'Overdue - default pending');
+
+      // Ensure partialRepay & extend stay strictly blocked in "Overdue - default pending"
+      await assert.rejects(
+        () =>
+          verifyAndPreviewLoanRepay({
+            loanId: p2LoanId,
+            payerAddress: ADDRESSES.borrower,
+            principalRepayRaw: '100000000',
+            cfg,
+          }),
+        /Partial repay is only available while Loan #\d+ is Active before maturity/
+      );
+      await assert.rejects(
+        () =>
+          signLoanExtension({
+            address: ADDRESSES.borrower,
+            loanId: p2LoanId,
+            newMaturity: BigInt(overdueState.maturity) + 86_400n,
+            newRateBps: 850,
+            provider: walletProvider,
+            cfg,
+          }),
+        /cannot be extended/
+      );
+
+      // Info 1 (borrower with $500 open LendOffer): repay in full + trimBufferAllowance=true resets LoanCore allowance to exact 500_000_000n!
+      const p2BorrowerRepayPreview = await verifyAndPreviewLoanRepay({
+        loanId: p2LoanId,
+        payerAddress: ADDRESSES.borrower,
+        cfg,
+      });
+      assert.equal(p2BorrowerRepayPreview.payerIsBorrower, true);
+      assert.equal(p2BorrowerRepayPreview.isThirdPartyPayer, false);
+      assert.equal(p2BorrowerRepayPreview.existingOpenSumRaw, '500000000');
+
+      const p2BorrowerRepayRes = await executeLoanRepay({
+        address: ADDRESSES.borrower,
+        loanId: p2LoanId,
+        expectedPreview: p2BorrowerRepayPreview,
+        autoApprove: true,
+        trimBufferAllowance: true,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(p2BorrowerRepayRes.payerIsBorrower, true);
+      assert.equal(p2BorrowerRepayRes.postTrimAllowanceRaw, '500000000');
+      const borrowerLoanCoreAllowAfterTrim = BigInt(
+        await publicClient.readContract({
+          address: BASE_USDC,
+          abi: erc20Abi,
+          functionName: 'allowance',
+          args: [ADDRESSES.borrower, deployed.loanCore],
+        })
+      );
+      assert.equal(
+        borrowerLoanCoreAllowAfterTrim,
+        500_000_000n,
+        'trimBufferAllowance must preserve exact open LendOffer sum (500_000_000n) while clearing leftover buffer'
+      );
+      await cancelSignedLendOffer({
+        address: ADDRESSES.borrower,
+        offer: p2BorrowerLendOffer.offer,
+        storage: ws35Storage,
+        provider: walletProvider,
+        cfg,
+      });
+
+      // Loans.jsx & Loan.jsx SSR + Source Verification (no PreviewBanner/mock rows, Low 1/2 + Info 1/2 UI controls wired)
+      const p2LoansHtml = renderToStaticMarkup(
+        createElement(
+          StoreProvider,
+          null,
+          createElement(MemoryRouter, { initialEntries: ['/loans'] }, createElement(Shell, null, createElement(Loans)))
+        )
+      );
+      assert.ok(!p2LoansHtml.includes('Preview data, not your positions'), '/loans must not render PreviewBanner');
+      assert.ok(
+        p2LoansHtml.includes('Inspect any on-chain Loan ID directly') &&
+          p2LoansHtml.includes('Indexed protocol loans'),
+        '/loans must render live indexer & direct lookup UI'
+      );
+
+      const p2LoanDetailHtml = renderToStaticMarkup(
+        createElement(
+          StoreProvider,
+          null,
+          createElement(
+            MemoryRouter,
+            { initialEntries: [`/loans/${p2LoanId}`] },
+            createElement(
+              Shell,
+              null,
+              createElement(Routes, null, createElement(Route, { path: '/loans/:id', element: createElement(Loan) }))
+            )
+          )
+        )
+      );
+      assert.ok(!p2LoanDetailHtml.includes('Preview data, not your positions'), '/loans/:id must not render PreviewBanner');
+      assert.match(p2LoanDetailHtml, /Live Base State/);
+      assert.match(p2LoanDetailHtml, /Refreshing on-chain state|Refresh LoanCore state/);
+
+      const p2InvalidLoanHtml = renderToStaticMarkup(
+        createElement(
+          StoreProvider,
+          null,
+          createElement(
+            MemoryRouter,
+            { initialEntries: ['/loan/L-1'] },
+            createElement(
+              Shell,
+              null,
+              createElement(Routes, null, createElement(Route, { path: '/loan/:id', element: createElement(Loan) }))
+            )
+          )
+        )
+      );
+      assert.ok(!p2InvalidLoanHtml.includes('Preview data, not your positions'), '/loan/L-1 must not render PreviewBanner');
+      assert.match(p2InvalidLoanHtml, /not found/);
+
+      const loanPageSrc = fs.readFileSync(path.join(process.cwd(), 'src/pages/Loan.jsx'), 'utf8');
+      const loansPageSrc = fs.readFileSync(path.join(process.cwd(), 'src/pages/Loans.jsx'), 'utf8');
+      assert.ok(
+        loanPageSrc.includes('readLoanOnChainState') &&
+          loanPageSrc.includes('verifyAndPreviewLoanRepay') &&
+          loanPageSrc.includes('executeLoanRepay') &&
+          loanPageSrc.includes('verifyAndPreviewLoanTopUp') &&
+          loanPageSrc.includes('executeLoanTopUp') &&
+          loanPageSrc.includes('signLoanExtension') &&
+          loanPageSrc.includes('verifyAndPreviewLoanExtend') &&
+          loanPageSrc.includes('executeLoanExtend') &&
+          loanPageSrc.includes('Pay for someone else') &&
+          loanPageSrc.includes('Top up for someone else') &&
+          loanPageSrc.includes('walletIsHolderNotBorrower') &&
+          loanPageSrc.includes('Deadline before signing') &&
+          loanPageSrc.includes('trimBufferAllowance') &&
+          loanPageSrc.includes('repaySeqRef.current') &&
+          loanPageSrc.includes('topUpSeqRef.current') &&
+          loanPageSrc.includes('extendVerifySeqRef.current') &&
+          loanPageSrc.includes('[cleanId, web3?.address, web3?.chainId, web3?.wrongNetwork]') &&
+          !loanPageSrc.includes('MaxUint256') &&
+          loansPageSrc.includes('fetchPaginatedApiRows') &&
+          loansPageSrc.includes('Overdue - default pending'),
+        'Loan.jsx and Loans.jsx must wire all WS3.5 Piece 2 live actions, sequence/wallet guards, Lows 1-2, and Infos 1-2'
+      );
+
+      console.log('PASS WS3.5 Piece 2: Loans.jsx / Loan.jsx live UI, Low 1/2, & Info 1/2 verified.');
+
+      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 FORK TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
       await new Promise<void>((r) => apiServer.close(() => r()));

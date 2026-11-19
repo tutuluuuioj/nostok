@@ -4046,6 +4046,8 @@ export const LOAN_CORE_SECONDS_PER_YEAR = 365n * 86_400n;
 export const LOAN_CORE_GRACE_PERIOD_SECS = 86_400n;
 export const LOAN_CORE_MAX_EXTENSION_WINDOW_SECS = 90n * 86_400n;
 export const LOAN_CORE_MAX_RATE_BPS = 4000;
+export const DEFAULT_EXTEND_DEADLINE_SECS = 3600n; // 1 hour
+export const MAX_EXTEND_DEADLINE_SECS = 24n * 3600n; // 24 hours
 
 const LOAN_CORE_BPS_YEAR_DENOM = 10_000n * LOAN_CORE_SECONDS_PER_YEAR;
 const MAX_UINT128_RAW = (1n << 128n) - 1n;
@@ -4123,6 +4125,37 @@ async function simulateLoanCoreCallOrPreApproval({
   }
 }
 
+function classifyLoanPayerRole(loanState, payer, actionLabel) {
+  if (!payer) {
+    return {
+      payerIsBorrower: null,
+      payerIsHolder: null,
+      isThirdPartyPayer: null,
+      thirdPartyWarning: '',
+    };
+  }
+  const payerLower = payer.toLowerCase();
+  const payerIsBorrower = payerLower === loanState.borrower.toLowerCase();
+  const payerIsHolder = Boolean(
+    loanState.positionOwner && payerLower === loanState.positionOwner.toLowerCase()
+  );
+  if (payerIsHolder && !payerIsBorrower) {
+    throw new Error(
+      `Connected wallet is the PositionNFT lender/holder (${loanState.positionOwner}); holder cannot ${actionLabel} this loan.`
+    );
+  }
+  const isThirdPartyPayer = !payerIsBorrower;
+  const thirdPartyWarning = isThirdPartyPayer
+    ? `Connected wallet (${payer}) is not the loan borrower (${loanState.borrower}). Confirm paying/topping up someone else's loan — released collateral returns to the borrower.`
+    : '';
+  return {
+    payerIsBorrower,
+    payerIsHolder,
+    isThirdPartyPayer,
+    thirdPartyWarning,
+  };
+}
+
 function resolveExtendCounterparties(loanState, address) {
   const wallet = getAddress(address);
   const borrower = getAddress(loanState.borrower);
@@ -4180,6 +4213,35 @@ export function extendOrderToJson(extendOrder) {
     newRateBps: n.newRateBps,
     nonce: n.nonce.toString(),
     deadline: n.deadline.toString(),
+  };
+}
+
+export function parseExtendPayloadFromJson(rawInput) {
+  let parsed = rawInput;
+  if (typeof rawInput === 'string') {
+    const trimmed = rawInput.trim();
+    if (!trimmed) {
+      throw new Error('Paste a signed ExtendOrder JSON payload first.');
+    }
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      throw new Error('Invalid JSON format for ExtendOrder payload.');
+    }
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('ExtendOrder payload must be a JSON object.');
+  }
+  const orderCandidate = parsed.extendOrderJson ?? parsed.extendOrder ?? parsed.order ?? parsed;
+  const extendOrder = normalizeExtendOrderStruct(orderCandidate);
+  const signature = typeof parsed.signature === 'string' ? parsed.signature.trim() : '';
+  if (!/^0x[0-9a-fA-F]{130,}$/.test(signature)) {
+    throw new Error('ExtendOrder payload is missing a valid hex signature.');
+  }
+  return {
+    extendOrder,
+    extendOrderJson: extendOrderToJson(extendOrder),
+    signature,
   };
 }
 
@@ -4362,6 +4424,7 @@ export async function readLoanOnChainState(
   const storedStatus = Number(loan.status);
   const isPastMaturity = blockTimestamp > maturity;
   const isPastGraceWindow = blockTimestamp > graceEndTimestamp;
+  const isOverdueDefaultPending = storedStatus <= 1 && isPastGraceWindow;
   const effectiveStatus = storedStatus === 0 && isPastMaturity ? 1 : storedStatus;
 
   const isLiveLifecycle = storedStatus <= 2;
@@ -4456,14 +4519,17 @@ export async function readLoanOnChainState(
     storedStatus,
     storedStatusName: LOAN_STATUS_NAMES[storedStatus] ?? `Status_${storedStatus}`,
     status: effectiveStatus,
-    statusName: LOAN_STATUS_NAMES[effectiveStatus] ?? `Status_${effectiveStatus}`,
+    statusName: isOverdueDefaultPending
+      ? 'Overdue - default pending'
+      : (LOAN_STATUS_NAMES[effectiveStatus] ?? `Status_${effectiveStatus}`),
     yieldMode: Number(loan.yieldMode),
     coreVersion: Number(loan.coreVersion),
     extensionNonce: BigInt(extensionNonce ?? 0n).toString(),
     activeAuctionId: BigInt(activeAuctionId ?? 0n).toString(),
     auctionLocked,
     isActive: effectiveStatus === 0,
-    isGrace: effectiveStatus === 1,
+    isGrace: effectiveStatus === 1 && !isOverdueDefaultPending,
+    isOverdueDefaultPending,
     isAuction: effectiveStatus === 2,
     isSettled: storedStatus >= 3,
     isPastMaturity,
@@ -4664,6 +4730,11 @@ export async function verifyAndPreviewLoanRepay({
       `Partial repay is only available while Loan #${loanState.loanId} is Active before maturity (current state: ${loanState.statusName}); use full repay() instead.`
     );
   }
+  const payerRole = classifyLoanPayerRole(
+    loanState,
+    payer,
+    hasPartial ? 'partially repay' : 'repay'
+  );
 
   const openLendSum = payer
     ? await resolveOpenLendOffersSumRaw({
@@ -4733,6 +4804,10 @@ export async function verifyAndPreviewLoanRepay({
     loanId: loanState.loanId,
     loanState,
     payerAddress: payer,
+    payerIsBorrower: payerRole.payerIsBorrower,
+    payerIsHolder: payerRole.payerIsHolder,
+    isThirdPartyPayer: payerRole.isThirdPartyPayer,
+    thirdPartyWarning: payerRole.thirdPartyWarning,
     token: usdcAddr,
     spender: loanCoreAddr,
     exact,
@@ -4756,6 +4831,8 @@ export async function executeLoanRepay({
   existingOpenSumRaw = null,
   expectedPreview = null,
   autoApprove = false,
+  allowThirdPartyPayer = false,
+  trimBufferAllowance = false,
   storage = null,
   provider = getInjectedProvider(),
   cfg = getFrontendConfig(),
@@ -4773,6 +4850,12 @@ export async function executeLoanRepay({
     cfg,
     publicClient,
   });
+
+  if (!preview.payerIsBorrower && !allowThirdPartyPayer) {
+    throw new Error(
+      `Third-party repay confirmation required: connected wallet (${wallet}) is not the borrower (${preview.loanState.borrower}); confirm "Pay for someone else" because released collateral returns to the borrower.`
+    );
+  }
 
   let approvalTargetRaw = BigInt(preview.requiredApprovalRaw);
   if (expectedPreview) {
@@ -4881,13 +4964,43 @@ export async function executeLoanRepay({
     throw new Error(`${eventName} event missing in transaction receipt for Loan #${preview.loanId}.`);
   }
 
+  let allowanceTrimTxHash = null;
+  let postTrimAllowanceRaw = null;
+  if (trimBufferAllowance) {
+    const openSum = BigInt(preview.existingOpenSumRaw ?? 0n);
+    const currentAllow = BigInt(
+      await publicClient.readContract({
+        address: preview.token,
+        abi: erc20Abi,
+        functionName: 'allowance',
+        args: [wallet, loanCoreAddr],
+      })
+    );
+    if (currentAllow > openSum) {
+      const trimRes = await setUsdcAllowanceForLend({
+        address: wallet,
+        targetAllowanceRaw: openSum,
+        provider,
+        cfg,
+        publicClient,
+      });
+      allowanceTrimTxHash = trimRes.txHash;
+      postTrimAllowanceRaw = trimRes.allowanceRaw;
+    } else {
+      postTrimAllowanceRaw = currentAllow.toString();
+    }
+  }
+
   return {
     txHash,
     approvalTxHash,
+    allowanceTrimTxHash,
+    postTrimAllowanceRaw,
     receipt,
     kind: preview.kind,
     isPartial: preview.isPartial,
     loanId: preview.loanId,
+    payerIsBorrower: preview.payerIsBorrower,
     principalPaidRaw: (evArgs.principalPaid ?? evArgs.principal ?? preview.exact.principalRepayRaw).toString(),
     interestPaidRaw: (evArgs.interestPaid ?? evArgs.interest ?? preview.exact.spotInterestRaw).toString(),
     collateralReleasedRaw: (evArgs.collateralReleased ?? preview.exact.collateralReleasedRaw).toString(),
@@ -4927,6 +5040,7 @@ export async function verifyAndPreviewLoanTopUp({
       `Loan #${loanState.loanId} is in ${loanState.statusName}; collateral top-up is only allowed in Active or Grace before auction.`
     );
   }
+  const payerRole = classifyLoanPayerRole(loanState, payer, 'top up collateral on');
 
   const openCollateralSum = payer
     ? await resolveOpenBorrowOrdersCollateralSumRaw({
@@ -4995,6 +5109,10 @@ export async function verifyAndPreviewLoanTopUp({
     loanId: loanState.loanId,
     loanState,
     payerAddress: payer,
+    payerIsBorrower: payerRole.payerIsBorrower,
+    payerIsHolder: payerRole.payerIsHolder,
+    isThirdPartyPayer: payerRole.isThirdPartyPayer,
+    thirdPartyWarning: payerRole.thirdPartyWarning,
     token: loanState.collateralToken,
     spender: escrowAddr,
     loanCoreTarget: loanCoreAddr,
@@ -5018,6 +5136,7 @@ export async function executeLoanTopUp({
   existingOpenCollateralRaw = null,
   expectedPreview = null,
   autoApprove = false,
+  allowThirdPartyPayer = false,
   storage = null,
   provider = getInjectedProvider(),
   cfg = getFrontendConfig(),
@@ -5034,6 +5153,12 @@ export async function executeLoanTopUp({
     cfg,
     publicClient,
   });
+
+  if (!preview.payerIsBorrower && !allowThirdPartyPayer) {
+    throw new Error(
+      `Third-party collateral top-up confirmation required: connected wallet (${wallet}) is not the borrower (${preview.loanState.borrower}); confirm "Top up for someone else" because collateral locks for the borrower.`
+    );
+  }
 
   if (expectedPreview) {
     if (String(expectedPreview.loanId) !== String(preview.loanId)) {
@@ -5104,6 +5229,7 @@ export async function executeLoanTopUp({
     approvalTxHash,
     receipt,
     loanId: preview.loanId,
+    payerIsBorrower: preview.payerIsBorrower,
     addedCollateralRaw: (evArgs.addedCollateral ?? preview.additionalCollateralRaw).toString(),
     newCollateralRaw: (evArgs.newTotalCollateral ?? preview.newCollateralRaw).toString(),
     existingOpenCollateralRaw: preview.existingOpenCollateralRaw,
@@ -5140,6 +5266,12 @@ function assertValidExtendTerms(loanState, normalizedOrder) {
       `Extension signature deadline (${normalizedOrder.deadline.toString()}) is already in the past (block timestamp ${currentTs.toString()}).`
     );
   }
+  const maxDeadline = currentTs + MAX_EXTEND_DEADLINE_SECS;
+  if (normalizedOrder.deadline > maxDeadline) {
+    throw new Error(
+      `Extension signature deadline (${normalizedOrder.deadline.toString()}) exceeds maximum 24 hours from current block (${maxDeadline.toString()}).`
+    );
+  }
   const chainNonce = BigInt(loanState.extensionNonce);
   if (normalizedOrder.nonce !== chainNonce) {
     throw new Error(
@@ -5150,14 +5282,14 @@ function assertValidExtendTerms(loanState, normalizedOrder) {
 
 /**
  * Signs an EIP-712 ExtendOrder in the "NOSTOK Loan Core" domain by either borrower or PositionNFT holder.
- * Zero token approvals are needed to extend a loan.
+ * Zero token approvals are needed to extend a loan. Deadline defaults to 1h and caps at 24h.
  */
 export async function signLoanExtension({
   address,
   loanId,
   newMaturity,
   newRateBps,
-  deadline,
+  deadline = null,
   provider = getInjectedProvider(),
   cfg = getFrontendConfig(),
   publicClient = createProtocolPublicClient(cfg),
@@ -5166,12 +5298,17 @@ export async function signLoanExtension({
   const loanState = await readLoanOnChainState(loanId, { cfg, publicClient });
   const parties = resolveExtendCounterparties(loanState, wallet);
 
+  const resolvedDeadline =
+    deadline !== null && deadline !== undefined && String(deadline).trim() !== ''
+      ? parseStrictRawBigInt(deadline, 'deadline', { min: 1n })
+      : BigInt(loanState.blockTimestamp) + DEFAULT_EXTEND_DEADLINE_SECS;
+
   const extendOrder = normalizeExtendOrderStruct({
     loanId: loanState.loanId,
     newMaturity,
     newRateBps,
     nonce: loanState.extensionNonce,
-    deadline,
+    deadline: resolvedDeadline,
   });
   assertValidExtendTerms(loanState, extendOrder);
 
@@ -5191,6 +5328,8 @@ export async function signLoanExtension({
     signer: wallet,
     signerRole: parties.role,
     expectedSubmitter: parties.counterparty,
+    deadline: extendOrder.deadline.toString(),
+    deadlineIso: new Date(Number(extendOrder.deadline) * 1000).toISOString(),
     extendOrder,
     extendOrderJson: extendOrderToJson(extendOrder),
     typedData,
