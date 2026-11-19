@@ -143,7 +143,8 @@ import {
   verifyAndPreviewLoanTopUp,
   verifyEligibilityDeclaration,
 } from '../src/lib/web3.js';
-import { App } from '../src/App.jsx';
+import { App, Frame } from '../src/App.jsx';
+import { Gate, GateChecking, Restricted } from '../src/components/Gate.jsx';
 import { Shell } from '../src/components/Shell.jsx';
 import { ErrorBoundary } from '../src/components/ui.jsx';
 import { Alerts } from '../src/pages/Alerts.jsx';
@@ -155,7 +156,14 @@ import { Loans } from '../src/pages/Loans.jsx';
 import { Markets } from '../src/pages/Markets.jsx';
 import { Positions } from '../src/pages/Positions.jsx';
 import { SubscriptionAction } from '../src/pages/SubscriptionAction.jsx';
-import { StoreProvider, createWalletEventsHandler } from '../src/store.jsx';
+import {
+  StoreProvider,
+  createWalletEventsHandler,
+  evaluateEligibilityDeclaration,
+  isHardRestrictionScreening,
+  loadPersistedDeclaration,
+  savePersistedDeclaration,
+} from '../src/store.jsx';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -6563,7 +6571,266 @@ async function runTests(): Promise<void> {
 
       console.log('PASS WS3.6 Piece 1: EligibilityGate, IP geoblock, sanctions screening, M1/L1 hardening & EIP-712 declaration verified.');
 
-      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 + WS3.6 PIECE 1 FORK TESTS PASSED.');
+      // ---------------------------------------------------------------------
+      // 3.12 WS3.6 Piece 2 (First Part): Gate, Compliance Screening Store & Declaration Binding
+      // ---------------------------------------------------------------------
+      console.log('\n=== WS3.6 Piece 2a: Verifiable Gate, compliance store, sessionStorage & declaration binding ===');
+
+      // 1) fetchWalletState enriches eligibility with userNonce, blockTimestamp, eligibilityReason, & decoded attestation
+      const enrichedWalletSnap = await fetchWalletState(ws36UserAddr, { cfg, attestationHex: ws36AttHex });
+      assert.ok(enrichedWalletSnap?.eligibility, 'fetchWalletState must populate eligibility object');
+      assert.equal(enrichedWalletSnap.eligibility.gateAddress.toLowerCase(), deployed.eligibilityGate.toLowerCase());
+      assert.equal(enrichedWalletSnap.eligibility.userNonce, '2');
+      assert.equal(enrichedWalletSnap.eligibility.isEligible, false, 'Old nonce=0 attestation ineligible after nonce=2 bump');
+      assert.equal(enrichedWalletSnap.eligibility.eligibilityReason, 'ineligible');
+      assert.equal(enrichedWalletSnap.eligibility.attestation.validFormat, true);
+      assert.equal(enrichedWalletSnap.eligibility.attestation.matchesAttestationSigner, false);
+      const garbageAttSnap = await fetchWalletState(ws36UserAddr, { cfg, attestationHex: '0x1234' });
+      assert.equal(garbageAttSnap?.eligibility?.attestation?.validFormat, false);
+
+      // 2) isHardRestrictionScreening blocks geo, sanctions & revoked wallets while allowing CH non-revoked wallets
+      for (const blockedCode of [
+        'GEO_RESTRICTED',
+        'GEO_TOR_BLOCKED',
+        'GEO_UNVERIFIED',
+        'GEO_UNTRUSTED_PROXY',
+        'GEO_HEADER_MALFORMED',
+        'WALLET_SANCTIONED',
+        'WALLET_REVOKED',
+      ]) {
+        assert.equal(
+          isHardRestrictionScreening({
+            allowed: false,
+            geo: { allowed: blockedCode.startsWith('GEO_') ? false : true },
+            wallet: { sanctioned: blockedCode === 'WALLET_SANCTIONED' },
+            onchain: { is_revoked: blockedCode === 'WALLET_REVOKED' },
+            rejection_reasons: [{ code: blockedCode, message: 'blocked' }],
+          }),
+          true,
+          `${blockedCode} must trigger hard restriction`
+        );
+      }
+      assert.equal(
+        isHardRestrictionScreening(
+          { allowed: true, geo: { allowed: true, verified: true, country_code: 'CH' }, wallet: { sanctioned: false }, onchain: { is_revoked: false }, rejection_reasons: [] },
+          null
+        ),
+        false
+      );
+      assert.equal(isHardRestrictionScreening(null, { isRevoked: true }), true, 'On-chain revoked wallet must hard-restrict immediately');
+
+      // 3) evaluateEligibilityDeclaration strict binding matrix
+      walletProvider.setAccount(ws36UserKey);
+      const freshPiece2Decl = await signEligibilityDeclaration({
+        address: ws36UserAddr,
+        jurisdiction: 'SG',
+        ttlSeconds: 3600n,
+        submitToApi: true,
+        provider: walletProvider,
+        cfg,
+      });
+      const validRecord = {
+        account: freshPiece2Decl.declarationJson.account,
+        chainId: BASE_CHAIN_ID,
+        gateAddress: deployed.eligibilityGate,
+        declarationJson: freshPiece2Decl.declarationJson,
+        signature: freshPiece2Decl.signature,
+        digest: freshPiece2Decl.digest,
+        verifiedAt: new Date().toISOString(),
+        serverVerification: freshPiece2Decl.serverVerification,
+      };
+      const evalOk = evaluateEligibilityDeclaration(validRecord, {
+        address: ws36UserAddr,
+        config: cfg,
+        walletEligibility: enrichedWalletSnap.eligibility,
+        screeningData: {
+          allowed: true,
+          geo: { allowed: true, verified: false, status: 'local_unverified', country_code: null },
+          onchain: { user_nonce: '2', block_timestamp: enrichedWalletSnap.eligibility.blockTimestamp, is_revoked: false },
+          declaration_params: { restricted_countries: ['US', 'CU', 'IR', 'KP', 'SY', 'RU', 'BY', 'MM'] },
+        },
+      });
+      assert.equal(evalOk.valid, true, `Expected valid declaration, got ${evalOk.code}: ${evalOk.reason}`);
+      assert.equal(evalOk.code, 'VERIFIED');
+      assert.equal(evalOk.jurisdiction, 'SG');
+
+      assert.equal(
+        evaluateEligibilityDeclaration(null, { address: ws36UserAddr, config: cfg }).code,
+        'DECLARATION_MISSING'
+      );
+      assert.equal(
+        evaluateEligibilityDeclaration(validRecord, { address: null, config: cfg }).code,
+        'WALLET_NOT_CONNECTED'
+      );
+      assert.equal(
+        evaluateEligibilityDeclaration(validRecord, { address: ADDRESSES.borrower, config: cfg }).code,
+        'DECLARATION_ACCOUNT_MISMATCH'
+      );
+      assert.equal(
+        evaluateEligibilityDeclaration({ ...validRecord, chainId: 1 }, { address: ws36UserAddr, config: cfg }).code,
+        'DECLARATION_CHAIN_MISMATCH'
+      );
+      assert.equal(
+        evaluateEligibilityDeclaration(
+          { ...validRecord, gateAddress: '0x0000000000000000000000000000000000000001' },
+          { address: ws36UserAddr, config: cfg }
+        ).code,
+        'DECLARATION_GATE_MISMATCH'
+      );
+      assert.equal(
+        evaluateEligibilityDeclaration(
+          { ...validRecord, serverVerification: { verified: false } },
+          { address: ws36UserAddr, config: cfg }
+        ).code,
+        'DECLARATION_UNVERIFIED'
+      );
+      assert.equal(
+        evaluateEligibilityDeclaration(validRecord, {
+          address: ws36UserAddr,
+          config: cfg,
+          walletEligibility: { ...enrichedWalletSnap.eligibility, isRevoked: true },
+        }).code,
+        'WALLET_REVOKED'
+      );
+      assert.equal(
+        evaluateEligibilityDeclaration(validRecord, {
+          address: ws36UserAddr,
+          config: cfg,
+          walletEligibility: { ...enrichedWalletSnap.eligibility, userNonce: '3' },
+        }).code,
+        'DECLARATION_NONCE_STALE'
+      );
+      assert.equal(
+        evaluateEligibilityDeclaration(validRecord, {
+          address: ws36UserAddr,
+          config: cfg,
+          walletEligibility: {
+            ...enrichedWalletSnap.eligibility,
+            blockTimestamp: (BigInt(freshPiece2Decl.declarationJson.expiresAt) + 1n).toString(),
+          },
+        }).code,
+        'DECLARATION_EXPIRED'
+      );
+      assert.equal(
+        evaluateEligibilityDeclaration(validRecord, {
+          address: ws36UserAddr,
+          config: cfg,
+          walletEligibility: {
+            ...enrichedWalletSnap.eligibility,
+            blockTimestamp: (BigInt(freshPiece2Decl.declarationJson.issuedAt) - 301n).toString(),
+          },
+        }).code,
+        'DECLARATION_FUTURE_TIMESTAMP'
+      );
+      assert.equal(
+        evaluateEligibilityDeclaration(
+          { ...validRecord, declarationJson: { ...validRecord.declarationJson, statementHash: '0x' + 'aa'.repeat(32) } },
+          { address: ws36UserAddr, config: cfg }
+        ).code,
+        'DECLARATION_STATEMENT_MISMATCH'
+      );
+      assert.equal(
+        evaluateEligibilityDeclaration(
+          { ...validRecord, declarationJson: { ...validRecord.declarationJson, jurisdiction: 'US' } },
+          { address: ws36UserAddr, config: cfg }
+        ).code,
+        'DECLARATION_JURISDICTION_RESTRICTED'
+      );
+      assert.equal(
+        evaluateEligibilityDeclaration(validRecord, {
+          address: ws36UserAddr,
+          config: cfg,
+          screeningData: { allowed: true, geo: { verified: true, country_code: 'CH' } },
+        }).code,
+        'DECLARATION_GEO_MISMATCH'
+      );
+      assert.equal(
+        evaluateEligibilityDeclaration(validRecord, {
+          address: ws36UserAddr,
+          config: cfg,
+          screeningData: { allowed: false, rejection_reasons: [{ code: 'GEO_RESTRICTED', message: 'US blocked' }] },
+        }).code,
+        'SCREENING_REJECTED'
+      );
+
+      // 4) Live bumpEligibilityNonce invalidates valid declaration automatically via fresh fetchWalletState
+      const bumpPiece2Res = await bumpEligibilityNonce({
+        address: ws36UserAddr,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(bumpPiece2Res.newNonce, '3');
+      const postBumpSnap = await fetchWalletState(ws36UserAddr, { cfg });
+      assert.equal(postBumpSnap?.eligibility?.userNonce, '3');
+      assert.equal(
+        evaluateEligibilityDeclaration(validRecord, {
+          address: ws36UserAddr,
+          config: cfg,
+          walletEligibility: postBumpSnap?.eligibility,
+        }).code,
+        'DECLARATION_NONCE_STALE'
+      );
+
+      // 5) Gate / Restricted / App / Shell SSR & sessionStorage bypass resistance
+      const gateHtml = renderToStaticMarkup(createElement(StoreProvider, null, createElement(Gate)));
+      assert.ok(!gateHtml.includes('type="radio"'), 'Mock location radio buttons must be removed from Gate.jsx');
+      assert.ok(!gateHtml.includes('Where do you sit?'), 'Old mock gate prompt must be removed');
+      assert.ok(gateHtml.includes('IP Geolocation:'), 'Gate must display live IP geolocation status');
+      assert.ok(gateHtml.includes('Wallet screening:'), 'Gate must display wallet sanctions/gate screening');
+      assert.ok(gateHtml.includes('Re-check screening'), 'Gate must provide screening refresh control');
+
+      const restrictedHtml = renderToStaticMarkup(createElement(StoreProvider, null, createElement(Restricted)));
+      assert.ok(restrictedHtml.includes('This interface is not available here.'));
+      assert.ok(restrictedHtml.includes('Re-check IP &amp; wallet eligibility') || restrictedHtml.includes('Re-check IP & wallet eligibility'));
+      assert.ok(!restrictedHtml.includes('Return to eligibility'), 'Unconditional reset escape hatch must be removed from Restricted');
+
+      const checkingHtml = renderToStaticMarkup(createElement(GateChecking));
+      assert.ok(checkingHtml.includes('Verifying eligibility.'));
+
+      // Simulated sessionStorage: pre-seeded gate=accepted MUST NOT expose Shell/Markets before GET /eligibility resolves
+      const origSessionStorage = (globalThis as Record<string, unknown>).sessionStorage;
+      const memStorage = new Map<string, string>();
+      (globalThis as Record<string, unknown>).sessionStorage = {
+        getItem: (k: string) => memStorage.get(k) ?? null,
+        setItem: (k: string, v: string) => { memStorage.set(k, String(v)); },
+        removeItem: (k: string) => { memStorage.delete(k); },
+      };
+      try {
+        memStorage.set('nostok-store-v1', JSON.stringify({ v: 2, gate: 'accepted', orders: [], loans: [], listings: [], claims: [], dismissed: [], nextId: 4000 }));
+        const preScreenAppHtml = renderToStaticMarkup(
+          createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: ['/markets'] }, createElement(Frame)))
+        );
+        assert.ok(
+          preScreenAppHtml.includes('Verifying eligibility.'),
+          'Frame with stored gate=accepted MUST hold on GateChecking until live GET /eligibility runs'
+        );
+        assert.ok(!preScreenAppHtml.includes('Markets'), 'Gated nav must not render prior to compliance verification');
+
+        memStorage.set('nostok-store-v1', JSON.stringify({ v: 2, gate: 'restricted', orders: [], loans: [], listings: [], claims: [], dismissed: [], nextId: 4000 }));
+        const restrictedFrameHtml = renderToStaticMarkup(
+          createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: ['/markets'] }, createElement(Frame)))
+        );
+        assert.ok(restrictedFrameHtml.includes('This interface is not available here.'));
+
+        savePersistedDeclaration(validRecord);
+        const restoredDecl = loadPersistedDeclaration();
+        assert.equal(restoredDecl?.signature, validRecord.signature);
+        assert.equal(restoredDecl?.declarationJson?.account, ws36UserAddr);
+        savePersistedDeclaration(null);
+        assert.equal(loadPersistedDeclaration(), null);
+      } finally {
+        if (origSessionStorage === undefined) delete (globalThis as Record<string, unknown>).sessionStorage;
+        else (globalThis as Record<string, unknown>).sessionStorage = origSessionStorage;
+      }
+
+      const shellStatusHtml = renderToStaticMarkup(
+        createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: ['/markets'] }, createElement(Shell, null, createElement(Markets))))
+      );
+      assert.ok(shellStatusHtml.includes('Geo pending'), 'Shell status line must surface compliance geo indicator');
+
+      console.log('PASS WS3.6 Piece 2a: Verifiable Gate, Restricted guard, compliance store & declaration binding verified.');
+
+      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 + WS3.6 PIECE 1 & 2a FORK TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
       await new Promise<void>((r) => apiServer.close(() => r()));

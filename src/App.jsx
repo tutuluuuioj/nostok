@@ -1,5 +1,5 @@
 import { BrowserRouter, Route, Routes, useLocation } from 'react-router-dom';
-import { Gate, Restricted } from './components/Gate.jsx';
+import { Gate, GateChecking, Restricted } from './components/Gate.jsx';
 import { Shell } from './components/Shell.jsx';
 import { ErrorBoundary } from './components/ui.jsx';
 import { getFrontendConfig } from './lib/contracts.js';
@@ -19,16 +19,28 @@ import { Terms } from './pages/Terms.jsx';
 import { Wallet } from './pages/Wallet.jsx';
 import { StoreProvider, useStore } from './store.jsx';
 
-function Frame() {
-  const { state } = useStore();
+export function Frame() {
+  const { state, web3 } = useStore();
   const location = useLocation();
   const isSubscriptionAction =
     location.pathname === '/subscriptions/confirm' ||
     location.pathname === '/subscriptions/block' ||
     location.pathname === '/subscriptions/unblock' ||
     location.pathname === '/subscriptions/manage';
-  if (state.gate === 'restricted') return <Restricted />;
-  if (state.gate !== 'accepted' && !isSubscriptionAction) return <Gate />;
+  const screening = web3?.eligibilityScreening;
+  if (web3?.hardRestricted || state.gate === 'restricted') return <Restricted />;
+  if (!isSubscriptionAction) {
+    if (state.gate === 'accepted' && !screening?.checkedOnce && !screening?.error) {
+      return <GateChecking />;
+    }
+    if (
+      state.gate !== 'accepted' ||
+      screening?.error ||
+      screening?.data?.allowed !== true
+    ) {
+      return <Gate />;
+    }
+  }
   return (
     <Shell>
       <Routes>

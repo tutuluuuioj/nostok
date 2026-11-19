@@ -1,23 +1,339 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { getAddress } from 'viem';
+import { getAddress, isAddress } from 'viem';
 import { freshState, reducer } from './lib/book.js';
-import { getFrontendConfig } from './lib/contracts.js';
+import {
+  ELIGIBILITY_DECLARATION_STATEMENT_HASH,
+  RESTRICTED_JURISDICTIONS,
+  getFrontendConfig,
+} from './lib/contracts.js';
 import { buildAlerts } from './lib/health.js';
 import {
+  bumpEligibilityNonce as web3BumpEligibilityNonce,
   connectWallet as web3ConnectWallet,
+  fetchEligibilityScreening,
   fetchNotificationsSessionState,
   fetchWalletState,
   formatWeb3Error,
   getInjectedProvider,
+  normalizeJurisdictionCode,
   parseChainIdHex,
   readConnectedAccount,
+  signEligibilityDeclaration as web3SignEligibilityDeclaration,
   signInWithSiwe as web3SignInWithSiwe,
   signOutSiwe as web3SignOutSiwe,
   switchToBaseChain,
 } from './lib/web3.js';
 
 const KEY = 'nostok-store-v1';
+const DECLARATION_KEY = 'nostok-eligibility-declaration-v1';
 const StoreContext = createContext(null);
+
+export const HARD_RESTRICTION_CODES = new Set([
+  'GEO_RESTRICTED',
+  'GEO_TOR_BLOCKED',
+  'GEO_UNVERIFIED',
+  'GEO_UNTRUSTED_PROXY',
+  'GEO_HEADER_MALFORMED',
+  'WALLET_SANCTIONED',
+  'WALLET_REVOKED',
+]);
+
+export function isHardRestrictionScreening(screeningData, walletEligibility = null) {
+  if (walletEligibility?.isRevoked === true) return true;
+  if (!screeningData || typeof screeningData !== 'object') return false;
+  if (screeningData.geo?.allowed === false) return true;
+  if (screeningData.wallet?.sanctioned === true) return true;
+  if (screeningData.onchain?.is_revoked === true) return true;
+  const reasons = Array.isArray(screeningData.rejection_reasons) ? screeningData.rejection_reasons : [];
+  return reasons.some((r) => HARD_RESTRICTION_CODES.has(String(r?.code ?? '')));
+}
+
+export function loadPersistedDeclaration() {
+  if (typeof sessionStorage === 'undefined') return null;
+  try {
+    const raw = sessionStorage.getItem(DECLARATION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (!parsed.declarationJson || typeof parsed.signature !== 'string') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export function savePersistedDeclaration(decl) {
+  if (typeof sessionStorage === 'undefined') return;
+  try {
+    if (!decl) {
+      sessionStorage.removeItem(DECLARATION_KEY);
+    } else {
+      sessionStorage.setItem(DECLARATION_KEY, JSON.stringify(decl));
+    }
+  } catch {
+    /* ignore storage quota failures */
+  }
+}
+
+export function evaluateEligibilityDeclaration(
+  declaration,
+  {
+    address = null,
+    config = getFrontendConfig(),
+    walletEligibility = null,
+    screeningData = null,
+    nowSeconds = null,
+  } = {}
+) {
+  if (!declaration || typeof declaration !== 'object') {
+    return {
+      valid: false,
+      code: 'DECLARATION_MISSING',
+      reason: 'Sign an EIP-712 Regulation S declaration for your connected wallet.',
+      expiresAt: null,
+      jurisdiction: null,
+    };
+  }
+
+  const declJson =
+    declaration.declarationJson && typeof declaration.declarationJson === 'object'
+      ? declaration.declarationJson
+      : declaration;
+  const sig = typeof declaration.signature === 'string' ? declaration.signature.trim() : '';
+
+  if (!/^0x[0-9a-fA-F]{130,}$/.test(sig) || sig.length % 2 !== 0) {
+    return {
+      valid: false,
+      code: 'DECLARATION_INVALID',
+      reason: 'Stored eligibility declaration signature is malformed.',
+      expiresAt: null,
+      jurisdiction: null,
+    };
+  }
+  if (!declJson.account || !isAddress(declJson.account)) {
+    return {
+      valid: false,
+      code: 'DECLARATION_INVALID',
+      reason: 'Eligibility declaration has an invalid account address.',
+      expiresAt: null,
+      jurisdiction: null,
+    };
+  }
+  const declAccount = getAddress(declJson.account);
+
+  const expectedChainId = Number(config?.chainId);
+  const storedChainId = Number(declaration.chainId);
+  if (!Number.isInteger(storedChainId) || storedChainId !== expectedChainId) {
+    return {
+      valid: false,
+      code: 'DECLARATION_CHAIN_MISMATCH',
+      reason: `Declaration chainId (${String(declaration.chainId ?? '?')}) does not match Base (${expectedChainId}).`,
+      expiresAt: null,
+      jurisdiction: null,
+    };
+  }
+
+  const expectedGate = config?.contracts?.eligibilityGate;
+  if (
+    !expectedGate ||
+    !isAddress(expectedGate) ||
+    !declaration.gateAddress ||
+    !isAddress(declaration.gateAddress) ||
+    getAddress(declaration.gateAddress).toLowerCase() !== getAddress(expectedGate).toLowerCase()
+  ) {
+    return {
+      valid: false,
+      code: 'DECLARATION_GATE_MISMATCH',
+      reason: 'Declaration verifying EligibilityGate address does not match active deployment.',
+      expiresAt: null,
+      jurisdiction: null,
+    };
+  }
+
+  if (!address || !isAddress(address)) {
+    return {
+      valid: false,
+      code: 'WALLET_NOT_CONNECTED',
+      reason: 'Connect a Base wallet to validate your EIP-712 Regulation S declaration.',
+      expiresAt: null,
+      jurisdiction: null,
+    };
+  }
+  const activeAccount = getAddress(address);
+  if (activeAccount.toLowerCase() !== declAccount.toLowerCase()) {
+    return {
+      valid: false,
+      code: 'DECLARATION_ACCOUNT_MISMATCH',
+      reason: `Declaration was signed for ${declAccount}, not active wallet ${activeAccount}.`,
+      expiresAt: null,
+      jurisdiction: null,
+    };
+  }
+
+  const nonceStr = declJson.nonce !== undefined && declJson.nonce !== null ? String(declJson.nonce).trim() : '';
+  const issuedStr =
+    declJson.issuedAt !== undefined && declJson.issuedAt !== null ? String(declJson.issuedAt).trim() : '';
+  const expiresStr =
+    declJson.expiresAt !== undefined && declJson.expiresAt !== null ? String(declJson.expiresAt).trim() : '';
+  if (!/^\d+$/.test(nonceStr) || !/^\d+$/.test(issuedStr) || !/^\d+$/.test(expiresStr)) {
+    return {
+      valid: false,
+      code: 'DECLARATION_INVALID',
+      reason: 'Declaration nonce or timestamp bounds are invalid.',
+      expiresAt: null,
+      jurisdiction: null,
+    };
+  }
+
+  const statementHash = typeof declJson.statementHash === 'string' ? declJson.statementHash.trim().toLowerCase() : '';
+  if (statementHash !== ELIGIBILITY_DECLARATION_STATEMENT_HASH.toLowerCase()) {
+    return {
+      valid: false,
+      code: 'DECLARATION_STATEMENT_MISMATCH',
+      reason: 'Declaration statement hash does not match the canonical Regulation S statement.',
+      expiresAt: expiresStr,
+      jurisdiction: null,
+    };
+  }
+
+  const restrictedList = Array.isArray(screeningData?.declaration_params?.restricted_countries)
+    ? screeningData.declaration_params.restricted_countries
+    : RESTRICTED_JURISDICTIONS;
+  let normalizedJurisdiction;
+  try {
+    normalizedJurisdiction = normalizeJurisdictionCode(declJson.jurisdiction, { restrictedList });
+  } catch (err) {
+    return {
+      valid: false,
+      code: 'DECLARATION_JURISDICTION_RESTRICTED',
+      reason: err instanceof Error ? err.message : 'Declared jurisdiction is restricted.',
+      expiresAt: expiresStr,
+      jurisdiction: null,
+    };
+  }
+
+  if (declaration.serverVerification?.verified !== true) {
+    return {
+      valid: false,
+      code: 'DECLARATION_UNVERIFIED',
+      reason: 'Declaration has not been verified by api/ POST /eligibility/verify.',
+      expiresAt: expiresStr,
+      jurisdiction: normalizedJurisdiction,
+    };
+  }
+
+  const verifiedWalletAcct = declaration.serverVerification?.wallet?.account;
+  if (
+    verifiedWalletAcct &&
+    isAddress(verifiedWalletAcct) &&
+    getAddress(verifiedWalletAcct).toLowerCase() !== activeAccount.toLowerCase()
+  ) {
+    return {
+      valid: false,
+      code: 'DECLARATION_ACCOUNT_MISMATCH',
+      reason: 'Server verification record belongs to a different wallet address.',
+      expiresAt: expiresStr,
+      jurisdiction: normalizedJurisdiction,
+    };
+  }
+
+  if (walletEligibility?.isRevoked) {
+    return {
+      valid: false,
+      code: 'WALLET_REVOKED',
+      reason: 'Connected wallet is revoked on EligibilityGate.',
+      expiresAt: expiresStr,
+      jurisdiction: normalizedJurisdiction,
+    };
+  }
+
+  if (
+    walletEligibility?.userNonce !== undefined &&
+    walletEligibility.userNonce !== null &&
+    String(walletEligibility.userNonce) !== nonceStr
+  ) {
+    return {
+      valid: false,
+      code: 'DECLARATION_NONCE_STALE',
+      reason: `EligibilityGate userNonce is now ${String(walletEligibility.userNonce)} (signed nonce ${nonceStr}); re-sign declaration.`,
+      expiresAt: expiresStr,
+      jurisdiction: normalizedJurisdiction,
+    };
+  }
+
+  if (screeningData && typeof screeningData === 'object') {
+    if (screeningData.allowed !== true) {
+      const msg = screeningData.rejection_reasons?.[0]?.message || 'Blocked by API eligibility screening.';
+      return {
+        valid: false,
+        code: 'SCREENING_REJECTED',
+        reason: msg,
+        expiresAt: expiresStr,
+        jurisdiction: normalizedJurisdiction,
+      };
+    }
+    if (
+      screeningData.onchain?.user_nonce !== undefined &&
+      screeningData.onchain.user_nonce !== null &&
+      String(screeningData.onchain.user_nonce) !== nonceStr
+    ) {
+      return {
+        valid: false,
+        code: 'DECLARATION_NONCE_STALE',
+        reason: `EligibilityGate userNonce is now ${String(screeningData.onchain.user_nonce)} (signed nonce ${nonceStr}); re-sign declaration.`,
+        expiresAt: expiresStr,
+        jurisdiction: normalizedJurisdiction,
+      };
+    }
+    if (
+      screeningData.geo?.verified &&
+      screeningData.geo?.country_code &&
+      normalizedJurisdiction !== String(screeningData.geo.country_code).trim().toUpperCase()
+    ) {
+      return {
+        valid: false,
+        code: 'DECLARATION_GEO_MISMATCH',
+        reason: `Declared jurisdiction (${normalizedJurisdiction}) does not match verified IP country (${screeningData.geo.country_code}); re-sign declaration.`,
+        expiresAt: expiresStr,
+        jurisdiction: normalizedJurisdiction,
+      };
+    }
+  }
+
+  const refNow = walletEligibility?.blockTimestamp
+    ? BigInt(walletEligibility.blockTimestamp)
+    : screeningData?.onchain?.block_timestamp
+      ? BigInt(screeningData.onchain.block_timestamp)
+      : BigInt(Math.floor(nowSeconds ?? Date.now() / 1000));
+  const issuedBig = BigInt(issuedStr);
+  const expiresBig = BigInt(expiresStr);
+  if (issuedBig > refNow + 300n) {
+    return {
+      valid: false,
+      code: 'DECLARATION_FUTURE_TIMESTAMP',
+      reason: 'Declaration issuedAt timestamp is in the future relative to Base chain time.',
+      expiresAt: expiresStr,
+      jurisdiction: normalizedJurisdiction,
+    };
+  }
+  if (expiresBig <= refNow) {
+    return {
+      valid: false,
+      code: 'DECLARATION_EXPIRED',
+      reason: 'EIP-712 Regulation S declaration has expired (24h max window); sign a fresh declaration.',
+      expiresAt: expiresStr,
+      jurisdiction: normalizedJurisdiction,
+    };
+  }
+
+  return {
+    valid: true,
+    code: 'VERIFIED',
+    reason: 'EIP-712 Regulation S declaration verified.',
+    expiresAt: expiresStr,
+    jurisdiction: normalizedJurisdiction,
+  };
+}
 
 function init() {
   if (typeof sessionStorage === 'undefined') return freshState();
@@ -46,6 +362,7 @@ export function createWalletEventsHandler({
   getConfig = getFrontendConfig,
   signOutImpl = web3SignOutSiwe,
   getAttestation = () => '0x',
+  onComplianceContextReset = () => {},
 }) {
   const onAccountsChanged = (accounts) => {
     const nextRaw = Array.isArray(accounts) && accounts.length > 0 ? accounts[0] : null;
@@ -62,6 +379,7 @@ export function createWalletEventsHandler({
       clearLocalSiweState({
         siweNotice: nextAddr ? 'Wallet changed. Sign in with SIWE for this address.' : '',
       });
+      onComplianceContextReset({ accountChanged: true, wrongNetwork: connRef.current.wrongNetwork });
     }
     const nextConn = updateWalletConn((prev) => ({
       ...prev,
@@ -92,6 +410,7 @@ export function createWalletEventsHandler({
         siweNotice: `Network changed away from Base (${currentCfg.chainId}); SIWE session cleared.`,
       });
     }
+    onComplianceContextReset({ accountChanged: false, wrongNetwork: wrong });
 
     const nextConn = updateWalletConn((prev) => ({
       ...prev,
@@ -150,6 +469,19 @@ export function StoreProvider({ children }) {
     loading: false,
     data: null,
   });
+  const [eligibilityScreening, setEligibilityScreening] = useState({
+    loading: false,
+    checkedOnce: false,
+    data: null,
+    error: '',
+  });
+  const [eligibilityDeclaration, setEligibilityDeclaration] = useState(loadPersistedDeclaration);
+  const [declActionState, setDeclActionState] = useState({
+    signing: false,
+    bumpingNonce: false,
+    error: '',
+    notice: '',
+  });
 
   const siweRef = useRef(siweState.session);
   siweRef.current = siweState.session;
@@ -158,6 +490,9 @@ export function StoreProvider({ children }) {
   const attestationRef = useRef(attestationHex);
   attestationRef.current = attestationHex;
   const snapshotSeqRef = useRef(0);
+  const screeningSeqRef = useRef(0);
+  const declSeqRef = useRef(0);
+  const prevScreeningTargetRef = useRef(undefined);
 
   const updateWalletConn = useCallback((nextOrUpdater) => {
     const next =
@@ -178,6 +513,88 @@ export function StoreProvider({ children }) {
       siweNotice: opts.siweNotice ?? '',
     });
   }, []);
+
+  const clearEligibilityDeclaration = useCallback((opts = {}) => {
+    ++declSeqRef.current;
+    savePersistedDeclaration(null);
+    setEligibilityDeclaration(null);
+    setDeclActionState({
+      signing: false,
+      bumpingNonce: false,
+      error: opts.error ?? '',
+      notice: opts.notice ?? '',
+    });
+  }, []);
+
+  const refreshEligibilityScreening = useCallback(
+    async (
+      targetAddr = undefined,
+      customAttestation = attestationRef.current,
+      opts = {}
+    ) => {
+      const requestId = ++screeningSeqRef.current;
+      const resolvedAccount =
+        targetAddr === undefined
+          ? connRef.current.connected && connRef.current.address && !connRef.current.wrongNetwork
+            ? getAddress(connRef.current.address)
+            : null
+          : targetAddr
+            ? getAddress(targetAddr)
+            : null;
+      const cfg = getFrontendConfig();
+
+      setEligibilityScreening((prev) => ({
+        ...prev,
+        loading: true,
+        error: '',
+      }));
+
+      try {
+        const data = await fetchEligibilityScreening({
+          account: resolvedAccount,
+          attestationHex: customAttestation,
+          cfg,
+        });
+        const currentExpected =
+          connRef.current.connected && connRef.current.address && !connRef.current.wrongNetwork
+            ? getAddress(connRef.current.address)
+            : null;
+        if (requestId !== screeningSeqRef.current || currentExpected !== resolvedAccount) {
+          return null;
+        }
+        setEligibilityScreening({
+          loading: false,
+          checkedOnce: true,
+          data,
+          error: '',
+        });
+        const hard = isHardRestrictionScreening(data, null);
+        if (hard && ref.current.gate !== 'restricted') {
+          act({ type: 'restrict' });
+        } else if (
+          !hard &&
+          data?.allowed === true &&
+          opts.allowRecoverFromRestriction &&
+          ref.current.gate === 'restricted'
+        ) {
+          act({ type: 'reset-gate' });
+        }
+        return data;
+      } catch (err) {
+        if (requestId !== screeningSeqRef.current) {
+          return null;
+        }
+        setEligibilityScreening({
+          loading: false,
+          checkedOnce: true,
+          data: null,
+          error: formatWeb3Error(err),
+        });
+        return null;
+      }
+    },
+    [act]
+  );
 
   const refreshWalletData = useCallback(
     async (
@@ -304,6 +721,10 @@ export function StoreProvider({ children }) {
       getConfig: getFrontendConfig,
       signOutImpl: web3SignOutSiwe,
       getAttestation: () => attestationRef.current,
+      onComplianceContextReset: () => {
+        ++declSeqRef.current;
+        setDeclActionState({ signing: false, bumpingNonce: false, error: '', notice: '' });
+      },
     });
 
     provider.on('accountsChanged', onAccountsChanged);
@@ -327,6 +748,33 @@ export function StoreProvider({ children }) {
       void refreshWalletData(connRef.current.address, attestationHex, { wrongNetwork: false });
     }
   }, [attestationHex, refreshWalletData]);
+
+  // Run GET /eligibility screening on initial mount and whenever wallet/network/attestation context changes
+  const activeScreeningTarget =
+    walletConn.connected && walletConn.address && !walletConn.wrongNetwork
+      ? getAddress(walletConn.address)
+      : null;
+  useEffect(() => {
+    const prevTarget = prevScreeningTargetRef.current;
+    prevScreeningTargetRef.current = activeScreeningTarget;
+    const accountChanged = prevTarget !== undefined && prevTarget !== activeScreeningTarget;
+    void refreshEligibilityScreening(activeScreeningTarget, attestationHex, {
+      allowRecoverFromRestriction: accountChanged,
+    });
+  }, [activeScreeningTarget, attestationHex, refreshEligibilityScreening]);
+
+  // If live on-chain EligibilityGate reports wallet revoked, lock UI to Restricted immediately
+  useEffect(() => {
+    if (
+      walletSnapshot.data &&
+      walletConn.address &&
+      walletSnapshot.data.address === walletConn.address &&
+      walletSnapshot.data.eligibility?.isRevoked === true &&
+      ref.current.gate !== 'restricted'
+    ) {
+      act({ type: 'restrict' });
+    }
+  }, [act, walletConn.address, walletSnapshot.data]);
 
   const connect = useCallback(async () => {
     const cfg = getFrontendConfig();
@@ -445,8 +893,120 @@ export function StoreProvider({ children }) {
     }
   }, [clearLocalSiweState]);
 
+  const signAndVerifyDeclaration = useCallback(
+    async ({ jurisdiction = null, ttlSeconds } = {}) => {
+      const cfg = getFrontendConfig();
+      const addr = connRef.current.address;
+      if (!connRef.current.connected || !addr || connRef.current.wrongNetwork) {
+        const msg = connRef.current.wrongNetwork
+          ? `Switch wallet to Base (${cfg.chainId}) before signing an eligibility declaration.`
+          : 'Connect your wallet before signing an eligibility declaration.';
+        setDeclActionState((prev) => ({ ...prev, error: msg, notice: '' }));
+        throw new Error(msg);
+      }
+
+      const requestId = ++declSeqRef.current;
+      setDeclActionState({ signing: true, bumpingNonce: false, error: '', notice: '' });
+      try {
+        const signed = await web3SignEligibilityDeclaration({
+          address: addr,
+          jurisdiction,
+          ...(ttlSeconds !== undefined ? { ttlSeconds } : {}),
+          requireServerScreening: true,
+          submitToApi: true,
+          attestationHex: attestationRef.current,
+          provider: getInjectedProvider(),
+          cfg,
+        });
+        if (
+          requestId !== declSeqRef.current ||
+          !connRef.current.address ||
+          connRef.current.address.toLowerCase() !== addr.toLowerCase() ||
+          connRef.current.wrongNetwork
+        ) {
+          throw new Error('Wallet account or network changed during declaration signing; aborted.');
+        }
+        const record = {
+          account: signed.declarationJson.account,
+          chainId: Number(cfg.chainId),
+          gateAddress: cfg.contracts.eligibilityGate,
+          declarationJson: signed.declarationJson,
+          signature: signed.signature,
+          digest: signed.digest,
+          verifiedAt: new Date().toISOString(),
+          serverVerification: signed.serverVerification,
+        };
+        savePersistedDeclaration(record);
+        setEligibilityDeclaration(record);
+        if (signed.screening) {
+          setEligibilityScreening({
+            loading: false,
+            checkedOnce: true,
+            data: signed.screening,
+            error: '',
+          });
+        }
+        setDeclActionState({
+          signing: false,
+          bumpingNonce: false,
+          error: '',
+          notice: `Signed & verified EIP-712 Regulation S declaration (${record.declarationJson.jurisdiction}, nonce ${record.declarationJson.nonce}).`,
+        });
+        void refreshWalletData(addr, attestationRef.current, { wrongNetwork: false });
+        return record;
+      } catch (err) {
+        const msg = formatWeb3Error(err);
+        if (requestId === declSeqRef.current) {
+          setDeclActionState({ signing: false, bumpingNonce: false, error: msg, notice: '' });
+        }
+        throw err;
+      }
+    },
+    [refreshWalletData]
+  );
+
+  const bumpMyEligibilityNonce = useCallback(async () => {
+    const cfg = getFrontendConfig();
+    const addr = connRef.current.address;
+    if (!connRef.current.connected || !addr || connRef.current.wrongNetwork) {
+      const msg = 'Connect your wallet on Base before bumping EligibilityGate nonce.';
+      setDeclActionState((prev) => ({ ...prev, error: msg, notice: '' }));
+      throw new Error(msg);
+    }
+    const requestId = ++declSeqRef.current;
+    setDeclActionState({ signing: false, bumpingNonce: true, error: '', notice: '' });
+    try {
+      const res = await web3BumpEligibilityNonce({
+        address: addr,
+        provider: getInjectedProvider(),
+        cfg,
+      });
+      if (requestId !== declSeqRef.current) return res;
+      savePersistedDeclaration(null);
+      setEligibilityDeclaration(null);
+      setDeclActionState({
+        signing: false,
+        bumpingNonce: false,
+        error: '',
+        notice: `Bumped EligibilityGate userNonce to ${res.newNonce} (tx ${res.txHash}); prior declarations invalidated.`,
+      });
+      await Promise.all([
+        refreshWalletData(addr, attestationRef.current, { wrongNetwork: false }),
+        refreshEligibilityScreening(addr, attestationRef.current, { allowRecoverFromRestriction: false }),
+      ]);
+      return res;
+    } catch (err) {
+      const msg = formatWeb3Error(err);
+      if (requestId === declSeqRef.current) {
+        setDeclActionState({ signing: false, bumpingNonce: false, error: msg, notice: '' });
+      }
+      throw err;
+    }
+  }, [refreshEligibilityScreening, refreshWalletData]);
+
   const disconnect = useCallback(async () => {
     ++snapshotSeqRef.current;
+    clearEligibilityDeclaration();
     setWalletSnapshot({ loading: false, data: null });
     updateWalletConn({
       connected: false,
@@ -457,7 +1017,28 @@ export function StoreProvider({ children }) {
       walletError: '',
     });
     await signOut();
-  }, [signOut, updateWalletConn]);
+  }, [clearEligibilityDeclaration, signOut, updateWalletConn]);
+
+  const matchingWalletEligibility =
+    walletSnapshot.data && walletConn.address && walletSnapshot.data.address === walletConn.address
+      ? walletSnapshot.data.eligibility
+      : null;
+
+  const hardRestricted = isHardRestrictionScreening(
+    eligibilityScreening.data,
+    matchingWalletEligibility
+  );
+
+  const eligibilityDeclarationStatus = useMemo(
+    () =>
+      evaluateEligibilityDeclaration(eligibilityDeclaration, {
+        address: walletConn.address,
+        config: getFrontendConfig(),
+        walletEligibility: matchingWalletEligibility,
+        screeningData: eligibilityScreening.data,
+      }),
+    [eligibilityDeclaration, eligibilityScreening.data, matchingWalletEligibility, walletConn.address]
+  );
 
   const web3 = useMemo(
     () => ({
@@ -473,26 +1054,52 @@ export function StoreProvider({ children }) {
       setAttestationHex,
       loadingState: walletSnapshot.loading,
       walletState: walletSnapshot.data,
+      eligibilityScreening,
+      hardRestricted,
+      eligibilityDeclaration,
+      eligibilityDeclarationStatus,
+      eligibilityDeclarationValid: eligibilityDeclarationStatus.valid,
+      signingDeclaration: declActionState.signing,
+      bumpingEligibilityNonce: declActionState.bumpingNonce,
+      declarationError: declActionState.error,
+      declarationNotice: declActionState.notice,
       connect,
       disconnect,
       switchNetwork,
       signIn,
       signOut,
+      refreshEligibilityScreening: (opts = {}) =>
+        refreshEligibilityScreening(undefined, attestationRef.current, opts),
+      signAndVerifyDeclaration,
+      bumpMyEligibilityNonce,
+      clearEligibilityDeclaration,
       refresh: () =>
-        refreshWalletData(connRef.current.address, attestationRef.current, {
-          wrongNetwork: connRef.current.wrongNetwork,
-        }),
+        Promise.all([
+          refreshWalletData(connRef.current.address, attestationRef.current, {
+            wrongNetwork: connRef.current.wrongNetwork,
+          }),
+          refreshEligibilityScreening(undefined, attestationRef.current),
+        ]),
     }),
     [
       walletConn,
       siweState,
       attestationHex,
       walletSnapshot,
+      eligibilityScreening,
+      hardRestricted,
+      eligibilityDeclaration,
+      eligibilityDeclarationStatus,
+      declActionState,
       connect,
       disconnect,
       switchNetwork,
       signIn,
       signOut,
+      refreshEligibilityScreening,
+      signAndVerifyDeclaration,
+      bumpMyEligibilityNonce,
+      clearEligibilityDeclaration,
       refreshWalletData,
     ]
   );

@@ -70,7 +70,19 @@ export function Shell({ children }) {
 
   const degradedMsg =
     web3?.walletError ||
-    (wsMatches ? web3?.walletState?.rpcError || web3?.walletState?.apiError : '');
+    (wsMatches ? web3?.walletState?.rpcError || web3?.walletState?.apiError : '') ||
+    web3?.eligibilityScreening?.error;
+
+  const geoInfo = web3?.eligibilityScreening?.data?.geo;
+  const geoLabel = geoInfo
+    ? geoInfo.verified
+      ? `Geo ${geoInfo.country_code}`
+      : geoInfo.status === 'disabled'
+        ? 'Geo disabled'
+        : geoInfo.status === 'local_unverified'
+          ? 'Geo local_unverified'
+          : `Geo ${geoInfo.status}`
+    : 'Geo pending';
 
   return (
     <>
@@ -108,10 +120,18 @@ export function Shell({ children }) {
       <div className="wrap">
         <div className={web3?.wrongNetwork || degradedMsg ? 'status-line err' : 'status-line'}>
           <span>{networkLabel}</span>
+          <span>{geoLabel}</span>
           {web3?.connected ? (
-            <span>
-              {web3.siweSession ? `SIWE verified (${shortAddress(web3.address)})` : 'SIWE not signed in'}
-            </span>
+            <>
+              <span>
+                {web3.siweSession ? `SIWE verified (${shortAddress(web3.address)})` : 'SIWE not signed in'}
+              </span>
+              <span>
+                {web3.eligibilityDeclarationValid
+                  ? `Reg S declaration verified (${web3.eligibilityDeclaration?.declarationJson?.jurisdiction})`
+                  : 'Reg S declaration required to transact'}
+              </span>
+            </>
           ) : null}
           {degradedMsg ? <span>{degradedMsg}</span> : null}
         </div>

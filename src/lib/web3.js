@@ -640,10 +640,6 @@ export async function fetchWalletState(
     return null;
   }
   const wallet = getAddress(address);
-  const cleanAttestation =
-    typeof attestationHex === 'string' && /^0x([0-9a-fA-F]{2})*$/.test(attestationHex.trim())
-      ? attestationHex.trim()
-      : '0x';
 
   const missingContracts = getMissingContractAddresses(cfg);
   let rpcError =
@@ -708,36 +704,16 @@ export async function fetchWalletState(
             args: [wallet],
           })
         : Promise.resolve(null),
+      cfg.contracts.eligibilityGate
+        ? readEligibilityStatus(wallet, { attestationHex, cfg, publicClient })
+        : Promise.resolve(null),
     ];
 
-    const gateAddr = cfg.contracts.eligibilityGate;
-    if (gateAddr) {
-      reads.push(
-        publicClient.readContract({ address: gateAddr, abi: eligibilityGateAbi, functionName: 'permissionlessMode' }),
-        publicClient.readContract({ address: gateAddr, abi: eligibilityGateAbi, functionName: 'isRevoked', args: [wallet] }),
-        publicClient.readContract({ address: gateAddr, abi: eligibilityGateAbi, functionName: 'allowlist', args: [wallet] }),
-        publicClient.readContract({
-          address: gateAddr,
-          abi: eligibilityGateAbi,
-          functionName: 'isEligible',
-          args: [wallet, cleanAttestation],
-        })
-      );
-    }
-
-    const [ethBal, usdcBal, claimBal, permMode, revoked, allowlisted, eligible] = await Promise.all(reads);
+    const [ethBal, usdcBal, claimBal, eligStatus] = await Promise.all(reads);
     ethBalanceRaw = ethBal;
     usdcBalanceRaw = usdcBal;
     claimableUsdcRaw = claimBal;
-    if (gateAddr) {
-      eligibility = {
-        gateAddress: gateAddr,
-        permissionlessMode: Boolean(permMode),
-        isRevoked: Boolean(revoked),
-        allowlisted: Boolean(allowlisted),
-        isEligible: Boolean(eligible),
-      };
-    }
+    eligibility = eligStatus;
 
     if (apiAssets.length > 0) {
       collateralBalances = await Promise.all(
