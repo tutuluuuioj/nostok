@@ -1,10 +1,10 @@
 import { useState } from 'react';
 import {
   ELIGIBILITY_DECLARATION_STATEMENT,
-  RESTRICTED_JURISDICTIONS,
 } from '../lib/contracts.js';
-import { formatWeb3Error, normalizeJurisdictionCode, shortAddress } from '../lib/web3.js';
+import { formatWeb3Error, shortAddress } from '../lib/web3.js';
 import { useStore } from '../store.jsx';
+import { resolveJurisdictionSelection } from './DeclarationPanel.jsx';
 import { Choice, Field } from './ui.jsx';
 
 const CHECKS = [
@@ -75,22 +75,15 @@ export function Gate() {
     return <Restricted />;
   }
 
-  const restrictedList = Array.isArray(screeningData?.declaration_params?.restricted_countries)
-    ? screeningData.declaration_params.restricted_countries
-    : RESTRICTED_JURISDICTIONS;
-
-  const isEdgeCountryLocked = Boolean(geo?.verified && geo?.country_code);
-  const rawJurisdiction = isEdgeCountryLocked
-    ? geo.country_code
-    : jurisdictionInput.trim() || 'NON_US_SELF_DECLARED';
-
-  let resolvedJurisdiction = rawJurisdiction;
-  let jurisdictionError = '';
-  try {
-    resolvedJurisdiction = normalizeJurisdictionCode(rawJurisdiction, { restrictedList });
-  } catch (err) {
-    jurisdictionError = err instanceof Error ? err.message : 'Invalid jurisdiction code.';
-  }
+  const {
+    isEdgeCountryLocked,
+    resolved: resolvedJurisdiction,
+    error: jurisdictionError,
+  } = resolveJurisdictionSelection(
+    geo,
+    jurisdictionInput,
+    screeningData?.declaration_params?.restricted_countries
+  );
 
   const screeningPassed = Boolean(screeningData?.allowed === true && !screening.error);
   const allChecksAccepted = CHECKS.every(([id]) => Boolean(checks[id]));
@@ -180,9 +173,11 @@ export function Gate() {
         {connected && !wrongNetwork ? (
           <p className="hint">
             <strong>EIP-712 Reg S declaration:</strong>{' '}
-            {declValid
-              ? `Verified (${declStatus.jurisdiction}, expires block ${declStatus.expiresAt})`
-              : declStatus.reason || 'Not yet signed for this wallet & nonce'}
+            {web3?.verifyingDeclaration
+              ? 'Verifying stored declaration via api/ POST /eligibility/verify…'
+              : declValid
+                ? `Verified (${declStatus.jurisdiction}, expires block ${declStatus.expiresAt})`
+                : declStatus.reason || 'Not yet signed for this wallet & nonce'}
           </p>
         ) : null}
       </div>

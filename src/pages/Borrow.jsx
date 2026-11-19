@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { formatUnits, zeroAddress } from 'viem';
+import {
+  ComplianceTxGateBanner,
+  formatRegSDeclarationRowValue,
+} from '../components/DeclarationPanel.jsx';
 import { Field, Page, Rows, Sheet, TextInput } from '../components/ui.jsx';
 import { USDC_DECIMALS } from '../lib/contracts.js';
 import {
@@ -619,6 +623,7 @@ export function Borrow() {
     txBusyRef.current = true;
     setTxBusy('approve');
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const liveOpenCollateralRaw = await resolveOpenBorrowOrdersCollateralSumRaw({
         borrowerAddress: web3.address,
         collateralToken: assetObj.token,
@@ -676,6 +681,7 @@ export function Borrow() {
     txBusyRef.current = true;
     setTxBusy('sign');
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const signed = await prepareAndSignBorrowOrder({
         address: web3.address,
         collateralToken: assetObj.token,
@@ -793,6 +799,7 @@ export function Borrow() {
     txBusyRef.current = true;
     setTxBusy('reduce-collateral-allowance');
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const targetRaw = collateralReductionState.targetAllowanceRaw;
       const res = await setCollateralAllowanceForBorrow({
         address: web3.address,
@@ -825,6 +832,7 @@ export function Borrow() {
     txBusyRef.current = true;
     setTxBusy('cancel');
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const res = await cancelSignedBorrowOrder({
         address: web3.address,
         order: orderObj,
@@ -860,6 +868,7 @@ export function Borrow() {
     txBusyRef.current = true;
     setTxBusy('cancel-paste');
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const res = await cancelSignedBorrowOrder({
         address: web3.address,
         order: parsed.order,
@@ -887,6 +896,7 @@ export function Borrow() {
     txBusyRef.current = true;
     setTxBusy('bump-nonce');
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const res = await bumpMakerNonceOnChain({
         address: web3.address,
         cfg: web3.config,
@@ -1011,6 +1021,7 @@ export function Borrow() {
     txBusyRef.current = true;
     setLendFillBusy(true);
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const res = await fillLendOfferAsBorrower({
         address: web3.address,
         offer: lendPreview.offer,
@@ -1066,6 +1077,8 @@ export function Borrow() {
           </div>
         </div>
       ) : null}
+
+      <ComplianceTxGateBanner actionLabel="approve collateral, publish BorrowOrders, fill LendOffers, or cancel orders" />
 
       <form className="form-layout" onSubmit={handleSignBorrowOrder}>
         <div className="fields">
@@ -1247,6 +1260,7 @@ export function Borrow() {
               disabled={
                 !web3?.connected ||
                 web3?.wrongNetwork ||
+                !web3?.eligibilityDeclarationValid ||
                 Boolean(txBusy) ||
                 !assetObj ||
                 quoteLoading ||
@@ -1266,6 +1280,7 @@ export function Borrow() {
               disabled={
                 !web3?.connected ||
                 web3?.wrongNetwork ||
+                !web3?.eligibilityDeclarationValid ||
                 Boolean(txBusy) ||
                 !assetObj ||
                 quoteLoading ||
@@ -1298,6 +1313,10 @@ export function Borrow() {
               {
                 label: 'EligibilityGate (on-chain)',
                 value: eligibilityStatusText,
+              },
+              {
+                label: 'EIP-712 Reg S declaration',
+                value: formatRegSDeclarationRowValue(web3),
               },
               tokenMeta.data
                 ? {
@@ -1424,7 +1443,7 @@ export function Borrow() {
             className="btn secondary"
             type="button"
             onClick={() => void handleBumpAllNonces()}
-            disabled={!web3?.connected || web3?.wrongNetwork || Boolean(txBusy)}
+            disabled={!web3?.connected || web3?.wrongNetwork || !web3?.eligibilityDeclarationValid || Boolean(txBusy)}
           >
             {txBusy === 'bump-nonce'
               ? 'Bumping maker nonce…'
@@ -1462,7 +1481,7 @@ export function Borrow() {
                 className="btn secondary"
                 type="button"
                 onClick={() => void handleReduceCollateralAfterCancel()}
-                disabled={Boolean(txBusy) || Boolean(collateralReductionState.blockedByUnknown)}
+                disabled={!web3?.eligibilityDeclarationValid || Boolean(txBusy) || Boolean(collateralReductionState.blockedByUnknown)}
               >
                 {collateralReductionState.blockedByUnknown
                   ? 'Reduction blocked (unknown order status)'
@@ -1517,7 +1536,7 @@ export function Borrow() {
                         className="btn secondary"
                         type="button"
                         onClick={() => void handleCancelOrder(ord)}
-                        disabled={Boolean(txBusy)}
+                        disabled={!web3?.eligibilityDeclarationValid || Boolean(txBusy)}
                       >
                         {txBusy === 'cancel' ? 'Cancelling…' : 'Cancel on-chain'}
                       </button>
@@ -1579,7 +1598,7 @@ export function Borrow() {
             <button
               className="btn secondary"
               type="submit"
-              disabled={!web3?.connected || web3?.wrongNetwork || Boolean(txBusy) || !pasteCancelJson.trim()}
+              disabled={!web3?.connected || web3?.wrongNetwork || !web3?.eligibilityDeclarationValid || Boolean(txBusy) || !pasteCancelJson.trim()}
             >
               {txBusy === 'cancel-paste' ? 'Cancelling pasted order…' : 'Cancel pasted BorrowOrder on-chain'}
             </button>
@@ -1742,7 +1761,7 @@ export function Borrow() {
                 className="btn"
                 type="button"
                 onClick={() => void handleConfirmFillLendOffer()}
-                disabled={lendFillBusy || !web3?.connected || web3?.wrongNetwork}
+                disabled={lendFillBusy || !web3?.connected || web3?.wrongNetwork || !web3?.eligibilityDeclarationValid}
               >
                 {lendFillBusy
                   ? '2. Approving & filling LendOffer…'

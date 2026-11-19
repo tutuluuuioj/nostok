@@ -156,6 +156,7 @@ import { Loans } from '../src/pages/Loans.jsx';
 import { Markets } from '../src/pages/Markets.jsx';
 import { Positions } from '../src/pages/Positions.jsx';
 import { SubscriptionAction } from '../src/pages/SubscriptionAction.jsx';
+import { Wallet } from '../src/pages/Wallet.jsx';
 import {
   StoreProvider,
   createWalletEventsHandler,
@@ -163,6 +164,7 @@ import {
   isHardRestrictionScreening,
   loadPersistedDeclaration,
   savePersistedDeclaration,
+  verifyStoredDeclarationOnServer,
 } from '../src/store.jsx';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -6740,6 +6742,15 @@ async function runTests(): Promise<void> {
         evaluateEligibilityDeclaration(validRecord, {
           address: ws36UserAddr,
           config: cfg,
+        }).code,
+        'DECLARATION_NONCE_UNAVAILABLE',
+        'Low 1: missing live userNonce data MUST fail closed'
+      );
+      assert.equal(
+        evaluateEligibilityDeclaration(validRecord, {
+          address: ws36UserAddr,
+          config: cfg,
+          walletEligibility: enrichedWalletSnap.eligibility,
           screeningData: { allowed: true, geo: { verified: true, country_code: 'CH' } },
         }).code,
         'DECLARATION_GEO_MISMATCH'
@@ -6813,9 +6824,34 @@ async function runTests(): Promise<void> {
         assert.ok(restrictedFrameHtml.includes('This interface is not available here.'));
 
         savePersistedDeclaration(validRecord);
+        const rawStoredDecl = JSON.parse(memStorage.get('nostok-eligibility-declaration-v1') ?? '{}') as Record<string, unknown>;
+        assert.equal(rawStoredDecl.serverVerification, undefined, 'Low 1: serverVerification MUST NOT be persisted to sessionStorage');
+
+        // Fake sessionStorage payload claiming serverVerification.verified=true + junk signature MUST load unverified
+        memStorage.set(
+          'nostok-eligibility-declaration-v1',
+          JSON.stringify({
+            ...validRecord,
+            signature: `0x${'ab'.repeat(65)}`,
+            serverVerification: { verified: true },
+          })
+        );
+        const restoredTampered = loadPersistedDeclaration();
+        assert.equal(restoredTampered?.serverVerification, null, 'Low 1: loadPersistedDeclaration MUST strip serverVerification');
+        assert.equal(
+          evaluateEligibilityDeclaration(restoredTampered, {
+            address: ws36UserAddr,
+            config: cfg,
+            walletEligibility: postBumpSnap?.eligibility,
+          }).code,
+          'DECLARATION_UNVERIFIED'
+        );
+
+        savePersistedDeclaration(validRecord);
         const restoredDecl = loadPersistedDeclaration();
         assert.equal(restoredDecl?.signature, validRecord.signature);
         assert.equal(restoredDecl?.declarationJson?.account, ws36UserAddr);
+        assert.equal(restoredDecl?.serverVerification, null);
         savePersistedDeclaration(null);
         assert.equal(loadPersistedDeclaration(), null);
       } finally {
@@ -6830,7 +6866,204 @@ async function runTests(): Promise<void> {
 
       console.log('PASS WS3.6 Piece 2a: Verifiable Gate, Restricted guard, compliance store & declaration binding verified.');
 
-      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 + WS3.6 PIECE 1 & 2a FORK TESTS PASSED.');
+      // ---------------------------------------------------------------------
+      // 3.13 WS3.6 Piece 2b: Low 1 + Info 1 + Wallet.jsx + Borrow/Lend/Loan Reg S Gating
+      // ---------------------------------------------------------------------
+      console.log('\n=== WS3.6 Piece 2b: Low 1 re-verify, Info 1 screening clear, Wallet.jsx & Borrow/Lend/Loan gating ===');
+
+      // Info 1: createWalletEventsHandler.onAccountsChanged synchronously clears screening before async fetch completes
+      {
+        const syncEvents: Array<Record<string, unknown>> = [];
+        const infoConnRef = { current: { connected: true, address: ADDRESSES.borrower, wrongNetwork: false } };
+        const infoSiweRef = { current: null };
+        const infoSeqRef = { current: 0 };
+        const handler = createWalletEventsHandler({
+          connRef: infoConnRef as any,
+          siweRef: infoSiweRef as any,
+          snapshotSeqRef: infoSeqRef,
+          updateWalletConn: (fn: any) => {
+            const next = typeof fn === 'function' ? fn(infoConnRef.current) : fn;
+            infoConnRef.current = next;
+            return next;
+          },
+          setWalletSnapshot: () => {},
+          clearLocalSiweState: () => {},
+          refreshWalletData: () => Promise.resolve(null),
+          onComplianceContextReset: (evt: Record<string, unknown>) => syncEvents.push(evt),
+        });
+        handler.onAccountsChanged([ADDRESSES.lender]);
+        assert.equal(syncEvents.length, 1);
+        assert.equal(syncEvents[0].accountChanged, true);
+        assert.equal(syncEvents[0].clearScreening, true);
+        assert.equal(syncEvents[0].nextAddress, ADDRESSES.lender);
+        handler.onAccountsChanged([]);
+        assert.equal(syncEvents.length, 2);
+        assert.equal(syncEvents[1].clearScreening, true);
+        assert.equal(syncEvents[1].nextAddress, null);
+      }
+
+      // Low 1: On-load & pre-tx live POST /eligibility/verify re-verification against real fork & API
+      walletProvider.setAccount(ws36UserKey);
+      const piece2bDecl = await signEligibilityDeclaration({
+        address: ws36UserAddr,
+        jurisdiction: 'CH',
+        ttlSeconds: 3600n,
+        submitToApi: true,
+        provider: walletProvider,
+        cfg,
+      });
+      const unsignedStrippedDecl = {
+        account: piece2bDecl.declarationJson.account,
+        chainId: BASE_CHAIN_ID,
+        gateAddress: deployed.eligibilityGate,
+        declarationJson: piece2bDecl.declarationJson,
+        signature: piece2bDecl.signature,
+        digest: piece2bDecl.digest,
+        serverVerification: null,
+      };
+      const reverified = await verifyStoredDeclarationOnServer({
+        declaration: unsignedStrippedDecl,
+        address: ws36UserAddr,
+        cfg,
+      });
+      assert.equal(reverified.verified, true);
+      assert.equal(reverified.record.serverVerification.verified, true);
+      assert.equal(
+        evaluateEligibilityDeclaration(reverified.record, {
+          address: ws36UserAddr,
+          config: cfg,
+          walletEligibility: reverified.liveStatus,
+        }).code,
+        'VERIFIED'
+      );
+
+      // Tampered junk signature in stored declaration MUST be rejected by verifyStoredDeclarationOnServer
+      await assert.rejects(
+        () =>
+          verifyStoredDeclarationOnServer({
+            declaration: {
+              ...unsignedStrippedDecl,
+              signature: `0x${'ab'.repeat(65)}`,
+            },
+            address: ws36UserAddr,
+            cfg,
+          }),
+        /INVALID_DECLARATION_SIGNATURE|signature|verification/i
+      );
+
+      // Live geo-enforced API server: switching IP to US rejects verifyStoredDeclarationOnServer before any tx
+      const piece2bGeoCfg = loadApiConfig({
+        rpcUrl: LOCAL_RPC_URL,
+        isFork: true,
+        forkChainId: BASE_CHAIN_ID,
+        databaseUrl: 'memory://',
+        corsOrigins: ['https://app.nostok.xyz'],
+        rateLimitMax: 2000,
+        rateLimitWindowMs: 60_000,
+        trustProxyHops: 1,
+        geoCountryHeader: 'cf-ipcountry',
+        geoRequireHeader: true,
+        sanctionedAddresses: [],
+        maxBodyBytes: 4096,
+        maxPageLimit: 100,
+        loanCore: deployed.loanCore,
+        orderSettlement: deployed.orderSettlement,
+        liquidationAuction: deployed.liquidationAuction,
+        positionNft: deployed.positionNFT,
+        collateralEscrow: deployed.collateralEscrow,
+        assetRegistry: deployed.assetRegistry,
+        oracleRouter: deployed.oracleRouter,
+        feeCollector: deployed.feeCollector,
+        eligibilityGate: deployed.eligibilityGate,
+        usdc: BASE_USDC,
+      });
+      const piece2bGeoServer = createApiServer(await createApiContext(piece2bGeoCfg, wrapApiReadOnly(idxCtx.db)));
+      await new Promise<void>((r) => piece2bGeoServer.listen(0, '127.0.0.1', r));
+      const piece2bGeoUrl = `http://127.0.0.1:${(piece2bGeoServer.address() as net.AddressInfo).port}`;
+      try {
+        await assert.rejects(
+          () =>
+            verifyStoredDeclarationOnServer({
+              declaration: unsignedStrippedDecl,
+              address: ws36UserAddr,
+              cfg: { ...cfg, apiUrl: piece2bGeoUrl },
+              submitImpl: (args: any) =>
+                submitEligibilityDeclaration({
+                  ...args,
+                  fetchImpl: (input: any, init: any) =>
+                    fetch(input, {
+                      ...init,
+                      headers: { ...(init?.headers ?? {}), 'cf-ipcountry': 'US' },
+                    }),
+                }),
+            }),
+          /GEO_RESTRICTED|restricted/i
+        );
+      } finally {
+        await new Promise<void>((r) => piece2bGeoServer.close(() => r()));
+      }
+
+      // On-chain bumpEligibilityNonce immediately invalidates pre-tx verifyStoredDeclarationOnServer check
+      const bump2bRes = await bumpEligibilityNonce({
+        address: ws36UserAddr,
+        provider: walletProvider,
+        cfg,
+      });
+      assert.equal(bump2bRes.newNonce, '4');
+      await assert.rejects(
+        () =>
+          verifyStoredDeclarationOnServer({
+            declaration: unsignedStrippedDecl,
+            address: ws36UserAddr,
+            cfg,
+          }),
+        /does not match on-chain EligibilityGate userNonce|does not match declaration nonce|NONCE_MISMATCH/i
+      );
+
+      // Wallet.jsx, Borrow.jsx, Lend.jsx, Loan.jsx SSR checks + gating coverage
+      const walletHtml = renderToStaticMarkup(
+        createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: ['/wallet'] }, createElement(Wallet)))
+      );
+      assert.ok(
+        walletHtml.includes('Compliance, EligibilityGate &amp; EIP-712 Reg S Declaration'),
+        'Wallet.jsx must render compliance & Reg S declaration sheet'
+      );
+      assert.ok(walletHtml.includes('Sign &amp; verify EIP-712 Reg S declaration'));
+      assert.ok(walletHtml.includes('Bump EligibilityGate nonce (on-chain)'));
+
+      const borrowGateHtml = renderToStaticMarkup(
+        createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: ['/borrow'] }, createElement(Borrow)))
+      );
+      assert.ok(borrowGateHtml.includes('EIP-712 Reg S declaration'), 'Borrow.jsx must render Reg S declaration status row');
+
+      const lendGateHtml = renderToStaticMarkup(
+        createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: ['/lend'] }, createElement(Lend)))
+      );
+      assert.ok(lendGateHtml.includes('EIP-712 Reg S declaration'), 'Lend.jsx must render Reg S declaration status row');
+
+      const loanGateHtml = renderToStaticMarkup(
+        createElement(
+          StoreProvider,
+          null,
+          createElement(
+            MemoryRouter,
+            { initialEntries: ['/loans/1'] },
+            createElement(Routes, null, createElement(Route, { path: '/loans/:id', element: createElement(Loan) }))
+          )
+        )
+      );
+      assert.ok(loanGateHtml.includes('Loan #1'), 'Loan.jsx detail route must render cleanly with Reg S gate');
+
+      for (const pageFile of ['Borrow.jsx', 'Lend.jsx', 'Loan.jsx']) {
+        const src = fs.readFileSync(path.join(REPO_ROOT, 'src', 'pages', pageFile), 'utf8');
+        assert.ok(src.includes('ComplianceTxGateBanner'), `${pageFile} must render ComplianceTxGateBanner`);
+        assert.ok(src.includes('ensureDeclarationVerifiedForTx()'), `${pageFile} must enforce pre-tx Reg S re-verification`);
+        assert.ok(src.includes('eligibilityDeclarationValid'), `${pageFile} must gate tx buttons on eligibilityDeclarationValid`);
+      }
+
+      console.log('PASS WS3.6 Piece 2b: Low 1, Info 1, Wallet.jsx declaration UI & Borrow/Lend/Loan Reg S gating verified.');
+
+      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 + WS3.6 PIECE 1 & 2 FORK TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
       await new Promise<void>((r) => apiServer.close(() => r()));

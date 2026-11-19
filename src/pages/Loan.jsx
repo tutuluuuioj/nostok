@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
+import {
+  ComplianceTxGateBanner,
+  formatRegSDeclarationRowValue,
+} from '../components/DeclarationPanel.jsx';
 import { Field, Page, Rows, Sheet, TextInput, Choice } from '../components/ui.jsx';
 import {
   OracleState,
@@ -290,6 +294,7 @@ export function Loan() {
     setRepayError('');
     setRepayBusy((p) => ({ ...p, submit: true }));
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const res = await executeLoanRepay({
         address: web3.address,
         loanId: repayPreview.loanId,
@@ -358,6 +363,7 @@ export function Loan() {
     setTopUpError('');
     setTopUpBusy((p) => ({ ...p, submit: true }));
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const res = await executeLoanTopUp({
         address: web3.address,
         loanId: topUpPreview.loanId,
@@ -387,6 +393,7 @@ export function Loan() {
     setExtCopied(false);
     setExtSignBusy(true);
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const signed = await signLoanExtension({
         address: web3.address,
         loanId: loanState.loanId,
@@ -467,6 +474,7 @@ export function Loan() {
     setExtSubmitError('');
     setExtVerifyBusy((p) => ({ ...p, submit: true }));
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const res = await executeLoanExtend({
         address: web3.address,
         loanId: extendPreview.loanId,
@@ -551,6 +559,8 @@ export function Loan() {
         </div>
       ) : null}
 
+      <ComplianceTxGateBanner actionLabel="repay, top up collateral, or co-sign/submit extensions" />
+
       {loanState ? (
         <>
           {!loanState.isSettled ? (
@@ -585,7 +595,14 @@ export function Loan() {
             <h2>Live LoanCore &amp; PositionNFT telemetry</h2>
             <Rows
               items={[
-                { label: 'Effective status', value: `${loanState.statusName} (stored contract status: ${loanState.storedStatusName})` },
+                {
+                  label: 'Effective status',
+                  value: `${loanState.statusName} (stored contract status: ${loanState.storedStatusName})`,
+                },
+                {
+                  label: 'EIP-712 Reg S declaration',
+                  value: formatRegSDeclarationRowValue(web3),
+                },
                 {
                   label: 'Borrower',
                   value: `${loanState.borrower}${walletIsBorrower ? ' (Your wallet)' : ''}`,
@@ -797,6 +814,7 @@ export function Loan() {
                       disabled={
                         repayBusy.submit ||
                         !walletOnBase ||
+                        !web3?.eligibilityDeclarationValid ||
                         walletIsHolderNotBorrower ||
                         (repayPreview.isThirdPartyPayer && !confirmThirdPartyRepay)
                       }
@@ -911,6 +929,7 @@ export function Loan() {
                       disabled={
                         topUpBusy.submit ||
                         !walletOnBase ||
+                        !web3?.eligibilityDeclarationValid ||
                         walletIsHolderNotBorrower ||
                         (topUpPreview.isThirdPartyPayer && !confirmThirdPartyTopUp)
                       }
@@ -1014,6 +1033,7 @@ export function Loan() {
                       type="submit"
                       disabled={
                         !walletOnBase ||
+                        !web3?.eligibilityDeclarationValid ||
                         !extendAllowed ||
                         (!walletIsBorrower && !walletIsHolder) ||
                         walletIsSelfFundedSameParty ||
@@ -1111,7 +1131,12 @@ export function Loan() {
                         className="btn"
                         type="button"
                         onClick={() => void handleConfirmExtend()}
-                        disabled={extVerifyBusy.submit || !walletOnBase || !extendAllowed}
+                        disabled={
+                          extVerifyBusy.submit ||
+                          !walletOnBase ||
+                          !web3?.eligibilityDeclarationValid ||
+                          !extendAllowed
+                        }
                       >
                         {extVerifyBusy.submit ? '2. Submitting LoanCore.extend()…' : '2. Confirm & Execute Extend'}
                       </button>

@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { formatUnits, zeroAddress } from 'viem';
+import {
+  ComplianceTxGateBanner,
+  formatRegSDeclarationRowValue,
+} from '../components/DeclarationPanel.jsx';
 import { Field, Page, Rows, Sheet, TextInput } from '../components/ui.jsx';
 import { USDC_DECIMALS } from '../lib/contracts.js';
 import {
@@ -589,6 +593,7 @@ export function Lend() {
     txBusyRef.current = true;
     setTxBusy('approve');
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const liveOpenUsdcSumRaw = await resolveOpenLendOffersSumRaw({
         lenderAddress: web3.address,
         existingOpenSumRaw: null,
@@ -644,6 +649,7 @@ export function Lend() {
     txBusyRef.current = true;
     setTxBusy('sign');
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const signed = await prepareAndSignLendOffer({
         address: web3.address,
         principalRaw: parsed.principalRaw,
@@ -765,6 +771,7 @@ export function Lend() {
     txBusyRef.current = true;
     setTxBusy('reduce-allowance');
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const targetRaw = allowanceReductionState.targetAllowanceRaw;
       const res = await setUsdcAllowanceForLend({
         address: web3.address,
@@ -794,6 +801,7 @@ export function Lend() {
     txBusyRef.current = true;
     setTxBusy('cancel');
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const res = await cancelSignedLendOffer({
         address: web3.address,
         offer: offerObj,
@@ -829,6 +837,7 @@ export function Lend() {
     txBusyRef.current = true;
     setTxBusy('cancel-paste');
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const res = await cancelSignedLendOffer({
         address: web3.address,
         offer: parsed.order,
@@ -856,6 +865,7 @@ export function Lend() {
     txBusyRef.current = true;
     setTxBusy('bump-nonce');
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const res = await bumpMakerNonceOnChain({
         address: web3.address,
         cfg: web3.config,
@@ -968,6 +978,7 @@ export function Lend() {
     txBusyRef.current = true;
     setBorrowFillBusy(true);
     try {
+      await web3.ensureDeclarationVerifiedForTx();
       const res = await fillBorrowOrderAsLender({
         address: web3.address,
         order: borrowPreview.order,
@@ -1010,6 +1021,8 @@ export function Lend() {
           Cumulative LoanCore allowance reserves use your full maker-scoped <code>/orders</code> query directly.
         </div>
       ) : null}
+
+      <ComplianceTxGateBanner actionLabel="approve USDC, publish LendOffers, fill BorrowOrders, or cancel offers" />
 
       <form className="form-layout" onSubmit={handleSignLendOffer}>
         <div className="fields">
@@ -1189,6 +1202,7 @@ export function Lend() {
               disabled={
                 !web3?.connected ||
                 web3?.wrongNetwork ||
+                !web3?.eligibilityDeclarationValid ||
                 Boolean(txBusy) ||
                 !quoteAssetObj ||
                 quoteLoading ||
@@ -1207,6 +1221,7 @@ export function Lend() {
               disabled={
                 !web3?.connected ||
                 web3?.wrongNetwork ||
+                !web3?.eligibilityDeclarationValid ||
                 Boolean(txBusy) ||
                 !quoteAssetObj ||
                 quoteLoading ||
@@ -1231,6 +1246,7 @@ export function Lend() {
               { label: 'OrderSettlement', value: web3?.config?.contracts?.orderSettlement ?? 'Unset' },
               { label: 'LoanCore (USDC spender)', value: web3?.config?.contracts?.loanCore ?? 'Unset' },
               { label: 'EligibilityGate (on-chain)', value: eligibilityStatusText },
+              { label: 'EIP-712 Reg S declaration', value: formatRegSDeclarationRowValue(web3) },
               {
                 label: 'USDC balance / LoanCore allowance',
                 value: lendMeta.data
@@ -1310,7 +1326,7 @@ export function Lend() {
                 className="btn secondary"
                 type="button"
                 onClick={() => void handleReduceAllowanceAfterCancel()}
-                disabled={Boolean(txBusy) || Boolean(allowanceReductionState.blockedByUnknown)}
+                disabled={!web3?.eligibilityDeclarationValid || Boolean(txBusy) || Boolean(allowanceReductionState.blockedByUnknown)}
               >
                 {allowanceReductionState.blockedByUnknown
                   ? 'Reduction blocked (unknown offer status)'
@@ -1334,7 +1350,7 @@ export function Lend() {
             className="btn secondary"
             type="button"
             onClick={() => void handleBumpAllNonces()}
-            disabled={!web3?.connected || web3?.wrongNetwork || Boolean(txBusy)}
+            disabled={!web3?.connected || web3?.wrongNetwork || !web3?.eligibilityDeclarationValid || Boolean(txBusy)}
           >
             {txBusy === 'bump-nonce' ? 'Bumping maker nonce…' : 'Bump maker nonce (invalidate all open orders)'}
           </button>
@@ -1374,7 +1390,7 @@ export function Lend() {
                         className="btn secondary"
                         type="button"
                         onClick={() => void handleCancelOffer(item.offerJson)}
-                        disabled={Boolean(txBusy)}
+                        disabled={!web3?.eligibilityDeclarationValid || Boolean(txBusy)}
                       >
                         Cancel on-chain
                       </button>
@@ -1429,7 +1445,7 @@ export function Lend() {
             <button
               className="btn secondary"
               type="submit"
-              disabled={!web3?.connected || web3?.wrongNetwork || Boolean(txBusy) || !pasteCancelJson.trim()}
+              disabled={!web3?.connected || web3?.wrongNetwork || !web3?.eligibilityDeclarationValid || Boolean(txBusy) || !pasteCancelJson.trim()}
             >
               {txBusy === 'cancel-paste' ? 'Cancelling offer…' : 'Cancel pasted LendOffer'}
             </button>
@@ -1604,7 +1620,7 @@ export function Lend() {
                 className="btn"
                 type="button"
                 onClick={() => void handleConfirmFillBorrowOrder()}
-                disabled={borrowFillBusy || !web3?.connected || web3?.wrongNetwork}
+                disabled={borrowFillBusy || !web3?.connected || web3?.wrongNetwork || !web3?.eligibilityDeclarationValid}
               >
                 {borrowFillBusy
                   ? '2. Approving USDC & filling BorrowOrder…'

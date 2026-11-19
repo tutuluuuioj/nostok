@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
+import { ComplianceDeclarationSheet } from '../components/DeclarationPanel.jsx';
 import { Field, Page, Rows, Sheet, TextInput } from '../components/ui.jsx';
 import { shortAddress } from '../lib/web3.js';
 import { useStore } from '../store.jsx';
@@ -203,6 +204,8 @@ export function Wallet() {
           ) : null}
         </Sheet>
       </div>
+
+      <ComplianceDeclarationSheet />
 
       <div className="actions">
         <Link className="btn" to="/loans">Your loans</Link>
