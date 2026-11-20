@@ -6304,18 +6304,41 @@ export async function fetchWalletPositionsAndClaimable({
 
   await apiPromise;
 
+  const isErc721NonexistentError = (err) => {
+    if (!err || typeof err !== 'object') return false;
+    if (decodeContractRevert(err)?.errorName === 'ERC721NonexistentToken') return true;
+    const msg = [
+      err.shortMessage,
+      err.message,
+      err.details,
+      err.cause?.shortMessage,
+      err.cause?.message,
+    ]
+      .filter(Boolean)
+      .join(' ');
+    return /\bERC721NonexistentToken\b/i.test(msg);
+  };
+
+  // Info 3 fix: strictly retain only API rows whose owner matches the connected/queried wallet.
+  const matchingApiRows = (Array.isArray(apiRows) ? apiRows : []).filter((row) => {
+    if (row?.loan_id === undefined || row?.loan_id === null) return false;
+    if (!row?.owner || !isAddress(row.owner)) return false;
+    return getAddress(row.owner).toLowerCase() === wallet.toLowerCase();
+  });
+
   const apiById = new Map();
-  for (const row of apiRows) {
-    if (row?.loan_id === undefined || row?.loan_id === null) continue;
+  for (const row of matchingApiRows) {
     apiById.set(String(row.loan_id), row);
   }
 
   if (!rpcCoreOk) {
-    const unverifiedPositions = apiRows.map((row) => ({
+    const unverifiedPositions = matchingApiRows.map((row) => ({
       loanId: String(row.loan_id),
-      owner: row.owner ? getAddress(row.owner) : wallet,
+      owner: getAddress(row.owner),
+      ownerUnknown: false,
+      ownerStatus: 'unverified',
       isBurned: Boolean(row.is_burned),
-      auctionLocked: Boolean(row.auction_locked),
+      auctionLocked: typeof row.auction_locked === 'boolean' ? row.auction_locked : null,
       collateralToken: row.collateral_token ? getAddress(row.collateral_token) : null,
       collateralSymbol: row.collateral_symbol || null,
       principalRaw: row.principal?.raw ?? null,
@@ -6334,6 +6357,8 @@ export async function fetchWalletPositionsAndClaimable({
       usdcBalanceRaw: null,
       usdcBalanceFormatted: null,
       nftBalanceCount: null,
+      verifiedOwnedCount: null,
+      positionsIncomplete: false,
       positions: unverifiedPositions,
       apiTruncated,
       apiError,
@@ -6342,67 +6367,91 @@ export async function fetchWalletPositionsAndClaimable({
     };
   }
 
-  const candidateIdSet = new Set(Array.from(apiById.keys()));
-  const activeApiCount = apiRows.filter((r) => !r.is_burned).length;
-  const needDirectScan = Boolean(apiError) || activeApiCount < nftBalanceCount;
+  const readPositionEntry = async (id) => {
+    const apiRow = apiById.get(id.toString()) ?? null;
+    const [loanRes, ownerRes, lockedRes, dueRes] = await Promise.allSettled([
+      publicClient.readContract({
+        address: loanCoreAddr,
+        abi: loanCoreAbi,
+        functionName: 'getLoan',
+        args: [id],
+      }),
+      publicClient.readContract({
+        address: positionNftAddr,
+        abi: positionNftAbi,
+        functionName: 'ownerOf',
+        args: [id],
+      }),
+      publicClient.readContract({
+        address: positionNftAddr,
+        abi: positionNftAbi,
+        functionName: 'isAuctionLocked',
+        args: [id],
+      }),
+      publicClient.readContract({
+        address: loanCoreAddr,
+        abi: loanCoreAbi,
+        functionName: 'getDueInterest',
+        args: [id],
+      }),
+    ]);
+    const loan = loanRes.status === 'fulfilled' ? loanRes.value : null;
+    const fulfilledOwner =
+      ownerRes.status === 'fulfilled' && ownerRes.value ? getAddress(ownerRes.value) : null;
+    const ownerNonexistent =
+      ownerRes.status === 'rejected'
+        ? isErc721NonexistentError(ownerRes.reason)
+        : fulfilledOwner === zeroAddress;
+    const ownerUnknown = ownerRes.status === 'rejected' && !ownerNonexistent;
+    const owner = fulfilledOwner && fulfilledOwner !== zeroAddress ? fulfilledOwner : null;
+    const auctionLocked = lockedRes.status === 'fulfilled' ? Boolean(lockedRes.value) : null;
+    const dueInterest = dueRes.status === 'fulfilled' ? BigInt(dueRes.value ?? 0n) : null;
+    return { id, apiRow, loan, owner, ownerUnknown, ownerNonexistent, auctionLocked, dueInterest };
+  };
+
+  // Low 1 fix: verify API candidate rows on-chain first, then compare actual on-chain verified owned
+  // count against PositionNFT.balanceOf(wallet) before deciding whether to run the fallback scan.
+  const apiCandidateIds = Array.from(apiById.keys())
+    .map((s) => BigInt(s))
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const apiEntries = await Promise.all(apiCandidateIds.map((id) => readPositionEntry(id)));
+  const apiVerifiedOwnedCount = apiEntries.filter(
+    (e) => !e.ownerUnknown && e.owner && e.owner.toLowerCase() === wallet.toLowerCase()
+  ).length;
+
+  const needDirectScan = Boolean(apiError) || apiVerifiedOwnedCount < nftBalanceCount;
   let scanTruncated = false;
+  let extraEntries = [];
 
   if (needDirectScan && nextLoanBig > 1n) {
     const endId = nextLoanBig - 1n;
     const maxScan = 50n;
     const startId = endId >= maxScan ? endId - (maxScan - 1n) : 1n;
     if (startId > 1n) scanTruncated = true;
+    const extraIds = [];
     for (let id = startId; id <= endId; id++) {
-      candidateIdSet.add(id.toString());
+      if (!apiById.has(id.toString())) {
+        extraIds.push(id);
+      }
     }
+    extraEntries = await Promise.all(extraIds.map((id) => readPositionEntry(id)));
   }
 
-  const candidateIds = Array.from(candidateIdSet)
-    .map((s) => BigInt(s))
-    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-
-  const rawEntries = await Promise.all(
-    candidateIds.map(async (id) => {
-      const apiRow = apiById.get(id.toString()) ?? null;
-      const [loanRes, ownerRes, lockedRes, dueRes] = await Promise.allSettled([
-        publicClient.readContract({
-          address: loanCoreAddr,
-          abi: loanCoreAbi,
-          functionName: 'getLoan',
-          args: [id],
-        }),
-        publicClient.readContract({
-          address: positionNftAddr,
-          abi: positionNftAbi,
-          functionName: 'ownerOf',
-          args: [id],
-        }),
-        publicClient.readContract({
-          address: positionNftAddr,
-          abi: positionNftAbi,
-          functionName: 'isAuctionLocked',
-          args: [id],
-        }),
-        publicClient.readContract({
-          address: loanCoreAddr,
-          abi: loanCoreAbi,
-          functionName: 'getDueInterest',
-          args: [id],
-        }),
-      ]);
-      const loan = loanRes.status === 'fulfilled' ? loanRes.value : null;
-      const owner = ownerRes.status === 'fulfilled' && ownerRes.value ? getAddress(ownerRes.value) : null;
-      const auctionLocked = lockedRes.status === 'fulfilled' ? Boolean(lockedRes.value) : false;
-      const dueInterest = dueRes.status === 'fulfilled' ? BigInt(dueRes.value ?? 0n) : null;
-      return { id, apiRow, loan, owner, auctionLocked, dueInterest };
-    })
+  const rawEntries = [...apiEntries, ...extraEntries].sort((a, b) =>
+    a.id < b.id ? -1 : a.id > b.id ? 1 : 0
   );
 
   const matching = rawEntries.filter((entry) => {
     if (entry.owner && entry.owner.toLowerCase() === wallet.toLowerCase()) return true;
-    if (includeBurned && entry.owner === null && entry.apiRow) return true;
+    // Info 1 fix: retain API-indexed positions when ownerOf RPC read fails instead of silently dropping them.
+    if (entry.ownerUnknown && entry.apiRow && (includeBurned || !entry.apiRow.is_burned)) return true;
+    if (includeBurned && entry.ownerNonexistent && entry.apiRow) return true;
     return false;
   });
+
+  const verifiedOwnedCount = matching.filter(
+    (entry) => !entry.ownerUnknown && entry.owner && entry.owner.toLowerCase() === wallet.toLowerCase()
+  ).length;
 
   const tokenMetaCache = new Map();
   const uniqueTokens = Array.from(
@@ -6426,65 +6475,73 @@ export async function fetchWalletPositionsAndClaimable({
     })
   );
 
-  const positions = matching.map(({ id, apiRow, loan, owner, auctionLocked, dueInterest }) => {
-    const collateralToken =
-      loan?.collateralToken && loan.collateralToken !== zeroAddress
-        ? getAddress(loan.collateralToken)
-        : apiRow?.collateral_token
-          ? getAddress(apiRow.collateral_token)
-          : null;
-    const tokMeta = collateralToken ? tokenMetaCache.get(collateralToken.toLowerCase()) : null;
-    const collateralSymbol = tokMeta?.symbol || apiRow?.collateral_symbol || null;
-    const collateralDecimals = tokMeta?.decimals ?? null;
-    const principalRaw = loan ? BigInt(loan.principal ?? 0n) : BigInt(apiRow?.principal?.raw ?? 0n);
-    const principalRepaidRaw = loan ? BigInt(loan.principalRepaid ?? 0n) : 0n;
-    const remainingPrincipal = principalRaw > principalRepaidRaw ? principalRaw - principalRepaidRaw : 0n;
-    const storedStatus = loan ? Number(loan.status) : apiRow?.loan_status ?? null;
-    const maturity = loan ? BigInt(loan.maturity ?? 0n) : 0n;
-    const graceEnd = maturity > 0n ? maturity + gracePeriodSeconds : 0n;
-    const isGraceClock = storedStatus === 0 && maturity > 0n && blockTimestamp > maturity && blockTimestamp <= graceEnd;
-    const isOverduePending =
-      (storedStatus === 0 || storedStatus === 1) && maturity > 0n && blockTimestamp > graceEnd;
-    const effectiveStatus = isGraceClock ? 1 : storedStatus;
-    const statusName = isOverduePending
-      ? 'Overdue - default pending'
-      : effectiveStatus !== null
-        ? (LOAN_STATUS_NAMES[effectiveStatus] ?? `Status_${effectiveStatus}`)
-        : 'Unknown';
+  const positions = matching.map(
+    ({ id, apiRow, loan, owner, ownerUnknown, ownerNonexistent, auctionLocked, dueInterest }) => {
+      const collateralToken =
+        loan?.collateralToken && loan.collateralToken !== zeroAddress
+          ? getAddress(loan.collateralToken)
+          : apiRow?.collateral_token
+            ? getAddress(apiRow.collateral_token)
+            : null;
+      const tokMeta = collateralToken ? tokenMetaCache.get(collateralToken.toLowerCase()) : null;
+      const collateralSymbol = tokMeta?.symbol || apiRow?.collateral_symbol || null;
+      const collateralDecimals = tokMeta?.decimals ?? null;
+      const principalRaw = loan ? BigInt(loan.principal ?? 0n) : BigInt(apiRow?.principal?.raw ?? 0n);
+      const principalRepaidRaw = loan ? BigInt(loan.principalRepaid ?? 0n) : 0n;
+      const remainingPrincipal = principalRaw > principalRepaidRaw ? principalRaw - principalRepaidRaw : 0n;
+      const storedStatus = loan ? Number(loan.status) : apiRow?.loan_status ?? null;
+      const maturity = loan ? BigInt(loan.maturity ?? 0n) : 0n;
+      const graceEnd = maturity > 0n ? maturity + gracePeriodSeconds : 0n;
+      const isGraceClock =
+        storedStatus === 0 && maturity > 0n && blockTimestamp > maturity && blockTimestamp <= graceEnd;
+      const isOverduePending =
+        (storedStatus === 0 || storedStatus === 1) && maturity > 0n && blockTimestamp > graceEnd;
+      const effectiveStatus = isGraceClock ? 1 : storedStatus;
+      const statusName = isOverduePending
+        ? 'Overdue - default pending'
+        : effectiveStatus !== null
+          ? (LOAN_STATUS_NAMES[effectiveStatus] ?? `Status_${effectiveStatus}`)
+          : 'Unknown';
 
-    return {
-      loanId: id.toString(),
-      borrower: loan?.borrower && loan.borrower !== zeroAddress ? getAddress(loan.borrower) : null,
-      owner,
-      isBurned: owner === null,
-      auctionLocked,
-      collateralToken,
-      collateralSymbol,
-      collateralDecimals,
-      collateralRaw: loan ? BigInt(loan.collateralRaw ?? 0n).toString() : null,
-      collateralFormatted:
-        loan && collateralDecimals !== null
-          ? formatTokenUnitsDisplay(BigInt(loan.collateralRaw ?? 0n), collateralDecimals, 4)
-          : null,
-      principalRaw: principalRaw.toString(),
-      principalRemainingRaw: remainingPrincipal.toString(),
-      principalRemainingFormatted: formatTokenUnitsDisplay(remainingPrincipal, USDC_DECIMALS, 2),
-      dueInterestRaw: dueInterest !== null ? dueInterest.toString() : null,
-      dueInterestFormatted: dueInterest !== null ? formatTokenUnitsDisplay(dueInterest, USDC_DECIMALS, 6) : null,
-      spotClaimValueRaw:
-        dueInterest !== null ? (remainingPrincipal + dueInterest).toString() : remainingPrincipal.toString(),
-      spotClaimValueFormatted: formatTokenUnitsDisplay(
-        remainingPrincipal + (dueInterest ?? 0n),
-        USDC_DECIMALS,
-        6
-      ),
-      rateBps: loan ? Number(loan.rateBps) : null,
-      maturity: loan ? loan.maturity.toString() : null,
-      status: effectiveStatus,
-      statusName,
-      onchainVerified: true,
-    };
-  });
+      const isBurned = ownerUnknown ? Boolean(apiRow?.is_burned) : Boolean(ownerNonexistent || owner === null);
+      const ownerStatus = ownerUnknown ? 'unknown' : owner ? 'verified' : 'burned';
+
+      return {
+        loanId: id.toString(),
+        borrower: loan?.borrower && loan.borrower !== zeroAddress ? getAddress(loan.borrower) : null,
+        owner,
+        ownerUnknown,
+        ownerStatus,
+        isBurned,
+        auctionLocked,
+        collateralToken,
+        collateralSymbol,
+        collateralDecimals,
+        collateralRaw: loan ? BigInt(loan.collateralRaw ?? 0n).toString() : null,
+        collateralFormatted:
+          loan && collateralDecimals !== null
+            ? formatTokenUnitsDisplay(BigInt(loan.collateralRaw ?? 0n), collateralDecimals, 4)
+            : null,
+        principalRaw: principalRaw.toString(),
+        principalRemainingRaw: remainingPrincipal.toString(),
+        principalRemainingFormatted: formatTokenUnitsDisplay(remainingPrincipal, USDC_DECIMALS, 2),
+        dueInterestRaw: dueInterest !== null ? dueInterest.toString() : null,
+        dueInterestFormatted: dueInterest !== null ? formatTokenUnitsDisplay(dueInterest, USDC_DECIMALS, 6) : null,
+        spotClaimValueRaw:
+          dueInterest !== null ? (remainingPrincipal + dueInterest).toString() : remainingPrincipal.toString(),
+        spotClaimValueFormatted: formatTokenUnitsDisplay(
+          remainingPrincipal + (dueInterest ?? 0n),
+          USDC_DECIMALS,
+          6
+        ),
+        rateBps: loan ? Number(loan.rateBps) : null,
+        maturity: loan ? loan.maturity.toString() : null,
+        status: effectiveStatus,
+        statusName,
+        onchainVerified: Boolean(!ownerUnknown && loan),
+      };
+    }
+  );
 
   return {
     address: wallet,
@@ -6495,6 +6552,8 @@ export async function fetchWalletPositionsAndClaimable({
     usdcBalanceRaw,
     usdcBalanceFormatted,
     nftBalanceCount,
+    verifiedOwnedCount,
+    positionsIncomplete: scanTruncated || verifiedOwnedCount < nftBalanceCount,
     positions,
     apiTruncated,
     apiError,
@@ -6510,6 +6569,7 @@ export async function fetchWalletPositionsAndClaimable({
 export async function executeLoanClaim({
   address,
   recipient = null,
+  allowAlternateRecipient = false,
   provider = getInjectedProvider(),
   cfg = getFrontendConfig(),
   publicClient = createProtocolPublicClient(cfg),
@@ -6531,6 +6591,11 @@ export async function executeLoanClaim({
   }
   if (toAddr === zeroAddress) {
     throw new Error('Claim recipient address cannot be zero.');
+  }
+  if (toAddr.toLowerCase() !== wallet.toLowerCase() && !allowAlternateRecipient) {
+    throw new Error(
+      `Claim recipient (${toAddr}) differs from connected wallet (${wallet}). Explicit confirmation required.`
+    );
   }
 
   const claimableBefore = BigInt(
@@ -6568,8 +6633,11 @@ export async function executeLoanClaim({
     data: callData,
   });
 
+  // Note: LoanCore.claim(to) emits Claimed(msg.sender, claimedAmount); topic 1 is the claimant (`msg.sender`),
+  // never the payout destination `to`. Always track payout destination from validated `toAddr`.
   const evArgs = decodeLoanCoreEvent(receipt, loanCoreAddr, 'Claimed');
   const claimedAmount = BigInt(evArgs?.amount ?? claimableBefore);
+  const claimant = evArgs?.claimant ? getAddress(evArgs.claimant) : wallet;
 
   const [remainingClaimable, usdcAfter] = await Promise.all([
     publicClient
@@ -6593,7 +6661,7 @@ export async function executeLoanClaim({
   return {
     txHash,
     receipt,
-    claimant: wallet,
+    claimant,
     recipient: toAddr,
     claimedAmountRaw: claimedAmount.toString(),
     claimedAmountFormatted: formatTokenUnitsDisplay(claimedAmount, USDC_DECIMALS, 6),

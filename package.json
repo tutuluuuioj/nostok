@@ -7,7 +7,8 @@
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1 --port 3020 --strictPort",
     "test": "node src/lib/money.test.js && node src/lib/book.test.js && node src/lib/contrast.test.js",
-    "test:fork": "tsx test/ws3_1.fork.test.ts"
+    "test:fork": "tsx test/ws3_1.fork.test.ts",
+    "test:smoke": "tsx test/ws4_7_smoke.fork.test.ts"
   },
   "dependencies": {
     "react": "^18.3.1",

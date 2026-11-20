@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
+import { getAddress, isAddress, zeroAddress } from 'viem';
 import { Choice, Field, Page, Rows, Sheet, TextInput } from '../components/ui.jsx';
 import { getFrontendConfig } from '../lib/contracts.js';
 import { formatBpsPercent } from '../lib/marketsApi.js';
@@ -25,6 +26,7 @@ export function Positions() {
 
   const [includeBurned, setIncludeBurned] = useState(false);
   const [recipientInput, setRecipientInput] = useState('');
+  const [confirmAlternateRecipient, setConfirmAlternateRecipient] = useState(false);
   const [lookupId, setLookupId] = useState('');
   const [lookupErr, setLookupErr] = useState('');
 
@@ -38,9 +40,23 @@ export function Positions() {
   const [claimResult, setClaimResult] = useState(null);
 
   const walletOnBase = Boolean(web3?.connected && web3?.address && !web3?.wrongNetwork);
+  const connectedAddr = web3?.address && isAddress(web3.address) ? getAddress(web3.address) : null;
+  const trimmedRecipient = recipientInput.trim();
+  const recipientValid =
+    trimmedRecipient === '' || (isAddress(trimmedRecipient) && getAddress(trimmedRecipient) !== zeroAddress);
+  const resolvedRecipient =
+    trimmedRecipient === ''
+      ? connectedAddr
+      : recipientValid
+        ? getAddress(trimmedRecipient)
+        : null;
+  const isAlternateRecipient = Boolean(
+    connectedAddr && resolvedRecipient && resolvedRecipient.toLowerCase() !== connectedAddr.toLowerCase()
+  );
 
   useEffect(() => {
     setRecipientInput(web3?.address || '');
+    setConfirmAlternateRecipient(false);
     setClaimError('');
     setClaimResult(null);
   }, [web3?.address]);
@@ -73,13 +89,22 @@ export function Positions() {
   async function handleClaim(event) {
     event.preventDefault();
     if (!walletOnBase) return;
+    if (!recipientValid) {
+      setClaimError('Enter a valid non-zero payout address.');
+      return;
+    }
+    if (isAlternateRecipient && !confirmAlternateRecipient) {
+      setClaimError('Confirm the alternate payout recipient address before claiming.');
+      return;
+    }
     setClaimError('');
     setClaimResult(null);
     setClaimBusy(true);
     try {
       const res = await executeLoanClaim({
         address: web3.address,
-        recipient: recipientInput.trim() || web3.address,
+        recipient: trimmedRecipient || web3.address,
+        allowAlternateRecipient: !isAlternateRecipient || confirmAlternateRecipient,
         provider: getInjectedProvider(),
         cfg: web3?.config ?? getFrontendConfig(),
       });
@@ -154,8 +179,22 @@ export function Positions() {
 
       {data?.apiError ? (
         <p className="hint block" role="status">
-          api/ /positions unavailable ({data.apiError}) — showing direct Base RPC LoanCore &amp; PositionNFT reads
-          {data.scanTruncated ? ' (recent 50 loan IDs scanned; use direct Loan ID lookup for older positions).' : '.'}
+          api/ /positions unavailable ({data.apiError}) — showing direct Base RPC LoanCore &amp; PositionNFT reads.
+        </p>
+      ) : null}
+
+      {data &&
+      !data.rpcError &&
+      (data.scanTruncated ||
+        data.positionsIncomplete ||
+        (data.nftBalanceCount !== null &&
+          (data.verifiedOwnedCount ?? activePositions.length) < data.nftBalanceCount)) ? (
+        <p className="hint block" role="status">
+          Showing {data.verifiedOwnedCount ?? activePositions.length} of {data.nftBalanceCount ?? '—'} held
+          PositionNFTs on-chain
+          {data.scanTruncated
+            ? ' (direct fallback scanned the recent 50 loan IDs only; use Inspect PositionNFT / Loan by ID for older positions).'
+            : ' (some positions could not be verified on-chain; use Inspect PositionNFT / Loan by ID or refresh).'}
         </p>
       ) : null}
 
@@ -216,12 +255,37 @@ export function Positions() {
                 <TextInput
                   id="claim-recipient"
                   value={recipientInput}
-                  onChange={setRecipientInput}
+                  onChange={(val) => {
+                    setRecipientInput(val);
+                    setConfirmAlternateRecipient(false);
+                  }}
+                  invalid={!recipientValid}
                   placeholder="0x…"
                   {...props}
                 />
               )}
             </Field>
+
+            {!recipientValid ? (
+              <p className="err" role="alert">
+                Enter a valid non-zero payout address.
+              </p>
+            ) : null}
+
+            {isAlternateRecipient ? (
+              <div style={{ marginTop: 10 }}>
+                <p className="hint" role="alert">
+                  Payout address ({resolvedRecipient}) differs from your connected wallet ({connectedAddr}). Claimed USDC will be sent permanently to that address.
+                </p>
+                <Choice
+                  id="confirm-alternate-claim-recipient"
+                  checked={confirmAlternateRecipient}
+                  onChange={setConfirmAlternateRecipient}
+                >
+                  Confirm sending claimed USDC to alternate payout address {resolvedRecipient}
+                </Choice>
+              </div>
+            ) : null}
 
             {claimError ? (
               <p className="err" role="alert">
@@ -230,8 +294,8 @@ export function Positions() {
             ) : null}
             {claimResult ? (
               <p className="note" role="status">
-                Claimed ${claimResult.claimedAmountFormatted} USDC ({claimResult.claimedAmountRaw} raw) to{' '}
-                {claimResult.recipient} (tx {claimResult.txHash}). Remaining claimable:{' '}
+                Claimed ${claimResult.claimedAmountFormatted} USDC ({claimResult.claimedAmountRaw} raw) for claimant{' '}
+                {claimResult.claimant} to payout address {claimResult.recipient} (tx {claimResult.txHash}). Remaining claimable:{' '}
                 {claimResult.remainingClaimableRaw} raw.
               </p>
             ) : null}
@@ -240,7 +304,13 @@ export function Positions() {
               <button
                 className="btn"
                 type="submit"
-                disabled={!walletOnBase || !hasClaimable || claimBusy}
+                disabled={
+                  !walletOnBase ||
+                  !hasClaimable ||
+                  claimBusy ||
+                  !recipientValid ||
+                  (isAlternateRecipient && !confirmAlternateRecipient)
+                }
               >
                 {claimBusy ? 'Claiming USDC…' : 'Claim USDC from LoanCore'}
               </button>
@@ -308,10 +378,16 @@ export function Positions() {
                   PositionNFT #{pos.loanId} · {pos.collateralSymbol || (pos.collateralToken ? shortAddress(pos.collateralToken) : 'Unknown')} · {pos.statusName}
                 </strong>
                 <span className="quiet">
-                  {pos.onchainVerified
-                    ? `Borrower ${pos.borrower ? shortAddress(pos.borrower) : '—'} · APR ${pos.rateBps !== null ? formatBpsPercent(pos.rateBps) : '—'} · Maturity ${formatMaturityIso(pos.maturity)}`
-                    : 'Not verified on-chain (Base RPC unavailable)'}
-                  {pos.auctionLocked ? ' · Transfer locked (active LiquidationAuction)' : ''}
+                  {pos.ownerUnknown
+                    ? 'Owner unknown (PositionNFT.ownerOf read failed)'
+                    : pos.onchainVerified
+                      ? `Borrower ${pos.borrower ? shortAddress(pos.borrower) : '—'} · APR ${pos.rateBps !== null ? formatBpsPercent(pos.rateBps) : '—'} · Maturity ${formatMaturityIso(pos.maturity)}`
+                      : 'Not verified on-chain (Base RPC unavailable)'}
+                  {pos.auctionLocked === true
+                    ? ' · Transfer locked (active LiquidationAuction)'
+                    : pos.auctionLocked === null
+                      ? ' · Transfer lock unknown'
+                      : ''}
                 </span>
                 {pos.collateralFormatted !== null ? (
                   <span className="quiet">

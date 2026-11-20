@@ -345,10 +345,12 @@ export const loanCoreAbi = [
     ],
   },
   {
+    // Note: ILoanCore names indexed topic 1 `recipient`, whereas LoanCore.sol emits Claimed(msg.sender, amount),
+    // i.e. the claimant withdrawing accrued credit rather than the `claim(address to)` payout destination.
     type: 'event',
     name: 'Claimed',
     inputs: [
-      { name: 'recipient', type: 'address', indexed: true },
+      { name: 'claimant', type: 'address', indexed: true },
       { name: 'amount', type: 'uint128', indexed: false },
     ],
   },
@@ -742,6 +744,7 @@ export const positionNftAbi = [
   { type: 'error', name: 'ZeroAddress', inputs: [] },
   { type: 'error', name: 'AuctionTransferLocked', inputs: [] },
   { type: 'error', name: 'IneligibleRecipient', inputs: [] },
+  { type: 'error', name: 'ERC721NonexistentToken', inputs: [{ name: 'tokenId', type: 'uint256' }] },
 ];
 
 export const collateralEscrowAbi = [

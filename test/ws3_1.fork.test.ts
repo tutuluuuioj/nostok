@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { execSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -8377,13 +8378,27 @@ async function runTests(): Promise<void> {
       });
       try {
         walletProvider.setAccount(KEYS.lender);
+        // Info 4: alternate payout recipient requires explicit confirmation
+        await assert.rejects(
+          () =>
+            executeLoanClaim({
+              address: ADDRESSES.lender,
+              recipient: ADDRESSES.outsider,
+              provider: walletProvider,
+              cfg: deadApiCfg,
+            }),
+          /Explicit confirmation required/i
+        );
         const claimRes = await executeLoanClaim({
           address: ADDRESSES.lender,
           recipient: ADDRESSES.outsider,
+          allowAlternateRecipient: true,
           provider: walletProvider,
           cfg: deadApiCfg,
         });
         assert.ok(claimRes.txHash);
+        assert.equal(claimRes.claimant, getAddress(ADDRESSES.lender), 'Claimed event topic 1 is msg.sender claimant');
+        assert.equal(claimRes.recipient, getAddress(ADDRESSES.outsider), 'Payout recipient tracks validated claim(to) address');
         assert.equal(claimRes.claimedAmountRaw, expectedClaimRaw.toString());
         assert.equal(claimRes.remainingClaimableRaw, '0');
         assert.equal(
@@ -8402,6 +8417,138 @@ async function runTests(): Promise<void> {
         });
       }
 
+      // Low 1 + Infos 1-3: Position enumeration edge cases (stale API rows, ownerOf failure, isAuctionLocked failure, RPC-down foreign owner)
+      const heldLoanId = String(low1OfferFillRes.loanId);
+      const mockPosSrv = http.createServer((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            pagination: { total: 3, limit: 100, offset: 0, has_more: false },
+            data: [
+              // Stale row pretending borrower owns loan #1 (actually lender/burned/other owner) so activeApiCount >= 1
+              {
+                loan_id: '1',
+                owner: ADDRESSES.borrower,
+                auction_locked: false,
+                is_burned: false,
+                collateral_token: nvdac,
+                collateral_symbol: 'NVDAc',
+                principal: { raw: '500000000' },
+                loan_status: 0,
+                loan_status_name: 'ACTIVE',
+              },
+              // Foreign owner row returned alongside
+              {
+                loan_id: heldLoanId,
+                owner: ADDRESSES.outsider,
+                auction_locked: true,
+                is_burned: false,
+                collateral_token: nvdac,
+                collateral_symbol: 'NVDAc',
+                principal: { raw: '500000000' },
+                loan_status: 0,
+                loan_status_name: 'ACTIVE',
+              },
+            ],
+          })
+        );
+      });
+      await new Promise<void>((r) => mockPosSrv.listen(0, '127.0.0.1', () => r()));
+      const mockPosPort = (mockPosSrv.address() as net.AddressInfo).port;
+      const mockPosCfg = { ...cfg, apiUrl: `http://127.0.0.1:${mockPosPort}` };
+      try {
+        // Low 1: stale API row (loan #1 is not owned on-chain by borrower) -> verifiedOwnedCount < balanceOf -> fallback scan STILL runs & finds heldLoanId
+        const staleScanSnap = await fetchWalletPositionsAndClaimable({
+          address: ADDRESSES.borrower,
+          cfg: mockPosCfg,
+        });
+        assert.equal(staleScanSnap.apiError, '');
+        assert.ok(staleScanSnap.verifiedOwnedCount! >= 1);
+        assert.ok(
+          staleScanSnap.positions.some((p) => p.loanId === heldLoanId && p.onchainVerified),
+          'Low 1: stale API row must not skip fallback scan when verifiedOwnedCount < nftBalanceCount'
+        );
+
+        // Info 3: RPC-down mode filters out foreign-owned API rows
+        const deadRpcClient = {
+          ...publicClient,
+          getBlock: async () => {
+            throw new Error('simulated Base RPC outage');
+          },
+          readContract: async () => {
+            throw new Error('simulated Base RPC outage');
+          },
+        } as unknown as typeof publicClient;
+        const rpcDownSnap = await fetchWalletPositionsAndClaimable({
+          address: ADDRESSES.borrower,
+          cfg: mockPosCfg,
+          publicClient: deadRpcClient,
+        });
+        assert.ok(rpcDownSnap.rpcError.length > 0);
+        assert.ok(
+          rpcDownSnap.positions.every((p) => p.owner.toLowerCase() === ADDRESSES.borrower.toLowerCase()),
+          'Info 3: RPC-down mode must filter out API rows owned by another address'
+        );
+
+        // Infos 1 & 2: ownerOf read failure retains API position as ownerUnknown, isAuctionLocked read failure returns null
+        const matchingApiSrv = http.createServer((_req, res) => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              pagination: { total: 1, limit: 100, offset: 0, has_more: false },
+              data: [
+                {
+                  loan_id: heldLoanId,
+                  owner: ADDRESSES.borrower,
+                  auction_locked: false,
+                  is_burned: false,
+                  collateral_token: nvdac,
+                  collateral_symbol: 'NVDAc',
+                  principal: { raw: '500000000' },
+                  loan_status: 0,
+                  loan_status_name: 'ACTIVE',
+                },
+              ],
+            })
+          );
+        });
+        await new Promise<void>((r) => matchingApiSrv.listen(0, '127.0.0.1', () => r()));
+        try {
+          const matchingApiCfg = {
+            ...cfg,
+            apiUrl: `http://127.0.0.1:${(matchingApiSrv.address() as net.AddressInfo).port}`,
+          };
+          const partialFailRpcClient = {
+            ...publicClient,
+            readContract: async (args: Parameters<typeof publicClient.readContract>[0]) => {
+              if (args.functionName === 'ownerOf' && String(args.args?.[0]) === heldLoanId) {
+                throw new Error('transient ownerOf timeout');
+              }
+              if (args.functionName === 'isAuctionLocked' && String(args.args?.[0]) === heldLoanId) {
+                throw new Error('transient isAuctionLocked timeout');
+              }
+              return publicClient.readContract(args);
+            },
+          } as unknown as typeof publicClient;
+          const partialFailSnap = await fetchWalletPositionsAndClaimable({
+            address: ADDRESSES.borrower,
+            cfg: matchingApiCfg,
+            publicClient: partialFailRpcClient,
+          });
+          const unknownPos = partialFailSnap.positions.find((p) => p.loanId === heldLoanId);
+          assert.ok(unknownPos, 'Info 1: failed ownerOf read must not drop API position silently');
+          assert.equal(unknownPos!.ownerUnknown, true);
+          assert.equal(unknownPos!.isBurned, false);
+          assert.equal(unknownPos!.onchainVerified, false);
+          assert.equal(unknownPos!.auctionLocked, null, 'Info 2: failed isAuctionLocked read must return null, never false');
+          assert.equal(partialFailSnap.positionsIncomplete, true);
+        } finally {
+          await new Promise<void>((r) => matchingApiSrv.close(() => r()));
+        }
+      } finally {
+        await new Promise<void>((r) => mockPosSrv.close(() => r()));
+      }
+
       // Positions.jsx SSR render & ungated source check (no PreviewBanner, no ensureDeclarationVerifiedForTx)
       const positionsPageHtml = renderToStaticMarkup(
         createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: ['/positions'] }, createElement(Shell, null, createElement(Positions))))
@@ -8413,10 +8560,11 @@ async function runTests(): Promise<void> {
       const positionsSrc = fs.readFileSync(path.join(REPO_ROOT, 'src', 'pages', 'Positions.jsx'), 'utf8');
       assert.ok(!positionsSrc.includes('ensureDeclarationVerifiedForTx'), 'Positions.jsx claim flow must never gate behind Reg S declaration');
       assert.ok(positionsSrc.includes('executeLoanClaim'));
+      assert.ok(positionsSrc.includes('confirm-alternate-claim-recipient'));
 
       console.log('PASS WS3.7 Review Fixes + Live Positions.jsx (PositionNFT Enumeration & Ungated LoanCore.claim) verified.');
 
-      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 + WS3.6 + WS3.7 + POSITIONS (M3.1 COMPLETE) FORK TESTS PASSED.');
+      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 + WS3.6 + WS3.7 + POSITIONS FORK TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
       await new Promise<void>((r) => apiServer.close(() => r()));
