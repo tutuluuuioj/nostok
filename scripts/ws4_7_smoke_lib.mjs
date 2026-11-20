@@ -28,6 +28,20 @@ import {
 } from '../src/lib/contracts.js';
 
 export const BASE_SEQUENCER_FEED_ADDRESS = '0xBCF85224fc0756B9Fa45aA7892530B47e10b6433';
+export const BASE_MAINNET_SMOKE_ASSETS = Object.freeze({
+  NVDAc: Object.freeze({
+    symbol: 'NVDAc',
+    token: '0xb20000000000000000000078ee7ce2fE4908108C',
+    feed: '0x04689a41629776563E6822F76f2e57D148d28513',
+    decimals: 8,
+  }),
+  METAc: Object.freeze({
+    symbol: 'METAc',
+    token: '0xb2000000000000000000008bC8786B856E61707C',
+    feed: '0x6526aE6797A76123638b863AeE4dD27Ba4E4b27D',
+    decimals: 8,
+  }),
+});
 export const DEFAULT_INITIALIZER_GLOBAL_CAP_RAW = 250_000_000_000n; // LoanCore.initialize default 250,000 USDC
 export const MIN_LOAN_PRINCIPAL_RAW = 500_000_000n; // LoanCore.openLoan min 500 USDC
 export const RECOMMENDED_SMOKE_PER_LOAN_CAP_RAW = 1_000_000_000n; // $1,000 USDC max per smoke loan
@@ -100,6 +114,21 @@ function normalizeOptAddress(value) {
 
 function sameAddr(a, b) {
   return Boolean(a && b && a.toLowerCase() === b.toLowerCase());
+}
+
+/**
+ * Redacts HTTP(S)/WS(S) credentials, paths (including RPC API keys), and query strings from
+ * error strings before printing to terminal or CI logs.
+ */
+export function sanitizeRpcErrorMessage(err) {
+  const raw =
+    err && typeof err === 'object'
+      ? String(err.shortMessage || err.message || err)
+      : String(err ?? 'Unknown error');
+  return raw.replace(
+    /((?:https?|wss?):\/\/)(?:[^@\s/]+@)?([^/\s:?#]+(?::\d+)?)(?:[^\s"')\]`]*)?/gi,
+    '$1$2/[redacted]'
+  );
 }
 
 /**
@@ -206,7 +235,7 @@ export async function validateSafeMultisigContract(
     } catch (err) {
       return {
         ok: false,
-        detail: `${roleName} (${normalized}) failed Safe.getOwners/getThreshold call: ${err?.shortMessage || err?.message || err}`,
+        detail: `${roleName} (${normalized}) failed Safe.getOwners/getThreshold call: ${sanitizeRpcErrorMessage(err)}`,
       };
     }
   }
@@ -230,6 +259,7 @@ export function validateSmokeAssetConfig(
     symbol,
     tokenName = '',
     tokenAddress,
+    tokenDecimals = null,
     feedDescription = '',
     supported,
     config,
@@ -241,6 +271,8 @@ export function validateSmokeAssetConfig(
     maxPerLoanCapRaw = RECOMMENDED_SMOKE_PER_LOAN_CAP_RAW,
     maxAssetCapRaw = MAX_INITIAL_GLOBAL_CAP_RAW,
     disallowMocks = true,
+    requirePinnedAssets = disallowMocks,
+    pinnedAssets = BASE_MAINNET_SMOKE_ASSETS,
     allowClosedMarket = true,
     allowHigherLtvs = false,
   } = {}
@@ -312,6 +344,34 @@ export function validateSmokeAssetConfig(
       errors.push(`${label}: mock price feed detected ("${feedDescription}"); WS4.7 requires real Chainlink feeds.`);
     }
   }
+  if (requirePinnedAssets) {
+    const pinnedEntries = Object.values(pinnedAssets || {});
+    const normalizedToken = normalizeOptAddress(tokenAddress);
+    const normalizedFeed = normalizeOptAddress(config.feed);
+    const pinnedMatch =
+      pinnedEntries.find((p) => symbol && p.symbol.toLowerCase() === String(symbol).toLowerCase()) ??
+      pinnedEntries.find((p) => normalizedToken && sameAddr(p.token, normalizedToken)) ??
+      null;
+    if (!pinnedMatch) {
+      errors.push(`${label}: token (${normalizedToken}) is not in pinned Base Mainnet WS4.7 B20 asset registry.`);
+    } else {
+      if (!normalizedToken || !sameAddr(normalizedToken, pinnedMatch.token)) {
+        errors.push(
+          `${label}: token address (${normalizedToken}) does not match pinned Base ${pinnedMatch.symbol} (${pinnedMatch.token}).`
+        );
+      }
+      if (!normalizedFeed || !sameAddr(normalizedFeed, pinnedMatch.feed)) {
+        errors.push(
+          `${label}: feed address (${normalizedFeed}) does not match pinned Base Chainlink ${pinnedMatch.symbol} feed (${pinnedMatch.feed}).`
+        );
+      }
+      if (tokenDecimals !== null && tokenDecimals !== undefined && Number(tokenDecimals) !== pinnedMatch.decimals) {
+        errors.push(
+          `${label}: token decimals (${tokenDecimals}) != pinned ${pinnedMatch.decimals}.`
+        );
+      }
+    }
+  }
 
   return {
     ok: errors.length === 0,
@@ -375,9 +435,11 @@ export async function runGuardedSmokePreflight({
   maxGlobalCapRaw = MAX_INITIAL_GLOBAL_CAP_RAW,
   maxPerLoanCapRaw = RECOMMENDED_SMOKE_PER_LOAN_CAP_RAW,
   maxAssetCapRaw = MAX_INITIAL_GLOBAL_CAP_RAW,
-  minSafeOwners = 1,
-  minSafeThreshold = 1,
+  minSafeOwners = 2,
+  minSafeThreshold = 2,
   disallowMocks = true,
+  requirePinnedAssets = disallowMocks,
+  pinnedAssets = BASE_MAINNET_SMOKE_ASSETS,
   allowClosedMarket = true,
   allowHigherLtvs = false,
 } = {}) {
@@ -666,10 +728,11 @@ export async function runGuardedSmokePreflight({
         record(`asset.${expectedSymbol || tokenAddr}`, false, `${tokenAddr} is not supported in AssetRegistry.`);
         continue;
       }
-      const [config, tokenName, symbol, recMult, priceTuple] = await Promise.all([
+      const [config, tokenName, symbol, tokenDecimals, recMult, priceTuple] = await Promise.all([
         publicClient.readContract({ address: resolved.assetRegistry, abi: assetRegistryAbi, functionName: 'getAssetConfig', args: [tokenAddr] }),
         publicClient.readContract({ address: tokenAddr, abi: erc20NameAbi, functionName: 'name' }).catch(() => ''),
         publicClient.readContract({ address: tokenAddr, abi: erc20Abi, functionName: 'symbol' }).catch(() => ''),
+        publicClient.readContract({ address: tokenAddr, abi: erc20Abi, functionName: 'decimals' }).catch(() => null),
         publicClient.readContract({ address: resolved.oracleRouter, abi: oracleRouterAbi, functionName: 'recordedMultiplier', args: [tokenAddr] }),
         publicClient
           .readContract({ address: resolved.oracleRouter, abi: oracleRouterAbi, functionName: 'getPrice', args: [tokenAddr] })
@@ -684,6 +747,7 @@ export async function runGuardedSmokePreflight({
           symbol: expectedSymbol || symbol || tokenAddr,
           tokenName,
           tokenAddress: tokenAddr,
+          tokenDecimals,
           feedDescription: feedDesc,
           supported,
           config,
@@ -695,6 +759,8 @@ export async function runGuardedSmokePreflight({
           maxPerLoanCapRaw,
           maxAssetCapRaw,
           disallowMocks,
+          requirePinnedAssets,
+          pinnedAssets,
           allowClosedMarket,
           allowHigherLtvs,
         }
@@ -727,19 +793,32 @@ function parseCliArgs(argv) {
   const opts = {
     help: false,
     json: false,
-    production: false,
     allowMocks: false,
+    allowSingleSignerSafe: false,
+    allowRemoteFork: false,
     rpcUrl: process.env.RPC_URL || process.env.BASE_RPC_URL || '',
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--help' || a === '-h') opts.help = true;
     else if (a === '--json') opts.json = true;
-    else if (a === '--production') opts.production = true;
-    else if (a === '--allow-mocks') opts.allowMocks = true;
+    else if (a === '--production') {
+      // Production safeguards are now enabled by default on Base Mainnet (8453); accepted as no-op.
+    } else if (a === '--allow-mocks') opts.allowMocks = true;
+    else if (a === '--allow-1of1-safe') opts.allowSingleSignerSafe = true;
+    else if (a === '--allow-remote-fork') opts.allowRemoteFork = true;
     else if (a === '--rpc-url' && argv[i + 1]) opts.rpcUrl = argv[++i];
   }
   return opts;
+}
+
+function isLoopbackRpcUrl(rpcUrl) {
+  try {
+    const parsed = new URL(rpcUrl);
+    return parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost' || parsed.hostname === '::1' || parsed.hostname === '[::1]';
+  } catch {
+    return false;
+  }
 }
 
 async function runCli() {
@@ -747,9 +826,9 @@ async function runCli() {
   if (opts.help) {
     console.log(
       [
-        'WS4.7 Guarded Base Mainnet Smoke Preflight Validator',
+        'WS4.7 Guarded Base Mainnet Smoke Preflight Validator (production checks enabled by default on 8453)',
         '',
-        'Usage: node scripts/ws4_7_smoke_lib.mjs --rpc-url <BASE_RPC_URL> [--production] [--json] [--allow-mocks]',
+        'Usage: node scripts/ws4_7_smoke_lib.mjs --rpc-url <BASE_RPC_URL> [--json] [--allow-mocks] [--allow-1of1-safe]',
         '',
         'Required environment variables:',
         '  OWNER_SAFE_ADDRESS, GUARDIAN_SAFE_ADDRESS, NOSTOK_TIMELOCK_ADDRESS,',
@@ -764,6 +843,12 @@ async function runCli() {
   }
   if (!opts.rpcUrl) {
     console.error('Missing --rpc-url or BASE_RPC_URL/RPC_URL.');
+    process.exit(1);
+  }
+  if ((opts.allowMocks || opts.allowSingleSignerSafe) && !isLoopbackRpcUrl(opts.rpcUrl) && !opts.allowRemoteFork) {
+    console.error(
+      'Refusing --allow-mocks / --allow-1of1-safe against a non-loopback RPC URL (pass --allow-remote-fork only for remote fork tests).'
+    );
     process.exit(1);
   }
   const chain = defineChain({
@@ -808,9 +893,10 @@ async function runCli() {
     deployer: process.env.DEPLOYER_ADDRESS,
     assets,
     allowlistWallets,
-    minSafeOwners: opts.production ? 2 : 1,
-    minSafeThreshold: opts.production ? 2 : 1,
+    minSafeOwners: opts.allowSingleSignerSafe ? 1 : 2,
+    minSafeThreshold: opts.allowSingleSignerSafe ? 1 : 2,
     disallowMocks: !opts.allowMocks,
+    requirePinnedAssets: !opts.allowMocks,
   });
 
   if (opts.json) {
@@ -826,7 +912,7 @@ async function runCli() {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   runCli().catch((err) => {
-    console.error(err);
+    console.error(`[WS4.7_PREFLIGHT_ERROR] ${sanitizeRpcErrorMessage(err)}`);
     process.exit(1);
   });
 }

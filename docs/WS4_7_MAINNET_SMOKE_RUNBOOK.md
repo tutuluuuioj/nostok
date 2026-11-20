@@ -13,6 +13,10 @@
 | --- | --- |
 | Collateral / Debt Settlement Token (`USDC`) | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
 | Chainlink L2 Sequencer Uptime Feed | `0xBCF85224fc0756B9Fa45aA7892530B47e10b6433` |
+| Pinned `NVDAc` B20 Token (`decimals = 8`) | `0xb20000000000000000000078ee7ce2fE4908108C` |
+| Pinned Chainlink `NVDA / USD` Proxy (`decimals = 8`) | `0x04689a41629776563E6822F76f2e57D148d28513` |
+| Pinned `METAc` B20 Token (`decimals = 8`) | `0xb2000000000000000000008bC8786B856E61707C` |
+| Pinned Chainlink `META / USD` Proxy (`decimals = 8`) | `0x6526aE6797A76123638b863AeE4dD27Ba4E4b27D` |
 | Governance Timelock (`NostokTimelock`) | `48 hours` (`172800s`), self-administered (`admin = address(0)`) |
 | `LoanCore` Minimum Principal | `500 USDC` (`500_000_000` raw) |
 | `LoanCore.initialize()` Default `globalUsdcCap` | `250_000 USDC` (**MUST be lowered before first loan**) |
@@ -27,8 +31,8 @@
 
 2. **Lower `LoanCore.globalUsdcCap` & List Real `NVDAc` / `METAc` Before First Loan:**
    - Because `DeployNostok.s.sol` transfers ownership of `LoanCore`, `AssetRegistry`, and `OracleRouter` to the 48-hour `NostokTimelock` (and `LoanCore.initialize` defaults `globalUsdcCap = 250_000 * 1e6`), the Owner Safe must queue and execute a `NostokTimelock` batch (`48h` delay) **before** opening any live trade:
-     - `LoanCore.setGlobalCap(10_000_000_000)` ($10,000 USDC; allowed guarded launch ceiling <= $25,000 USDC — no raise above initial guarded launch caps prior to published Tier-1 audit report).
-     - `AssetRegistry.setAssetConfig(NVDAc, ...)` & `AssetRegistry.setAssetConfig(METAc, ...)` using **real Coinbase B20 token contracts** and **real Chainlink Base feeds**:
+     - `LoanCore.setGlobalCap(10_000_000_000)` ($10,000 USDC; deliberately chosen within the roadmap's $5,000–$25,000 guarded initial aggregate cap range so concurrent `NVDAc` + `METAc` smoke loans fit cleanly alongside `$5,000` single-asset cap examples — no cap raise above initial guarded launch caps prior to published Tier-1 audit report).
+     - `AssetRegistry.setAssetConfig(NVDAc, ...)` & `AssetRegistry.setAssetConfig(METAc, ...)` using **only the pinned Base Mainnet B20 tokens & Chainlink proxies above**:
        - `perLoanCap`: `500_000_000`–`1_000_000_000` ($500–$1,000 USDC)
        - `assetCap`: `5_000_000_000` ($5,000 USDC; <= $25,000 guarded max)
        - `maxStaleOpenSecs`: `21600` (6 hours, within `1800`–`86400`s)
@@ -46,12 +50,11 @@ Run the fork dry-run suite locally before mainnet execution:
 npm run test:smoke
 ```
 
-Before submitting the first live Base Mainnet (`8453`) smoke order, run the automated preflight CLI against the production Base RPC:
+Before submitting the first live Base Mainnet (`8453`) smoke order, run the automated preflight CLI against the production Base RPC (production checks — 2-of-2 Safe thresholds, non-mock names, and pinned Base Mainnet `NVDAc`/`METAc` token + Chainlink feed addresses — are enabled by default; failed RPC errors automatically redact URL keys/paths):
 
 ```bash
 node scripts/ws4_7_smoke_lib.mjs \
-  --rpc-url "$BASE_RPC_URL" \
-  --production
+  --rpc-url "$BASE_RPC_URL"
 ```
 
 Required environment variables for `scripts/ws4_7_smoke_lib.mjs`:

@@ -1,6 +1,6 @@
 /// <reference path="./ambient.d.ts" />
 import assert from 'node:assert/strict';
-import { execSync, spawn, type ChildProcess } from 'node:child_process';
+import { execSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -49,11 +49,13 @@ import {
   signLoanExtension,
 } from '../src/lib/web3.js';
 import {
+  BASE_MAINNET_SMOKE_ASSETS,
   DEFAULT_INITIALIZER_GLOBAL_CAP_RAW,
   RECOMMENDED_MAX_STALE_OPEN_SECS,
   TIMELOCK_MIN_DELAY_SECS,
   evaluateSafeSnapshot,
   runGuardedSmokePreflight,
+  sanitizeRpcErrorMessage,
   validateGlobalSmokeCap,
   validateSmokeAssetConfig,
 } from '../scripts/ws4_7_smoke_lib.mjs';
@@ -345,7 +347,95 @@ function testPurePreflightValidators() {
   assert.equal(reduceOnlyRejection.ok, false);
   assert.ok(reduceOnlyRejection.errors.some((e) => /ReduceOnly/.test(e)));
 
-  console.log('PASS Pure WS4.7 preflight validators (EIP-7702 detection, 250k default cap trap, anti-mock checks).');
+  // Low 1 (510140d): sanitizeRpcErrorMessage scrubs RPC URL API keys / paths / query tokens before logging
+  const leakedErr = {
+    message:
+      'HTTP request failed for https://base-mainnet.g.alchemy.com/v2/TOP_SECRET_API_KEY?auth=secret123',
+  };
+  const cleanErr = sanitizeRpcErrorMessage(leakedErr);
+  assert.ok(!cleanErr.includes('TOP_SECRET_API_KEY'));
+  assert.ok(!cleanErr.includes('secret123'));
+  assert.ok(cleanErr.includes('https://base-mainnet.g.alchemy.com/[redacted]'));
+
+  const cliSecretRes = spawnSync(
+    'node',
+    ['scripts/ws4_7_smoke_lib.mjs', '--rpc-url', 'http://127.0.0.1:1/v2/SUPER_SECRET_CI_KEY'],
+    { cwd: REPO_ROOT, encoding: 'utf8' }
+  );
+  assert.notEqual(cliSecretRes.status, 0);
+  assert.ok(
+    !`${cliSecretRes.stdout}\n${cliSecretRes.stderr}`.includes('SUPER_SECRET_CI_KEY'),
+    'CLI error output must redact RPC URL API key on RPC failure'
+  );
+
+  // Info 1 (510140d): production check pins exact Base Mainnet NVDAc/METAc token & Chainlink feed addresses
+  const spoofedPinRejection = validateSmokeAssetConfig(
+    {
+      symbol: 'NVDAc',
+      tokenName: 'NVIDIA Corporation',
+      tokenAddress: '0x4444444444444444444444444444444444444444',
+      tokenDecimals: 8,
+      feedDescription: 'Coinbase NVDA',
+      supported: true,
+      config: {
+        feed: BASE_MAINNET_SMOKE_ASSETS.NVDAc.feed,
+        feedDecimals: 8,
+        status: 0,
+        perLoanCap: 1_000_000_000n,
+        assetCap: 5_000_000_000n,
+        maxStaleOpenSecs: 21_600,
+        maxInitLtvBps: 6000,
+        marginCallLtvBps: 7000,
+        liqLtvBps: 7800,
+        badDebtLtvBps: 9000,
+      },
+      recordedMultiplier: 1_000537939576369481n,
+      oraclePrice: 140_00000000n,
+      oracleState: 0,
+    },
+    { disallowMocks: true }
+  );
+  assert.equal(spoofedPinRejection.ok, false);
+  assert.ok(spoofedPinRejection.errors.some((e) => /does not match pinned Base NVDAc/i.test(e)));
+
+  const pinnedAccepted = validateSmokeAssetConfig(
+    {
+      symbol: 'NVDAc',
+      tokenName: 'NVIDIA Corporation',
+      tokenAddress: BASE_MAINNET_SMOKE_ASSETS.NVDAc.token,
+      tokenDecimals: 8,
+      feedDescription: 'Coinbase NVDA',
+      supported: true,
+      config: {
+        feed: BASE_MAINNET_SMOKE_ASSETS.NVDAc.feed,
+        feedDecimals: 8,
+        status: 0,
+        perLoanCap: 1_000_000_000n,
+        assetCap: 5_000_000_000n,
+        maxStaleOpenSecs: 21_600,
+        maxInitLtvBps: 6000,
+        marginCallLtvBps: 7000,
+        liqLtvBps: 7800,
+        badDebtLtvBps: 9000,
+      },
+      recordedMultiplier: 1_000537939576369481n,
+      oraclePrice: 140_00000000n,
+      oracleState: 0,
+    },
+    { disallowMocks: true }
+  );
+  assert.equal(pinnedAccepted.ok, true);
+
+  // Info 2 (510140d): remote RPC refuses --allow-mocks / --allow-1of1-safe unless explicit --allow-remote-fork
+  const remoteRelaxRes = spawnSync(
+    'node',
+    ['scripts/ws4_7_smoke_lib.mjs', '--rpc-url', 'https://mainnet.base.org', '--allow-mocks'],
+    { cwd: REPO_ROOT, encoding: 'utf8' }
+  );
+  assert.notEqual(remoteRelaxRes.status, 0);
+  assert.match(remoteRelaxRes.stderr, /Refusing --allow-mocks/i);
+
+  console.log('PASS Pure WS4.7 preflight validators (EIP-7702 detection, 250k default cap trap, anti-mock + pinned Base asset checks, RPC URL redaction).');
 }
 
 async function deployCanonicalSafeProxy(
