@@ -249,12 +249,46 @@ export function formatDurationHuman(seconds) {
 export function formatAssetOraclePrice(oracle, { maxFractionDigits = 2 } = {}) {
   if (!oracle) return 'unavailable';
   if (oracle.state_name === 'not verified on-chain') return 'not verified on-chain';
-  if (oracle.state_name === 'unavailable' || !oracle.price) return 'unavailable';
+  if (oracle.state_name === 'unavailable') return 'unavailable';
+  const stateNum = oracle.state !== null && oracle.state !== undefined ? Number(oracle.state) : null;
+  if (
+    stateNum === OracleState.FROZEN_CORPORATE_ACTION ||
+    oracle.state_name === 'FROZEN_CORPORATE_ACTION' ||
+    stateNum === OracleState.INVALID_SEQUENCER ||
+    oracle.state_name === 'INVALID_SEQUENCER'
+  ) {
+    return 'n/a';
+  }
+  if (!oracle.price) return 'unavailable';
+  const isStale = stateNum === OracleState.STALE_FEED || oracle.state_name === 'STALE_FEED';
+  if (isStale && BigInt(oracle.price.raw ?? 0n) <= 0n) {
+    return 'n/a (stale)';
+  }
   const base = formatApiAmount(oracle.price, { prefixUsd: true, maxFractionDigits });
-  if (Number(oracle.state) === OracleState.STALE_FEED || oracle.state_name === 'STALE_FEED') {
+  if (isStale) {
     return `${base} (stale)`;
   }
   return base;
+}
+
+export function formatOracleUnitValue(amountObj, oracle) {
+  if (!oracle) return 'unavailable';
+  if (oracle.state_name === 'not verified on-chain') return 'not verified on-chain';
+  if (oracle.state_name === 'unavailable') return 'unavailable';
+  const stateNum = oracle.state !== null && oracle.state !== undefined ? Number(oracle.state) : null;
+  if (
+    stateNum === OracleState.FROZEN_CORPORATE_ACTION ||
+    oracle.state_name === 'FROZEN_CORPORATE_ACTION' ||
+    stateNum === OracleState.INVALID_SEQUENCER ||
+    oracle.state_name === 'INVALID_SEQUENCER'
+  ) {
+    return 'n/a';
+  }
+  if (!amountObj) return 'unavailable';
+  const base = formatApiAmount(amountObj, { prefixUsd: true });
+  return stateNum === OracleState.STALE_FEED || oracle.state_name === 'STALE_FEED'
+    ? `${base} (stale)`
+    : base;
 }
 
 export function evaluateAssetOriginationStatus(asset, protocol = null) {
@@ -275,14 +309,39 @@ export function evaluateAssetOriginationStatus(asset, protocol = null) {
       message: 'Asset is from api/ only (not verified on-chain); origination status unconfirmed.',
     };
   }
-  if (protocol?.paused) {
+  if (!protocol || protocol.paused === null || protocol.paused === undefined) {
+    return {
+      canOriginate: false,
+      severity: 'err',
+      message: 'LoanCore pause status unknown (Base RPC paused() read unavailable); origination eligibility unconfirmed.',
+    };
+  }
+  if (protocol.paused) {
     return {
       canOriginate: false,
       severity: 'err',
       message: 'LoanCore is paused (blocks new loans only; repay, top-up & auctions remain open).',
     };
   }
-  if (asset.status !== undefined && asset.status !== null && Number(asset.status) !== 0) {
+  if (
+    asset.decimals === null ||
+    asset.decimals === undefined ||
+    !Number.isInteger(Number(asset.decimals))
+  ) {
+    return {
+      canOriginate: false,
+      severity: 'err',
+      message: 'Collateral decimals unavailable from on-chain RPC; origination status unconfirmed.',
+    };
+  }
+  if (asset.status === null || asset.status === undefined) {
+    return {
+      canOriginate: false,
+      severity: 'err',
+      message: 'AssetRegistry status unknown; origination blocked.',
+    };
+  }
+  if (Number(asset.status) !== 0) {
     return {
       canOriginate: false,
       severity: 'err',
@@ -809,50 +868,22 @@ function collectTokenLogs(logs, out, seen) {
   }
 }
 
-async function discoverAssetTokensFromLogs(
-  client,
-  assetRegistryAddr,
-  blockNumber,
-  { fromBlock = null, chunkSize = 5_000n } = {}
-) {
-  const eventAbi = assetRegistryAbi.find((item) => item.type === 'event' && item.name === 'AssetConfigSet');
-  if (!eventAbi) return [];
-
-  if (fromBlock !== null && fromBlock !== undefined && String(fromBlock).trim() !== '') {
-    let cur = BigInt(fromBlock);
-    if (cur <= blockNumber) {
-      const addrs = [];
-      const seen = new Set();
-      let step = chunkSize > 0n ? BigInt(chunkSize) : 5_000n;
-      let iterations = 0;
-      const MAX_CHUNK_ITERATIONS = 500;
-      while (cur <= blockNumber && iterations < MAX_CHUNK_ITERATIONS) {
-        iterations += 1;
-        let to = cur + step - 1n;
-        if (to > blockNumber) to = blockNumber;
-        try {
-          const logs = await client.getLogs({
-            address: assetRegistryAddr,
-            event: eventAbi,
-            fromBlock: cur,
-            toBlock: to,
-          });
-          collectTokenLogs(logs, addrs, seen);
-          cur = to + 1n;
-        } catch {
-          if (step > 100n) {
-            const nextStep = step / 2n;
-            step = nextStep < 100n ? 100n : nextStep;
-            continue;
-          }
-          break;
-        }
-      }
-      return addrs;
-    }
-    return [];
+function mergeUniqueAddresses(listA, listB) {
+  const out = [];
+  const seen = new Set();
+  for (const addr of [...(listA || []), ...(listB || [])]) {
+    if (!addr || !isAddress(addr)) continue;
+    const cs = getAddress(addr);
+    const key = cs.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(cs);
   }
+  return out;
+}
 
+async function scanRecentAssetLogs(client, assetRegistryAddr, eventAbi, blockNumber) {
+  let lastError = null;
   for (const windowBlocks of [10_000n, 2_000n, 500n]) {
     const start = blockNumber > windowBlocks ? blockNumber - windowBlocks : 0n;
     try {
@@ -864,15 +895,16 @@ async function discoverAssetTokensFromLogs(
       });
       const addrs = [];
       collectTokenLogs(logs, addrs, new Set());
-      return addrs;
-    } catch {
-      // Retry with smaller window if RPC limits eth_getLogs block span
+      return { tokens: addrs, warning: '' };
+    } catch (err) {
+      lastError = formatWeb3Error(err);
     }
   }
 
   const addrs = [];
   const seen = new Set();
   let curTo = blockNumber;
+  let stepFailed = false;
   for (let i = 0; i < 4 && curTo > 0n; i++) {
     const curFrom = curTo > 150n ? curTo - 149n : 0n;
     try {
@@ -883,13 +915,94 @@ async function discoverAssetTokensFromLogs(
         toBlock: curTo,
       });
       collectTokenLogs(logs, addrs, seen);
-    } catch {
+    } catch (err) {
+      stepFailed = true;
+      lastError = formatWeb3Error(err);
       break;
     }
     if (curFrom === 0n) break;
     curTo = curFrom - 1n;
   }
-  return addrs;
+
+  if (addrs.length === 0 && (stepFailed || lastError)) {
+    return {
+      tokens: [],
+      warning: `Recent AssetRegistry log scan failed (${lastError}); falling back to recent loans and api/ asset list.`,
+    };
+  }
+  return { tokens: addrs, warning: '' };
+}
+
+async function discoverAssetTokensFromLogs(
+  client,
+  assetRegistryAddr,
+  blockNumber,
+  { fromBlock = null, chunkSize = 5_000n } = {}
+) {
+  const eventAbi = assetRegistryAbi.find((item) => item.type === 'event' && item.name === 'AssetConfigSet');
+  if (!eventAbi) return { tokens: [], warning: '' };
+
+  if (fromBlock !== null && fromBlock !== undefined && String(fromBlock).trim() !== '') {
+    const start = BigInt(fromBlock);
+    if (start > blockNumber) {
+      const tail = await scanRecentAssetLogs(client, assetRegistryAddr, eventAbi, blockNumber);
+      const msg = `Configured deploy fromBlock (#${start}) exceeds chain head (#${blockNumber}); fell back to recent-block lookback.`;
+      return {
+        tokens: tail.tokens,
+        warning: tail.warning ? `${msg} ${tail.warning}` : msg,
+      };
+    }
+
+    let cur = start;
+    const addrs = [];
+    const seen = new Set();
+    let step = chunkSize > 0n ? BigInt(chunkSize) : 5_000n;
+    let iterations = 0;
+    const MAX_CHUNK_ITERATIONS = 500;
+    let lastError = '';
+    let haltedOnError = false;
+
+    while (cur <= blockNumber && iterations < MAX_CHUNK_ITERATIONS) {
+      iterations += 1;
+      let to = cur + step - 1n;
+      if (to > blockNumber) to = blockNumber;
+      try {
+        const logs = await client.getLogs({
+          address: assetRegistryAddr,
+          event: eventAbi,
+          fromBlock: cur,
+          toBlock: to,
+        });
+        collectTokenLogs(logs, addrs, seen);
+        cur = to + 1n;
+        lastError = '';
+      } catch (err) {
+        lastError = formatWeb3Error(err);
+        if (step > 100n) {
+          const nextStep = step / 2n;
+          step = nextStep < 100n ? 100n : nextStep;
+          continue;
+        }
+        haltedOnError = true;
+        break;
+      }
+    }
+
+    if (cur <= blockNumber) {
+      const tail = await scanRecentAssetLogs(client, assetRegistryAddr, eventAbi, blockNumber);
+      const combinedTokens = mergeUniqueAddresses(addrs, tail.tokens);
+      const reason = haltedOnError
+        ? `AssetRegistry deploy log scan failed at block #${cur} (${lastError}); fell back to recent-block lookback.`
+        : `AssetRegistry deploy log scan hit ${MAX_CHUNK_ITERATIONS}-chunk limit at block #${cur - 1n} (chain head #${blockNumber}); fell back to recent-block lookback.`;
+      return {
+        tokens: combinedTokens,
+        warning: tail.warning ? `${reason} ${tail.warning}` : reason,
+      };
+    }
+    return { tokens: addrs, warning: '' };
+  }
+
+  return scanRecentAssetLogs(client, assetRegistryAddr, eventAbi, blockNumber);
 }
 
 async function discoverAssetTokensFromRecentLoans(client, loanCoreAddr, nextLoanId, blockNumber) {
@@ -1078,28 +1191,30 @@ async function readSingleOnChainAssetState({
       return { status: 'unsupported', token: tokenAddr };
     }
 
-    const tokenDecimals =
-      decimalsRead.ok && decimalsRead.value !== null && decimalsRead.value !== undefined
-        ? Number(decimalsRead.value)
-        : Number.isInteger(fallbackAsset?.decimals)
-          ? fallbackAsset.decimals
-          : 18;
+    const decimalsKnown =
+      decimalsRead.ok &&
+      decimalsRead.value !== null &&
+      decimalsRead.value !== undefined &&
+      Number.isInteger(Number(decimalsRead.value)) &&
+      Number(decimalsRead.value) >= 0;
+    const tokenDecimals = decimalsKnown ? Number(decimalsRead.value) : null;
     const symbol =
       symbolRead.ok && typeof symbolRead.value === 'string' && symbolRead.value.trim()
         ? symbolRead.value.trim()
         : fallbackAsset?.symbol ?? null;
 
-    const oneWholeTokenRaw = 10n ** BigInt(tokenDecimals);
     const [unitValueRead, roundRead] = await Promise.all([
-      tryRead(
-        client.readContract({
-          address: oracleRouterAddr,
-          abi: oracleRouterAbi,
-          functionName: 'getValue',
-          args: [tokenAddr, oneWholeTokenRaw],
-          blockNumber,
-        })
-      ),
+      tokenDecimals !== null
+        ? tryRead(
+            client.readContract({
+              address: oracleRouterAddr,
+              abi: oracleRouterAbi,
+              functionName: 'getValue',
+              args: [tokenAddr, 10n ** BigInt(tokenDecimals)],
+              blockNumber,
+            })
+          )
+        : Promise.resolve({ ok: false, value: null, error: 'Token decimals unavailable' }),
       tryRead(
         client.readContract({
           address: feedAddr,
@@ -1231,9 +1346,10 @@ async function readSingleOnChainAssetState({
           gross_unit_value_usdc: grossUnitUsdcObj,
           effective_unit_value_usdc: effectiveUnitUsdcObj,
         },
-        escrow_balance: escrowRead.ok
-          ? formatRawAmountObject(escrowRead.value ?? 0n, tokenDecimals, symbol)
-          : null,
+        escrow_balance:
+          escrowRead.ok && tokenDecimals !== null
+            ? formatRawAmountObject(escrowRead.value ?? 0n, tokenDecimals, symbol)
+            : null,
         live_block_number: blockNumber.toString(),
         live_block_timestamp: Number(blockTimestamp),
       },
@@ -1414,16 +1530,18 @@ export async function fetchLiveProtocolContractState({
           fromBlock,
           chunkSize: logChunkSize,
         })
-      : Promise.resolve([]);
+      : Promise.resolve({ tokens: [], warning: '' });
     const loanDiscoveryPromise = nextLoanRead.ok
       ? discoverAssetTokensFromRecentLoans(client, loanCoreAddr, nextLoanRead.value, blockNumber)
       : Promise.resolve([]);
 
-    const [fees, logTokens, loanTokens] = await Promise.all([
+    const [fees, logDiscovery, loanTokens] = await Promise.all([
       safeRead(feePromise, null),
       logDiscoveryPromise,
       loanDiscoveryPromise,
     ]);
+    const logTokens = logDiscovery?.tokens ?? [];
+    const discoveryWarning = logDiscovery?.warning ?? '';
 
     const knownByLower = new Map();
     for (const a of Array.isArray(knownAssets) ? knownAssets : []) {
@@ -1511,6 +1629,7 @@ export async function fetchLiveProtocolContractState({
       assets: liveAssets,
       unsupportedTokens,
       tokenAddressesUsed: candidateList,
+      discoveryWarning,
     };
   } catch (err) {
     return {
@@ -1524,6 +1643,7 @@ export async function fetchLiveProtocolContractState({
       assets: [],
       unsupportedTokens: [],
       tokenAddressesUsed: [],
+      discoveryWarning: '',
     };
   }
 }
@@ -1575,10 +1695,10 @@ export function reconcileLiveAssetsWithApi(apiAssets, onChainSnapshot) {
         `${label}: live Base contract read unavailable (${chainAsset.error || 'RPC call failed'})`
       );
       merged.push({
+        ...chainAsset,
         token: chainAsset.token,
         symbol: chainAsset.symbol ?? apiAsset?.symbol ?? null,
         decimals: chainAsset.decimals ?? apiAsset?.decimals ?? null,
-        ...chainAsset,
         updated_block: apiAsset?.updated_block ?? null,
       });
       continue;
@@ -1731,13 +1851,17 @@ export async function fetchMarketsAndLiveContracts({
       }
     }
     if (extraApiTokens.length > 0) {
-      onChain = await fetchLiveProtocolContractState({
+      const mergedOnChain = await fetchLiveProtocolContractState({
         cfg,
         publicClient,
         tokenAddresses: [...onChain.tokenAddressesUsed, ...extraApiTokens],
         knownAssets: market.assets ?? [],
         includeLogDiscovery: false,
       });
+      onChain = {
+        ...mergedOnChain,
+        discoveryWarning: initialOnChain.discoveryWarning || mergedOnChain.discoveryWarning || '',
+      };
     }
   }
 

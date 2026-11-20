@@ -20,6 +20,7 @@ import {
   formatAssetOraclePrice,
   formatBpsPercent,
   formatDurationHuman,
+  formatOracleUnitValue,
   parseDecimalToRaw,
   parsePercentToBps,
   reconcileLiveAssetsWithApi,
@@ -592,5 +593,70 @@ assert.throws(() => {
   getFrontendConfig();
 }, /Invalid VITE_DEPLOY_BLOCK/);
 setFrontendConfigOverrides({});
+
+// b68087c Review Low 1 & Infos (1)-(5) unit checks:
+// Low 1: null protocol or protocol.paused === null blocks origination as status unknown
+const validNvdaSample = {
+  source: 'onchain_rpc',
+  onchain_verified: true,
+  unavailable: false,
+  decimals: 18,
+  status: 0,
+  status_name: 'Active',
+  oracle: { state: 0, state_name: 'VALID_OPEN' },
+  ltv: { closed_market_haircut_bps: 500 },
+};
+assert.equal(evaluateAssetOriginationStatus(validNvdaSample, null).canOriginate, false);
+assert.match(evaluateAssetOriginationStatus(validNvdaSample, { paused: null }).message, /pause status unknown/i);
+assert.equal(evaluateAssetOriginationStatus(validNvdaSample, { paused: true }).canOriginate, false);
+assert.equal(evaluateAssetOriginationStatus({ ...validNvdaSample, status: 1, status_name: 'ReduceOnly' }, { paused: false }).canOriginate, false);
+assert.equal(evaluateAssetOriginationStatus({ ...validNvdaSample, status: 3, status_name: 'Frozen' }, { paused: false }).canOriginate, false);
+assert.equal(evaluateAssetOriginationStatus({ ...validNvdaSample, oracle: { state: 3, state_name: 'STALE_FEED' } }, { paused: false }).canOriginate, false);
+assert.equal(evaluateAssetOriginationStatus({ ...validNvdaSample, oracle: { state: 4, state_name: 'INVALID_SEQUENCER' } }, { paused: false }).canOriginate, false);
+assert.equal(evaluateAssetOriginationStatus({ ...validNvdaSample, decimals: null }, { paused: false }).canOriginate, false);
+assert.equal(evaluateAssetOriginationStatus(validNvdaSample, { paused: false }).canOriginate, true);
+
+// Info 3: Unavailable on-chain asset preserves API symbol & decimals without overwriting with null
+const recPreserveMeta = reconcileLiveAssetsWithApi(
+  [{ token: '0x2222222222222222222222222222222222222222', symbol: 'NVDAc', decimals: 18, status: 0, status_name: 'Active' }],
+  {
+    ok: true,
+    assets: [
+      {
+        source: 'onchain_unavailable',
+        unavailable: true,
+        onchain_verified: false,
+        error: 'RPC error',
+        token: '0x2222222222222222222222222222222222222222',
+        symbol: null,
+        decimals: null,
+        status: null,
+        status_name: 'unavailable',
+        oracle: { price: null, state: null, state_name: 'unavailable' },
+      },
+    ],
+  }
+);
+assert.equal(recPreserveMeta.assets[0].symbol, 'NVDAc');
+assert.equal(recPreserveMeta.assets[0].decimals, 18);
+assert.equal(recPreserveMeta.assets[0].status_name, 'unavailable');
+
+// Info 5: FROZEN_CORPORATE_ACTION and INVALID_SEQUENCER render 'n/a' instead of '$0.00'
+assert.equal(
+  formatAssetOraclePrice({ price: { raw: '0', decimals: 8, symbol: 'USD' }, state: 2, state_name: 'FROZEN_CORPORATE_ACTION' }),
+  'n/a'
+);
+assert.equal(
+  formatAssetOraclePrice({ price: { raw: '0', decimals: 8, symbol: 'USD' }, state: 4, state_name: 'INVALID_SEQUENCER' }),
+  'n/a'
+);
+assert.equal(
+  formatOracleUnitValue({ raw: '0', decimals: 6, symbol: 'USDC' }, { state: 2, state_name: 'FROZEN_CORPORATE_ACTION' }),
+  'n/a'
+);
+assert.equal(
+  formatOracleUnitValue({ raw: '0', decimals: 6, symbol: 'USDC' }, { state: 4, state_name: 'INVALID_SEQUENCER' }),
+  'n/a'
+);
 
 console.log('book ok');

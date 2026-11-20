@@ -26,7 +26,13 @@ export function normalizeRoutePath(pathname) {
 
 export function isSafetyOrExitRoute(pathname) {
   const norm = normalizeRoutePath(pathname);
-  if (norm === '/loans' || norm === '/borrow' || norm === '/lend' || norm === '/wallet') {
+  if (
+    norm === '/loans' ||
+    norm === '/positions' ||
+    norm === '/borrow' ||
+    norm === '/lend' ||
+    norm === '/wallet'
+  ) {
     return true;
   }
   return /^\/loans?\/[^/]+$/.test(norm);

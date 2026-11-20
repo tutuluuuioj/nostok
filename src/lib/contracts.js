@@ -344,6 +344,14 @@ export const loanCoreAbi = [
       { name: 'status', type: 'uint8', indexed: false },
     ],
   },
+  {
+    type: 'event',
+    name: 'Claimed',
+    inputs: [
+      { name: 'recipient', type: 'address', indexed: true },
+      { name: 'amount', type: 'uint128', indexed: false },
+    ],
+  },
   { type: 'error', name: 'UnauthorizedCaller', inputs: [] },
   { type: 'error', name: 'ZeroAddress', inputs: [] },
   { type: 'error', name: 'ProtocolPaused', inputs: [] },

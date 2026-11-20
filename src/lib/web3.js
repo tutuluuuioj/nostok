@@ -6199,4 +6199,407 @@ export async function verifyEligibilityDeclaration({
   };
 }
 
+/**
+ * Loads live LoanCore claimable USDC and PositionNFT holdings (api/ /positions verified against
+ * PositionNFT & LoanCore on Base RPC, with automatic on-chain loan scan fallback during API outages/lag).
+ */
+export async function fetchWalletPositionsAndClaimable({
+  address,
+  includeBurned = false,
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+} = {}) {
+  if (!address || !isAddress(address) || getAddress(address) === zeroAddress) {
+    throw new Error('Valid non-zero wallet address required.');
+  }
+  if (!cfg?.contracts?.loanCore || !cfg?.contracts?.positionNft) {
+    throw new Error('LoanCore and PositionNFT contract addresses must be configured.');
+  }
+  const wallet = getAddress(address);
+  const loanCoreAddr = getAddress(cfg.contracts.loanCore);
+  const positionNftAddr = getAddress(cfg.contracts.positionNft);
+  const usdcAddr = getAddress(cfg.usdcAddress || BASE_USDC_ADDRESS);
+
+  let apiRows = [];
+  let apiTruncated = false;
+  let apiError = '';
+
+  const apiPromise = cfg.apiUrl
+    ? fetchPaginatedApiRows(
+        `${cfg.apiUrl}/positions?owner=${wallet}${includeBurned ? '' : '&burned=false'}`,
+        { limit: 100, maxPages: 10, cfg }
+      )
+        .then((res) => {
+          apiRows = res.rows ?? [];
+          apiTruncated = Boolean(res.truncated);
+        })
+        .catch((err) => {
+          apiError = formatWeb3Error(err);
+        })
+    : Promise.resolve().then(() => {
+        apiError = 'VITE_API_URL not configured.';
+      });
+
+  let rpcError = '';
+  let blockNumber = null;
+  let blockTimestamp = null;
+  let claimableRaw = null;
+  let claimableFormatted = null;
+  let usdcBalanceRaw = null;
+  let usdcBalanceFormatted = null;
+  let nftBalanceCount = null;
+  let nextLoanBig = 1n;
+  let gracePeriodSeconds = 86_400n;
+  let rpcCoreOk = false;
+
+  try {
+    const [block, claimable, nftBal, nextLoanId, usdcBal, graceSecs] = await Promise.all([
+      publicClient.getBlock({ blockTag: 'latest' }),
+      publicClient.readContract({
+        address: loanCoreAddr,
+        abi: loanCoreAbi,
+        functionName: 'getClaimable',
+        args: [wallet],
+      }),
+      publicClient.readContract({
+        address: positionNftAddr,
+        abi: positionNftAbi,
+        functionName: 'balanceOf',
+        args: [wallet],
+      }),
+      publicClient.readContract({
+        address: loanCoreAddr,
+        abi: loanCoreAbi,
+        functionName: 'nextLoanId',
+      }),
+      publicClient.readContract({
+        address: usdcAddr,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [wallet],
+      }),
+      publicClient
+        .readContract({
+          address: loanCoreAddr,
+          abi: loanCoreAbi,
+          functionName: 'GRACE_PERIOD_SECONDS',
+        })
+        .catch(() => 86_400n),
+    ]);
+    blockNumber = block.number;
+    blockTimestamp = BigInt(block.timestamp ?? 0n);
+    const claimBig = BigInt(claimable ?? 0n);
+    const usdcBig = BigInt(usdcBal ?? 0n);
+    claimableRaw = claimBig.toString();
+    claimableFormatted = formatTokenUnitsDisplay(claimBig, USDC_DECIMALS, 6);
+    usdcBalanceRaw = usdcBig.toString();
+    usdcBalanceFormatted = formatTokenUnitsDisplay(usdcBig, USDC_DECIMALS, 2);
+    nftBalanceCount = Number(nftBal ?? 0n);
+    nextLoanBig = BigInt(nextLoanId ?? 1n);
+    gracePeriodSeconds = BigInt(graceSecs ?? 86_400n);
+    rpcCoreOk = true;
+  } catch (err) {
+    rpcError = formatWeb3Error(err);
+  }
+
+  await apiPromise;
+
+  const apiById = new Map();
+  for (const row of apiRows) {
+    if (row?.loan_id === undefined || row?.loan_id === null) continue;
+    apiById.set(String(row.loan_id), row);
+  }
+
+  if (!rpcCoreOk) {
+    const unverifiedPositions = apiRows.map((row) => ({
+      loanId: String(row.loan_id),
+      owner: row.owner ? getAddress(row.owner) : wallet,
+      isBurned: Boolean(row.is_burned),
+      auctionLocked: Boolean(row.auction_locked),
+      collateralToken: row.collateral_token ? getAddress(row.collateral_token) : null,
+      collateralSymbol: row.collateral_symbol || null,
+      principalRaw: row.principal?.raw ?? null,
+      principalRemainingFormatted: row.principal?.raw
+        ? formatTokenUnitsDisplay(BigInt(row.principal.raw), USDC_DECIMALS, 2)
+        : null,
+      statusName: row.loan_status_name ? `${row.loan_status_name} (not verified on-chain)` : 'not verified on-chain',
+      onchainVerified: false,
+    }));
+    return {
+      address: wallet,
+      blockNumber: null,
+      blockTimestamp: null,
+      claimableRaw: null,
+      claimableFormatted: null,
+      usdcBalanceRaw: null,
+      usdcBalanceFormatted: null,
+      nftBalanceCount: null,
+      positions: unverifiedPositions,
+      apiTruncated,
+      apiError,
+      rpcError,
+      scanTruncated: false,
+    };
+  }
+
+  const candidateIdSet = new Set(Array.from(apiById.keys()));
+  const activeApiCount = apiRows.filter((r) => !r.is_burned).length;
+  const needDirectScan = Boolean(apiError) || activeApiCount < nftBalanceCount;
+  let scanTruncated = false;
+
+  if (needDirectScan && nextLoanBig > 1n) {
+    const endId = nextLoanBig - 1n;
+    const maxScan = 50n;
+    const startId = endId >= maxScan ? endId - (maxScan - 1n) : 1n;
+    if (startId > 1n) scanTruncated = true;
+    for (let id = startId; id <= endId; id++) {
+      candidateIdSet.add(id.toString());
+    }
+  }
+
+  const candidateIds = Array.from(candidateIdSet)
+    .map((s) => BigInt(s))
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+
+  const rawEntries = await Promise.all(
+    candidateIds.map(async (id) => {
+      const apiRow = apiById.get(id.toString()) ?? null;
+      const [loanRes, ownerRes, lockedRes, dueRes] = await Promise.allSettled([
+        publicClient.readContract({
+          address: loanCoreAddr,
+          abi: loanCoreAbi,
+          functionName: 'getLoan',
+          args: [id],
+        }),
+        publicClient.readContract({
+          address: positionNftAddr,
+          abi: positionNftAbi,
+          functionName: 'ownerOf',
+          args: [id],
+        }),
+        publicClient.readContract({
+          address: positionNftAddr,
+          abi: positionNftAbi,
+          functionName: 'isAuctionLocked',
+          args: [id],
+        }),
+        publicClient.readContract({
+          address: loanCoreAddr,
+          abi: loanCoreAbi,
+          functionName: 'getDueInterest',
+          args: [id],
+        }),
+      ]);
+      const loan = loanRes.status === 'fulfilled' ? loanRes.value : null;
+      const owner = ownerRes.status === 'fulfilled' && ownerRes.value ? getAddress(ownerRes.value) : null;
+      const auctionLocked = lockedRes.status === 'fulfilled' ? Boolean(lockedRes.value) : false;
+      const dueInterest = dueRes.status === 'fulfilled' ? BigInt(dueRes.value ?? 0n) : null;
+      return { id, apiRow, loan, owner, auctionLocked, dueInterest };
+    })
+  );
+
+  const matching = rawEntries.filter((entry) => {
+    if (entry.owner && entry.owner.toLowerCase() === wallet.toLowerCase()) return true;
+    if (includeBurned && entry.owner === null && entry.apiRow) return true;
+    return false;
+  });
+
+  const tokenMetaCache = new Map();
+  const uniqueTokens = Array.from(
+    new Set(
+      matching
+        .map((e) => e.loan?.collateralToken)
+        .filter((t) => t && t !== zeroAddress && isAddress(t))
+        .map((t) => getAddress(t))
+    )
+  );
+  await Promise.all(
+    uniqueTokens.map(async (tok) => {
+      const [symRes, decRes] = await Promise.allSettled([
+        publicClient.readContract({ address: tok, abi: erc20Abi, functionName: 'symbol' }),
+        publicClient.readContract({ address: tok, abi: erc20Abi, functionName: 'decimals' }),
+      ]);
+      tokenMetaCache.set(tok.toLowerCase(), {
+        symbol: symRes.status === 'fulfilled' && typeof symRes.value === 'string' ? symRes.value : null,
+        decimals: decRes.status === 'fulfilled' ? Number(decRes.value) : null,
+      });
+    })
+  );
+
+  const positions = matching.map(({ id, apiRow, loan, owner, auctionLocked, dueInterest }) => {
+    const collateralToken =
+      loan?.collateralToken && loan.collateralToken !== zeroAddress
+        ? getAddress(loan.collateralToken)
+        : apiRow?.collateral_token
+          ? getAddress(apiRow.collateral_token)
+          : null;
+    const tokMeta = collateralToken ? tokenMetaCache.get(collateralToken.toLowerCase()) : null;
+    const collateralSymbol = tokMeta?.symbol || apiRow?.collateral_symbol || null;
+    const collateralDecimals = tokMeta?.decimals ?? null;
+    const principalRaw = loan ? BigInt(loan.principal ?? 0n) : BigInt(apiRow?.principal?.raw ?? 0n);
+    const principalRepaidRaw = loan ? BigInt(loan.principalRepaid ?? 0n) : 0n;
+    const remainingPrincipal = principalRaw > principalRepaidRaw ? principalRaw - principalRepaidRaw : 0n;
+    const storedStatus = loan ? Number(loan.status) : apiRow?.loan_status ?? null;
+    const maturity = loan ? BigInt(loan.maturity ?? 0n) : 0n;
+    const graceEnd = maturity > 0n ? maturity + gracePeriodSeconds : 0n;
+    const isGraceClock = storedStatus === 0 && maturity > 0n && blockTimestamp > maturity && blockTimestamp <= graceEnd;
+    const isOverduePending =
+      (storedStatus === 0 || storedStatus === 1) && maturity > 0n && blockTimestamp > graceEnd;
+    const effectiveStatus = isGraceClock ? 1 : storedStatus;
+    const statusName = isOverduePending
+      ? 'Overdue - default pending'
+      : effectiveStatus !== null
+        ? (LOAN_STATUS_NAMES[effectiveStatus] ?? `Status_${effectiveStatus}`)
+        : 'Unknown';
+
+    return {
+      loanId: id.toString(),
+      borrower: loan?.borrower && loan.borrower !== zeroAddress ? getAddress(loan.borrower) : null,
+      owner,
+      isBurned: owner === null,
+      auctionLocked,
+      collateralToken,
+      collateralSymbol,
+      collateralDecimals,
+      collateralRaw: loan ? BigInt(loan.collateralRaw ?? 0n).toString() : null,
+      collateralFormatted:
+        loan && collateralDecimals !== null
+          ? formatTokenUnitsDisplay(BigInt(loan.collateralRaw ?? 0n), collateralDecimals, 4)
+          : null,
+      principalRaw: principalRaw.toString(),
+      principalRemainingRaw: remainingPrincipal.toString(),
+      principalRemainingFormatted: formatTokenUnitsDisplay(remainingPrincipal, USDC_DECIMALS, 2),
+      dueInterestRaw: dueInterest !== null ? dueInterest.toString() : null,
+      dueInterestFormatted: dueInterest !== null ? formatTokenUnitsDisplay(dueInterest, USDC_DECIMALS, 6) : null,
+      spotClaimValueRaw:
+        dueInterest !== null ? (remainingPrincipal + dueInterest).toString() : remainingPrincipal.toString(),
+      spotClaimValueFormatted: formatTokenUnitsDisplay(
+        remainingPrincipal + (dueInterest ?? 0n),
+        USDC_DECIMALS,
+        6
+      ),
+      rateBps: loan ? Number(loan.rateBps) : null,
+      maturity: loan ? loan.maturity.toString() : null,
+      status: effectiveStatus,
+      statusName,
+      onchainVerified: true,
+    };
+  });
+
+  return {
+    address: wallet,
+    blockNumber: blockNumber.toString(),
+    blockTimestamp: Number(blockTimestamp),
+    claimableRaw,
+    claimableFormatted,
+    usdcBalanceRaw,
+    usdcBalanceFormatted,
+    nftBalanceCount,
+    positions,
+    apiTruncated,
+    apiError,
+    rpcError,
+    scanTruncated,
+  };
+}
+
+/**
+ * Claims accrued pull-payment USDC on LoanCore for `address` via `LoanCore.claim(recipient)`.
+ * Pull payments and position exits never require a Reg S declaration or API availability.
+ */
+export async function executeLoanClaim({
+  address,
+  recipient = null,
+  provider = getInjectedProvider(),
+  cfg = getFrontendConfig(),
+  publicClient = createProtocolPublicClient(cfg),
+} = {}) {
+  const wallet = await assertActiveWalletAndChain(provider, address, cfg.chainId);
+  if (!cfg?.contracts?.loanCore) {
+    throw new Error('LoanCore contract address is not configured.');
+  }
+  const loanCoreAddr = getAddress(cfg.contracts.loanCore);
+  const usdcAddr = getAddress(cfg.usdcAddress || BASE_USDC_ADDRESS);
+
+  const rawRecipient = recipient !== null && recipient !== undefined ? String(recipient).trim() : '';
+  let toAddr = wallet;
+  if (rawRecipient) {
+    if (!isAddress(rawRecipient)) {
+      throw new Error(`Invalid claim recipient address: "${rawRecipient}".`);
+    }
+    toAddr = getAddress(rawRecipient);
+  }
+  if (toAddr === zeroAddress) {
+    throw new Error('Claim recipient address cannot be zero.');
+  }
+
+  const claimableBefore = BigInt(
+    await publicClient.readContract({
+      address: loanCoreAddr,
+      abi: loanCoreAbi,
+      functionName: 'getClaimable',
+      args: [wallet],
+    })
+  );
+  if (claimableBefore === 0n) {
+    throw new Error(`No claimable USDC balance on LoanCore for ${wallet}.`);
+  }
+
+  const callData = encodeFunctionData({
+    abi: loanCoreAbi,
+    functionName: 'claim',
+    args: [toAddr],
+  });
+
+  try {
+    await publicClient.call({
+      account: wallet,
+      to: loanCoreAddr,
+      data: callData,
+    });
+  } catch (simErr) {
+    const decoded = decodeContractRevert(simErr);
+    throw new Error(decoded ? decoded.message : formatWeb3Error(simErr));
+  }
+
+  const { txHash, receipt } = await sendWalletTransaction(provider, publicClient, {
+    from: wallet,
+    to: loanCoreAddr,
+    data: callData,
+  });
+
+  const evArgs = decodeLoanCoreEvent(receipt, loanCoreAddr, 'Claimed');
+  const claimedAmount = BigInt(evArgs?.amount ?? claimableBefore);
+
+  const [remainingClaimable, usdcAfter] = await Promise.all([
+    publicClient
+      .readContract({
+        address: loanCoreAddr,
+        abi: loanCoreAbi,
+        functionName: 'getClaimable',
+        args: [wallet],
+      })
+      .then((v) => BigInt(v ?? 0n)),
+    publicClient
+      .readContract({
+        address: usdcAddr,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [toAddr],
+      })
+      .then((v) => BigInt(v ?? 0n)),
+  ]);
+
+  return {
+    txHash,
+    receipt,
+    claimant: wallet,
+    recipient: toAddr,
+    claimedAmountRaw: claimedAmount.toString(),
+    claimedAmountFormatted: formatTokenUnitsDisplay(claimedAmount, USDC_DECIMALS, 6),
+    remainingClaimableRaw: remainingClaimable.toString(),
+    recipientUsdcBalanceRaw: usdcAfter.toString(),
+  };
+}
+
 

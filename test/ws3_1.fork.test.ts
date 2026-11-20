@@ -73,6 +73,7 @@ import {
   formatApiAmount,
   formatAssetOraclePrice,
   formatBpsPercent,
+  formatOracleUnitValue,
   reconcileLiveAssetsWithApi,
 } from '../src/lib/marketsApi.js';
 import {
@@ -129,6 +130,8 @@ import {
   executeLoanExtend,
   executeLoanRepay,
   executeLoanTopUp,
+  executeLoanClaim,
+  fetchWalletPositionsAndClaimable,
   readLoanOnChainState,
   signInWithSiwe,
   signLoanExtension,
@@ -1227,7 +1230,6 @@ async function runTests(): Promise<void> {
       const forbiddenDemoActionRe =
         /<button[^>]*>\s*(Open|Download my records|Claim|List this claim|Cancel listing|Buy claim|Dismiss|Repay all|Repay part|Add collateral|Extend|Roll|Post lend offer)\s*<\/button>/i;
       const demoRoutes: Array<{ route: string; el: ReturnType<typeof createElement> }> = [
-        { route: '/positions', el: createElement(Positions) },
         { route: '/alerts', el: createElement(Alerts) },
         { route: '/builders', el: createElement(Builders) },
       ];
@@ -7102,7 +7104,7 @@ async function runTests(): Promise<void> {
         assert.ok(blockedMarketsHtml.includes('This interface is not available here.'));
         assert.ok(blockedMarketsHtml.includes('Manage existing positions (/loans)'));
 
-        for (const exitRoute of ['/loans', '/loans/', '/loans/1', '/loans/1/', '/loan/1', '/loan/1/', '/borrow', '/borrow/', '/lend', '/lend/', '/wallet', '/wallet/']) {
+        for (const exitRoute of ['/loans', '/loans/', '/loans/1', '/loans/1/', '/loan/1', '/loan/1/', '/positions', '/positions/', '/borrow', '/borrow/', '/lend', '/lend/', '/wallet', '/wallet/']) {
           assert.equal(isSafetyOrExitRoute(exitRoute), true, `${exitRoute} must match isSafetyOrExitRoute`);
           const exitHtml = renderToStaticMarkup(
             createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: [exitRoute] }, createElement(Frame)))
@@ -8215,7 +8217,206 @@ async function runTests(): Promise<void> {
 
       console.log('PASS WS3.7 Piece 2 + Low 1 + Infos (1)-(5): Markets.jsx live AssetRegistry/OracleRouter integration & hardened snapshot semantics verified.');
 
-      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 + WS3.6 + WS3.7 PIECE 1-2 (WITH LOW 1 & INFOS) FORK TESTS PASSED.');
+      // ---------------------------------------------------------------------
+      // 3.18 b68087c Review Low 1 & Infos (1)-(5) + Positions.jsx Live Claim & Enumeration
+      // ---------------------------------------------------------------------
+      console.log('\n=== b68087c Fixes (Low 1 + Infos 1-5) & Positions.jsx (Live PositionNFT + LoanCore.claim) ===');
+
+      // Low 1: LoanCore.paused() failure yields paused=null and evaluateAssetOriginationStatus blocks as unknown
+      const pausedFailClient = {
+        ...publicClient,
+        getBlock: (args: any) => publicClient.getBlock(args),
+        getLogs: (args: any) => publicClient.getLogs(args),
+        readContract: async (args: any) => {
+          if (args.functionName === 'paused') throw new Error('Simulated paused() RPC failure');
+          return publicClient.readContract(args);
+        },
+      };
+      const pausedFailSnap = await fetchLiveProtocolContractState({
+        cfg,
+        publicClient: pausedFailClient,
+        includeLogDiscovery: false,
+      });
+      assert.equal(pausedFailSnap.ok, true);
+      assert.equal(pausedFailSnap.protocol.paused, null);
+      const pausedUnknownNvda = pausedFailSnap.assets.find((a) => a.token.toLowerCase() === nvdac.toLowerCase())!;
+      const pausedUnknownStatus = evaluateAssetOriginationStatus(pausedUnknownNvda, pausedFailSnap.protocol);
+      assert.equal(pausedUnknownStatus.canOriginate, false);
+      assert.match(pausedUnknownStatus.message, /pause status unknown/i);
+
+      // Info 2: deployBlock above head + getLogs error both fall back and populate discoveryWarning
+      const latestForkBlk = await publicClient.getBlockNumber();
+      const aboveHeadSnap = await fetchLiveProtocolContractState({
+        cfg: { ...cfg, deployBlock: (latestForkBlk + 500n).toString() },
+      });
+      assert.equal(aboveHeadSnap.ok, true);
+      assert.match(aboveHeadSnap.discoveryWarning, /exceeds chain head/i);
+      assert.ok(aboveHeadSnap.assets.some((a) => a.token.toLowerCase() === nvdac.toLowerCase()));
+
+      const getLogsErrorClient = {
+        ...publicClient,
+        getBlock: (args: any) => publicClient.getBlock(args),
+        readContract: (args: any) => publicClient.readContract(args),
+        getLogs: async () => {
+          throw new Error('Simulated getLogs limit failure');
+        },
+      };
+      const logErrSnap = await fetchLiveProtocolContractState({
+        cfg: { ...cfg, deployBlock: startBlock.toString() },
+        publicClient: getLogsErrorClient,
+      });
+      assert.equal(logErrSnap.ok, true);
+      assert.match(logErrSnap.discoveryWarning, /log scan failed/i);
+      assert.ok(logErrSnap.assets.some((a) => a.token.toLowerCase() === nvdac.toLowerCase()));
+
+      // Info 4: Failed ERC20.decimals() read yields null (unavailable) instead of silent 18
+      const decimalsFailClient = {
+        ...publicClient,
+        getBlock: (args: any) => publicClient.getBlock(args),
+        getLogs: (args: any) => publicClient.getLogs(args),
+        readContract: async (args: any) => {
+          if (args.functionName === 'decimals' && getAddress(args.address) === nvdac) {
+            throw new Error('Simulated decimals() revert');
+          }
+          return publicClient.readContract(args);
+        },
+      };
+      const decimalsFailSnap = await fetchLiveProtocolContractState({
+        cfg,
+        publicClient: decimalsFailClient,
+        includeLogDiscovery: false,
+      });
+      const decimalsFailNvda = decimalsFailSnap.assets.find((a) => a.token.toLowerCase() === nvdac.toLowerCase())!;
+      assert.equal(decimalsFailNvda.decimals, null);
+      assert.equal(decimalsFailNvda.escrow_balance, null);
+      assert.equal(decimalsFailNvda.oracle.gross_unit_value_usdc, null);
+      assert.equal(evaluateAssetOriginationStatus(decimalsFailNvda, decimalsFailSnap.protocol).canOriginate, false);
+
+      // Info 5: Frozen asset on-chain price & unit value display 'n/a' instead of '$0.00'
+      try {
+        await publicClient.waitForTransactionReceipt({
+          hash: await rawWalletClient.sendTransaction({
+            account: deployed.nostokTimelock,
+            to: deployed.assetRegistry,
+            data: encodeFunctionData({
+              abi: parseAbi(['function setAssetStatus(address token, uint8 newStatus)']),
+              functionName: 'setAssetStatus',
+              args: [nvdac, 3],
+            }),
+          }),
+        });
+        const frozenSnap = await fetchLiveProtocolContractState({ cfg, includeLogDiscovery: false });
+        const frozenNvda = frozenSnap.assets.find((a) => a.token.toLowerCase() === nvdac.toLowerCase())!;
+        assert.equal(frozenNvda.oracle.state_name, 'FROZEN_CORPORATE_ACTION');
+        assert.equal(formatAssetOraclePrice(frozenNvda.oracle), 'n/a');
+        assert.equal(formatOracleUnitValue(frozenNvda.oracle.effective_unit_value_usdc, frozenNvda.oracle), 'n/a');
+      } finally {
+        await publicClient.waitForTransactionReceipt({
+          hash: await rawWalletClient.sendTransaction({
+            account: deployed.nostokTimelock,
+            to: deployed.assetRegistry,
+            data: encodeFunctionData({
+              abi: parseAbi(['function setAssetStatus(address token, uint8 newStatus)']),
+              functionName: 'setAssetStatus',
+              args: [nvdac, 0],
+            }),
+          }),
+        });
+      }
+
+      // Info 1: Markets.jsx ties BOTH card Quote button & Simulate live quote button to evaluateAssetOriginationStatus
+      assert.ok(marketsPageSrc.includes('disabled={!itemOrigination.canOriginate}'));
+      assert.ok(marketsPageSrc.includes('disabled={quoteLoading || !selectedOriginationStatus.canOriginate}'));
+
+      // Live Positions.jsx enumeration (both api/ healthy and api/ down) + ungated LoanCore.claim(to)
+      const borrowerPositionsSnap = await fetchWalletPositionsAndClaimable({
+        address: ADDRESSES.borrower,
+        cfg,
+      });
+      assert.equal(borrowerPositionsSnap.rpcError, '');
+      assert.ok(borrowerPositionsSnap.nftBalanceCount! >= 1, 'Borrower holds fresh PositionNFT from low1OfferFillRes');
+      assert.ok(
+        borrowerPositionsSnap.positions.some((p) => p.loanId === String(low1OfferFillRes.loanId) && p.onchainVerified),
+        'Live Positions must enumerate newly minted PositionNFT verified on-chain'
+      );
+
+      // Direct Base RPC enumeration fallback while api/ is unreachable
+      const borrowerOutagePositions = await fetchWalletPositionsAndClaimable({
+        address: ADDRESSES.borrower,
+        cfg: deadApiCfg,
+      });
+      assert.ok(borrowerOutagePositions.apiError.length > 0);
+      assert.ok(
+        borrowerOutagePositions.positions.some((p) => p.loanId === String(low1OfferFillRes.loanId)),
+        'Positions must still enumerate held PositionNFTs on Base RPC during api/ outage'
+      );
+
+      // Lender claims accumulated repaid principal + interest via LoanCore.claim() WHILE revoked & API down
+      const lenderPreClaim = await fetchWalletPositionsAndClaimable({
+        address: ADDRESSES.lender,
+        cfg: deadApiCfg,
+      });
+      assert.ok(BigInt(lenderPreClaim.claimableRaw ?? '0') > 0n, 'Lender must have accumulated claimable USDC on LoanCore');
+      const expectedClaimRaw = BigInt(lenderPreClaim.claimableRaw!);
+      const recipientUsdcBefore = BigInt(
+        await publicClient.readContract({
+          address: BASE_USDC,
+          abi: erc20Abi,
+          functionName: 'balanceOf',
+          args: [ADDRESSES.outsider],
+        })
+      );
+
+      await publicClient.waitForTransactionReceipt({
+        hash: await ownerClient.writeContract({
+          address: deployed.eligibilityGate,
+          abi: parseAbi(['function revokeUser(address account, bool revoked)']),
+          functionName: 'revokeUser',
+          args: [ADDRESSES.lender, true],
+        }),
+      });
+      try {
+        walletProvider.setAccount(KEYS.lender);
+        const claimRes = await executeLoanClaim({
+          address: ADDRESSES.lender,
+          recipient: ADDRESSES.outsider,
+          provider: walletProvider,
+          cfg: deadApiCfg,
+        });
+        assert.ok(claimRes.txHash);
+        assert.equal(claimRes.claimedAmountRaw, expectedClaimRaw.toString());
+        assert.equal(claimRes.remainingClaimableRaw, '0');
+        assert.equal(
+          BigInt(claimRes.recipientUsdcBalanceRaw),
+          recipientUsdcBefore + expectedClaimRaw,
+          'Claimed USDC must transfer directly from LoanCore to recipient even when revoked & API dead'
+        );
+      } finally {
+        await publicClient.waitForTransactionReceipt({
+          hash: await ownerClient.writeContract({
+            address: deployed.eligibilityGate,
+            abi: parseAbi(['function revokeUser(address account, bool revoked)']),
+            functionName: 'revokeUser',
+            args: [ADDRESSES.lender, false],
+          }),
+        });
+      }
+
+      // Positions.jsx SSR render & ungated source check (no PreviewBanner, no ensureDeclarationVerifiedForTx)
+      const positionsPageHtml = renderToStaticMarkup(
+        createElement(StoreProvider, null, createElement(MemoryRouter, { initialEntries: ['/positions'] }, createElement(Shell, null, createElement(Positions))))
+      );
+      assert.ok(!positionsPageHtml.includes('Preview data, not your positions.'));
+      assert.ok(positionsPageHtml.includes('LoanCore pull-payment USDC claims (claim)'));
+      assert.ok(positionsPageHtml.includes('Held PositionNFTs'));
+      assert.ok(positionsPageHtml.includes('Secondary Position Market status'));
+      const positionsSrc = fs.readFileSync(path.join(REPO_ROOT, 'src', 'pages', 'Positions.jsx'), 'utf8');
+      assert.ok(!positionsSrc.includes('ensureDeclarationVerifiedForTx'), 'Positions.jsx claim flow must never gate behind Reg S declaration');
+      assert.ok(positionsSrc.includes('executeLoanClaim'));
+
+      console.log('PASS WS3.7 Review Fixes + Live Positions.jsx (PositionNFT Enumeration & Ungated LoanCore.claim) verified.');
+
+      console.log('\nALL WS3.1 + WS3.2 + PRE-WS3.3 + WS3.3 + PRE-WS3.4 + WS3.4 PIECE 1-4 + WS3.5 PIECE 1-2 + WS3.6 + WS3.7 + POSITIONS (M3.1 COMPLETE) FORK TESTS PASSED.');
     } finally {
       await new Promise<void>((r) => notifServer.close(() => r()));
       await new Promise<void>((r) => apiServer.close(() => r()));

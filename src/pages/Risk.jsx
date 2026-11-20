@@ -10,6 +10,7 @@ import {
   formatApiAmount,
   formatAssetOraclePrice,
   formatBpsPercent,
+  formatOracleUnitValue,
 } from '../lib/marketsApi.js';
 import { shortAddress } from '../lib/web3.js';
 import { useStore } from '../store.jsx';
@@ -85,6 +86,12 @@ export function Risk() {
         </p>
       ) : null}
 
+      {onChain?.discoveryWarning ? (
+        <p className="hint block" role="status">
+          Asset discovery notice: {onChain.discoveryWarning}
+        </p>
+      ) : null}
+
       {market && (market.stale || market.degraded || market.error) ? (
         <p className={onChain?.ok && assets.length > 0 ? 'hint block' : 'err block'} role="alert">
           {onChain?.ok && assets.length > 0
@@ -148,16 +155,16 @@ export function Risk() {
                   </strong>
                   {isUnavailable ? (
                     <span className="quiet">
-                      {asset.token} · Live Base contract read unavailable ({asset.error || 'RPC error'}) — state not shown as valid.
+                      {asset.token} ({asset.decimals ?? 'unavailable'} dec) · Live Base contract read unavailable ({asset.error || 'RPC error'}) — state not shown as valid.
                     </span>
                   ) : isApiOnly ? (
                     <span className="quiet">
-                      {asset.token} · api/ entry is not verified on-chain (Base AssetRegistry/OracleRouter did not confirm this asset).
+                      {asset.token} ({asset.decimals ?? 'unavailable'} dec) · api/ entry is not verified on-chain (Base AssetRegistry/OracleRouter did not confirm this asset).
                     </span>
                   ) : (
                     <>
                       <span className="quiet">
-                        {asset.token} · {asset.tier_name ?? `Tier ${asset.tier ?? '—'}`} · Oracle{' '}
+                        {asset.token} ({asset.decimals ?? 'unavailable'} dec) · {asset.tier_name ?? `Tier ${asset.tier ?? '—'}`} · Oracle{' '}
                         {asset.oracle?.state_name ?? 'unavailable'} · Recorded mult{' '}
                         {asset.multiplier?.recorded?.formatted ?? 'unavailable'}
                         {asset.multiplier?.ui
@@ -198,14 +205,9 @@ export function Risk() {
                       {asset.oracle ? (
                         <span className="quiet">
                           1 {asset.symbol || 'token'} value: gross{' '}
-                          {asset.oracle.gross_unit_value_usdc
-                            ? formatApiAmount(asset.oracle.gross_unit_value_usdc, { prefixUsd: true })
-                            : 'unavailable'}{' '}
-                          / effective{' '}
-                          {asset.oracle.effective_unit_value_usdc
-                            ? formatApiAmount(asset.oracle.effective_unit_value_usdc, { prefixUsd: true })
-                            : 'unavailable'}{' '}
-                          · Feed age {asset.oracle.feed_age_seconds ?? 'unavailable'}s / open max{' '}
+                          {formatOracleUnitValue(asset.oracle.gross_unit_value_usdc, asset.oracle)} / effective{' '}
+                          {formatOracleUnitValue(asset.oracle.effective_unit_value_usdc, asset.oracle)} · Feed age{' '}
+                          {asset.oracle.feed_age_seconds ?? 'unavailable'}s / open max{' '}
                           {asset.oracle.max_stale_open_secs ?? 'unavailable'}s
                         </span>
                       ) : null}

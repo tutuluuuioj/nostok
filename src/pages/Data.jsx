@@ -72,6 +72,12 @@ export function Data() {
         </p>
       ) : null}
 
+      {onChain?.discoveryWarning ? (
+        <p className="hint block" role="status">
+          Asset discovery notice: {onChain.discoveryWarning}
+        </p>
+      ) : null}
+
       {data && (data.stale || data.degraded || data.error) ? (
         <p className={onChain?.ok ? 'hint block' : 'err block'} role="alert">
           {onChain?.ok

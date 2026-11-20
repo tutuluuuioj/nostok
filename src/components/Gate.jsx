@@ -62,11 +62,14 @@ function ManageExistingPositionsPanel() {
   return (
     <section className="note block" aria-label="Manage existing positions">
       <p className="hint">
-        <strong>Manage existing positions &amp; cancel open orders:</strong> Repay, partial-repay, collateral top-up, cancelling signed orders, bumping maker nonce, and reducing allowances never require a Regulation S declaration and remain available regardless of IP region, gate revocation, or compliance API downtime.
+        <strong>Manage existing positions, claim USDC &amp; cancel open orders:</strong> Repay, partial-repay, collateral top-up, claiming settled USDC, cancelling signed orders, bumping maker nonce, and reducing allowances never require a Regulation S declaration and remain available regardless of IP region, gate revocation, or compliance API downtime.
       </p>
       <div className="actions" style={{ marginTop: 10 }}>
         <SafeRouteLink className="btn secondary" to="/loans">
           Manage existing positions (/loans)
+        </SafeRouteLink>
+        <SafeRouteLink className="btn secondary" to="/positions">
+          Claimable USDC &amp; PositionNFTs (/positions)
         </SafeRouteLink>
         <SafeRouteLink className="btn secondary" to="/borrow">
           Cancel BorrowOrders (/borrow)

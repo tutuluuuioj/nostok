@@ -9,6 +9,7 @@ import {
   formatApiAmount,
   formatAssetOraclePrice,
   formatBpsPercent,
+  formatOracleUnitValue,
   parseDecimalToRaw,
   parsePercentToBps,
 } from '../lib/marketsApi.js';
@@ -180,20 +181,20 @@ export function Markets() {
     setQuoteError('');
     setQuoteResult(null);
 
-    if (!selectedAssetObj) {
-      setQuoteError('No registered assets available to quote.');
+    if (!selectedOriginationStatus.canOriginate) {
+      setQuoteError(selectedOriginationStatus.message);
       return;
     }
-    if (selectedAssetObj.unavailable || selectedAssetObj.source === 'api_only') {
-      setQuoteError(
-        selectedAssetObj.unavailable
-          ? 'Selected asset contract read is unavailable on Base RPC.'
-          : 'Selected asset is not verified on-chain in AssetRegistry.'
-      );
+    if (
+      selectedAssetObj.decimals === null ||
+      selectedAssetObj.decimals === undefined ||
+      !Number.isInteger(Number(selectedAssetObj.decimals))
+    ) {
+      setQuoteError('Collateral token decimals unavailable from on-chain RPC.');
       return;
     }
 
-    const tokenDecimals = Number(selectedAssetObj.decimals ?? 18);
+    const tokenDecimals = Number(selectedAssetObj.decimals);
     const principalRaw = quotePrincipal.trim()
       ? parseDecimalToRaw(quotePrincipal, USDC_DECIMALS)
       : null;
@@ -280,7 +281,11 @@ export function Markets() {
           <span className="hint">
             {onChain?.ok
               ? `Base RPC #${onChain.blockNumber} · ${
-                  onChain.protocol?.paused ? 'LoanCore PAUSED (blocks new loans only)' : 'LoanCore active'
+                  onChain.protocol?.paused === null || onChain.protocol?.paused === undefined
+                    ? 'LoanCore status unavailable'
+                    : onChain.protocol.paused
+                      ? 'LoanCore PAUSED (blocks new loans only)'
+                      : 'LoanCore active'
                 } · ${
                   onChain.protocol?.marketOpen === null || onChain.protocol?.marketOpen === undefined
                     ? 'Market unavailable'
@@ -304,6 +309,12 @@ export function Markets() {
       {onChain && !onChain.ok ? (
         <p className="err block" role="alert">
           Direct Base RPC contract read unavailable — {onChain.error}
+        </p>
+      ) : null}
+
+      {onChain?.discoveryWarning ? (
+        <p className="hint block" role="status">
+          Asset discovery notice: {onChain.discoveryWarning}
         </p>
       ) : null}
 
@@ -353,6 +364,7 @@ export function Markets() {
           assets.map((item) => {
             const isApiOnly = item.source === 'api_only';
             const isUnavailable = Boolean(item.unavailable);
+            const itemOrigination = evaluateAssetOriginationStatus(item, onChain?.protocol ?? null);
             return (
               <article className="order-row" key={item.token}>
                 <div>
@@ -361,16 +373,16 @@ export function Markets() {
                   </strong>
                   {isUnavailable ? (
                     <span className="quiet">
-                      {item.token} · Live Base contract read unavailable ({item.error || 'RPC error'}) — state not shown as valid.
+                      {item.token} ({item.decimals ?? 'unavailable'} dec) · Live Base contract read unavailable ({item.error || 'RPC error'}) — state not shown as valid.
                     </span>
                   ) : isApiOnly ? (
                     <span className="quiet">
-                      {item.token} · api/ entry is not verified on-chain (Base AssetRegistry/OracleRouter did not confirm this asset).
+                      {item.token} ({item.decimals ?? 'unavailable'} dec) · api/ entry is not verified on-chain (Base AssetRegistry/OracleRouter did not confirm this asset).
                     </span>
                   ) : (
                     <>
                       <span className="quiet">
-                        {item.token} ({item.decimals ?? '—'} dec) · {item.tier_name ?? `Tier ${item.tier ?? '—'}`} · Oracle{' '}
+                        {item.token} ({item.decimals ?? 'unavailable'} dec) · {item.tier_name ?? `Tier ${item.tier ?? '—'}`} · Oracle{' '}
                         {item.oracle?.state_name ?? 'unavailable'}
                         {item.multiplier?.ui
                           ? ` · uiMult drift ${
@@ -392,14 +404,9 @@ export function Markets() {
                       {item.oracle ? (
                         <span className="quiet">
                           1 {item.symbol || 'token'} value: gross{' '}
-                          {item.oracle.gross_unit_value_usdc
-                            ? formatApiAmount(item.oracle.gross_unit_value_usdc, { prefixUsd: true })
-                            : 'unavailable'}{' '}
-                          / effective{' '}
-                          {item.oracle.effective_unit_value_usdc
-                            ? formatApiAmount(item.oracle.effective_unit_value_usdc, { prefixUsd: true })
-                            : 'unavailable'}{' '}
-                          · Feed age {item.oracle.feed_age_seconds ?? 'unavailable'}s / open max{' '}
+                          {formatOracleUnitValue(item.oracle.gross_unit_value_usdc, item.oracle)} / effective{' '}
+                          {formatOracleUnitValue(item.oracle.effective_unit_value_usdc, item.oracle)} · Feed age{' '}
+                          {item.oracle.feed_age_seconds ?? 'unavailable'}s / open max{' '}
                           {item.oracle.max_stale_open_secs ?? 'unavailable'}s
                         </span>
                       ) : null}
@@ -414,7 +421,7 @@ export function Markets() {
                     <button
                       className="btn secondary"
                       type="button"
-                      disabled={isUnavailable || isApiOnly}
+                      disabled={!itemOrigination.canOriginate}
                       onClick={() => {
                         quoteSeqRef.current += 1;
                         setQuoteLoading(false);
@@ -613,7 +620,13 @@ export function Markets() {
 
             <Field
               id="quote-collateral"
-              label={`Collateral amount (${selectedAssetObj?.symbol ?? 'tokens'}, up to ${selectedAssetObj?.decimals ?? 18} decimals)`}
+              label={`Collateral amount (${selectedAssetObj?.symbol ?? 'tokens'}, ${
+                selectedAssetObj?.decimals !== null &&
+                selectedAssetObj?.decimals !== undefined &&
+                Number.isInteger(Number(selectedAssetObj.decimals))
+                  ? `up to ${selectedAssetObj.decimals} decimals`
+                  : 'decimals unavailable'
+              })`}
               hint="Optional when Principal is provided — /quote computes exact required collateral."
             >
               {(props) => (
@@ -675,12 +688,7 @@ export function Markets() {
               <button
                 className="btn"
                 type="submit"
-                disabled={
-                  quoteLoading ||
-                  assets.length === 0 ||
-                  Boolean(selectedAssetObj?.unavailable) ||
-                  selectedAssetObj?.source === 'api_only'
-                }
+                disabled={quoteLoading || !selectedOriginationStatus.canOriginate}
               >
                 {quoteLoading ? 'Calculating quote…' : 'Simulate live quote'}
               </button>
