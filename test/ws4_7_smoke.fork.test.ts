@@ -299,9 +299,13 @@ function testPurePreflightValidators() {
       symbol: 'NVDAc',
       tokenName: 'MockB20Token',
       tokenAddress: '0x4444444444444444444444444444444444444444',
+      tokenDecimals: 8,
+      feedDecimalsOnChain: 8,
       feedDescription: 'MockAggregator',
       supported: true,
       config: {
+        feed: '0x5555555555555555555555555555555555555555',
+        feedDecimals: 8,
         status: 0,
         perLoanCap: 1_000_000_000n,
         assetCap: 5_000_000_000n,
@@ -326,9 +330,13 @@ function testPurePreflightValidators() {
       symbol: 'NVDAc',
       tokenName: 'NVIDIA Tokenized',
       tokenAddress: '0x4444444444444444444444444444444444444444',
+      tokenDecimals: 8,
+      feedDecimalsOnChain: 8,
       feedDescription: 'NVDA / USD',
       supported: true,
       config: {
+        feed: '0x5555555555555555555555555555555555555555',
+        feedDecimals: 8,
         status: 1, // ReduceOnly
         perLoanCap: 1_000_000_000n,
         assetCap: 5_000_000_000n,
@@ -347,15 +355,18 @@ function testPurePreflightValidators() {
   assert.equal(reduceOnlyRejection.ok, false);
   assert.ok(reduceOnlyRejection.errors.some((e) => /ReduceOnly/.test(e)));
 
-  // Low 1 (510140d): sanitizeRpcErrorMessage scrubs RPC URL API keys / paths / query tokens before logging
-  const leakedErr = {
-    message:
-      'HTTP request failed for https://base-mainnet.g.alchemy.com/v2/TOP_SECRET_API_KEY?auth=secret123',
-  };
-  const cleanErr = sanitizeRpcErrorMessage(leakedErr);
-  assert.ok(!cleanErr.includes('TOP_SECRET_API_KEY'));
-  assert.ok(!cleanErr.includes('secret123'));
-  assert.ok(cleanErr.includes('https://base-mainnet.g.alchemy.com/[redacted]'));
+  // Low 1 (510140d) + hardened redaction: strip hostname secrets, IPv6 URLs, JSON-escaped & URL-encoded URLs
+  for (const leaked of [
+    'HTTP request failed for https://base-mainnet.g.alchemy.com/v2/TOP_SECRET_API_KEY?auth=secret123',
+    'RPC error at https://SECRET_HOST_TOKEN.quiknode.pro/path_secret/v1',
+    'Connect failed http://[::1]:8545/v2/IPV6_SECRET',
+    '{"url":"https:\\/\\/base-mainnet.g.alchemy.com\\/v2\\/JSON_ESC_SECRET"}',
+    'proxy=https%3A%2F%2Fbase-mainnet.g.alchemy.com%2Fv2%2FURL_ENC_SECRET',
+  ]) {
+    const cleanErr = sanitizeRpcErrorMessage({ message: leaked });
+    assert.ok(!/SECRET|secret123/.test(cleanErr), `Secret leaked in sanitized output: ${cleanErr}`);
+    assert.ok(cleanErr.includes('[REDACTED_URL]'), `URL not redacted in output: ${cleanErr}`);
+  }
 
   const cliSecretRes = spawnSync(
     'node',
@@ -368,13 +379,14 @@ function testPurePreflightValidators() {
     'CLI error output must redact RPC URL API key on RPC failure'
   );
 
-  // Info 1 (510140d): production check pins exact Base Mainnet NVDAc/METAc token & Chainlink feed addresses
+  // Info 1 (510140d) + Low 1 (38616f5): pin Base Mainnet NVDAc/METAc token + feed addresses and fail on wrong/missing decimals
   const spoofedPinRejection = validateSmokeAssetConfig(
     {
       symbol: 'NVDAc',
       tokenName: 'NVIDIA Corporation',
       tokenAddress: '0x4444444444444444444444444444444444444444',
       tokenDecimals: 8,
+      feedDecimalsOnChain: 8,
       feedDescription: 'Coinbase NVDA',
       supported: true,
       config: {
@@ -398,12 +410,76 @@ function testPurePreflightValidators() {
   assert.equal(spoofedPinRejection.ok, false);
   assert.ok(spoofedPinRejection.errors.some((e) => /does not match pinned Base NVDAc/i.test(e)));
 
+  // Wrong AssetRegistry.feedDecimals (6 instead of pinned 8 = 100x valuation distortion) must fail
+  const wrongFeedDecRejection = validateSmokeAssetConfig(
+    {
+      symbol: 'NVDAc',
+      tokenName: 'NVIDIA Corporation',
+      tokenAddress: BASE_MAINNET_SMOKE_ASSETS.NVDAc.token,
+      tokenDecimals: 8,
+      feedDecimalsOnChain: 8,
+      feedDescription: 'Coinbase NVDA',
+      supported: true,
+      config: {
+        feed: BASE_MAINNET_SMOKE_ASSETS.NVDAc.feed,
+        feedDecimals: 6,
+        status: 0,
+        perLoanCap: 1_000_000_000n,
+        assetCap: 5_000_000_000n,
+        maxStaleOpenSecs: 21_600,
+        maxInitLtvBps: 6000,
+        marginCallLtvBps: 7000,
+        liqLtvBps: 7800,
+        badDebtLtvBps: 9000,
+      },
+      recordedMultiplier: 1_000537939576369481n,
+      oraclePrice: 140_00000000n,
+      oracleState: 0,
+    },
+    { disallowMocks: true }
+  );
+  assert.equal(wrongFeedDecRejection.ok, false);
+  assert.ok(wrongFeedDecRejection.errors.some((e) => /feedDecimals/i.test(e)));
+
+  // Failed token/feed decimals read (null) must fail instead of skipping
+  const failedDecimalsReadRejection = validateSmokeAssetConfig(
+    {
+      symbol: 'NVDAc',
+      tokenName: 'NVIDIA Corporation',
+      tokenAddress: BASE_MAINNET_SMOKE_ASSETS.NVDAc.token,
+      tokenDecimals: null,
+      feedDecimalsOnChain: null,
+      feedDescription: 'Coinbase NVDA',
+      supported: true,
+      config: {
+        feed: BASE_MAINNET_SMOKE_ASSETS.NVDAc.feed,
+        feedDecimals: 8,
+        status: 0,
+        perLoanCap: 1_000_000_000n,
+        assetCap: 5_000_000_000n,
+        maxStaleOpenSecs: 21_600,
+        maxInitLtvBps: 6000,
+        marginCallLtvBps: 7000,
+        liqLtvBps: 7800,
+        badDebtLtvBps: 9000,
+      },
+      recordedMultiplier: 1_000537939576369481n,
+      oraclePrice: 140_00000000n,
+      oracleState: 0,
+    },
+    { disallowMocks: false }
+  );
+  assert.equal(failedDecimalsReadRejection.ok, false);
+  assert.ok(failedDecimalsReadRejection.errors.some((e) => /ERC20\.decimals\(\) read failed/i.test(e)));
+  assert.ok(failedDecimalsReadRejection.errors.some((e) => /Aggregator\.decimals\(\) read failed/i.test(e)));
+
   const pinnedAccepted = validateSmokeAssetConfig(
     {
       symbol: 'NVDAc',
       tokenName: 'NVIDIA Corporation',
       tokenAddress: BASE_MAINNET_SMOKE_ASSETS.NVDAc.token,
       tokenDecimals: 8,
+      feedDecimalsOnChain: 8,
       feedDescription: 'Coinbase NVDA',
       supported: true,
       config: {
@@ -426,7 +502,7 @@ function testPurePreflightValidators() {
   );
   assert.equal(pinnedAccepted.ok, true);
 
-  // Info 2 (510140d): remote RPC refuses --allow-mocks / --allow-1of1-safe unless explicit --allow-remote-fork
+  // Info 2 (510140d): remote RPC refuses --allow-mocks / --allow-1of1-safe without --allow-remote-fork AND refuses non-fork node even with --allow-remote-fork
   const remoteRelaxRes = spawnSync(
     'node',
     ['scripts/ws4_7_smoke_lib.mjs', '--rpc-url', 'https://mainnet.base.org', '--allow-mocks'],
@@ -435,7 +511,15 @@ function testPurePreflightValidators() {
   assert.notEqual(remoteRelaxRes.status, 0);
   assert.match(remoteRelaxRes.stderr, /Refusing --allow-mocks/i);
 
-  console.log('PASS Pure WS4.7 preflight validators (EIP-7702 detection, 250k default cap trap, anti-mock + pinned Base asset checks, RPC URL redaction).');
+  const remoteNonForkRes = spawnSync(
+    'node',
+    ['scripts/ws4_7_smoke_lib.mjs', '--rpc-url', 'https://mainnet.base.org', '--allow-mocks', '--allow-remote-fork'],
+    { cwd: REPO_ROOT, encoding: 'utf8' }
+  );
+  assert.notEqual(remoteNonForkRes.status, 0);
+  assert.match(remoteNonForkRes.stderr, /Anvil\/Hardhat\/Foundry fork/i);
+
+  console.log('PASS Pure WS4.7 preflight validators (EIP-7702, 250k cap trap, decimals/pinning checks, fork probe, hardened URL redaction).');
 }
 
 async function deployCanonicalSafeProxy(
@@ -951,6 +1035,10 @@ async function runTests(): Promise<void> {
     });
     assert.equal(prodMockPreflight.ok, false);
     assert.ok(prodMockPreflight.failures.some((f) => f.id === 'asset.NVDAc' && /mock/i.test(f.detail)));
+    assert.ok(
+      prodMockPreflight.failures.some((f) => f.id === 'assets.pinned_set' && /METAc/i.test(f.detail)),
+      'Production WS4.7 preflight must require both pinned NVDAc and METAc'
+    );
 
     // Fund borrower (NVDAc & METAc + USDC for interest/repay) and lender/liquidator (USDC)
     await rpcCall('anvil_impersonateAccount', [BASE_USDC_WHALE]);

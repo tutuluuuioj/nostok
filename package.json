@@ -9,7 +9,8 @@
     "test": "node src/lib/money.test.js && node src/lib/book.test.js && node src/lib/contrast.test.js",
     "test:fork": "tsx test/ws3_1.fork.test.ts",
     "test:smoke": "tsx test/ws4_7_smoke.fork.test.ts",
-    "test:wargames": "tsx test/ws4_6_wargames.fork.test.ts"
+    "test:wargames": "tsx test/ws4_6_wargames.fork.test.ts",
+    "test:wargames:fullstack": "tsx test/m3_3_fullstack_wargames.fork.test.ts"
   },
   "dependencies": {
     "react": "^18.3.1",

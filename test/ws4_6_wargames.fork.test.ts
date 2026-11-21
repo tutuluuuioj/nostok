@@ -29,6 +29,7 @@ import {
   ORDER_SETTLEMENT_DOMAIN_NAME,
   ORDER_SETTLEMENT_DOMAIN_VERSION,
   OracleState,
+  PROTOCOL_ERROR_ABI,
   assetRegistryAbi,
   collateralEscrowAbi,
   eligibilityGateAbi,
@@ -758,7 +759,6 @@ async function runTests(): Promise<void> {
         yieldMode: 0,
         allowInKindSettlement: false,
       };
-      // Increment nonce via bump or reuse unique salt? Note fillBorrowOrder doesn't bump makerNonce; expiry+nonce tuple is hashed cleanly if unique collateral/nonce, or bumpNonce on settlement!
       const sig = await privateKeyToAccount(KEYS.borrower).signTypedData({
         domain: settlementDomain,
         types: BORROW_ORDER_EIP712_TYPES,
@@ -786,7 +786,7 @@ async function runTests(): Promise<void> {
       await publicClient.waitForTransactionReceipt({
         hash: await lenderClient.writeContract({
           address: deployed.orderSettlement,
-          abi: orderSettlementAbi,
+          abi: [...orderSettlementAbi, ...PROTOCOL_ERROR_ABI],
           functionName: 'fillBorrowOrderWithAttestations',
           args: [order, sig, principalRaw, bAtt, lAtt],
         }),
@@ -959,16 +959,25 @@ async function runTests(): Promise<void> {
     assert.equal(satOrigStatus.severity, 'hint');
     assert.match(satOrigStatus.message, /VALID_CLOSED.*closed-market haircut/i);
 
-    // Sniping weekend gap liquidation must REVERT cleanly
+    const startLiquidationAbi = [
+      ...PROTOCOL_ERROR_ABI,
+      { type: 'function', name: 'startLiquidation', stateMutability: 'nonpayable', inputs: [{ name: 'loanId', type: 'uint256' }], outputs: [{ name: 'auctionId', type: 'uint256' }] },
+    ] as const;
+    const syncMultiplierFullAbi = [
+      ...PROTOCOL_ERROR_ABI,
+      { type: 'function', name: 'syncMultiplier', stateMutability: 'nonpayable', inputs: [{ name: 'token', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
+    ] as const;
+
+    // Sniping weekend gap liquidation must REVERT cleanly with OracleInvalidForAction
     await assert.rejects(
       () =>
         keeperClient.writeContract({
           address: deployed.loanCore,
-          abi: parseAbi(['function startLiquidation(uint256)']),
+          abi: startLiquidationAbi,
           functionName: 'startLiquidation',
           args: [loanId1],
         }),
-      /OracleInvalidForAction|0x/i
+      /OracleInvalidForAction/
     );
 
     // Advance into Monday regular NYSE open BEFORE monday feed updates -> stale age > 21,600s -> STALE_FEED (blocks snipe before fresh open print)
@@ -1068,8 +1077,23 @@ async function runTests(): Promise<void> {
     assert.equal(formatAssetOraclePrice(aaplSeqDown.oracle), 'n/a');
     assert.equal(formatOracleUnitValue(aaplSeqDown.oracle_unit_value, aaplSeqDown.oracle), 'n/a');
 
-    // New loans must REVERT while sequencer down
-    await assert.rejects(() => mintBorrowLoan(aaplc, 10_00000000n, 1_000_000_000n));
+    // New loans AND startLiquidation must REVERT with OracleInvalidForAction while sequencer down (WS4.6)
+    await assert.rejects(
+      () => mintBorrowLoan(aaplc, 10_00000000n, 1_000_000_000n),
+      /OracleInvalidForAction/
+    );
+    await refreshFeeds(105_00000000n, 250_00000000n);
+    await assert.rejects(
+      () =>
+        keeperClient.writeContract({
+          address: deployed.loanCore,
+          abi: startLiquidationAbi,
+          functionName: 'startLiquidation',
+          args: [loanId1],
+        }),
+      /OracleInvalidForAction/
+    );
+    await refreshFeeds(200_00000000n, 250_00000000n);
     // Exit & defensive topUp/repay remain OPEN during sequencer outage!
     walletProvider.setAccount(KEYS.borrower);
     await executeLoanTopUp({
@@ -1155,11 +1179,11 @@ async function runTests(): Promise<void> {
       () =>
         keeperClient.writeContract({
           address: deployed.oracleRouter,
-          abi: parseAbi(['function syncMultiplier(address)']),
+          abi: syncMultiplierFullAbi,
           functionName: 'syncMultiplier',
           args: [aaplc],
         }),
-      /CorporateActionSplitPending|0x/i
+      /CorporateActionSplitPending/
     );
     const liveSplitFreeze = await fetchLiveProtocolContractState({ cfg, tokenAddresses: [aaplc], includeLogDiscovery: false });
     const aaplFrozen = liveSplitFreeze.assets.find((a) => a.symbol === 'AAPLc')!;
@@ -1197,9 +1221,6 @@ async function runTests(): Promise<void> {
     // =========================================================================
     // Set up Loan #3 (50 AAPLc @ $200, $5,000 USDC), drop price to $105 (~95% LTV -> 100% collateral auction)
     const loanId3 = await mintBorrowLoan(aaplc, 50_00000000n, 5_000_000_000n);
-    // Wait a tiny beat and drop price with exact multiplier accounted (~$105 -> LTV <90%? Wait: mult ~= 2.001x! Keep nominal raw price scaled!).
-    // Note OracleRouter.getValue for MockB20Token divides/multiplies? Check getValue:
-    // Actually we saw price * raw * multiplier OR price only (getValue uses Chainlink price directly! Let's read getValue on-chain to target exact LTV).
     const curValAt200 = (await publicClient.readContract({
       address: deployed.oracleRouter,
       abi: oracleRouterAbi,
@@ -1266,6 +1287,7 @@ async function runTests(): Promise<void> {
 
     // Healthy VALID_OPEN emergencyCancelAuction MUST REVERT (OracleNotStaleOrFrozen)
     const emergencyCancelAbi = [
+      ...PROTOCOL_ERROR_ABI,
       ...liquidationAuctionAbi,
       { type: 'function', name: 'emergencyCancelAuction', stateMutability: 'nonpayable', inputs: [{ name: 'auctionId', type: 'uint256' }], outputs: [] },
     ] as const;
@@ -1275,7 +1297,7 @@ async function runTests(): Promise<void> {
       emergencyCancelAbi,
       'emergencyCancelAuction',
       [aucId3],
-      /OracleNotStaleOrFrozen|0x/i
+      /OracleNotStaleOrFrozen/
     );
 
     // Advance 22,000s (> maxStaleOpenSecs=21,600 and > duration=1,800s, < maxFeedAge=43,200s):
@@ -1355,7 +1377,7 @@ async function runTests(): Promise<void> {
       emergencyCancelAbi,
       'emergencyCancelAuction',
       [aucId3],
-      /UnauthorizedCaller|0x/i
+      /UnauthorizedCaller/
     );
     await sendRawChecked(
       guardianSafe,
@@ -1386,6 +1408,7 @@ async function runTests(): Promise<void> {
 
     // Guardian freezes AAPLc (status=3 Frozen); Guardian trying to loosen back to Active (0) MUST REVERT GuardianCanOnlyTighten!
     const setStatusAbi = [
+      ...PROTOCOL_ERROR_ABI,
       ...assetRegistryAbi,
       { type: 'function', name: 'setAssetStatus', stateMutability: 'nonpayable', inputs: [{ name: 'token', type: 'address' }, { name: 'status', type: 'uint8' }], outputs: [] },
     ] as const;
@@ -1402,7 +1425,7 @@ async function runTests(): Promise<void> {
       setStatusAbi,
       'setAssetStatus',
       [aaplc, 0],
-      /GuardianCanOnlyTighten|0x/i
+      /GuardianCanOnlyTighten/
     );
 
     await expectRevert(
@@ -1411,7 +1434,7 @@ async function runTests(): Promise<void> {
       emergencyCancelAbi,
       'emergencyCancelAuction',
       [aucId4],
-      /EmergencyCancelCooldownActive|0x/i
+      /EmergencyCancelCooldownActive/
     );
     await advanceForkBySeconds(3605);
     await sendRawChecked(
@@ -1422,22 +1445,122 @@ async function runTests(): Promise<void> {
       [aucId4]
     );
 
-    // 6C: Guardian pauses LoanCore (`setPaused(true)`): new loans revert ProtocolPaused, frontend blocks origination,
-    // while borrower full `repay()` on Loan #1 and Loan #3 + lender `claim()` succeed cleanly to exact zero balances!
-    await sendRawChecked(
-      guardianSafe,
-      deployed.loanCore,
-      parseAbi(['function setPaused(bool)']),
-      'setPaused',
-      [true]
+    // 6C: Guardian pauses LoanCore (`setPaused(true)`) via REAL Gnosis Safe 2-of-2 EIP-712 execTransaction signatures
+    // (no anvil_impersonateAccount). New loans revert ProtocolPaused, frontend blocks origination,
+    // while topUp(), full repay(), and lender claim() remain unblocked!
+    const safeExecAbi = parseAbi([
+      'function nonce() view returns (uint256)',
+      'function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures) payable returns (bool success)',
+    ]);
+    const safeNonce = (await publicClient.readContract({
+      address: guardianSafe,
+      abi: safeExecAbi,
+      functionName: 'nonce',
+    })) as bigint;
+    const pauseCalldata = encodeFunctionData({
+      abi: parseAbi(['function setPaused(bool)']),
+      functionName: 'setPaused',
+      args: [true],
+    });
+    const safeTypedDomain = {
+      chainId: BASE_CHAIN_ID,
+      verifyingContract: guardianSafe,
+    };
+    const safeTxTypes = {
+      SafeTx: [
+        { name: 'to', type: 'address' },
+        { name: 'value', type: 'uint256' },
+        { name: 'data', type: 'bytes' },
+        { name: 'operation', type: 'uint8' },
+        { name: 'safeTxGas', type: 'uint256' },
+        { name: 'baseGas', type: 'uint256' },
+        { name: 'gasPrice', type: 'uint256' },
+        { name: 'gasToken', type: 'address' },
+        { name: 'refundReceiver', type: 'address' },
+        { name: 'nonce', type: 'uint256' },
+      ],
+    } as const;
+    const safeTxMessage = {
+      to: deployed.loanCore,
+      value: 0n,
+      data: pauseCalldata,
+      operation: 0,
+      safeTxGas: 0n,
+      baseGas: 0n,
+      gasPrice: 0n,
+      gasToken: zeroAddress,
+      refundReceiver: zeroAddress,
+      nonce: safeNonce,
+    } as const;
+    const gSignerA = privateKeyToAccount(KEYS.guardianSignerA);
+    const gSignerB = privateKeyToAccount(KEYS.guardianSignerB);
+    const orderedSigners = [gSignerA, gSignerB].sort((a, b) =>
+      a.address.toLowerCase().localeCompare(b.address.toLowerCase())
     );
+    const packedSafeSigs = `0x${(
+      await Promise.all(
+        orderedSigners.map(async (signer) => {
+          const s = await signer.signTypedData({
+            domain: safeTypedDomain,
+            types: safeTxTypes,
+            primaryType: 'SafeTx',
+            message: safeTxMessage,
+          });
+          return s.slice(2);
+        })
+      )
+    ).join('')}` as Hex;
+
+    await rpcCall('anvil_stopImpersonatingAccount', [guardianSafe]);
+    const safePauseReceipt = await publicClient.waitForTransactionReceipt({
+      hash: await keeperClient.writeContract({
+        address: guardianSafe,
+        abi: safeExecAbi,
+        functionName: 'execTransaction',
+        args: [
+          safeTxMessage.to,
+          safeTxMessage.value,
+          safeTxMessage.data,
+          safeTxMessage.operation,
+          safeTxMessage.safeTxGas,
+          safeTxMessage.baseGas,
+          safeTxMessage.gasPrice,
+          safeTxMessage.gasToken,
+          safeTxMessage.refundReceiver,
+          packedSafeSigs,
+        ],
+      }),
+    });
+    assert.equal(safePauseReceipt.status, 'success', 'Real 2-of-2 Safe execTransaction must succeed without impersonation');
+
     const livePaused = await fetchLiveProtocolContractState({ cfg, tokenAddresses: [aaplc], includeLogDiscovery: false });
     assert.equal(livePaused.protocol?.paused, true);
     assert.equal(evaluateAssetOriginationStatus(livePaused.assets[0], livePaused.protocol).canOriginate, false);
 
-    await assert.rejects(() => mintBorrowLoan(aaplc, 10_00000000n, 1_000_000_000n));
+    await assert.rejects(
+      () => mintBorrowLoan(aaplc, 10_00000000n, 1_000_000_000n),
+      /ProtocolPaused/
+    );
 
     walletProvider.setAccount(KEYS.borrower);
+    const escrowAaplBeforePausedTopUp = BigInt(
+      await publicClient.readContract({ address: aaplc, abi: erc20Abi, functionName: 'balanceOf', args: [deployed.collateralEscrow] })
+    );
+    await executeLoanTopUp({
+      address: ADDRESSES.borrower,
+      loanId: loanId1,
+      additionalCollateralRaw: 1_00000000n,
+      existingOpenCollateralRaw: 0n,
+      autoApprove: true,
+      provider: walletProvider,
+      cfg,
+    });
+    assert.equal(
+      BigInt(await publicClient.readContract({ address: aaplc, abi: erc20Abi, functionName: 'balanceOf', args: [deployed.collateralEscrow] })) -
+        escrowAaplBeforePausedTopUp,
+      1_00000000n,
+      'topUp must succeed while LoanCore is paused'
+    );
     await executeLoanRepay({
       address: ADDRESSES.borrower,
       loanId: loanId1,

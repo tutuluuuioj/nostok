@@ -117,18 +117,21 @@ function sameAddr(a, b) {
 }
 
 /**
- * Redacts HTTP(S)/WS(S) credentials, paths (including RPC API keys), and query strings from
- * error strings before printing to terminal or CI logs.
+ * Redacts HTTP(S)/WS(S) URLs (including hostname API keys, IPv6 literals, JSON-escaped,
+ * and URL-encoded forms) plus credential parameters before printing to terminal or CI logs.
  */
 export function sanitizeRpcErrorMessage(err) {
   const raw =
     err && typeof err === 'object'
       ? String(err.shortMessage || err.message || err)
       : String(err ?? 'Unknown error');
-  return raw.replace(
-    /((?:https?|wss?):\/\/)(?:[^@\s/]+@)?([^/\s:?#]+(?::\d+)?)(?:[^\s"')\]`]*)?/gi,
-    '$1$2/[redacted]'
-  );
+  return raw
+    .replace(
+      /(?:https?|wss?)(?::|%3a)(?:\/\/|%2f%2f|\\\/\\\/)(?:[^\s"')\]`<>\\@]+@)?(?:\[[0-9a-f:%.]+\]|%5b[0-9a-f:%.]+%5d)?(?:\\\/|[^\s"')\]`<>\\])*/gi,
+      '[REDACTED_URL]'
+    )
+    .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, '$1[redacted]')
+    .replace(/([?&](?:api[_-]?key|apikey|token|key|secret|auth)=)[^&\s"')\]`]+/gi, '$1[redacted]');
 }
 
 /**
@@ -260,6 +263,7 @@ export function validateSmokeAssetConfig(
     tokenName = '',
     tokenAddress,
     tokenDecimals = null,
+    feedDecimalsOnChain = null,
     feedDescription = '',
     supported,
     config,
@@ -344,6 +348,21 @@ export function validateSmokeAssetConfig(
       errors.push(`${label}: mock price feed detected ("${feedDescription}"); WS4.7 requires real Chainlink feeds.`);
     }
   }
+  const tokDec = tokenDecimals !== null && tokenDecimals !== undefined ? Number(tokenDecimals) : NaN;
+  if (!Number.isInteger(tokDec) || tokDec <= 0) {
+    errors.push(`${label}: ERC20.decimals() read failed or invalid (${tokenDecimals}).`);
+  }
+  const feedDecRead =
+    feedDecimalsOnChain !== null && feedDecimalsOnChain !== undefined ? Number(feedDecimalsOnChain) : NaN;
+  if (!Number.isInteger(feedDecRead) || feedDecRead <= 0) {
+    errors.push(`${label}: Aggregator.decimals() read failed or invalid (${feedDecimalsOnChain}).`);
+  }
+  const cfgFeedDec = config.feedDecimals !== null && config.feedDecimals !== undefined ? Number(config.feedDecimals) : NaN;
+  if (Number.isInteger(feedDecRead) && cfgFeedDec !== feedDecRead) {
+    errors.push(
+      `${label}: AssetRegistry.feedDecimals (${config.feedDecimals}) != feed.decimals() (${feedDecimalsOnChain}); valuation would distort.`
+    );
+  }
   if (requirePinnedAssets) {
     const pinnedEntries = Object.values(pinnedAssets || {});
     const normalizedToken = normalizeOptAddress(tokenAddress);
@@ -365,9 +384,14 @@ export function validateSmokeAssetConfig(
           `${label}: feed address (${normalizedFeed}) does not match pinned Base Chainlink ${pinnedMatch.symbol} feed (${pinnedMatch.feed}).`
         );
       }
-      if (tokenDecimals !== null && tokenDecimals !== undefined && Number(tokenDecimals) !== pinnedMatch.decimals) {
+      if (tokDec !== pinnedMatch.decimals) {
         errors.push(
           `${label}: token decimals (${tokenDecimals}) != pinned ${pinnedMatch.decimals}.`
+        );
+      }
+      if (cfgFeedDec !== pinnedMatch.decimals || feedDecRead !== pinnedMatch.decimals) {
+        errors.push(
+          `${label}: AssetRegistry.feedDecimals (${config.feedDecimals}) / feed.decimals() (${feedDecimalsOnChain}) != pinned ${pinnedMatch.decimals}.`
         );
       }
     }
@@ -708,6 +732,7 @@ export async function runGuardedSmokePreflight({
   );
 
   // 7. Collateral assets, Chainlink feeds & anti-mock validation
+  const validatedAssetAddrs = new Set();
   if (!Array.isArray(assets) || assets.length === 0) {
     record('assets.configured', false, 'At least one collateral asset (e.g. NVDAc / METAc) must be supplied for preflight.');
   } else {
@@ -738,9 +763,14 @@ export async function runGuardedSmokePreflight({
           .readContract({ address: resolved.oracleRouter, abi: oracleRouterAbi, functionName: 'getPrice', args: [tokenAddr] })
           .catch(() => [0n, 8, 3]),
       ]);
-      const feedDesc = await publicClient
-        .readContract({ address: config.feed, abi: aggregatorV3Abi, functionName: 'description' })
-        .catch(() => '');
+      const [feedDesc, feedDecimalsOnChain] = await Promise.all([
+        publicClient
+          .readContract({ address: config.feed, abi: aggregatorV3Abi, functionName: 'description' })
+          .catch(() => ''),
+        publicClient
+          .readContract({ address: config.feed, abi: aggregatorV3Abi, functionName: 'decimals' })
+          .catch(() => null),
+      ]);
 
       const assetRes = validateSmokeAssetConfig(
         {
@@ -748,6 +778,7 @@ export async function runGuardedSmokePreflight({
           tokenName,
           tokenAddress: tokenAddr,
           tokenDecimals,
+          feedDecimalsOnChain,
           feedDescription: feedDesc,
           supported,
           config,
@@ -769,14 +800,29 @@ export async function runGuardedSmokePreflight({
         assetRes.ok = false;
         assetRes.errors.push(`Expected symbol ${expectedSymbol}, on-chain ERC20.symbol()="${symbol}".`);
       }
+      if (assetRes.ok) {
+        validatedAssetAddrs.add(tokenAddr.toLowerCase());
+      }
       record(
         `asset.${expectedSymbol || symbol || tokenAddr}`,
         assetRes.ok,
         assetRes.ok
-          ? `${symbol} (${tokenAddr}): feed="${feedDesc || config.feed}", price=${priceTuple[0]} (${ORACLE_STATE_NAMES[Number(priceTuple[2])] ?? priceTuple[2]}), perLoanCap=${config.perLoanCap}, assetCap=${config.assetCap}, maxStaleOpen=${config.maxStaleOpenSecs}s, mult=${recMult}`
+          ? `${symbol} (${tokenAddr}): feed="${feedDesc || config.feed}", feedDec=${feedDecimalsOnChain}, price=${priceTuple[0]} (${ORACLE_STATE_NAMES[Number(priceTuple[2])] ?? priceTuple[2]}), perLoanCap=${config.perLoanCap}, assetCap=${config.assetCap}, maxStaleOpen=${config.maxStaleOpenSecs}s, mult=${recMult}`
           : assetRes.errors.join(' ')
       );
     }
+  }
+  if (requirePinnedAssets) {
+    const missingPinned = Object.values(pinnedAssets || {}).filter(
+      (p) => !validatedAssetAddrs.has(p.token.toLowerCase())
+    );
+    record(
+      'assets.pinned_set',
+      missingPinned.length === 0,
+      missingPinned.length === 0
+        ? `Both pinned WS4.7 Base Mainnet B20 assets verified (${Object.keys(pinnedAssets || {}).join(', ')}).`
+        : `WS4.7 requires all pinned Base Mainnet assets; missing/failed: ${missingPinned.map((p) => `${p.symbol} (${p.token})`).join(', ')}.`
+    );
   }
 
   const failures = checks.filter((c) => !c.ok);
@@ -821,6 +867,32 @@ function isLoopbackRpcUrl(rpcUrl) {
   }
 }
 
+/**
+ * Confirms an RPC endpoint is genuinely a local/fork test node (Anvil/Hardhat/Foundry/REVM)
+ * before permitting relaxed flags such as `--allow-mocks` or `--allow-1of1-safe`.
+ */
+export async function verifyForkRpcNode(publicClient) {
+  try {
+    const version = await publicClient.request({ method: 'web3_clientVersion', params: [] });
+    if (typeof version === 'string' && /anvil|hardhat|foundry|revm/i.test(version)) {
+      return { isFork: true, detail: version };
+    }
+  } catch {
+    // Fall back to explicit Anvil/Hardhat RPC probe methods
+  }
+  for (const method of ['anvil_nodeInfo', 'hardhat_metadata']) {
+    try {
+      const info = await publicClient.request({ method, params: [] });
+      if (info && typeof info === 'object') {
+        return { isFork: true, detail: method };
+      }
+    } catch {
+      // Not supported by this node
+    }
+  }
+  return { isFork: false, detail: 'RPC node did not report Anvil/Hardhat/Foundry fork capabilities.' };
+}
+
 async function runCli() {
   const opts = parseCliArgs(process.argv.slice(2));
   if (opts.help) {
@@ -861,6 +933,13 @@ async function runCli() {
     transport: http(opts.rpcUrl),
     cacheTime: 0,
   });
+  if (opts.allowMocks || opts.allowSingleSignerSafe || opts.allowRemoteFork) {
+    const forkProbe = await verifyForkRpcNode(publicClient);
+    if (!forkProbe.isFork) {
+      console.error(`Refusing --allow-mocks / --allow-1of1-safe / --allow-remote-fork: ${forkProbe.detail}`);
+      process.exit(1);
+    }
+  }
   const assets = (process.env.SMOKE_ASSETS || '')
     .split(',')
     .map((entry) => entry.trim())
