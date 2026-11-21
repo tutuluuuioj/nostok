@@ -316,24 +316,35 @@ function validateDeploymentAndSmokeRunbooks(): void {
   assert.ok(assetCfgSection.length > 0, 'docs/DEPLOYMENT_RUNBOOK.md must contain AssetRegistry.setAssetConfig section');
   for (const field of assetConfigFields) {
     assert.ok(
-      assetCfgSection.includes(field),
-      `docs/DEPLOYMENT_RUNBOOK.md setAssetConfig section must document IAssetRegistry.AssetConfig field "${field}"`
+      new RegExp(`\\b${field}\\b`).test(assetCfgSection),
+      `docs/DEPLOYMENT_RUNBOOK.md setAssetConfig section must document IAssetRegistry.AssetConfig field "${field}" as a whole word`
     );
   }
   assert.ok(!assetCfgSection.includes('minInterestDays'), 'AssetConfig section must not list minInterestDays');
   assert.ok(!assetCfgSection.includes('maxStaleClosedSecs'), 'AssetConfig section must not list maxStaleClosedSecs');
 
-  // Verify every table created by indexer/src/db.ts & notifications/src/db.ts appears in DEPLOYMENT_RUNBOOK.md DB provisioning SQL
+  // Verify every table created by indexer/src/db.ts & notifications/src/db.ts appears as a whole word inside SQL blocks
+  const sqlBlocks = Array.from(deployRunbook.matchAll(/```sql\s*([\s\S]*?)```/g), (m) => m[1]);
+  assert.ok(sqlBlocks.length >= 2, `Expected separate "Run Now" and "Run After First Start" SQL blocks, got ${sqlBlocks.length}`);
+  const sqlText = sqlBlocks.join('\n');
   const indexerTables = Array.from(indexerDbTs.matchAll(/CREATE TABLE IF NOT EXISTS\s+([a-z_][a-z0-9_]*)/g), (m) => m[1]);
   const notifTables = Array.from(notifDbTs.matchAll(/CREATE TABLE IF NOT EXISTS\s+([a-z_][a-z0-9_]*)/g), (m) => m[1]);
   assert.ok(indexerTables.length >= 11, `Expected >=11 tables in indexer/src/db.ts, got ${indexerTables.length}`);
   assert.ok(notifTables.length >= 12, `Expected >=12 tables in notifications/src/db.ts, got ${notifTables.length}`);
   for (const table of indexerTables) {
-    assert.ok(deployRunbook.includes(table), `docs/DEPLOYMENT_RUNBOOK.md must list indexer table "${table}"`);
+    assert.ok(
+      new RegExp(`\\b${table}\\b`).test(sqlText),
+      `docs/DEPLOYMENT_RUNBOOK.md SQL blocks must grant/list indexer table "${table}" as a whole word`
+    );
   }
   for (const table of notifTables) {
-    assert.ok(deployRunbook.includes(table), `docs/DEPLOYMENT_RUNBOOK.md must list notifications table "${table}"`);
+    assert.ok(
+      new RegExp(`\\b${table}\\b`).test(sqlText),
+      `docs/DEPLOYMENT_RUNBOOK.md SQL blocks must grant/list notifications table "${table}" as a whole word`
+    );
   }
+  assert.ok(sqlText.includes('REVOKE CONNECT, TEMP ON DATABASE nostok FROM PUBLIC'), 'Runbook SQL must revoke PUBLIC CONNECT/TEMP on nostok');
+  assert.ok(sqlText.includes('REVOKE CONNECT, TEMP ON DATABASE nostok_notifications FROM PUBLIC'), 'Runbook SQL must revoke PUBLIC CONNECT/TEMP on nostok_notifications');
 
   // Verify ETHERSCAN_API_KEY env var usage (never --etherscan-api-key CLI flag), GRANT SQL, and rollback controls
   assert.ok(!deployRunbook.includes('--etherscan-api-key'), 'Runbook must not pass --etherscan-api-key on CLI');

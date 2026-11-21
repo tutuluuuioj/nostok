@@ -1,0 +1,16 @@
+testMode: property
+testLimit: 1000000
+seqLen: 50
+shrinkLimit: 5000
+corpusDir: "echidna-corpus"
+coverage: true
+deployer: "0x1000000000000000000000000000000000000001"
+sender: ["0x2000000000000000000000000000000000000002", "0x3000000000000000000000000000000000000003"]
+cryticArgs:
+  [
+    "--foundry-compile-all",
+    "--solc-remaps",
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/ @openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/ forge-std/=lib/forge-std/src/",
+  ]
+filterBlacklist: true
+filterFunctions: []

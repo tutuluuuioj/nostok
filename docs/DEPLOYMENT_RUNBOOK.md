@@ -84,7 +84,7 @@ Verify all governance and signing infrastructure **before** broadcasting `Deploy
 
 1. **Schedule `NostokTimelock` Batch via `OWNER_ADDRESS` Safe (Wait >= 48 Hours, Then Execute):**
    - `LoanCore.setGlobalCap(10_000_000_000)` ($10,000 USDC — within the $5,000–$25,000 initial aggregate guarded launch cap range).
-   - `AssetRegistry.setAssetConfig(token, cfg)` using the exact `IAssetRegistry.AssetConfig` struct fields for pinned Base Mainnet Tier A B20 equities (`feedDecimals = 8`, `tier = 0` (`Tier A`), `maxInitLtvBps = 6000`, `marginCallLtvBps = 7000`, `liqLtvBps = 7800`, `badDebtLtvBps = 9000`, `maxDiscountBps = 600`, `closedMarketHaircutBps = 500`, `perLoanCap = 1_000_000_000`, `assetCap = 5_000_000_000`, `maxStaleOpenSecs = 21600`, `status = 0` (`Active`), `restricted = false` so allowlisted/permissionless liquidations can clear without per-asset liquidator restrictions):
+   - `AssetRegistry.setAssetConfig(token, cfg)` using the exact `IAssetRegistry.AssetConfig` struct fields for pinned Base Mainnet Tier A B20 equities (`feed`, `feedDecimals = 8`, `tier = 0` (`Tier A`), `maxInitLtvBps = 6000`, `marginCallLtvBps = 7000`, `liqLtvBps = 7800`, `badDebtLtvBps = 9000`, `maxDiscountBps = 600`, `closedMarketHaircutBps = 500`, `perLoanCap = 1_000_000_000`, `assetCap = 5_000_000_000`, `maxStaleOpenSecs = 21600`, `status = 0` (`Active`), `restricted = false` so allowlisted/permissionless liquidations can clear without per-asset liquidator restrictions):
      - `NVDAc` (`0xb20000000000000000000078ee7ce2fE4908108C`) -> `feed = 0x04689a41629776563E6822F76f2e57D148d28513` (Chainlink `NVDA / USD`, `feedDecimals = 8`)
      - `METAc` (`0xb2000000000000000000008bC8786B856E61707C`) -> `feed = 0x6526aE6797A76123638b863AeE4dD27Ba4E4b27D` (Chainlink `META / USD`, `feedDecimals = 8`)
      - *(Minimum interest duration is passed per loan in `LoanCore.openLoan`, and closed-market staleness `360000`s is a single contract-wide `OracleRouter` setting rather than per-asset `AssetConfig` fields.)*
@@ -97,7 +97,9 @@ Verify all governance and signing infrastructure **before** broadcasting `Deploy
 
 ## 4. Database & Role Provisioning (PostgreSQL)
 
-Provision PostgreSQL with **strict role separation** (all off-chain services refuse `memory://` or embedded PGlite when `FORK=false`). Because `notifications/src/db.ts` (`initNotifSchema`) runs `CREATE TABLE IF NOT EXISTS`, `ALTER TABLE`, and `CREATE INDEX IF NOT EXISTS` on startup, grant `CREATE` on its isolated `nostok_notifications` database/schema (or pre-create the `notif_*` tables owned by `nostok_notif`). Grant `nostok_ro` `SELECT` **after** `indexer` creates its tables on first startup (and set `ALTER DEFAULT PRIVILEGES` for `nostok_indexer`):
+Provision PostgreSQL with **strict role separation** (all off-chain services refuse `memory://` or embedded PGlite when `FORK=false`). Because `notifications/src/db.ts` (`initNotifSchema`) runs `CREATE TABLE IF NOT EXISTS`, `ALTER TABLE`, and `CREATE INDEX IF NOT EXISTS` on startup, grant `CREATE` on its isolated `nostok_notifications` database/schema (or pre-create the `notif_*` tables owned by `nostok_notif`).
+
+### 4.1 Run Now (Before Starting Any Service)
 
 ```sql
 CREATE ROLE nostok_indexer WITH LOGIN PASSWORD '<INDEXER_PASSWORD>';
@@ -106,26 +108,36 @@ CREATE ROLE nostok_notif   WITH LOGIN PASSWORD '<NOTIF_PASSWORD>';
 
 -- 1. Indexer database & writer role (creates & updates all 11 indexer tables)
 CREATE DATABASE nostok OWNER nostok_indexer;
+REVOKE CONNECT, TEMP ON DATABASE nostok FROM PUBLIC;
+GRANT CONNECT ON DATABASE nostok TO nostok_indexer, nostok_ro;
 \c nostok
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 GRANT USAGE, CREATE ON SCHEMA public TO nostok_indexer;
-
--- 2. Strictly read-only query role for api/, risk/, and notifications/ INDEXER_DATABASE_URL
 GRANT USAGE ON SCHEMA public TO nostok_ro;
--- Run after `cd indexer && npm run once` creates tables, plus keep future tables readable:
+ALTER DEFAULT PRIVILEGES FOR ROLE nostok_indexer IN SCHEMA public
+  GRANT SELECT ON TABLES TO nostok_ro;
+
+-- 2. Isolated notifications database & role (initNotifSchema runs DDL + DML on notif_* tables)
+CREATE DATABASE nostok_notifications OWNER nostok_notif;
+REVOKE CONNECT, TEMP ON DATABASE nostok_notifications FROM PUBLIC;
+GRANT CONNECT ON DATABASE nostok_notifications TO nostok_notif;
+\c nostok_notifications
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT USAGE, CREATE ON SCHEMA public TO nostok_notif;
+```
+
+### 4.2 Run After First Service Start (`indexer` & `notifications` Initial Sync)
+
+Execute after `cd indexer && npm run once` and `cd notifications && npm run once` create the schema tables:
+
+```sql
+\c nostok
 GRANT SELECT ON TABLE
   indexer_state, indexed_blocks, assets, loans, loan_events,
   orders, order_fills, auctions, auction_buys, positions, claims
 TO nostok_ro;
-ALTER DEFAULT PRIVILEGES FOR ROLE nostok_indexer IN SCHEMA public
-  GRANT SELECT ON TABLES TO nostok_ro;
 
--- 3. Isolated notifications database & role (initNotifSchema runs DDL + DML on notif_* tables)
-CREATE DATABASE nostok_notifications OWNER nostok_notif;
 \c nostok_notifications
-REVOKE ALL ON SCHEMA public FROM PUBLIC;
-GRANT USAGE, CREATE ON SCHEMA public TO nostok_notif;
--- After `cd notifications && npm run once` initializes the 12 notif_* tables (or if pre-created first):
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   notif_nonces, notif_subscriptions, notif_preferences, notif_deliveries,
   notif_dead_letters, notif_cursor, notif_alert_episodes, notif_revoked_sessions,
