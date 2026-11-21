@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {Test} from "forge-std/Test.sol";
+import {TestBase} from "forge-std/Base.sol";
+import {StdUtils} from "forge-std/StdUtils.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 
 import {LoanCore} from "../src/LoanCore.sol";
 import {CollateralEscrow} from "../src/CollateralEscrow.sol";
@@ -20,131 +22,189 @@ import {MockAggregator} from "./mocks/MockAggregator.sol";
 import {MockSequencer} from "./mocks/MockSequencer.sol";
 
 /**
+ * @notice Minimal ERC-1271 + ERC-721 receiver wallet so LoanCore.extend() and PositionNFT._safeMint()
+ *         work identically under Foundry and Halmos symbolic execution without vm.sign / ecrecover.
+ */
+contract HalmosLenderWallet is IERC721Receiver {
+    function onERC721Received(
+        address,
+        address,
+        uint256,
+        bytes calldata
+    ) external pure override returns (bytes4) {
+        return IERC721Receiver.onERC721Received.selector;
+    }
+
+    function isValidSignature(bytes32, bytes calldata) external pure returns (bytes4) {
+        return 0x1626ba7e;
+    }
+}
+
+/**
  * @title FormalPropertiesTest
- * @notice WS4.3 Halmos-compatible `check_*` symbolic & high-run Foundry property proofs
- *         verifying:
- *         1. Actual/365 simple interest ceiling rounding & 1-wei checkpoint additivity
+ * @notice WS4.3 Halmos-compatible `check_*` symbolic properties (using ONLY Halmos-supported
+ *         cheatcodes: vm.warp, vm.prank, vm.startPrank, vm.stopPrank, vm.assume; native Solidity
+ *         `assert(...)` and `try/catch` instead of vm.assertEq/vm.expectRevert/vm.sign; concrete
+ *         setUp deployment with `dynamic_test_linking = false` so no vm.deployCode is emitted),
+ *         paired with 512-run Foundry fuzz wrappers (`test_check_*`).
+ *
+ *         Properties verified:
+ *         1. Actual/365 simple interest ceiling rounding, monotonicity & 1-wei checkpoint additivity
  *         2. 24h grace penalty spread (+500 bps) & cumulative 90d / 40% extend caps
  *         3. minInterestDays lifetime floor without double-counting
- *         4. Liquidation close factors (50% vs 100%), linear Dutch price bounds, and 0-wei waterfall USDC conservation
- *         5. CollateralEscrow multi-token / multi-deposit isolation
+ *         4. Liquidation close factors (50% vs 100%), linear Dutch price bounds & 0-wei waterfall conservation (6/8/18 dec)
+ *         5. CollateralEscrow multi-token isolation, over-release revert & unauthorized caller rejection
  */
-contract FormalPropertiesTest is Test {
-    uint256 internal constant BASE_TIME = 1_795_100_400; // Tuesday 15:00 UTC (market open)
-    uint256 internal constant SECONDS_PER_YEAR = 365 days;
-    bytes32 internal constant EXTEND_ORDER_TYPEHASH = keccak256(
-        "ExtendOrder(uint256 loanId,uint64 newMaturity,uint32 newRateBps,uint256 nonce,uint64 deadline)"
-    );
+contract FormalPropertiesTest is TestBase, StdUtils {
+    bool public IS_TEST = true;
 
-    struct Stack {
-        LoanCore core;
-        CollateralEscrow escrow;
-        PositionNFT nft;
-        LiquidationAuction auction;
-        AssetRegistry registry;
-        OracleRouter router;
-        FeeCollector feeCollector;
-        EligibilityGate gate;
-        MockERC20 usdc;
-        MockERC20 col;
-        MockAggregator feed;
-        MockSequencer seq;
-        address owner;
-        address guardian;
-        address treasury;
-        address reserve;
-        address settlement;
-        address borrower;
-        address lender;
-        uint256 lenderPk;
-        address keeper;
-        address liquidator;
-    }
+    uint256 internal constant BASE_TIME = 1_795_100_400; // Tuesday 15:00 UTC (regular US market open)
+    uint256 internal constant SECONDS_PER_YEAR = 365 days;
+    uint128 internal constant FIXED_COL_8 = 5_000e8; // $1,000,000 at $200 => <= 50% LTV for all principals <= $500k
+
+    address internal constant OWNER = address(0x1111);
+    address internal constant GUARDIAN = address(0x2222);
+    address internal constant TREASURY = address(0x3333);
+    address internal constant RESERVE = address(0x4444);
+    address internal constant SETTLEMENT = address(0x5555);
+    address internal constant BORROWER = address(0xB0B0);
+    address internal constant KEEPER = address(0xCAFE);
+    address internal constant LIQUIDATOR = address(0xDEAD);
+    address internal constant ISO_AUTH = address(0x9001);
+    address internal constant ISO_USER_A = address(0xA001);
+    address internal constant ISO_USER_B = address(0xB001);
+
+    LoanCore internal core;
+    CollateralEscrow internal escrow;
+    PositionNFT internal nft;
+    LiquidationAuction internal auction;
+    AssetRegistry internal registry;
+    OracleRouter internal router;
+    FeeCollector internal feeCollector;
+    EligibilityGate internal gate;
+    HalmosLenderWallet internal lenderWallet;
+
+    MockERC20 internal usdc;
+    MockERC20 internal col6;
+    MockERC20 internal col8;
+    MockERC20 internal col18;
+    MockAggregator internal feed6;
+    MockAggregator internal feed8;
+    MockAggregator internal feed18;
+    MockSequencer internal seq;
+
+    CollateralEscrow internal isoEscrow;
+    MockERC20 internal isoTokA;
+    MockERC20 internal isoTokB;
 
     function _ceilDiv(uint256 num, uint256 den) internal pure returns (uint256) {
         return num == 0 ? 0 : (num + den - 1) / den;
     }
 
-    function _deployStack(uint8 colDecimals, int256 initPrice) internal returns (Stack memory s) {
+    function _assetCfg(address feed) internal pure returns (IAssetRegistry.AssetConfig memory) {
+        return IAssetRegistry.AssetConfig({
+            feed: feed,
+            feedDecimals: 8,
+            tier: 0,
+            maxInitLtvBps: 6000,
+            marginCallLtvBps: 7000,
+            liqLtvBps: 7800,
+            badDebtLtvBps: 9000,
+            maxDiscountBps: 600,
+            closedMarketHaircutBps: 500,
+            perLoanCap: 10_000_000e6,
+            assetCap: 50_000_000e6,
+            maxStaleOpenSecs: 86400,
+            status: uint8(IAssetRegistry.AssetStatus.Active),
+            restricted: false
+        });
+    }
+
+    function setUp() public {
         vm.warp(BASE_TIME);
-        s.owner = address(0x1111);
-        s.guardian = address(0x2222);
-        s.treasury = address(0x3333);
-        s.reserve = address(0x4444);
-        s.settlement = address(0x5555);
-        s.borrower = address(0xB0B0);
-        s.lenderPk = 0x7777;
-        s.lender = vm.addr(s.lenderPk);
-        s.keeper = address(0xCAFE);
-        s.liquidator = address(0xDEAD);
 
-        s.usdc = new MockERC20("USD Coin", "USDC", 6);
-        s.col = new MockERC20("Collateral", "COL", colDecimals);
-        s.col.setUiMultiplier(1e18);
-        s.feed = new MockAggregator(8, initPrice);
-        s.seq = new MockSequencer(0);
+        lenderWallet = new HalmosLenderWallet();
+        usdc = new MockERC20("USD Coin", "USDC", 6);
+        col6 = new MockERC20("Collateral 6", "COL6", 6);
+        col8 = new MockERC20("Collateral 8", "COL8", 8);
+        col18 = new MockERC20("Collateral 18", "COL18", 18);
+        col6.setUiMultiplier(1e18);
+        col8.setUiMultiplier(1e18);
+        col18.setUiMultiplier(1e18);
 
-        vm.startPrank(s.owner);
-        s.gate = new EligibilityGate(s.owner, s.owner, true);
-        s.escrow = new CollateralEscrow(s.owner);
-        s.nft = new PositionNFT(s.owner, address(s.gate));
-        s.registry = AssetRegistry(address(new ERC1967Proxy(address(new AssetRegistry()), "")));
-        s.registry.initialize(s.owner, s.guardian);
-        s.router = OracleRouter(address(new ERC1967Proxy(address(new OracleRouter()), "")));
-        s.router.initialize(s.owner, address(s.registry), address(s.seq));
-        s.router.setMarketSession(true, true);
-        s.registry.setOracleRouter(address(s.router));
-        s.feeCollector = FeeCollector(address(new ERC1967Proxy(address(new FeeCollector()), "")));
-        s.feeCollector.initialize(s.owner, s.treasury, s.reserve);
+        feed6 = new MockAggregator(8, 200e8);
+        feed8 = new MockAggregator(8, 200e8);
+        feed18 = new MockAggregator(8, 200e8);
+        seq = new MockSequencer(0);
 
-        s.core = LoanCore(address(new ERC1967Proxy(address(new LoanCore()), "")));
-        s.auction = LiquidationAuction(address(new ERC1967Proxy(address(new LiquidationAuction()), "")));
-        s.core.initialize(s.owner, s.guardian, address(s.escrow), address(s.nft), address(s.registry), address(s.router), address(s.feeCollector), address(s.auction), address(s.usdc));
-        s.core.setOrderSettlement(s.settlement);
-        s.core.setGlobalCap(10_000_000e6);
-        s.auction.initialize(s.owner, address(s.escrow), address(s.core), address(s.feeCollector), address(s.usdc));
-        s.escrow.setAuthorizedCore(address(s.core), true);
-        s.escrow.setAuthorizedCore(address(s.auction), true);
-        s.nft.setAuthorizedCore(address(s.core), true);
+        vm.startPrank(OWNER);
+        gate = new EligibilityGate(OWNER, OWNER, true);
+        escrow = new CollateralEscrow(OWNER);
+        nft = new PositionNFT(OWNER, address(gate));
+        registry = AssetRegistry(address(new ERC1967Proxy(address(new AssetRegistry()), "")));
+        registry.initialize(OWNER, GUARDIAN);
+        router = OracleRouter(address(new ERC1967Proxy(address(new OracleRouter()), "")));
+        router.initialize(OWNER, address(registry), address(seq));
+        router.setMarketSession(true, true);
+        registry.setOracleRouter(address(router));
+        feeCollector = FeeCollector(address(new ERC1967Proxy(address(new FeeCollector()), "")));
+        feeCollector.initialize(OWNER, TREASURY, RESERVE);
 
-        s.registry.setAssetConfig(
-            address(s.col),
-            IAssetRegistry.AssetConfig({
-                feed: address(s.feed),
-                feedDecimals: 8,
-                tier: 0,
-                maxInitLtvBps: 6000,
-                marginCallLtvBps: 7000,
-                liqLtvBps: 7800,
-                badDebtLtvBps: 9000,
-                maxDiscountBps: 600,
-                closedMarketHaircutBps: 500,
-                perLoanCap: 10_000_000e6,
-                assetCap: 10_000_000e6,
-                maxStaleOpenSecs: 86400,
-                status: uint8(IAssetRegistry.AssetStatus.Active),
-                restricted: false
-            })
+        core = LoanCore(address(new ERC1967Proxy(address(new LoanCore()), "")));
+        auction = LiquidationAuction(address(new ERC1967Proxy(address(new LiquidationAuction()), "")));
+        core.initialize(
+            OWNER,
+            GUARDIAN,
+            address(escrow),
+            address(nft),
+            address(registry),
+            address(router),
+            address(feeCollector),
+            address(auction),
+            address(usdc)
         );
+        core.setOrderSettlement(SETTLEMENT);
+        core.setGlobalCap(100_000_000e6);
+        auction.initialize(OWNER, address(escrow), address(core), address(feeCollector), address(usdc));
+        escrow.setAuthorizedCore(address(core), true);
+        escrow.setAuthorizedCore(address(auction), true);
+        nft.setAuthorizedCore(address(core), true);
+
+        registry.setAssetConfig(address(col6), _assetCfg(address(feed6)));
+        registry.setAssetConfig(address(col8), _assetCfg(address(feed8)));
+        registry.setAssetConfig(address(col18), _assetCfg(address(feed18)));
+        router.syncMultiplier(address(col6));
+        router.syncMultiplier(address(col8));
+        router.syncMultiplier(address(col18));
         vm.stopPrank();
+
+        // Standalone CollateralEscrow stack for Property 5
+        isoEscrow = new CollateralEscrow(address(this));
+        isoEscrow.setAuthorizedCore(ISO_AUTH, true);
+        isoTokA = new MockERC20("Token A", "TOKA", 8);
+        isoTokB = new MockERC20("Token B", "TOKB", 18);
     }
 
-    function _signExtend(Stack memory s, uint256 loanId, uint64 newMat, uint32 newRate, uint256 nonce, uint64 deadline) internal view returns (bytes memory) {
-        bytes32 domain = keccak256(
-            abi.encode(
-                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
-                keccak256(bytes("NOSTOK Loan Core")),
-                keccak256(bytes("1")),
-                block.chainid,
-                address(s.core)
-            )
-        );
-        bytes32 sh = keccak256(abi.encode(EXTEND_ORDER_TYPEHASH, loanId, newMat, newRate, nonce, deadline));
-        (uint8 v, bytes32 r, bytes32 s_) = vm.sign(s.lenderPk, keccak256(abi.encodePacked("\x19\x01", domain, sh)));
-        return abi.encodePacked(r, s_, v);
+    function _openLoan(
+        MockERC20 tok,
+        uint128 colAmt,
+        uint128 principal,
+        uint32 rateBps,
+        uint16 termDays,
+        uint16 minDays
+    ) internal returns (uint256 loanId) {
+        tok.mint(BORROWER, colAmt);
+        vm.prank(BORROWER);
+        tok.approve(address(escrow), colAmt);
+        usdc.mint(address(lenderWallet), principal);
+        vm.prank(address(lenderWallet));
+        usdc.approve(address(core), principal);
+        vm.prank(SETTLEMENT);
+        loanId = core.openLoan(BORROWER, address(lenderWallet), address(tok), colAmt, principal, rateBps, termDays, 6000, minDays, 0);
     }
 
-    /// @notice Foundry wrapper executing Halmos-compatible property 1 with 512 fuzz runs.
+    // ---------------- Property 1: Simple Interest Actual/365, Monotonicity & Checkpoint Additivity ----------------
+
     /// forge-config: default.fuzz.runs = 512
     function test_check_SimpleInterestEquivalenceAndCeiling(
         uint64 principalSeed,
@@ -153,81 +213,63 @@ contract FormalPropertiesTest is Test {
         uint32 elapsed1Seed,
         uint32 elapsed2Seed
     ) public {
-        check_SimpleInterestEquivalenceAndCeiling(principalSeed, rateSeed, termDaysSeed, elapsed1Seed, elapsed2Seed);
+        uint64 principal = uint64(bound(principalSeed, 500e6, 500_000e6));
+        uint16 rateBps = uint16(bound(rateSeed, 100, 4000));
+        uint16 termDays = uint16(bound(termDaysSeed, 7, 60));
+        uint32 totalTerm = uint32(uint256(termDays) * 1 days);
+        uint32 e1 = uint32(bound(elapsed1Seed, 3 days, totalTerm - 1 days));
+        uint32 e2 = uint32(bound(elapsed2Seed, 0, totalTerm - e1));
+        check_SimpleInterestEquivalenceAndCeiling(principal, rateBps, termDays, e1, e2);
     }
 
-    /// @notice WS4.3 Property 1: Simple Interest Actual/365 ceiling formula, monotonicity, and checkpoint additivity.
-    /// forge-config: default.fuzz.runs = 512
+    /// @notice WS4.3 Property 1 (Halmos-compatible): Actual/365 ceiling formula, monotonicity & 1-wei checkpoint additivity.
     function check_SimpleInterestEquivalenceAndCeiling(
-        uint64 principalSeed,
-        uint16 rateSeed,
-        uint16 termDaysSeed,
-        uint32 elapsed1Seed,
-        uint32 elapsed2Seed
+        uint64 principal,
+        uint16 rateBps,
+        uint16 termDays,
+        uint32 e1,
+        uint32 e2
     ) public {
-        Stack memory s = _deployStack(8, 200e8);
-        uint128 principal = uint128(bound(principalSeed, 500e6, 500_000e6));
-        uint32 rateBps = uint32(bound(rateSeed, 100, 4000));
-        uint16 termDays = uint16(bound(termDaysSeed, 7, 60));
-
-        // Ensure elapsed1 + elapsed2 stays inside [minDays..termDays] and post-minInterest floor
+        vm.assume(principal >= 500e6 && principal <= 500_000e6);
+        vm.assume(rateBps >= 100 && rateBps <= 4000);
+        vm.assume(termDays >= 7 && termDays <= 60);
         uint256 totalTerm = uint256(termDays) * 1 days;
-        uint256 e1 = bound(elapsed1Seed, 3 days, totalTerm - 1 days);
-        uint256 e2 = bound(elapsed2Seed, 0, totalTerm - e1);
-        uint256 colNeeded = _ceilDiv((uint256(principal) * 10000) / 6000, 200e6) * 1e8 + 10e8;
+        vm.assume(e1 >= 3 days && e1 <= totalTerm - 1 days);
+        vm.assume(e2 <= totalTerm - e1);
 
-        s.col.mint(s.borrower, colNeeded);
-        vm.prank(s.borrower);
-        s.col.approve(address(s.escrow), colNeeded);
-        s.usdc.mint(s.lender, principal);
-        vm.prank(s.lender);
-        s.usdc.approve(address(s.core), principal);
-        vm.prank(s.settlement);
-        uint256 loanId = s.core.openLoan(s.borrower, s.lender, address(s.col), uint128(colNeeded), principal, rateBps, termDays, 6000, 1, 0);
+        // Open two identical loans at BASE_TIME: loan1 accrues continuously, loan2 checkpoints via extend() at t1
+        uint256 loan1 = _openLoan(col8, FIXED_COL_8, principal, rateBps, termDays, 1);
+        uint256 loan2 = _openLoan(col8, FIXED_COL_8, principal, rateBps, termDays, 1);
 
-        // Snapshot single-interval accrual at BASE_TIME + e1 and BASE_TIME + e1 + e2 (explicit monotonic timestamps for --via-ir safety)
         uint256 t1 = BASE_TIME + e1;
         vm.warp(t1);
-        uint128 due1 = s.core.getDueInterest(loanId);
+        uint128 due1 = core.getDueInterest(loan1);
         uint256 expected1 = _ceilDiv(uint256(principal) * rateBps * e1, 10000 * SECONDS_PER_YEAR);
-        assertEq(due1, expected1, "Pre-maturity getDueInterest mismatch vs exact Actual/365 ceil equation");
+        assert(due1 == expected1);
+
+        // Checkpoint loan2 at t1 using ERC-1271 lender wallet (no vm.sign / ecrecover)
+        if (e2 > 0) {
+            ILoanCore.Loan memory l2 = core.getLoan(loan2);
+            vm.prank(BORROWER);
+            core.extend(loan2, l2.maturity + 1 days, rateBps, uint64(t1 + 1 hours), "");
+        }
 
         uint256 t2 = BASE_TIME + e1 + e2;
         vm.warp(t2);
-        uint128 dueCombined = s.core.getDueInterest(loanId);
-        uint256 expectedCombined = _ceilDiv(uint256(principal) * rateBps * (e1 + e2), 10000 * SECONDS_PER_YEAR);
-        assertEq(dueCombined, expectedCombined, "Combined Actual/365 ceil equation mismatch");
-        assertGe(dueCombined, due1, "Interest must be monotonically non-decreasing");
+        uint128 dueCombined = core.getDueInterest(loan1);
+        uint256 expectedCombined = _ceilDiv(uint256(principal) * rateBps * (uint256(e1) + e2), 10000 * SECONDS_PER_YEAR);
+        assert(dueCombined == expectedCombined);
+        assert(dueCombined >= due1);
 
-        // Checkpoint via zero-rate extension at BASE_TIME + e1 preserves old accrual and continues at same rate
-        if (e2 > 0 && BASE_TIME + totalTerm + 1 days <= BASE_TIME + 90 days) {
-            // Deploy fresh mirror loan and checkpoint via extend(rate=rateBps) at BASE_TIME + e1
-            Stack memory s2 = _deployStack(8, 200e8);
-            s2.col.mint(s2.borrower, colNeeded);
-            vm.prank(s2.borrower);
-            s2.col.approve(address(s2.escrow), colNeeded);
-            s2.usdc.mint(s2.lender, principal);
-            vm.prank(s2.lender);
-            s2.usdc.approve(address(s2.core), principal);
-            vm.prank(s2.settlement);
-            uint256 id2 = s2.core.openLoan(s2.borrower, s2.lender, address(s2.col), uint128(colNeeded), principal, rateBps, termDays, 6000, 1, 0);
-
-            vm.warp(t1);
-            ILoanCore.Loan memory l2 = s2.core.getLoan(id2);
-            uint64 newMat = l2.maturity + 1 days;
-            uint64 dl = uint64(t1 + 1 hours);
-            bytes memory sig = _signExtend(s2, id2, newMat, rateBps, 0, dl);
-            vm.prank(s2.borrower);
-            s2.core.extend(id2, newMat, rateBps, dl, sig);
-
-            vm.warp(t2);
-            uint128 checkpointTotal = s2.core.getDueInterest(id2);
-            assertGe(checkpointTotal, dueCombined);
-            assertLe(checkpointTotal, dueCombined + 1, "Split ceil accrual can differ by at most +1 wei");
+        if (e2 > 0) {
+            uint128 checkpointTotal = core.getDueInterest(loan2);
+            assert(checkpointTotal >= dueCombined);
+            assert(checkpointTotal <= dueCombined + 1);
         }
     }
 
-    /// @notice Foundry wrapper executing Halmos-compatible property 2 with 512 fuzz runs.
+    // ---------------- Property 2: Grace Penalty (+500 bps) & Extend Caps (40% APR / 90d) ----------------
+
     /// forge-config: default.fuzz.runs = 512
     function test_check_GracePenaltySpreadAndExtendCap(
         uint64 principalSeed,
@@ -236,64 +278,57 @@ contract FormalPropertiesTest is Test {
         uint32 badRateSeed,
         uint16 excessDaysSeed
     ) public {
-        check_GracePenaltySpreadAndExtendCap(principalSeed, rateSeed, graceSecsSeed, badRateSeed, excessDaysSeed);
-    }
-
-    /// @notice WS4.3 Property 2: Grace penalty (+500 bps post-maturity) & extend limits (40% max APR, 90d cumulative).
-    /// forge-config: default.fuzz.runs = 512
-    function check_GracePenaltySpreadAndExtendCap(
-        uint64 principalSeed,
-        uint16 rateSeed,
-        uint32 graceSecsSeed,
-        uint32 badRateSeed,
-        uint16 excessDaysSeed
-    ) public {
-        Stack memory s = _deployStack(8, 200e8);
-        uint128 principal = uint128(bound(principalSeed, 500e6, 200_000e6));
-        uint32 rateBps = uint32(bound(rateSeed, 200, 3500));
-        uint256 colNeeded = _ceilDiv((uint256(principal) * 10000) / 6000, 200e6) * 1e8 + 10e8;
-
-        s.col.mint(s.borrower, colNeeded);
-        vm.prank(s.borrower);
-        s.col.approve(address(s.escrow), colNeeded);
-        s.usdc.mint(s.lender, principal);
-        vm.prank(s.lender);
-        s.usdc.approve(address(s.core), principal);
-        vm.prank(s.settlement);
-        uint256 loanId = s.core.openLoan(s.borrower, s.lender, address(s.col), uint128(colNeeded), principal, rateBps, 10, 6000, 3, 0);
-
-        ILoanCore.Loan memory l = s.core.getLoan(loanId);
-        uint256 graceElapsed = bound(graceSecsSeed, 1, 24 hours);
-        vm.warp(l.maturity + graceElapsed);
-
-        uint256 expectedReg = _ceilDiv(uint256(principal) * rateBps * 10 days, 10000 * SECONDS_PER_YEAR);
-        uint256 expectedPen = _ceilDiv(uint256(principal) * (rateBps + 500) * graceElapsed, 10000 * SECONDS_PER_YEAR);
-        assertEq(s.core.getDueInterest(loanId), expectedReg + expectedPen, "Grace interest equation mismatch");
-
-        // Enforce extend rate > 4000 bps and maturity > startTime + 90 days always revert on a pre-maturity loan
-        Stack memory s2 = _deployStack(8, 200e8);
-        s2.col.mint(s2.borrower, colNeeded);
-        vm.prank(s2.borrower);
-        s2.col.approve(address(s2.escrow), colNeeded);
-        s2.usdc.mint(s2.lender, principal);
-        vm.prank(s2.lender);
-        s2.usdc.approve(address(s2.core), principal);
-        vm.prank(s2.settlement);
-        uint256 id2 = s2.core.openLoan(s2.borrower, s2.lender, address(s2.col), uint128(colNeeded), principal, rateBps, 10, 6000, 3, 0);
-        ILoanCore.Loan memory l2 = s2.core.getLoan(id2);
-
+        uint64 principal = uint64(bound(principalSeed, 500e6, 200_000e6));
+        uint16 rateBps = uint16(bound(rateSeed, 200, 3500));
+        uint32 graceElapsed = uint32(bound(graceSecsSeed, 1, 24 hours));
         uint32 invalidRate = uint32(bound(badRateSeed, 4001, 50_000));
-        vm.prank(s2.borrower);
-        vm.expectRevert(LoanCore.InvalidLoanTerms.selector);
-        s2.core.extend(id2, l2.maturity + 1 days, invalidRate, uint64(block.timestamp + 1 hours), "");
-
-        uint64 overMaxMat = l2.startTime + 90 days + uint64(bound(excessDaysSeed, 1, 30) * 1 days);
-        vm.prank(s2.borrower);
-        vm.expectRevert(LoanCore.InvalidLoanTerms.selector);
-        s2.core.extend(id2, overMaxMat, rateBps, uint64(block.timestamp + 1 hours), "");
+        uint16 excessDays = uint16(bound(excessDaysSeed, 1, 30));
+        check_GracePenaltySpreadAndExtendCap(principal, rateBps, graceElapsed, invalidRate, excessDays);
     }
 
-    /// @notice Foundry wrapper executing Halmos-compatible property 3 with 512 fuzz runs.
+    /// @notice WS4.3 Property 2 (Halmos-compatible): +500 bps grace penalty spread & extend rate/term cap enforcement.
+    function check_GracePenaltySpreadAndExtendCap(
+        uint64 principal,
+        uint16 rateBps,
+        uint32 graceElapsed,
+        uint32 invalidRate,
+        uint16 excessDays
+    ) public {
+        vm.assume(principal >= 500e6 && principal <= 200_000e6);
+        vm.assume(rateBps >= 200 && rateBps <= 3500);
+        vm.assume(graceElapsed >= 1 && graceElapsed <= 24 hours);
+        vm.assume(invalidRate >= 4001 && invalidRate <= 50_000);
+        vm.assume(excessDays >= 1 && excessDays <= 30);
+
+        uint256 loanId = _openLoan(col8, FIXED_COL_8, principal, rateBps, 10, 3);
+        ILoanCore.Loan memory l = core.getLoan(loanId);
+
+        // Pre-maturity: extend rate > 4000 bps MUST revert InvalidLoanTerms
+        vm.prank(BORROWER);
+        try core.extend(loanId, l.maturity + 1 days, invalidRate, uint64(BASE_TIME + 1 hours), "") {
+            assert(false);
+        } catch (bytes memory err) {
+            assert(err.length >= 4 && bytes4(err) == LoanCore.InvalidLoanTerms.selector);
+        }
+
+        // Pre-maturity: extend maturity > startTime + 90 days MUST revert InvalidLoanTerms
+        uint64 overMaxMat = l.startTime + 90 days + uint64(excessDays) * 1 days;
+        vm.prank(BORROWER);
+        try core.extend(loanId, overMaxMat, rateBps, uint64(BASE_TIME + 1 hours), "") {
+            assert(false);
+        } catch (bytes memory err) {
+            assert(err.length >= 4 && bytes4(err) == LoanCore.InvalidLoanTerms.selector);
+        }
+
+        // Post-maturity grace penalty: regular 10d accrual + (rateBps + 500) penalty over graceElapsed
+        vm.warp(uint256(l.maturity) + graceElapsed);
+        uint256 expectedReg = _ceilDiv(uint256(principal) * rateBps * 10 days, 10000 * SECONDS_PER_YEAR);
+        uint256 expectedPen = _ceilDiv(uint256(principal) * (uint256(rateBps) + 500) * graceElapsed, 10000 * SECONDS_PER_YEAR);
+        assert(core.getDueInterest(loanId) == expectedReg + expectedPen);
+    }
+
+    // ---------------- Property 3: minInterestDays Lifetime Floor (No Double Counting) ----------------
+
     /// forge-config: default.fuzz.runs = 512
     function test_check_MinInterestFloorNoDoubleCount(
         uint64 principalSeed,
@@ -301,33 +336,26 @@ contract FormalPropertiesTest is Test {
         uint8 minDaysSeed,
         uint32 elapsedSeed
     ) public {
-        check_MinInterestFloorNoDoubleCount(principalSeed, rateSeed, minDaysSeed, elapsedSeed);
+        uint64 principal = uint64(bound(principalSeed, 500e6, 200_000e6));
+        uint16 rateBps = uint16(bound(rateSeed, 200, 4000));
+        uint8 minDays = uint8(bound(minDaysSeed, 1, 14));
+        uint32 elapsed = uint32(bound(elapsedSeed, 0, 29 days));
+        check_MinInterestFloorNoDoubleCount(principal, rateBps, minDays, elapsed);
     }
 
-    /// @notice WS4.3 Property 3: minInterestDays acts strictly as a lifetime floor without double counting.
-    /// forge-config: default.fuzz.runs = 512
+    /// @notice WS4.3 Property 3 (Halmos-compatible): minInterestDays acts strictly as lifetime floor with zero double-counting on extend.
     function check_MinInterestFloorNoDoubleCount(
-        uint64 principalSeed,
-        uint16 rateSeed,
-        uint8 minDaysSeed,
-        uint32 elapsedSeed
+        uint64 principal,
+        uint16 rateBps,
+        uint8 minDays,
+        uint32 elapsed
     ) public {
-        Stack memory s = _deployStack(8, 200e8);
-        uint128 principal = uint128(bound(principalSeed, 500e6, 200_000e6));
-        uint32 rateBps = uint32(bound(rateSeed, 200, 4000));
-        uint16 minDays = uint16(bound(minDaysSeed, 1, 14));
-        uint256 colNeeded = _ceilDiv((uint256(principal) * 10000) / 6000, 200e6) * 1e8 + 10e8;
+        vm.assume(principal >= 500e6 && principal <= 200_000e6);
+        vm.assume(rateBps >= 200 && rateBps <= 4000);
+        vm.assume(minDays >= 1 && minDays <= 14);
+        vm.assume(elapsed <= 29 days);
 
-        s.col.mint(s.borrower, colNeeded);
-        vm.prank(s.borrower);
-        s.col.approve(address(s.escrow), colNeeded);
-        s.usdc.mint(s.lender, principal);
-        vm.prank(s.lender);
-        s.usdc.approve(address(s.core), principal);
-        vm.prank(s.settlement);
-        uint256 loanId = s.core.openLoan(s.borrower, s.lender, address(s.col), uint128(colNeeded), principal, rateBps, 30, 6000, minDays, 0);
-
-        uint256 elapsed = bound(elapsedSeed, 0, 29 days);
+        uint256 loanId = _openLoan(col8, FIXED_COL_8, principal, rateBps, 30, minDays);
         uint256 tTarget = BASE_TIME + elapsed;
         vm.warp(tTarget);
 
@@ -335,180 +363,190 @@ contract FormalPropertiesTest is Test {
         uint256 realExpected = elapsed == 0 ? 0 : _ceilDiv(uint256(principal) * rateBps * elapsed, 10000 * SECONDS_PER_YEAR);
         uint256 expectedDue = realExpected > floorExpected ? realExpected : floorExpected;
 
-        uint128 due = s.core.getDueInterest(loanId);
-        assertEq(due, expectedDue, "Exact max(realAccrued, minFloor) equality failed");
-        assertGe(due, floorExpected);
+        uint128 due = core.getDueInterest(loanId);
+        assert(due == expectedDue);
+        assert(due >= floorExpected);
 
-        // Extending early and repaying immediately must NEVER charge floor twice
-        ILoanCore.Loan memory l = s.core.getLoan(loanId);
-        uint64 dl = uint64(tTarget + 1 hours);
-        bytes memory sig = _signExtend(s, loanId, l.maturity + 1 days, 4000, 0, dl);
-        vm.prank(s.borrower);
-        s.core.extend(loanId, l.maturity + 1 days, 4000, dl, sig);
-        assertEq(s.core.getDueInterest(loanId), expectedDue, "Extend mutated accrued/floored due interest");
+        // Extending early at 40% APR must NEVER mutate accrued/floored due interest at tTarget
+        ILoanCore.Loan memory l = core.getLoan(loanId);
+        vm.prank(BORROWER);
+        core.extend(loanId, l.maturity + 1 days, 4000, uint64(tTarget + 1 hours), "");
+        assert(core.getDueInterest(loanId) == expectedDue);
     }
 
-    /// @notice Foundry wrapper executing Halmos-compatible property 4 with 512 fuzz runs.
+    // ---------------- Property 4: Close Factor, Linear Dutch Price & 0-Wei Waterfall Conservation ----------------
+
     /// forge-config: default.fuzz.runs = 512
     function test_check_CloseFactorAndAuctionWaterfallConservation(
-        uint8 decIdx,
+        uint8 decIdxSeed,
         uint64 principalSeed,
         uint16 crashPriceUsdSeed,
         uint16 buyElapsedSeed,
         uint16 buyFracBpsSeed
     ) public {
-        check_CloseFactorAndAuctionWaterfallConservation(decIdx, principalSeed, crashPriceUsdSeed, buyElapsedSeed, buyFracBpsSeed);
+        uint8 decIdx = uint8(bound(decIdxSeed, 0, 2));
+        uint64 principal = uint64(bound(principalSeed, 1_000e6, 1_200e6));
+        uint16 crashPriceUsd = uint16(bound(crashPriceUsdSeed, 60, 125));
+        uint16 buyElapsed = uint16(bound(buyElapsedSeed, 0, 1800));
+        uint16 buyFracBps = uint16(bound(buyFracBpsSeed, 4000, 10000));
+        check_CloseFactorAndAuctionWaterfallConservation(decIdx, principal, crashPriceUsd, buyElapsed, buyFracBps);
     }
 
-    /// @notice WS4.3 Property 4: Liquidation close factor (50% vs 100%), linear price decay bounds,
-    ///         and 0-wei global USDC conservation across 6, 8, and 18 collateral decimals.
-    /// forge-config: default.fuzz.runs = 512
+    /// @notice WS4.3 Property 4 (Halmos-compatible): Close factor (50% vs 100%), linear Dutch bounds & 0-wei waterfall conservation across 6/8/18 dec.
     function check_CloseFactorAndAuctionWaterfallConservation(
         uint8 decIdx,
-        uint64 principalSeed,
-        uint16 crashPriceUsdSeed,
-        uint16 buyElapsedSeed,
-        uint16 buyFracBpsSeed
+        uint64 principal,
+        uint16 crashPriceUsd,
+        uint16 buyElapsed,
+        uint16 buyFracBps
     ) public {
-        uint8 colDec = decIdx % 3 == 0 ? 6 : (decIdx % 3 == 1 ? 8 : 18);
-        uint256 colUnit = 10 ** colDec;
-        Stack memory s = _deployStack(colDec, 200e8);
+        vm.assume(decIdx <= 2);
+        vm.assume(principal >= 1_000e6 && principal <= 1_200e6);
+        vm.assume(crashPriceUsd >= 60 && crashPriceUsd <= 125);
+        vm.assume(buyElapsed <= 1800);
+        vm.assume(buyFracBps >= 4000 && buyFracBps <= 10000);
 
-        uint128 principal = uint128(bound(principalSeed, 1_000e6, 50_000e6));
-        // Target initial LTV ~50% at $200 => collateral value = 2 * principal => whole shares to simplify rounding bounds
-        uint256 shares = _ceilDiv(uint256(principal) * 2, 200e6);
-        uint128 colAmt = uint128(shares * colUnit);
+        MockERC20 tok;
+        MockAggregator feed;
+        uint256 colUnit;
+        if (decIdx == 0) {
+            tok = col6;
+            feed = feed6;
+            colUnit = 1e6;
+        } else if (decIdx == 1) {
+            tok = col8;
+            feed = feed8;
+            colUnit = 1e8;
+        } else {
+            tok = col18;
+            feed = feed18;
+            colUnit = 1e18;
+        }
 
-        s.col.mint(s.borrower, colAmt);
-        vm.prank(s.borrower);
-        s.col.approve(address(s.escrow), colAmt);
-        s.usdc.mint(s.lender, principal);
-        vm.prank(s.lender);
-        s.usdc.approve(address(s.core), principal);
-        vm.prank(s.settlement);
-        uint256 loanId = s.core.openLoan(s.borrower, s.lender, address(s.col), colAmt, principal, 800, 30, 6000, 3, 0);
+        // 10 shares @ $200 = $2,000 => 50%..60% init LTV for principal in [$1,000 .. $1,200]
+        uint128 colAmt = uint128(10 * colUnit);
+        uint256 loanId = _openLoan(tok, colAmt, principal, 800, 30, 3);
 
-        // Crash oracle price into liquidatable range [$60 .. $125]
-        uint256 crashPrice8 = bound(crashPriceUsdSeed, 60, 125) * 1e8;
-        s.feed.setPrice(int256(crashPrice8));
-        (uint256 grossVal, , ) = s.router.getValue(address(s.col), colAmt);
-        uint256 debt = uint256(principal) + s.core.getDueInterest(loanId);
+        uint256 crashPrice8 = uint256(crashPriceUsd) * 1e8;
+        feed.setPrice(int256(crashPrice8));
+        (uint256 grossVal, , ) = router.getValue(address(tok), colAmt);
+        uint256 debt = uint256(principal) + core.getDueInterest(loanId);
         uint256 ltvBps = (debt * 10000) / grossVal;
         vm.assume(ltvBps >= 7800);
 
-        vm.prank(s.keeper);
-        uint256 aucId = s.core.startLiquidation(loanId);
-        ILiquidationAuction.Auction memory a = s.auction.getAuction(aucId);
+        vm.prank(KEEPER);
+        uint256 aucId = core.startLiquidation(loanId);
+        ILiquidationAuction.Auction memory a = auction.getAuction(aucId);
 
-        // Verify close-factor law: < badDebtLtvBps (9000) => 50%, >= badDebtLtvBps => 100%
         if (ltvBps >= 9000) {
-            assertEq(a.collateralTotal, colAmt, ">= badDebtLtvBps must trigger 100% close factor");
+            assert(a.collateralTotal == colAmt);
         } else {
-            assertEq(a.collateralTotal, colAmt / 2, "< badDebtLtvBps must trigger 50% partial close factor");
+            assert(a.collateralTotal == colAmt / 2);
         }
 
-        // Advance inside auction duration and verify linear Dutch price invariant: floor <= cur <= start
-        uint256 elapsed = bound(buyElapsedSeed, 0, a.duration);
-        uint256 tBuy = BASE_TIME + elapsed;
+        uint256 tBuy = BASE_TIME + buyElapsed;
         vm.warp(tBuy);
-        s.feed.setUpdatedAt(tBuy);
-        uint256 curPrice = s.auction.getCurrentPrice(aucId);
-        assertGe(curPrice, a.floorPrice);
-        assertLe(curPrice, a.startPrice);
-        assertEq(curPrice, a.startPrice - (((a.startPrice - a.floorPrice) * elapsed) / a.duration));
+        feed.setUpdatedAt(tBuy);
+        uint256 curPrice = auction.getCurrentPrice(aucId);
+        assert(curPrice >= a.floorPrice);
+        assert(curPrice <= a.startPrice);
+        assert(curPrice == a.startPrice - (((a.startPrice - a.floorPrice) * buyElapsed) / a.duration));
 
-        // Buy partial/full slice above MIN_BUY_USDC and prove 0-wei waterfall conservation!
-        uint128 colBuy = uint128((uint256(a.collateralRemaining) * bound(buyFracBpsSeed, 4000, 10000)) / 10000);
+        uint128 colBuy = uint128((uint256(a.collateralRemaining) * buyFracBps) / 10000);
         if (colBuy == 0) colBuy = a.collateralRemaining;
         uint256 den = colUnit * 1e8;
         uint128 expectedPaid = uint128(_ceilDiv(uint256(colBuy) * curPrice * 1e6, den));
-        if (expectedPaid < s.auction.MIN_BUY_USDC()) {
+        if (expectedPaid < auction.MIN_BUY_USDC()) {
             colBuy = a.collateralRemaining;
             expectedPaid = uint128(_ceilDiv(uint256(colBuy) * curPrice * 1e6, den));
         }
 
-        uint256 keepBefore = s.usdc.balanceOf(s.keeper);
-        uint256 feeBefore = s.usdc.balanceOf(s.treasury) + s.usdc.balanceOf(s.reserve);
-        uint256 bBefore = s.usdc.balanceOf(s.borrower);
-        uint256 coreBefore = s.usdc.balanceOf(address(s.core));
-        uint256 lClaimBefore = s.core.getClaimable(s.lender);
+        uint256 keepBefore = usdc.balanceOf(KEEPER);
+        uint256 feeBefore = usdc.balanceOf(TREASURY) + usdc.balanceOf(RESERVE);
+        uint256 bBefore = usdc.balanceOf(BORROWER);
+        uint256 coreBefore = usdc.balanceOf(address(core));
+        uint256 lClaimBefore = core.getClaimable(address(lenderWallet));
 
-        s.usdc.mint(s.liquidator, expectedPaid);
-        vm.prank(s.liquidator);
-        s.usdc.approve(address(s.auction), expectedPaid);
-        vm.prank(s.liquidator);
-        uint128 paid = s.auction.buy(aucId, colBuy, expectedPaid);
-        assertEq(paid, expectedPaid);
+        usdc.mint(LIQUIDATOR, expectedPaid);
+        vm.prank(LIQUIDATOR);
+        usdc.approve(address(auction), expectedPaid);
+        vm.prank(LIQUIDATOR);
+        uint128 paid = auction.buy(aucId, colBuy, expectedPaid);
+        assert(paid == expectedPaid);
 
-        uint256 keeperDelta = s.usdc.balanceOf(s.keeper) - keepBefore;
-        uint256 feeDelta = (s.usdc.balanceOf(s.treasury) + s.usdc.balanceOf(s.reserve)) - feeBefore;
-        uint256 borrowerDelta = s.usdc.balanceOf(s.borrower) - bBefore;
-        uint256 claimDelta = s.core.getClaimable(s.lender) - lClaimBefore;
-        uint256 coreDelta = s.usdc.balanceOf(address(s.core)) - coreBefore;
+        uint256 keeperDelta = usdc.balanceOf(KEEPER) - keepBefore;
+        uint256 feeDelta = (usdc.balanceOf(TREASURY) + usdc.balanceOf(RESERVE)) - feeBefore;
+        uint256 borrowerDelta = usdc.balanceOf(BORROWER) - bBefore;
+        uint256 claimDelta = core.getClaimable(address(lenderWallet)) - lClaimBefore;
+        uint256 coreDelta = usdc.balanceOf(address(core)) - coreBefore;
 
-        assertEq(keeperDelta + feeDelta + borrowerDelta + claimDelta, paid, "0-wei waterfall USDC conservation violated");
-        assertEq(coreDelta, claimDelta, "LoanCore USDC delta must match lender claimable increase");
-        assertEq(s.usdc.balanceOf(address(s.auction)), 0, "Auction must never retain stranded USDC");
+        assert(keeperDelta + feeDelta + borrowerDelta + claimDelta == paid);
+        assert(coreDelta == claimDelta);
+        assert(usdc.balanceOf(address(auction)) == 0);
     }
 
-    /// @notice Foundry wrapper executing Halmos-compatible property 5 with 512 fuzz runs.
+    // ---------------- Property 5: CollateralEscrow Multi-Token Isolation & Access Control ----------------
+
     /// forge-config: default.fuzz.runs = 512
     function test_check_CollateralEscrowIsolation(uint64 amtA1, uint64 amtA2, uint64 amtB, uint64 releaseA) public {
-        check_CollateralEscrowIsolation(amtA1, amtA2, amtB, releaseA);
+        uint64 a1 = uint64(bound(amtA1, 1, 1_000_000e8));
+        uint64 a2 = uint64(bound(amtA2, 1, 1_000_000e8));
+        uint64 b1 = uint64(bound(amtB, 1, 1_000_000e18));
+        uint64 rel = uint64(bound(releaseA, 0, a1));
+        check_CollateralEscrowIsolation(a1, a2, b1, rel);
     }
 
-    /// @notice WS4.3 Property 5: CollateralEscrow isolates independent tokens & balances and reverts on over-release.
-    /// forge-config: default.fuzz.runs = 512
-    function check_CollateralEscrowIsolation(uint64 amtA1, uint64 amtA2, uint64 amtB, uint64 releaseA) public {
-        address coreAuth = address(0x9001);
-        address userA = address(0xA001);
-        address userB = address(0xB001);
+    /// @notice WS4.3 Property 5 (Halmos-compatible): Multi-token isolation, over-release rejection & unauthorized withdrawal rejection.
+    function check_CollateralEscrowIsolation(uint64 a1, uint64 a2, uint64 b1, uint64 rel) public {
+        vm.assume(a1 >= 1 && a1 <= 1_000_000e8);
+        vm.assume(a2 >= 1 && a2 <= 1_000_000e8);
+        vm.assume(b1 >= 1 && b1 <= 1_000_000e18);
+        vm.assume(rel <= a1);
 
-        CollateralEscrow escrow = new CollateralEscrow(address(this));
-        escrow.setAuthorizedCore(coreAuth, true);
-        MockERC20 tokA = new MockERC20("Token A", "TOKA", 8);
-        MockERC20 tokB = new MockERC20("Token B", "TOKB", 18);
+        isoTokA.mint(ISO_USER_A, a1);
+        isoTokA.mint(ISO_USER_B, a2);
+        isoTokB.mint(ISO_USER_B, b1);
 
-        uint256 a1 = bound(amtA1, 1, 1_000_000e8);
-        uint256 a2 = bound(amtA2, 1, 1_000_000e8);
-        uint256 b1 = bound(amtB, 1, 1_000_000e18);
+        vm.prank(ISO_USER_A);
+        isoTokA.approve(address(isoEscrow), a1);
+        vm.prank(ISO_USER_B);
+        isoTokA.approve(address(isoEscrow), a2);
+        vm.prank(ISO_USER_B);
+        isoTokB.approve(address(isoEscrow), b1);
 
-        tokA.mint(userA, a1);
-        tokA.mint(userB, a2);
-        tokB.mint(userB, b1);
-
-        vm.prank(userA);
-        tokA.approve(address(escrow), a1);
-        vm.prank(userB);
-        tokA.approve(address(escrow), a2);
-        vm.prank(userB);
-        tokB.approve(address(escrow), b1);
-
-        vm.startPrank(coreAuth);
-        escrow.depositCollateral(address(tokA), userA, a1);
-        escrow.depositCollateral(address(tokA), userB, a2);
-        escrow.depositCollateral(address(tokB), userB, b1);
+        vm.startPrank(ISO_AUTH);
+        isoEscrow.depositCollateral(address(isoTokA), ISO_USER_A, a1);
+        isoEscrow.depositCollateral(address(isoTokA), ISO_USER_B, a2);
+        isoEscrow.depositCollateral(address(isoTokB), ISO_USER_B, b1);
         vm.stopPrank();
 
-        assertEq(escrow.getBalance(address(tokA)), a1 + a2);
-        assertEq(escrow.getBalance(address(tokB)), b1);
+        assert(isoEscrow.getBalance(address(isoTokA)) == uint256(a1) + a2);
+        assert(isoEscrow.getBalance(address(isoTokB)) == b1);
 
-        uint256 rel = bound(releaseA, 0, a1);
-        vm.prank(coreAuth);
-        escrow.releaseCollateral(address(tokA), userA, rel);
+        // Unauthorized direct withdrawal MUST revert UnauthorizedCaller
+        vm.prank(ISO_USER_A);
+        try isoEscrow.releaseCollateral(address(isoTokA), ISO_USER_A, 1) {
+            assert(false);
+        } catch (bytes memory err) {
+            assert(err.length >= 4 && bytes4(err) == CollateralEscrow.UnauthorizedCaller.selector);
+        }
 
-        // Releasing tokA never mutates tokB
-        assertEq(escrow.getBalance(address(tokA)), (a1 + a2) - rel);
-        assertEq(tokA.balanceOf(address(escrow)), (a1 + a2) - rel);
-        assertEq(escrow.getBalance(address(tokB)), b1);
-        assertEq(tokB.balanceOf(address(escrow)), b1);
+        vm.prank(ISO_AUTH);
+        isoEscrow.releaseCollateral(address(isoTokA), ISO_USER_A, rel);
 
-        // Over-releasing tokA reverts cleanly with InsufficientBalance and leaves balances untouched
-        uint256 tooMuch = ((a1 + a2) - rel) + 1;
-        vm.prank(coreAuth);
-        vm.expectRevert(CollateralEscrow.InsufficientBalance.selector);
-        escrow.releaseCollateral(address(tokA), userA, tooMuch);
+        uint256 expectedRemA = (uint256(a1) + a2) - rel;
+        assert(isoEscrow.getBalance(address(isoTokA)) == expectedRemA);
+        assert(isoTokA.balanceOf(address(isoEscrow)) == expectedRemA);
+        assert(isoEscrow.getBalance(address(isoTokB)) == b1);
+        assert(isoTokB.balanceOf(address(isoEscrow)) == b1);
 
-        assertEq(escrow.getBalance(address(tokB)), b1);
+        // Over-releasing tokA MUST revert InsufficientBalance and leave tokB untouched
+        vm.prank(ISO_AUTH);
+        try isoEscrow.releaseCollateral(address(isoTokA), ISO_USER_A, expectedRemA + 1) {
+            assert(false);
+        } catch (bytes memory err) {
+            assert(err.length >= 4 && bytes4(err) == CollateralEscrow.InsufficientBalance.selector);
+        }
+        assert(isoEscrow.getBalance(address(isoTokB)) == b1);
     }
 }
