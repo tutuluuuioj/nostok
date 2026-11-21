@@ -659,4 +659,13 @@ assert.equal(
   'n/a'
 );
 
+// Missing status or oracle field from api/ must be reported as a discrepancy, never skipped
+const recMissingApiFields = reconcileLiveAssetsWithApi(
+  [{ token: '0x2222222222222222222222222222222222222222', symbol: 'NVDAc' }],
+  mockOnChainSnapshot
+);
+assert.equal(recMissingApiFields.discrepancies.length, 2);
+assert.ok(recMissingApiFields.discrepancies.some((d) => /AssetStatus missing from api\//.test(d)));
+assert.ok(recMissingApiFields.discrepancies.some((d) => /OracleState missing from api\//.test(d)));
+
 console.log('book ok');

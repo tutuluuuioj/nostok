@@ -40,6 +40,7 @@ Verify all governance and signing infrastructure **before** broadcasting `Deploy
 1. **Export Verified Deployment Environment Variables:**
    ```bash
    export BASE_RPC_URL="https://<your-dedicated-base-mainnet-rpc>"
+   export ETHERSCAN_API_KEY="<your-basescan-etherscan-api-key>"
    export OWNER_ADDRESS="0x..."
    export GUARDIAN_ADDRESS="0x..."
    export TREASURY_ADDRESS="0x..."
@@ -57,12 +58,11 @@ Verify all governance and signing infrastructure **before** broadcasting `Deploy
    # 1. Dry-run without --broadcast
    forge script script/DeployNostok.s.sol --rpc-url "$BASE_RPC_URL"
 
-   # 2. Broadcast & verify on BaseScan once simulation addresses/args are reviewed
+   # 2. Broadcast & verify on BaseScan using ETHERSCAN_API_KEY from env (never via CLI flag)
    forge script script/DeployNostok.s.sol \
      --rpc-url "$BASE_RPC_URL" \
      --broadcast \
-     --verify \
-     --etherscan-api-key "$BASESCAN_API_KEY"
+     --verify
    ```
 
 3. **Record Deployment Output & Block Height:**
@@ -84,9 +84,10 @@ Verify all governance and signing infrastructure **before** broadcasting `Deploy
 
 1. **Schedule `NostokTimelock` Batch via `OWNER_ADDRESS` Safe (Wait >= 48 Hours, Then Execute):**
    - `LoanCore.setGlobalCap(10_000_000_000)` ($10,000 USDC — within the $5,000–$25,000 initial aggregate guarded launch cap range).
-   - `AssetRegistry.setAssetConfig(token, cfg)` for pinned Base Mainnet Tier A B20 equities only (`Status = 0 Active`, `Tier = 0 Tier A`, `maxInitLtvBps = 6000`, `marginCallLtvBps = 7000`, `liqLtvBps = 7800`, `badDebtLtvBps = 9000`, `maxDiscountBps = 600`, `closedMarketHaircutBps = 500`, `minInterestDays = 3`, `maxStaleOpenSecs = 21600`, `maxStaleClosedSecs = 360000`, `perLoanCap = 1_000_000_000`, `assetCap = 5_000_000_000`):
-     - `NVDAc` (`0xb20000000000000000000078ee7ce2fE4908108C`) -> Chainlink `NVDA / USD` (`0x04689a41629776563E6822F76f2e57D148d28513`, `feedDecimals = 8`)
-     - `METAc` (`0xb2000000000000000000008bC8786B856E61707C`) -> Chainlink `META / USD` (`0x6526aE6797A76123638b863AeE4dD27Ba4E4b27D`, `feedDecimals = 8`)
+   - `AssetRegistry.setAssetConfig(token, cfg)` using the exact `IAssetRegistry.AssetConfig` struct fields for pinned Base Mainnet Tier A B20 equities (`feedDecimals = 8`, `tier = 0` (`Tier A`), `maxInitLtvBps = 6000`, `marginCallLtvBps = 7000`, `liqLtvBps = 7800`, `badDebtLtvBps = 9000`, `maxDiscountBps = 600`, `closedMarketHaircutBps = 500`, `perLoanCap = 1_000_000_000`, `assetCap = 5_000_000_000`, `maxStaleOpenSecs = 21600`, `status = 0` (`Active`), `restricted = false` so allowlisted/permissionless liquidations can clear without per-asset liquidator restrictions):
+     - `NVDAc` (`0xb20000000000000000000078ee7ce2fE4908108C`) -> `feed = 0x04689a41629776563E6822F76f2e57D148d28513` (Chainlink `NVDA / USD`, `feedDecimals = 8`)
+     - `METAc` (`0xb2000000000000000000008bC8786B856E61707C`) -> `feed = 0x6526aE6797A76123638b863AeE4dD27Ba4E4b27D` (Chainlink `META / USD`, `feedDecimals = 8`)
+     - *(Minimum interest duration is passed per loan in `LoanCore.openLoan`, and closed-market staleness `360000`s is a single contract-wide `OracleRouter` setting rather than per-asset `AssetConfig` fields.)*
    - Confirm `OracleRouter.recordedMultiplier(NVDAc)` and `OracleRouter.recordedMultiplier(METAc)` are non-zero (call permissionless `OracleRouter.syncMultiplier(token)` if any baseline is `0`).
 
 2. **Configure `EligibilityGate` Allowlist (Direct Owner Safe Call, Zero Timelock Delay):**
@@ -96,15 +97,45 @@ Verify all governance and signing infrastructure **before** broadcasting `Deploy
 
 ## 4. Database & Role Provisioning (PostgreSQL)
 
-Provision PostgreSQL with **strict role separation** (all off-chain services refuse `memory://` or embedded PGlite when `FORK=false`):
+Provision PostgreSQL with **strict role separation** (all off-chain services refuse `memory://` or embedded PGlite when `FORK=false`). Because `notifications/src/db.ts` (`initNotifSchema`) runs `CREATE TABLE IF NOT EXISTS`, `ALTER TABLE`, and `CREATE INDEX IF NOT EXISTS` on startup, grant `CREATE` on its isolated `nostok_notifications` database/schema (or pre-create the `notif_*` tables owned by `nostok_notif`). Grant `nostok_ro` `SELECT` **after** `indexer` creates its tables on first startup (and set `ALTER DEFAULT PRIVILEGES` for `nostok_indexer`):
 
-1. **Indexer Writer Role (`nostok_indexer`):**
-   - Owns the indexer database/schema tables (`indexer_state`, `indexed_blocks`, `loans`, `loan_events`, `orders`, `order_fills`, `auctions`, `auction_buys`, `positions`, `claims`, `assets`).
-2. **Strictly Read-Only Query Role (`nostok_ro`):**
-   - Grant `USAGE` on schema + `SELECT` **only** on indexer tables (zero `INSERT`/`UPDATE`/`DELETE`/`DDL`/superuser privileges).
-   - Used by `api/` (`DATABASE_URL`), `risk/` (`DATABASE_URL`), and `notifications/` (`INDEXER_DATABASE_URL`).
-3. **Scoped Notifications Role (`nostok_notif`):**
-   - Grant `SELECT`, `INSERT`, `UPDATE`, `DELETE` strictly on `notif_*` tables (`notif_nonces`, `notif_subscriptions`, `notif_preferences`, `notif_deliveries`, `notif_dead_letters`, `notif_cursor`, `notif_alert_episodes`, `notif_revoked_sessions`, `notif_manage_token_usage`, `notif_blocked_senders`, `notif_verify_sends`, `notif_verify_target_state`) and **zero** write privileges on indexer tables.
+```sql
+CREATE ROLE nostok_indexer WITH LOGIN PASSWORD '<INDEXER_PASSWORD>';
+CREATE ROLE nostok_ro      WITH LOGIN PASSWORD '<READONLY_PASSWORD>';
+CREATE ROLE nostok_notif   WITH LOGIN PASSWORD '<NOTIF_PASSWORD>';
+
+-- 1. Indexer database & writer role (creates & updates all 11 indexer tables)
+CREATE DATABASE nostok OWNER nostok_indexer;
+\c nostok
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT USAGE, CREATE ON SCHEMA public TO nostok_indexer;
+
+-- 2. Strictly read-only query role for api/, risk/, and notifications/ INDEXER_DATABASE_URL
+GRANT USAGE ON SCHEMA public TO nostok_ro;
+-- Run after `cd indexer && npm run once` creates tables, plus keep future tables readable:
+GRANT SELECT ON TABLE
+  indexer_state, indexed_blocks, assets, loans, loan_events,
+  orders, order_fills, auctions, auction_buys, positions, claims
+TO nostok_ro;
+ALTER DEFAULT PRIVILEGES FOR ROLE nostok_indexer IN SCHEMA public
+  GRANT SELECT ON TABLES TO nostok_ro;
+
+-- 3. Isolated notifications database & role (initNotifSchema runs DDL + DML on notif_* tables)
+CREATE DATABASE nostok_notifications OWNER nostok_notif;
+\c nostok_notifications
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT USAGE, CREATE ON SCHEMA public TO nostok_notif;
+-- After `cd notifications && npm run once` initializes the 12 notif_* tables (or if pre-created first):
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+  notif_nonces, notif_subscriptions, notif_preferences, notif_deliveries,
+  notif_dead_letters, notif_cursor, notif_alert_episodes, notif_revoked_sessions,
+  notif_blocked_senders, notif_verify_sends, notif_verify_target_state, notif_manage_token_usage
+TO nostok_notif;
+```
+
+1. **Indexer Writer (`nostok_indexer`)**: Creates and writes the 11 indexer tables in `nostok`; no other service holds write grants on them.
+2. **Read-Only Query Role (`nostok_ro`)**: Used by `api/` (`DATABASE_URL`), `risk/` (`DATABASE_URL`), and `notifications/` (`INDEXER_DATABASE_URL`); zero `INSERT`/`UPDATE`/`DELETE`/`DDL`/superuser privileges.
+3. **Scoped Notifications Role (`nostok_notif`)**: Used only by `notifications/` (`DATABASE_URL`) against `nostok_notifications`; holds `USAGE, CREATE` on its own isolated schema (or pre-created `notif_*` tables owned by `nostok_notif`) and zero privileges on `nostok` indexer tables.
 
 ---
 
@@ -223,6 +254,8 @@ Before clearing guarded launch or inviting allowlisted wallets:
 
 ## 8. Rollback & Incident Controls
 
+- **Halfway / Interrupted `DeployNostok.s.sol` Broadcast:** Before the final step of `DeployNostok.s.sol` (`transferOwnership(address(timelock))` and `EligibilityGate.transferOwnership(multisigOwner)`), the `DEPLOYER` key temporarily still owns any already-broadcast contracts and `EligibilityGate` operator status. Do **not** point backends, the frontend, or `WS4.7` at a partial broadcast. Inspect `contracts/broadcast/DeployNostok.s.sol/8453/run-latest.json`, strip `DEPLOYER` authority on partial contracts (`LoanCore.setPaused(true)`, `EligibilityGate.setOperator(deployer, false)`, transfer ownership to `NostokTimelock` / `OWNER_ADDRESS` or abandon and re-run a clean `DeployNostok.s.sol` broadcast), and re-verify `owner()` and `isOperator(DEPLOYER) == false` before publishing addresses.
+- **Cancel a Bad `NostokTimelock` Batch During the 48h Wait:** `NostokTimelock` (OpenZeppelin `TimelockController`, `admin = address(0)`) grants `CANCELLER_ROLE` to `OWNER_ADDRESS` alongside `PROPOSER_ROLE`. Compute `bytes32 id = timelock.hashOperationBatch(targets, values, payloads, predecessor, salt)` (or `hashOperation(...)` for a single call) and submit `NostokTimelock.cancel(id)` from the `OWNER_ADDRESS` Safe any time before execution while `isOperationPending(id)` is `true`.
 - **Halt New Originations Immediately:** Guardian Safe executes `LoanCore.setPaused(true)` (existing borrower repayments, collateral top-ups, partial repayments, cancellations, and lender claims remain functional).
 - **Restrict or Freeze an Asset:** Guardian Safe calls `AssetRegistry.setAssetStatus(token, 1)` (`ReduceOnly`) or `AssetRegistry.setAssetStatus(token, 3)` (`Frozen`) without timelock delay; only `NostokTimelock` governance can restore `Active (0)`.
 - **Halt Keeper Auto-Broadcasts:** Stop the `keeper/` process or revert to `DRY_RUN=true` while investigating RPC/oracle incidents.

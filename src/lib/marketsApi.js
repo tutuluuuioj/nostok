@@ -1705,20 +1705,22 @@ export function reconcileLiveAssetsWithApi(apiAssets, onChainSnapshot) {
     }
 
     if (apiAsset) {
-      if (
-        apiAsset.status !== undefined &&
-        apiAsset.status !== null &&
-        chainAsset.status !== null &&
-        Number(apiAsset.status) !== Number(chainAsset.status)
-      ) {
+      if (apiAsset.status === undefined || apiAsset.status === null) {
+        discrepancies.push(
+          `${label}: AssetStatus missing from api/ vs Base AssetRegistry=${chainAsset.status_name ?? chainAsset.status}`
+        );
+      } else if (chainAsset.status !== null && Number(apiAsset.status) !== Number(chainAsset.status)) {
         discrepancies.push(
           `${label}: AssetStatus api=${apiAsset.status_name ?? apiAsset.status} vs Base AssetRegistry=${chainAsset.status_name}`
         );
       }
-      if (
-        apiAsset.oracle?.state !== undefined &&
-        apiAsset.oracle?.state !== null &&
+      if (apiAsset.oracle?.state === undefined || apiAsset.oracle?.state === null) {
+        discrepancies.push(
+          `${label}: OracleState missing from api/ vs Base OracleRouter=${chainAsset.oracle?.state_name ?? chainAsset.oracle?.state ?? 'unknown'}`
+        );
+      } else if (
         chainAsset.oracle?.state !== null &&
+        chainAsset.oracle?.state !== undefined &&
         Number(apiAsset.oracle.state) !== Number(chainAsset.oracle.state)
       ) {
         discrepancies.push(

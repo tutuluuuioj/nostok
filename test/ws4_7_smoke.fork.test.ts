@@ -278,6 +278,12 @@ function validateDeploymentAndSmokeRunbooks(): void {
   const deployRunbook = fs.readFileSync(path.join(REPO_ROOT, 'docs', 'DEPLOYMENT_RUNBOOK.md'), 'utf8');
   const smokeRunbook = fs.readFileSync(path.join(REPO_ROOT, 'docs', 'WS4_7_MAINNET_SMOKE_RUNBOOK.md'), 'utf8');
   const deploySol = fs.readFileSync(path.join(REPO_ROOT, 'contracts', 'script', 'DeployNostok.s.sol'), 'utf8');
+  const assetRegistrySol = fs.readFileSync(
+    path.join(REPO_ROOT, 'contracts', 'src', 'interfaces', 'IAssetRegistry.sol'),
+    'utf8'
+  );
+  const indexerDbTs = fs.readFileSync(path.join(REPO_ROOT, 'indexer', 'src', 'db.ts'), 'utf8');
+  const notifDbTs = fs.readFileSync(path.join(REPO_ROOT, 'notifications', 'src', 'db.ts'), 'utf8');
   const rootEnvEx = fs.readFileSync(path.join(REPO_ROOT, '.env.example'), 'utf8');
 
   // Verify every env var read by DeployNostok.s.sol is covered in DEPLOYMENT_RUNBOOK.md
@@ -293,6 +299,54 @@ function validateDeploymentAndSmokeRunbooks(): void {
   ]) {
     assert.ok(deploySol.includes(`"${envVar}"`), `DeployNostok.s.sol missing expected env var ${envVar}`);
     assert.ok(deployRunbook.includes(envVar), `docs/DEPLOYMENT_RUNBOOK.md must document ${envVar}`);
+  }
+
+  // Verify exact AssetConfig struct fields extracted from IAssetRegistry.sol appear in setAssetConfig section
+  const assetCfgStruct = assetRegistrySol.match(/struct\s+AssetConfig\s*\{([\s\S]*?)\}/);
+  assert.ok(assetCfgStruct, 'IAssetRegistry.sol must declare struct AssetConfig');
+  const assetConfigFields = assetCfgStruct[1]
+    .split('\n')
+    .map((line) => line.replace(/\/\/.*$/, '').trim())
+    .filter(Boolean)
+    .map((decl) => decl.match(/^\S+\s+([A-Za-z_][A-Za-z0-9_]*)\s*;$/)?.[1])
+    .filter((name): name is string => Boolean(name));
+  assert.ok(assetConfigFields.length >= 14, `Expected >=14 AssetConfig fields in IAssetRegistry.sol, got ${assetConfigFields.length}`);
+  const assetCfgSection =
+    deployRunbook.match(/AssetRegistry\.setAssetConfig\(token,\s*cfg\)([\s\S]*?)-\s*Confirm\s+`OracleRouter\.recordedMultiplier/)?.[1] ?? '';
+  assert.ok(assetCfgSection.length > 0, 'docs/DEPLOYMENT_RUNBOOK.md must contain AssetRegistry.setAssetConfig section');
+  for (const field of assetConfigFields) {
+    assert.ok(
+      assetCfgSection.includes(field),
+      `docs/DEPLOYMENT_RUNBOOK.md setAssetConfig section must document IAssetRegistry.AssetConfig field "${field}"`
+    );
+  }
+  assert.ok(!assetCfgSection.includes('minInterestDays'), 'AssetConfig section must not list minInterestDays');
+  assert.ok(!assetCfgSection.includes('maxStaleClosedSecs'), 'AssetConfig section must not list maxStaleClosedSecs');
+
+  // Verify every table created by indexer/src/db.ts & notifications/src/db.ts appears in DEPLOYMENT_RUNBOOK.md DB provisioning SQL
+  const indexerTables = Array.from(indexerDbTs.matchAll(/CREATE TABLE IF NOT EXISTS\s+([a-z_][a-z0-9_]*)/g), (m) => m[1]);
+  const notifTables = Array.from(notifDbTs.matchAll(/CREATE TABLE IF NOT EXISTS\s+([a-z_][a-z0-9_]*)/g), (m) => m[1]);
+  assert.ok(indexerTables.length >= 11, `Expected >=11 tables in indexer/src/db.ts, got ${indexerTables.length}`);
+  assert.ok(notifTables.length >= 12, `Expected >=12 tables in notifications/src/db.ts, got ${notifTables.length}`);
+  for (const table of indexerTables) {
+    assert.ok(deployRunbook.includes(table), `docs/DEPLOYMENT_RUNBOOK.md must list indexer table "${table}"`);
+  }
+  for (const table of notifTables) {
+    assert.ok(deployRunbook.includes(table), `docs/DEPLOYMENT_RUNBOOK.md must list notifications table "${table}"`);
+  }
+
+  // Verify ETHERSCAN_API_KEY env var usage (never --etherscan-api-key CLI flag), GRANT SQL, and rollback controls
+  assert.ok(!deployRunbook.includes('--etherscan-api-key'), 'Runbook must not pass --etherscan-api-key on CLI');
+  assert.ok(deployRunbook.includes('ETHERSCAN_API_KEY'), 'Runbook must use ETHERSCAN_API_KEY env var');
+  for (const sqlAndRollbackTerm of [
+    'GRANT SELECT',
+    'ALTER DEFAULT PRIVILEGES',
+    'GRANT USAGE, CREATE ON SCHEMA',
+    'initNotifSchema',
+    'hashOperationBatch',
+    'cancel(',
+  ]) {
+    assert.ok(deployRunbook.includes(sqlAndRollbackTerm), `docs/DEPLOYMENT_RUNBOOK.md must document ${sqlAndRollbackTerm}`);
   }
 
   // Verify pinned Base Mainnet USDC, Sequencer feed, and B20/Chainlink addresses match across runbooks & code
@@ -332,7 +386,7 @@ function validateDeploymentAndSmokeRunbooks(): void {
     assert.ok(deployRunbook.includes(viteKey), `docs/DEPLOYMENT_RUNBOOK.md must document ${viteKey}`);
   }
 
-  for (const reqTerm of ['nostok_ro', 'nostok_notif', 'FORK=false', 'TRUST_PROXY', 'GEO_REQUIRE_HEADER', 'TRUSTED_PROXY_CIDRS', 'DRY_RUN=true', 'DRY_RUN=false']) {
+  for (const reqTerm of ['nostok_indexer', 'nostok_ro', 'nostok_notif', 'FORK=false', 'TRUST_PROXY', 'GEO_REQUIRE_HEADER', 'TRUSTED_PROXY_CIDRS', 'DRY_RUN=true', 'DRY_RUN=false']) {
     assert.ok(deployRunbook.includes(reqTerm), `docs/DEPLOYMENT_RUNBOOK.md must document ${reqTerm}`);
   }
 }
