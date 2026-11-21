@@ -1201,7 +1201,9 @@ async function runTests(): Promise<void> {
       cfg,
     });
 
-    // 4C: Guardian Safe calls syncMultiplier to ratify post-split multiplier and cleanly restore VALID_OPEN
+    // 4C: Guardian Safe calls syncMultiplier to ratify post-split multiplier and cleanly restore VALID_OPEN.
+    // Note: War Game 4C (syncMultiplier) and 6A/6B (emergencyCancelAuction, setAssetStatus) drive Guardian via
+    // anvil_impersonateAccount(guardianSafe); real Gnosis Safe 2-of-2 EIP-712 execTransaction signatures are tested in 6C below.
     await rpcCall('anvil_impersonateAccount', [guardianSafe]);
     await publicClient.waitForTransactionReceipt({
       hash: await rawWalletClient.sendTransaction({
@@ -1370,7 +1372,8 @@ async function runTests(): Promise<void> {
     assert.equal(aucBlockedCap.startTime, aucAfterRestart.startTime, 'Past maxFeedAge (2x maxStaleOpenSecs), restartOrCancelAuction must NOT restart');
     assert.equal(Number(aucBlockedCap.status), 0);
 
-    // 6A: Guardian first emergencyCancelAuction while STALE_FEED succeeds; unauthorized caller reverts
+    // 6A: Guardian (via anvil_impersonateAccount(guardianSafe)) first emergencyCancelAuction while STALE_FEED succeeds; unauthorized caller reverts.
+    // (Real 2-of-2 Safe execTransaction signatures are verified on LoanCore.setPaused(true) in 6C below.)
     await expectRevert(
       ADDRESSES.keeper,
       deployed.liquidationAuction,
@@ -1406,7 +1409,7 @@ async function runTests(): Promise<void> {
     })) as bigint;
     assert.ok(aucId4 > 0n);
 
-    // Guardian freezes AAPLc (status=3 Frozen); Guardian trying to loosen back to Active (0) MUST REVERT GuardianCanOnlyTighten!
+    // Guardian (still via anvil_impersonateAccount(guardianSafe)) freezes AAPLc (status=3 Frozen); Guardian trying to loosen back to Active (0) MUST REVERT GuardianCanOnlyTighten!
     const setStatusAbi = [
       ...PROTOCOL_ERROR_ABI,
       ...assetRegistryAbi,

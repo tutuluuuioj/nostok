@@ -33,8 +33,10 @@ import { loadConfig as loadKeeperConfig } from '../keeper/src/config.js';
 import { createKeeperContext, runKeeperCycle } from '../keeper/src/keeper.js';
 import { loadNotificationsConfig } from '../notifications/src/config.js';
 import { wrapIndexerQueryableAsReadOnly as wrapNotifReadOnly } from '../notifications/src/db.js';
+import type { NotificationOutboundMessage } from '../notifications/src/channels.js';
 import { createNotificationsContext, runNotificationsCycle } from '../notifications/src/engine.js';
 import { createNotificationsServer } from '../notifications/src/server.js';
+import { formatSiweMessage } from '../notifications/src/siwe.js';
 import { loadRiskConfig } from '../risk/src/config.js';
 import { wrapQueryableAsReadOnly as wrapRiskReadOnly } from '../risk/src/db.js';
 import { createRiskContext, runRiskScan } from '../risk/src/monitor.js';
@@ -781,6 +783,7 @@ async function runTests(): Promise<void> {
       piiHashSecret: crypto.randomBytes(32).toString('hex'),
       webhookSigningSecret: crypto.randomBytes(32).toString('hex'),
       publicBaseUrl: 'http://127.0.0.1:3003',
+      riskApiUrl: riskUrl,
       corsOrigins: ['https://app.nostok.xyz'],
       rateLimitMax: 200,
       authNonceRateLimitMax: 50,
@@ -792,15 +795,16 @@ async function runTests(): Promise<void> {
       oracleRouter: deployed.oracleRouter,
       positionNft: deployed.positionNFT,
     });
+    const capturedNotifications: NotificationOutboundMessage[] = [];
     const notifCtx = await createNotificationsContext(notifCfg, {
       indexerDbOverride: wrapNotifReadOnly({
         query: (sql, params) => idxCtx.db.query(sql, params),
         async close() {},
       }),
       transportsOverride: {
-        async sendEmail() {},
-        async sendTelegram() {},
-        async sendWebhook() {},
+        async sendEmail(msg) { capturedNotifications.push(msg); },
+        async sendTelegram(msg) { capturedNotifications.push(msg); },
+        async sendWebhook(msg) { capturedNotifications.push(msg); },
       },
     });
     const notifServer = createNotificationsServer(notifCtx);
@@ -848,21 +852,100 @@ async function runTests(): Promise<void> {
       };
       setFrontendConfigOverrides(cfg);
 
+      // Register & confirm a real Telegram alert subscription for the borrower via SIWE
+      const borrowerAcct = privateKeyToAccount(KEYS.borrower);
+      const nonceRes = await fetch(`${notifUrl}/auth/nonce`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ wallet_address: ADDRESSES.borrower }),
+      });
+      assert.equal(nonceRes.status, 200);
+      const nonceJson = (await nonceRes.json()) as {
+        nonce: string;
+        domain: string;
+        uri: string;
+        chain_id: number;
+      };
+      const siweMessage = formatSiweMessage({
+        domain: nonceJson.domain,
+        address: ADDRESSES.borrower,
+        uri: nonceJson.uri,
+        chainId: nonceJson.chain_id,
+        nonce: nonceJson.nonce,
+        issuedAt: new Date().toISOString(),
+        expirationTime: new Date(Date.now() + 600_000).toISOString(),
+      });
+      const siweSig = await borrowerAcct.signMessage({ message: siweMessage });
+      const verifyRes = await fetch(`${notifUrl}/auth/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: siweMessage, signature: siweSig }),
+      });
+      assert.equal(verifyRes.status, 200);
+      const { token: notifJwt } = (await verifyRes.json()) as { token: string };
+      const subRes = await fetch(`${notifUrl}/subscriptions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${notifJwt}`,
+        },
+        body: JSON.stringify({ channel: 'telegram', target: '9988776655' }),
+      });
+      assert.equal(subRes.status, 201);
+      const verifyMsg = capturedNotifications.find(
+        (m) => m.alertType === 'subscription_verification' && m.wallet?.toLowerCase() === ADDRESSES.borrower.toLowerCase()
+      );
+      assert.ok(
+        verifyMsg?.payload?.confirm_token,
+        `Notifications verification message must be dispatched and captured (captured=${capturedNotifications.length})`
+      );
+      const confirmRes = await fetch(`${notifUrl}/subscriptions/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: String(verifyMsg.payload.confirm_token) }),
+      });
+      assert.equal(confirmRes.status, 200);
+      const confirmJson = (await confirmRes.json()) as { verified: boolean; enabled: boolean };
+      assert.equal(confirmJson.verified, true);
+      assert.equal(confirmJson.enabled, true);
+
       let scanTimeMs = Date.now();
       const syncAllServices = async () => {
         await runIndexerSync(idxCtx);
         scanTimeMs += 3000;
         const riskSummary = await runRiskScan(riskCtx, scanTimeMs);
         await runNotificationsCycle(notifCtx, scanTimeMs);
-        const [reconciled, riskHttp, marketSnap] = await Promise.all([
+        const [reconciled, riskHttp, riskLoansRes, marketSnap] = await Promise.all([
           fetchMarketsAndLiveContracts({ cfg }),
           fetchRiskSummaryOptional(cfg),
+          fetch(`${riskUrl}/risk/loans`),
           fetchMarketSnapshot({ cfg }),
         ]);
-        return { riskSummary, reconciled, riskHttp, marketSnap };
+        assert.equal(riskLoansRes.ok, true, `GET /risk/loans failed: ${riskLoansRes.status}`);
+        const riskLoans = (await riskLoansRes.json()) as {
+          data: Array<{ loan_id: string; loan_status: number | null; loan_status_name: string }>;
+        };
+        return { riskSummary, reconciled, riskHttp, riskLoans, marketSnap };
       };
 
       const assertZeroFrontendDesync = (reconciled: Awaited<ReturnType<typeof fetchMarketsAndLiveContracts>>) => {
+        assert.equal(Boolean(reconciled.market.error), false, `API market fetch failed: ${reconciled.market.error}`);
+        assert.equal(reconciled.market.stale, false, 'API market snapshot must not be stale');
+        assert.equal(reconciled.market.degraded, false, 'API market snapshot must not be degraded');
+        assert.equal(reconciled.onChain.ok, true, `On-chain snapshot failed: ${reconciled.onChain.error}`);
+        assert.equal(reconciled.usingOnChainAssets, true, 'Frontend must verify live on-chain assets against API');
+        assert.ok(
+          reconciled.market.assets.some(
+            (a) => a.token?.toLowerCase() === nvdac.toLowerCase() && String(a.symbol).toUpperCase() === 'NVDAC'
+          ),
+          `API /assets must include NVDAc (${nvdac}) instead of empty outage fallback`
+        );
+        assert.ok(
+          reconciled.assets.some(
+            (a) => a.token?.toLowerCase() === nvdac.toLowerCase() && !a.unavailable && a.source !== 'api_only'
+          ),
+          'Reconciled NVDAc asset must be live-verified on-chain'
+        );
         assert.equal(reconciled.discrepancies.length, 0, `Frontend/API discrepancies detected: ${JSON.stringify(reconciled.discrepancies)}`);
       };
 
@@ -966,6 +1049,15 @@ async function runTests(): Promise<void> {
       assert.equal(nvdaSplitUi.oracle?.state, OracleState.FROZEN_CORPORATE_ACTION);
       assert.equal(formatAssetOraclePrice(nvdaSplitUi.oracle), 'n/a');
       assert.equal(evaluateAssetOriginationStatus(nvdaSplitUi, duringSplit.reconciled.onChain.protocol).canOriginate, false);
+      assert.ok(
+        capturedNotifications.some(
+          (m) =>
+            m.alertType === 'asset_frozen_or_corporate_action' &&
+            m.channel === 'telegram' &&
+            m.wallet?.toLowerCase() === ADDRESSES.borrower.toLowerCase()
+        ),
+        'Notifications must dispatch asset_frozen_or_corporate_action Telegram alert on >=5% split'
+      );
 
       // Real 2/2 Guardian Safe unfreeze via execTransaction
       await execRealMultisigSafeTx(
@@ -1004,6 +1096,18 @@ async function runTests(): Promise<void> {
       const duringAuctionSync = await syncAllServices();
       assertZeroFrontendDesync(duringAuctionSync.reconciled);
       assert.equal(duringAuctionSync.marketSnap.auctions.filter((a) => Number(a.status) === 0).length, 1);
+      const riskLoanAuction = duringAuctionSync.riskLoans.data.find((l) => String(l.loan_id) === '1');
+      assert.equal(riskLoanAuction?.loan_status, 2, 'Risk /risk/loans must report Loan #1 in Auction (2)');
+      assert.equal(riskLoanAuction?.loan_status_name, 'Auction');
+      assert.ok(
+        capturedNotifications.some(
+          (m) =>
+            m.alertType === 'liquidation_started' &&
+            m.channel === 'telegram' &&
+            m.wallet?.toLowerCase() === ADDRESSES.borrower.toLowerCase()
+        ),
+        'Notifications must dispatch liquidation_started Telegram alert when Auction #1 starts'
+      );
       const lenderPosAuction = await fetchWalletPositionsAndClaimable({ address: ADDRESSES.lender, cfg });
       assert.equal(lenderPosAuction.positions.length, 1);
       assert.equal(lenderPosAuction.positions[0].auctionLocked, true);
@@ -1024,10 +1128,22 @@ async function runTests(): Promise<void> {
       const postCancelSync = await syncAllServices();
       assertZeroFrontendDesync(postCancelSync.reconciled);
       assert.equal(postCancelSync.marketSnap.auctions.filter((a) => Number(a.status) === 0).length, 0);
+      const riskLoanRestored = postCancelSync.riskLoans.data.find((l) => String(l.loan_id) === '1');
+      assert.equal(riskLoanRestored?.loan_status, 0, 'Risk /risk/loans must restore Loan #1 to Active (0) after auction cancel');
+      assert.equal(riskLoanRestored?.loan_status_name, 'Active');
+      assert.ok(
+        capturedNotifications.some(
+          (m) =>
+            m.alertType === 'auction_cancelled' &&
+            m.channel === 'telegram' &&
+            m.wallet?.toLowerCase() === ADDRESSES.borrower.toLowerCase()
+        ),
+        'Notifications must dispatch auction_cancelled Telegram alert after recovery cancel'
+      );
       const lenderPosRestored = await fetchWalletPositionsAndClaimable({ address: ADDRESSES.lender, cfg });
       assert.equal(lenderPosRestored.positions[0].auctionLocked, false);
       assert.equal(lenderPosRestored.positions[0].statusName, 'Active');
-      console.log('PASS FULLSTACK WAR GAME B: Keeper auto-liquidation, live Positions/API/Risk Auction lock, recovery cancel & unlock parity verified.');
+      console.log('PASS FULLSTACK WAR GAME B: Keeper auto-liquidation, live Positions/API/Risk/Notifications Auction lock, recovery cancel & unlock parity verified.');
 
       // =======================================================================
       // FULLSTACK WAR GAME C: Sequencer Outage + Stale Feed Restart/Cap Across Full Stack
@@ -1062,7 +1178,18 @@ async function runTests(): Promise<void> {
       await rpcCall('evm_increaseTime', [3605]);
       await rpcCall('evm_mine', []);
       await refreshFeed(105_00000000n);
-      await runKeeperCycle(keeperCtx);
+      const crash2KeeperRun = await runKeeperCycle(keeperCtx);
+      assert.ok(
+        crash2KeeperRun.liquidationResults.some((r) => /startLiquidation/i.test(r.action) && r.executed && r.receipt?.status === 'success'),
+        'Keeper must start Auction #2 after $105 price drop'
+      );
+      const auc2Sync = await syncAllServices();
+      assertZeroFrontendDesync(auc2Sync.reconciled);
+      assert.ok(
+        auc2Sync.marketSnap.auctions.some((a) => String(a.auction_id) === '2' && Number(a.status) === 0),
+        'API /auctions must report Auction #2 active (0)'
+      );
+      assert.equal(auc2Sync.riskLoans.data.find((l) => String(l.loan_id) === '1')?.loan_status, 2);
 
       // Let feed become STALE_FEED (22,000s > 21,600s) & expired auction (>1,800s): floor buy allowed while keeper restarts & emits STALE_FEED alert!
       await rpcCall('evm_increaseTime', [22_000]);

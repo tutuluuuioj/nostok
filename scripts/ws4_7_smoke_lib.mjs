@@ -871,6 +871,26 @@ function isLoopbackRpcUrl(rpcUrl) {
  * Confirms an RPC endpoint is genuinely a local/fork test node (Anvil/Hardhat/Foundry/REVM)
  * before permitting relaxed flags such as `--allow-mocks` or `--allow-1of1-safe`.
  */
+function isValidForkMetadata(method, info) {
+  if (!info || typeof info !== 'object') return false;
+  if (method === 'anvil_nodeInfo') {
+    return (
+      typeof info.currentBlockNumber === 'string' ||
+      typeof info.currentBlockNumber === 'number' ||
+      typeof info.currentBlockTimestamp === 'number' ||
+      (info.forkConfig != null && typeof info.forkConfig === 'object')
+    );
+  }
+  if (method === 'hardhat_metadata') {
+    return (
+      typeof info.clientVersion === 'string' ||
+      typeof info.chainId === 'number' ||
+      (info.forkedNetwork != null && typeof info.forkedNetwork === 'object')
+    );
+  }
+  return false;
+}
+
 export async function verifyForkRpcNode(publicClient) {
   try {
     const version = await publicClient.request({ method: 'web3_clientVersion', params: [] });
@@ -883,7 +903,7 @@ export async function verifyForkRpcNode(publicClient) {
   for (const method of ['anvil_nodeInfo', 'hardhat_metadata']) {
     try {
       const info = await publicClient.request({ method, params: [] });
-      if (info && typeof info === 'object') {
+      if (isValidForkMetadata(method, info)) {
         return { isFork: true, detail: method };
       }
     } catch {

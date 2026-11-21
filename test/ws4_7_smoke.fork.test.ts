@@ -2,6 +2,8 @@
 import assert from 'node:assert/strict';
 import { execSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
+import type net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -58,6 +60,7 @@ import {
   sanitizeRpcErrorMessage,
   validateGlobalSmokeCap,
   validateSmokeAssetConfig,
+  verifyForkRpcNode,
 } from '../scripts/ws4_7_smoke_lib.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -259,7 +262,82 @@ function createMockEip1193Provider(initialKey: Hex) {
   };
 }
 
-function testPurePreflightValidators() {
+async function runCliAsync(args: string[]): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('node', args, { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (chunk) => { stdout += String(chunk); });
+    child.stderr?.on('data', (chunk) => { stderr += String(chunk); });
+    child.on('error', reject);
+    child.on('close', (status) => resolve({ status, stdout, stderr }));
+  });
+}
+
+function validateDeploymentAndSmokeRunbooks(): void {
+  const deployRunbook = fs.readFileSync(path.join(REPO_ROOT, 'docs', 'DEPLOYMENT_RUNBOOK.md'), 'utf8');
+  const smokeRunbook = fs.readFileSync(path.join(REPO_ROOT, 'docs', 'WS4_7_MAINNET_SMOKE_RUNBOOK.md'), 'utf8');
+  const deploySol = fs.readFileSync(path.join(REPO_ROOT, 'contracts', 'script', 'DeployNostok.s.sol'), 'utf8');
+  const rootEnvEx = fs.readFileSync(path.join(REPO_ROOT, '.env.example'), 'utf8');
+
+  // Verify every env var read by DeployNostok.s.sol is covered in DEPLOYMENT_RUNBOOK.md
+  for (const envVar of [
+    'DEPLOYER_PRIVATE_KEY',
+    'OWNER_ADDRESS',
+    'GUARDIAN_ADDRESS',
+    'TREASURY_ADDRESS',
+    'RESERVE_ADDRESS',
+    'ATTESTATION_SIGNER',
+    'USDC_ADDRESS',
+    'SEQUENCER_FEED',
+  ]) {
+    assert.ok(deploySol.includes(`"${envVar}"`), `DeployNostok.s.sol missing expected env var ${envVar}`);
+    assert.ok(deployRunbook.includes(envVar), `docs/DEPLOYMENT_RUNBOOK.md must document ${envVar}`);
+  }
+
+  // Verify pinned Base Mainnet USDC, Sequencer feed, and B20/Chainlink addresses match across runbooks & code
+  assert.ok(deploySol.includes(BASE_USDC_ADDRESS), 'DeployNostok.s.sol must pin Base USDC');
+  for (const text of [deployRunbook, smokeRunbook]) {
+    assert.ok(text.includes(BASE_USDC_ADDRESS), 'Runbook must reference Base USDC');
+    assert.ok(text.includes('0xBCF85224fc0756B9Fa45aA7892530B47e10b6433'), 'Runbook must reference Base Sequencer Uptime feed');
+    for (const pinned of Object.values(BASE_MAINNET_SMOKE_ASSETS)) {
+      assert.ok(text.includes(pinned.token), `Runbook must reference pinned ${pinned.symbol} token`);
+      assert.ok(text.includes(pinned.feed), `Runbook must reference pinned ${pinned.symbol} Chainlink feed`);
+    }
+    assert.ok(text.includes('scripts/ws4_7_smoke_lib.mjs'), 'Runbook must reference preflight CLI');
+  }
+
+  // Verify all frontend VITE_* build variables & backend fail-closed requirements are documented
+  for (const viteKey of [
+    'VITE_CHAIN_ID',
+    'VITE_IS_FORK',
+    'VITE_RPC_URL',
+    'VITE_API_URL',
+    'VITE_NOTIFICATIONS_URL',
+    'VITE_RISK_URL',
+    'VITE_SIWE_DOMAIN',
+    'VITE_SIWE_ORIGIN',
+    'VITE_USDC_ADDRESS',
+    'VITE_LOAN_CORE_ADDRESS',
+    'VITE_ORDER_SETTLEMENT_ADDRESS',
+    'VITE_LIQUIDATION_AUCTION_ADDRESS',
+    'VITE_POSITION_NFT_ADDRESS',
+    'VITE_COLLATERAL_ESCROW_ADDRESS',
+    'VITE_ASSET_REGISTRY_ADDRESS',
+    'VITE_ORACLE_ROUTER_ADDRESS',
+    'VITE_ELIGIBILITY_GATE_ADDRESS',
+    'VITE_DEPLOY_BLOCK',
+  ]) {
+    assert.ok(rootEnvEx.includes(`${viteKey}=`), `.env.example missing ${viteKey}`);
+    assert.ok(deployRunbook.includes(viteKey), `docs/DEPLOYMENT_RUNBOOK.md must document ${viteKey}`);
+  }
+
+  for (const reqTerm of ['nostok_ro', 'nostok_notif', 'FORK=false', 'TRUST_PROXY', 'GEO_REQUIRE_HEADER', 'TRUSTED_PROXY_CIDRS', 'DRY_RUN=true', 'DRY_RUN=false']) {
+    assert.ok(deployRunbook.includes(reqTerm), `docs/DEPLOYMENT_RUNBOOK.md must document ${reqTerm}`);
+  }
+}
+
+async function testPurePreflightValidators() {
   // Out-of-band Safe validation checks (WS4.6): reject EOAs, EIP-7702 delegated EOAs, duplicates, deployer reuse
   const eoaCheck = evaluateSafeSnapshot('OWNER_SAFE', ADDRESSES.deployer, {
     code: '0x',
@@ -502,24 +580,68 @@ function testPurePreflightValidators() {
   );
   assert.equal(pinnedAccepted.ok, true);
 
-  // Info 2 (510140d): remote RPC refuses --allow-mocks / --allow-1of1-safe without --allow-remote-fork AND refuses non-fork node even with --allow-remote-fork
+  // Info 2 (510140d): non-loopback RPC refuses --allow-mocks / --allow-1of1-safe without --allow-remote-fork (offline URL check, zero mainnet traffic),
+  // verifyForkRpcNode rejects empty {} from anvil_nodeInfo/hardhat_metadata, and CLI rejects a local non-fork HTTP server even with --allow-remote-fork.
   const remoteRelaxRes = spawnSync(
     'node',
-    ['scripts/ws4_7_smoke_lib.mjs', '--rpc-url', 'https://mainnet.base.org', '--allow-mocks'],
+    ['scripts/ws4_7_smoke_lib.mjs', '--rpc-url', 'https://remote-node.invalid:8545', '--allow-mocks'],
     { cwd: REPO_ROOT, encoding: 'utf8' }
   );
   assert.notEqual(remoteRelaxRes.status, 0);
   assert.match(remoteRelaxRes.stderr, /Refusing --allow-mocks/i);
 
-  const remoteNonForkRes = spawnSync(
-    'node',
-    ['scripts/ws4_7_smoke_lib.mjs', '--rpc-url', 'https://mainnet.base.org', '--allow-mocks', '--allow-remote-fork'],
-    { cwd: REPO_ROOT, encoding: 'utf8' }
-  );
-  assert.notEqual(remoteNonForkRes.status, 0);
-  assert.match(remoteNonForkRes.stderr, /Anvil\/Hardhat\/Foundry fork/i);
+  const emptyObjProbe = await verifyForkRpcNode({
+    async request({ method }: { method: string }) {
+      if (method === 'web3_clientVersion') return 'op-geth/v1.101411.0-linux-amd64/go1.22';
+      if (method === 'anvil_nodeInfo' || method === 'hardhat_metadata') return {};
+      throw new Error(`Unexpected method: ${method}`);
+    },
+  });
+  assert.equal(emptyObjProbe.isFork, false, 'Empty {} from anvil_nodeInfo/hardhat_metadata must NOT pass fork probe');
 
-  console.log('PASS Pure WS4.7 preflight validators (EIP-7702, 250k cap trap, decimals/pinning checks, fork probe, hardened URL redaction).');
+  const validAnvilProbe = await verifyForkRpcNode({
+    async request({ method }: { method: string }) {
+      if (method === 'web3_clientVersion') return 'Geth-proxy';
+      if (method === 'anvil_nodeInfo') return { currentBlockNumber: '0x1', forkConfig: { forkUrl: 'http://127.0.0.1:8545' } };
+      return null;
+    },
+  });
+  assert.equal(validAnvilProbe.isFork, true, 'Real anvil_nodeInfo metadata fields must pass fork probe');
+
+  const fakeNonForkServer = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += String(c); });
+    req.on('end', () => {
+      const rpc = JSON.parse(body || '{}') as { id?: unknown; method?: string };
+      res.setHeader('Content-Type', 'application/json');
+      if (rpc.method === 'web3_clientVersion') {
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: rpc.id, result: 'op-geth/v1.101411.0-linux-amd64/go1.22' }));
+      } else if (rpc.method === 'anvil_nodeInfo') {
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: rpc.id, result: {} }));
+      } else {
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: rpc.id, error: { code: -32601, message: 'Method not found' } }));
+      }
+    });
+  });
+  await new Promise<void>((r) => fakeNonForkServer.listen(0, '127.0.0.1', r));
+  try {
+    const fakePort = (fakeNonForkServer.address() as net.AddressInfo).port;
+    const localNonForkRes = await runCliAsync([
+      'scripts/ws4_7_smoke_lib.mjs',
+      '--rpc-url',
+      `http://127.0.0.1:${fakePort}`,
+      '--allow-mocks',
+      '--allow-remote-fork',
+    ]);
+    assert.notEqual(localNonForkRes.status, 0);
+    assert.match(localNonForkRes.stderr, /Anvil\/Hardhat\/Foundry fork/i);
+  } finally {
+    await new Promise<void>((r) => fakeNonForkServer.close(() => r()));
+  }
+
+  validateDeploymentAndSmokeRunbooks();
+
+  console.log('PASS Pure WS4.7 preflight validators (EIP-7702, 250k cap trap, decimals/pinning checks, local fork probe, hardened URL redaction, runbooks validated).');
 }
 
 async function deployCanonicalSafeProxy(
@@ -651,7 +773,7 @@ async function mintAttestationViaContract(
 }
 
 async function runTests(): Promise<void> {
-  testPurePreflightValidators();
+  await testPurePreflightValidators();
 
   const anvilProc = await startAnvilFork();
   try {
