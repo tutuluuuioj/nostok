@@ -242,16 +242,28 @@ async function waitForRpcReady(rpcUrl: string, timeoutMs = 30_000): Promise<void
   throw new Error(`Timed out waiting for Anvil at ${rpcUrl}`);
 }
 
+const BASE_FORK_BLOCK = process.env.FORK_BLOCK_NUMBER ?? '62164000';
+
 async function startAnvilFork(): Promise<ChildProcess> {
   const candidates = process.env.FORK_RPC_URL
     ? [process.env.FORK_RPC_URL]
     : ['https://mainnet.base.org', 'https://base-rpc.publicnode.com'];
 
   for (const forkUrl of candidates) {
-    console.log(`[WS3.1_TEST] Starting Anvil fork against ${forkUrl} on port ${ANVIL_PORT}...`);
+    console.log(`[WS3.1_TEST] Starting Anvil fork against ${forkUrl} @ block ${BASE_FORK_BLOCK} on port ${ANVIL_PORT}...`);
     const proc = spawn(
       `${FOUNDRY_BIN_DIR}/anvil`,
-      ['--fork-url', forkUrl, '--port', String(ANVIL_PORT), '--chain-id', '8453', '--silent'],
+      [
+        '--fork-url',
+        forkUrl,
+        '--fork-block-number',
+        BASE_FORK_BLOCK,
+        '--port',
+        String(ANVIL_PORT),
+        '--chain-id',
+        '8453',
+        '--silent',
+      ],
       { env: getShellEnv(), stdio: ['ignore', 'pipe', 'pipe'] }
     );
     try {
@@ -878,6 +890,7 @@ async function runTests(): Promise<void> {
         assetRegistry: deployed.assetRegistry,
         oracleRouter: deployed.oracleRouter,
         eligibilityGate: deployed.eligibilityGate,
+        deployBlock: startBlock.toString(),
       });
 
       const cfg = getFrontendConfig();
@@ -1111,6 +1124,7 @@ async function runTests(): Promise<void> {
         assetRegistry: deployed.assetRegistry,
         oracleRouter: deployed.oracleRouter,
         eligibilityGate: deployed.eligibilityGate,
+        deployBlock: startBlock.toString(),
       });
 
       // Fix #5: logout unreachable throws so store clears local session & reports expiry

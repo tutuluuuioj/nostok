@@ -858,4 +858,227 @@ contract FormalPropertiesTest is TestBase, StdUtils {
         }
         assert(isoEscrow.getBalance(address(isoTokB)) == b1);
     }
+
+    // ---------------- Property 6: Joint Multi-Variable Symbolic Proofs ----------------
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_SimpleInterestFormula_JointPrincipalRateTerm(
+        uint64 principalSeed,
+        uint16 rateSeed,
+        uint16 termDaysSeed
+    ) public {
+        check_SimpleInterestFormula_JointPrincipalRateTerm(
+            uint64(bound(principalSeed, 500e6, 500_000e6)),
+            uint16(bound(rateSeed, 100, 4000)),
+            uint16(bound(termDaysSeed, 7, 60))
+        );
+    }
+
+    /// @notice WS4.3 Property 6a: Joint principal [500..500k] x rate [1%..40%] x term [7d..60d] Actual/365 ceiling exactness (with origination fees active).
+    function check_SimpleInterestFormula_JointPrincipalRateTerm(
+        uint64 principal,
+        uint16 rateBps,
+        uint16 termDays
+    ) public {
+        vm.assume(principal >= 500e6 && principal <= 500_000e6);
+        vm.assume(rateBps >= 100 && rateBps <= 4000);
+        vm.assume(termDays >= 7 && termDays <= 60);
+
+        uint256 elapsed = uint256(termDays) * 1 days;
+        uint256 loanId = _openLoan(col8, FIXED_COL_8, principal, rateBps, termDays, 1);
+        vm.warp(BASE_TIME + elapsed);
+        uint128 due = core.getDueInterest(loanId);
+        uint256 expected = _ceilDiv(uint256(principal) * rateBps * elapsed, 10000 * SECONDS_PER_YEAR);
+        assert(due == expected);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_CloseFactor_MidPartialBucket_9kTo11k(uint64 principalSeed) public {
+        check_CloseFactor_MidPartialBucket_9kTo11k(uint64(bound(principalSeed, 9_360e6, 10_792e6)));
+    }
+
+    /// @notice WS4.3 Property 6b-1: Symbolic principal [9,360 .. 10,792] USDC 50% partial close factor (@ 100 shares x $120 crash = $12k gross, fees active).
+    function check_CloseFactor_MidPartialBucket_9kTo11k(uint64 principal) public {
+        vm.assume(principal >= 9_360e6 && principal <= 10_792e6);
+        feed8.setPrice(1_000e8);
+        uint128 colAmt = 100e8;
+        uint256 loanId = _openLoan(col8, colAmt, principal, STD_RATE_BPS, 30, 3);
+        feed8.setPrice(120e8);
+        vm.prank(KEEPER);
+        uint256 aucId = core.startLiquidation(loanId);
+        assert(auction.getAuction(aucId).collateralTotal == colAmt / 2);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_CloseFactor_HighPartialBucket_47kTo50k(uint64 principalSeed) public {
+        check_CloseFactor_HighPartialBucket_47kTo50k(uint64(bound(principalSeed, 46_800e6, 50_000e6)));
+    }
+
+    /// @notice WS4.3 Property 6b-2: Symbolic principal [46,800 .. 50,000] USDC 50% partial close factor (@ 100 shares x $600 crash = $60k gross, fees active).
+    function check_CloseFactor_HighPartialBucket_47kTo50k(uint64 principal) public {
+        vm.assume(principal >= 46_800e6 && principal <= 50_000e6);
+        feed8.setPrice(2_000e8);
+        uint128 colAmt = 100e8;
+        uint256 loanId = _openLoan(col8, colAmt, principal, STD_RATE_BPS, 30, 3);
+        feed8.setPrice(600e8);
+        vm.prank(KEEPER);
+        uint256 aucId = core.startLiquidation(loanId);
+        assert(auction.getAuction(aucId).collateralTotal == colAmt / 2);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_CloseFactor_SymbolicShares_50k(uint16 sharesSeed) public {
+        check_CloseFactor_SymbolicShares_50k(uint16(bound(sharesSeed, 100, 640)));
+    }
+
+    /// @notice WS4.3 Property 6b-3: Symbolic collateral shares [100 .. 640] at $50,000 USDC x $100 crash ($10k..$64k gross) proving 100% vs 50% close factor.
+    function check_CloseFactor_SymbolicShares_50k(uint16 shares) public {
+        vm.assume(shares >= 100 && shares <= 640);
+        feed8.setPrice(2_000e8);
+        uint128 colAmt = uint128(uint256(shares) * 1e8);
+        uint256 loanId = _openLoan(col8, colAmt, 50_000e6, STD_RATE_BPS, 30, 3);
+        feed8.setPrice(100e8);
+        uint256 debt = 50_000e6 + core.getDueInterest(loanId);
+        uint256 grossVal = uint256(shares) * 100e6;
+        uint256 ltvBps = (debt * 10000) / grossVal;
+        vm.prank(KEEPER);
+        uint256 aucId = core.startLiquidation(loanId);
+        assert(auction.getAuction(aucId).collateralTotal == (ltvBps >= 9000 ? colAmt : (colAmt / 2)));
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    /// @notice Foundry fuzz (outside Halmos check_* due to bvudiv(symDebt, symGross) QF_BV bound): 3-way joint principal x shares x crashPrice CloseFactor.
+    function test_JointCloseFactor_PriceSharesPrincipal_PartialAndFull(
+        uint64 principalSeed,
+        uint16 sharesSeed,
+        uint16 crashPriceSeed,
+        bool expectFull
+    ) public {
+        uint64 principal = uint64(bound(principalSeed, 1_000e6, 50_000e6));
+        uint16 shares = uint16(bound(sharesSeed, 10, 1_000));
+        uint256 floor3d = _ceilDiv(uint256(principal) * STD_RATE_BPS * 3 days, 10000 * SECONDS_PER_YEAR);
+        uint256 debt = uint256(principal) + floor3d;
+        uint256 minPrice = expectFull ? 5 : ((debt * 10000) / (9000 * uint256(shares) * 1e6) + 1);
+        uint256 maxPrice = expectFull
+            ? ((debt * 10000) / (9000 * uint256(shares) * 1e6))
+            : ((debt * 10000) / (7800 * uint256(shares) * 1e6));
+        if (minPrice > maxPrice || maxPrice < 5 || minPrice > 5_000) return;
+        uint16 crashPriceUsd = uint16(bound(crashPriceSeed, minPrice < 5 ? 5 : minPrice, maxPrice > 5_000 ? 5_000 : maxPrice));
+
+        feed8.setPrice(20_000e8);
+        uint128 colAmt = uint128(uint256(shares) * 1e8);
+        uint256 loanId = _openLoan(col8, colAmt, principal, STD_RATE_BPS, 30, 3);
+        feed8.setPrice(int256(uint256(crashPriceUsd) * 1e8));
+        vm.prank(KEEPER);
+        uint256 aucId = core.startLiquidation(loanId);
+        assert(auction.getAuction(aucId).collateralTotal == (expectFull ? colAmt : (colAmt / 2)));
+    }
+
+    function _verifyJointWaterfallRegion(
+        uint64 principal,
+        uint16 shares,
+        uint16 crashPriceUsd,
+        bool expectFull
+    ) internal {
+        vm.assume(principal >= 1_000e6 && principal <= 50_000e6);
+        vm.assume(shares >= 10 && shares <= 1_000);
+        vm.assume(crashPriceUsd >= 5 && crashPriceUsd <= 5_000);
+
+        uint256 grossCrash = uint256(shares) * uint256(crashPriceUsd) * 1e6;
+        uint256 debt = uint256(principal);
+        vm.assume(debt * 10000 >= 7800 * grossCrash);
+        if (expectFull) {
+            vm.assume(debt * 10000 >= 9000 * grossCrash);
+        } else {
+            vm.assume(debt * 10000 < 9000 * grossCrash);
+        }
+
+        // Isolate liquidation + FeeCollector waterfall across [1k..50k] x [10..1000] x [$5..$5000] (originationFeeBps=0 avoids duplicate openLoan fee path blowup while liquidationFee=100, interestCut=1000, safetyReserve=2000 remain active).
+        vm.prank(OWNER);
+        feeCollector.setFeeRates(0, 1000, 100, 2000);
+
+        feed8.setPrice(20_000e8);
+        uint128 colAmt = uint128(uint256(shares) * 1e8);
+        uint256 loanId = _openLoan(col8, colAmt, principal, 0, 30, 1);
+
+        feed8.setPrice(int256(uint256(crashPriceUsd) * 1e8));
+        vm.prank(KEEPER);
+        uint256 aucId = core.startLiquidation(loanId);
+
+        uint128 colBuy = expectFull ? colAmt : (colAmt / 2);
+        uint256 startPrice = (uint256(crashPriceUsd) * 1e8 * 99) / 100;
+        uint128 expectedPaid = uint128(_ceilDiv(uint256(colBuy) * startPrice * 1e6, 1e16));
+
+        uint256 keepBefore = usdc.balanceOf(KEEPER);
+        uint256 feeBefore = usdc.balanceOf(TREASURY) + usdc.balanceOf(RESERVE);
+        uint256 bBefore = usdc.balanceOf(BORROWER);
+        uint256 coreBefore = usdc.balanceOf(address(core));
+        uint256 lClaimBefore = core.getClaimable(address(lenderWallet));
+
+        usdc.mint(LIQUIDATOR, expectedPaid);
+        vm.prank(LIQUIDATOR);
+        usdc.approve(address(auction), expectedPaid);
+        vm.prank(LIQUIDATOR);
+        uint128 paid = auction.buy(aucId, colBuy, expectedPaid);
+        assert(paid == expectedPaid);
+
+        uint256 keeperDelta = usdc.balanceOf(KEEPER) - keepBefore;
+        uint256 feeDelta = (usdc.balanceOf(TREASURY) + usdc.balanceOf(RESERVE)) - feeBefore;
+        uint256 borrowerDelta = usdc.balanceOf(BORROWER) - bBefore;
+        uint256 claimDelta = core.getClaimable(address(lenderWallet)) - lClaimBefore;
+        uint256 coreDelta = usdc.balanceOf(address(core)) - coreBefore;
+
+        assert(keeperDelta + feeDelta + borrowerDelta + claimDelta == paid);
+        assert(coreDelta == claimDelta);
+        assert(usdc.balanceOf(address(auction)) == 0);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_AuctionWaterfall_JointPriceSharesPrincipal_Partial(
+        uint64 principalSeed,
+        uint16 sharesSeed,
+        uint16 crashPriceSeed
+    ) public {
+        uint64 principal = uint64(bound(principalSeed, 1_000e6, 50_000e6));
+        uint16 shares = uint16(bound(sharesSeed, 10, 1_000));
+        uint256 debt = uint256(principal);
+        uint256 minPrice = (debt * 10000) / (9000 * uint256(shares) * 1e6) + 1;
+        uint256 maxPrice = (debt * 10000) / (7800 * uint256(shares) * 1e6);
+        if (minPrice > maxPrice || maxPrice < 5 || minPrice > 5_000) return;
+        uint16 crashPriceUsd = uint16(bound(crashPriceSeed, minPrice < 5 ? 5 : minPrice, maxPrice > 5_000 ? 5_000 : maxPrice));
+        check_AuctionWaterfall_JointPriceSharesPrincipal_Partial(principal, shares, crashPriceUsd);
+    }
+
+    /// @notice WS4.3 Property 6d: Joint principal [1k..50k] x shares [10..1000] x crashPrice [$5..$5000] waterfall conservation (50% partial close).
+    function check_AuctionWaterfall_JointPriceSharesPrincipal_Partial(
+        uint64 principal,
+        uint16 shares,
+        uint16 crashPriceUsd
+    ) public {
+        _verifyJointWaterfallRegion(principal, shares, crashPriceUsd, false);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_AuctionWaterfall_JointPriceSharesPrincipal_Full(
+        uint64 principalSeed,
+        uint16 sharesSeed,
+        uint16 crashPriceSeed
+    ) public {
+        uint64 principal = uint64(bound(principalSeed, 1_000e6, 50_000e6));
+        uint16 shares = uint16(bound(sharesSeed, 10, 1_000));
+        uint256 debt = uint256(principal);
+        uint256 maxPrice = (debt * 10000) / (9000 * uint256(shares) * 1e6);
+        if (maxPrice < 5) return;
+        uint16 crashPriceUsd = uint16(bound(crashPriceSeed, 5, maxPrice > 5_000 ? 5_000 : maxPrice));
+        check_AuctionWaterfall_JointPriceSharesPrincipal_Full(principal, shares, crashPriceUsd);
+    }
+
+    /// @notice WS4.3 Property 6e: Joint principal [1k..50k] x shares [10..1000] x crashPrice [$5..$5000] waterfall conservation (100% close: surplus + bad debt).
+    function check_AuctionWaterfall_JointPriceSharesPrincipal_Full(
+        uint64 principal,
+        uint16 shares,
+        uint16 crashPriceUsd
+    ) public {
+        _verifyJointWaterfallRegion(principal, shares, crashPriceUsd, true);
+    }
 }

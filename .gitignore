@@ -32,3 +32,5 @@ notifications/dist
 contracts/out
 contracts/cache
 contracts/broadcast
+contracts/echidna-corpus
+contracts/crytic-export
