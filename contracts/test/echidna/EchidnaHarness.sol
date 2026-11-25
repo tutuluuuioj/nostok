@@ -123,6 +123,8 @@ contract EchidnaHarness {
     uint256 public claimsCount;
     uint256 public nftTransfersCount;
     uint256 public surplusRefundsCount;
+    uint256 public leftoverCollateralReturnsCount;
+    uint256 public badDebtSettlementsCount;
     uint256 public overCapPerLoanRevertsCount;
     uint256 public overCapAssetRevertsCount;
     uint256 public overCapGlobalRevertsCount;
@@ -652,12 +654,16 @@ contract EchidnaHarness {
         ILiquidationAuction.Auction memory a = auction.getAuction(aucId);
         if (a.status != ILiquidationAuction.AuctionStatus.Active || a.collateralRemaining == 0) return;
 
-        // If expired during open market, restart/cancel cleanly first
+        // If expired during open market, restart/cancel cleanly first (revert = bug unless caught explicitly)
         if (block.timestamp > a.startTime + a.duration && router.isMarketOpen()) {
             MockAggregator feed = a.collateralToken == address(stock18) ? feed18 : feed8;
             feed.setUpdatedAt(block.timestamp);
-            auction.restartOrCancelAuction(aucId);
-            restartOrCancelCount++;
+            try auction.restartOrCancelAuction(aucId) {
+                restartOrCancelCount++;
+            } catch {
+                _unexpectedActionRevert = true;
+                return;
+            }
             a = auction.getAuction(aucId);
             if (a.status != ILiquidationAuction.AuctionStatus.Active || a.collateralRemaining == 0) return;
         }
@@ -739,13 +745,120 @@ contract EchidnaHarness {
                 _removeOpenLoan(loanId);
                 // Roadmap #5: Residual collateral returned directly to borrower when debt is 100% satisfied
                 if (lAfter.principalRepaid >= lAfter.principal) {
+                    uint256 bColDelta = MockERC20(a.collateralToken).balanceOf(a.borrower) - bColBefore;
                     if (
                         lAfter.collateralRaw != 0 ||
-                        MockERC20(a.collateralToken).balanceOf(a.borrower) - bColBefore != loanColBefore - colToBuy
+                        bColDelta != loanColBefore - colToBuy
                     ) {
                         _surplusViolated = true;
                     }
+                    if (bColDelta > 0) leftoverCollateralReturnsCount++;
+                } else {
+                    badDebtSettlementsCount++;
                 }
+            }
+        } catch {
+            _unexpectedActionRevert = true;
+        }
+    }
+
+    /// @notice Explicitly drives Roadmap #5 leftover collateral return (moderate crash where partial buy pays 100% debt)
+    ///         AND LoanCore.sol:709-713 bad debt settlement (extreme price crash + full auction buy leaving shortfall).
+    function actionDriveLeftoverOrBadDebt(uint256 idxSeed, bool driveBadDebt) external {
+        if (!router.isSequencerValid()) return;
+        (bool found, uint256 loanId) = _findLoanByStatus(idxSeed, false);
+        if (!found) return;
+        ILoanCore.Loan memory l = core.getLoan(loanId);
+
+        MockAggregator feed = l.collateralToken == address(stock18) ? feed18 : feed8;
+        uint256 colUnit = l.collateralToken == address(stock18) ? 1e18 : 1e8;
+        router.setMarketSession(true, true);
+        feed.setUpdatedAt(block.timestamp);
+
+        uint256 debt = uint256(l.principal - l.principalRepaid) + core.getDueInterest(loanId);
+        // If driveBadDebt: crash LTV to ~180% so 100% buy leaves principal shortfall -> BadDebtRecorded (LoanCore.sol:709-713).
+        // If !driveBadDebt: set LTV to 92% (>= 90% badDebtLtvBps -> 100% collateral auctioned), then buy 97% at 99% oracle:
+        // 0.97 * 0.99 / 0.92 = 104.3% of debt (> 100% after 1% liq fee), paying 100% debt & returning 3% leftover collateral (LoanCore.sol:700)!
+        uint256 targetLtv = driveBadDebt ? 18000 : 9200;
+        uint256 targetPrice8 = (debt * 10000 * colUnit * 100) / (uint256(l.collateralRaw) * targetLtv);
+        if (targetPrice8 < 2e8) return;
+        feed.setPrice(int256(targetPrice8));
+        (uint256 grossCheck, , ) = router.getValue(l.collateralToken, l.collateralRaw);
+        if (grossCheck == 0 || (debt * 10000) / grossCheck < 9000) {
+            targetPrice8 = (targetPrice8 * 96) / 100;
+            if (targetPrice8 < 1e8) return;
+            feed.setPrice(int256(targetPrice8));
+        }
+
+        liquidationAttempts++;
+        try keeper.callTarget(address(core), abi.encodeCall(LoanCore.startLiquidation, (loanId))) {} catch {
+            _unexpectedActionRevert = true;
+            return;
+        }
+        liquidationsStartedCount++;
+
+        uint256 aucId = core.loanActiveAuction(loanId);
+        ILiquidationAuction.Auction memory a = auction.getAuction(aucId);
+        uint128 colToBuy = driveBadDebt ? a.collateralRemaining : uint128((uint256(a.collateralRemaining) * 9700) / 10000);
+        if (colToBuy == 0 || (!driveBadDebt && colToBuy == a.collateralRemaining)) return;
+
+        // If leftover-collateral test, advance 20m so Dutch price is near oracle and 95% easily pays 100% debt? No, buy at t=0 (99% oracle): 1/1.10 = 90.9% < 95%!
+        uint256 curPrice = auction.getCurrentPrice(aucId);
+        uint256 den = colUnit * 1e8;
+        uint128 expectedPaid = uint128((uint256(colToBuy) * curPrice * 1e6 + den - 1) / den);
+        if (expectedPaid < auction.MIN_BUY_USDC()) return;
+
+        uint256 bColBefore = MockERC20(a.collateralToken).balanceOf(a.borrower);
+        uint256 bUsdcBefore = usdc.balanceOf(a.borrower);
+        uint256 feeBefore = usdc.balanceOf(treasury) + usdc.balanceOf(safetyReserve);
+        uint256 totalOutBefore = core.totalOutstandingPrincipal();
+        uint128 loanColBefore = core.getLoan(loanId).collateralRaw;
+        uint128 remBefore = a.debtPrincipalRemaining;
+        uint128 dueInterestBefore = core.getDueInterest(loanId);
+
+        usdc.mint(address(liquidator), expectedPaid);
+        liquidator.approveToken(address(usdc), address(auction), expectedPaid);
+        buyAttempts++;
+        try liquidator.callTarget(
+            address(auction),
+            abi.encodeCall(LiquidationAuction.buy, (aucId, colToBuy, expectedPaid))
+        ) returns (bytes memory ret) {
+            auctionBuysCount++;
+            uint128 paid = abi.decode(ret, (uint128));
+            (uint128 expLiqProt, ) = _expectedLiqFee(paid);
+            uint128 totalFeeAndKeep;
+            {
+                (uint128 pF, uint128 kR) = _expectedLiqFee(paid);
+                totalFeeAndKeep = pF + kR;
+                expLiqProt = pF;
+            }
+            uint128 netProceeds = paid - totalFeeAndKeep;
+            uint128 expIntPaid = netProceeds > dueInterestBefore ? dueInterestBefore : netProceeds;
+            uint128 expIntCut = _expectedIntCut(expIntPaid);
+            if ((usdc.balanceOf(treasury) + usdc.balanceOf(safetyReserve)) - feeBefore != uint256(expLiqProt) + expIntCut) {
+                _capOrFeeViolated = true;
+            }
+            ghostExpectedFees += uint256(expLiqProt) + expIntCut;
+
+            ILoanCore.Loan memory lAfter = core.getLoan(loanId);
+            ghostEscrow[a.collateralToken] -= (loanColBefore - lAfter.collateralRaw);
+            if (lAfter.status > uint8(ILoanCore.LoanStatus.Auction)) {
+                _removeOpenLoan(loanId);
+            }
+
+            if (driveBadDebt) {
+                badDebtSettlementsCount++;
+                // Bad debt clears loan, clears totalOutstandingPrincipal (including shortfall), leaves 0 collateral
+                if (lAfter.collateralRaw != 0 || totalOutBefore - core.totalOutstandingPrincipal() != remBefore) {
+                    _capOrFeeViolated = true;
+                }
+            } else if (lAfter.principalRepaid >= lAfter.principal) {
+                uint256 bColDelta = MockERC20(a.collateralToken).balanceOf(a.borrower) - bColBefore;
+                if (lAfter.collateralRaw != 0 || bColDelta != loanColBefore - colToBuy) {
+                    _surplusViolated = true;
+                }
+                if (bColDelta > 0) leftoverCollateralReturnsCount++;
+                if (usdc.balanceOf(a.borrower) > bUsdcBefore) surplusRefundsCount++;
             }
         } catch {
             _unexpectedActionRevert = true;

@@ -1,0 +1,8 @@
+[global]
+contract = "FormalPropertiesTest"
+solver = "yices"
+loop = 2
+solver_timeout_branching = "20ms"
+solver_timeout_assertion = "60s"
+cache_solver = true
+statistics = true

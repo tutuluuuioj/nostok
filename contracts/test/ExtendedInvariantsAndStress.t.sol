@@ -1080,6 +1080,10 @@ contract ExtendedProtocolHandler is CommonBase, StdCheats, StdUtils {
     function openLoanCount() external view returns (uint256) {
         return openLoanIds.length;
     }
+
+    function resetSeededOpenLoanCount() external {
+        cntOpenLoan = 0;
+    }
 }
 
 /**
@@ -1232,9 +1236,11 @@ contract ExtendedInvariantsTest is Test {
             liquidator
         );
 
-        // Seed 2 initial positions (28k stock8 + 12k stock18 = 40k total) so PerLoan, Asset, and Global cap probes & auctions hit immediately
+        // Seed 2 initial positions (28k stock8 + 12k stock18 = 40k total) so PerLoan, Asset, and Global cap probes & auctions hit immediately.
+        // Mark seededLoansCount afterward and reset cntOpenLoan so invariant-run counts only count handler-opened loans.
         handler.openLoanViaSettlement(0, 28_000e6, false, false, false);
         handler.openLoanViaSettlement(0, 12_000e6, true, true, true);
+        handler.resetSeededOpenLoanCount();
 
         bytes4[] memory selectors = new bytes4[](15);
         selectors[0] = ExtendedProtocolHandler.openLoanViaSettlement.selector;
@@ -1965,6 +1971,14 @@ contract SecurityBoundaryStressTest is Test {
         assertGe(eh.unstoppableChecksCount(), 3, "Expected >= 3 pause/freeze unstoppable checks");
         assertGe(eh.nonceBumpsCount(), 1, "Expected >= 1 strict nonce bump");
 
+        // 9. Explicitly verify leftover collateral return (LoanCore.sol:700) & bad debt (LoanCore.sol:709-713)
+        eh.actionOpenLoan(0, 5_000e6, false, false, false);
+        eh.actionDriveLeftoverOrBadDebt(0, false); // leftover collateral return
+        eh.actionOpenLoan(0, 5_000e6, true, true, true);
+        eh.actionDriveLeftoverOrBadDebt(0, true);  // bad debt settlement
+        assertGe(eh.leftoverCollateralReturnsCount(), 1, "Expected >= 1 leftover collateral return");
+        assertGe(eh.badDebtSettlementsCount(), 1, "Expected >= 1 bad debt settlement");
+
         // All 8 roadmap-mapped properties + liveness check
         assertTrue(eh.echidna_1_collateral_solvency(), "echidna_1_collateral_solvency failed");
         assertTrue(eh.echidna_2_strict_escrow_isolation(), "echidna_2_strict_escrow_isolation failed");
@@ -2039,7 +2053,7 @@ contract SecurityBoundaryStressTest is Test {
         console2.log("cntGateNonceBumped:", h.cntGateNonceBumped());
         console2.log("cntOrderNonceBumped:", h.cntOrderNonceBumped());
 
-        assertGe(h.cntOpenLoan(), 7);
+        assertGe(h.cntOpenLoan(), 5);
         assertGe(h.cntTopUp(), 4);
         assertGe(h.cntPartialRepay(), 1);
         assertGe(h.cntExtend(), 1);
@@ -2085,7 +2099,7 @@ contract SecurityBoundaryStressTest is Test {
             else if (tMode == 2) vm.warp(block.timestamp + 2400);
             else if (tMode == 3) vm.warp(block.timestamp + 2 days);
 
-            uint256 act = (rng >> 8) % 12;
+            uint256 act = (rng >> 8) % 13;
             uint256 s1 = uint256(keccak256(abi.encode(rng, uint256(1))));
             uint256 s2 = uint256(keccak256(abi.encode(rng, uint256(2))));
             if (act == 0 || act == 1) eh.actionOpenLoan(s1, s2, (s1 & 1) == 1, (s1 & 2) == 2, (s1 & 4) == 4);
@@ -2098,7 +2112,8 @@ contract SecurityBoundaryStressTest is Test {
             else if (act == 8) eh.actionBuyAuction(s1, s2);
             else if (act == 9) eh.actionProbeEscrowIsolation(s1);
             else if (act == 10) eh.actionTestPauseAndFreezeUnstoppable(s1, uint8(s2));
-            else if (act == 11) {
+            else if (act == 11) eh.actionDriveLeftoverOrBadDebt(s1, (s2 & 1) == 1);
+            else if (act == 12) {
                 eh.actionBumpNonce();
                 eh.actionClaimLender((s1 & 1) == 1);
             }
@@ -2130,6 +2145,8 @@ contract SecurityBoundaryStressTest is Test {
         assertGe(eh.escrowIsolationProbesCount(), 10);
         assertGe(eh.unstoppableChecksCount(), 10);
         assertGe(eh.nonceBumpsCount(), 10);
+        assertGe(eh.leftoverCollateralReturnsCount(), 1, "Expected >= 1 leftover collateral return in 500 steps");
+        assertGe(eh.badDebtSettlementsCount(), 1, "Expected >= 1 bad debt settlement in 500 steps");
     }
 
     /// @notice WS4.2: Executes a uniform-random 64x16 campaign (matching foundry.toml [invariant] runs=64, depth=16)
@@ -2212,7 +2229,7 @@ contract SecurityBoundaryStressTest is Test {
         console2.log("AGG_64x16 capPL/capA/capG:", totCapPL, totCapA, totCapG);
         console2.log("AGG_64x16 gateNonce/orderNonce:", totGateN, totOrderN);
 
-        assertGe(totOpen, 150, "Expected high openLoan successes across 64x16");
+        assertGe(totOpen, 40, "Expected handler-opened loan successes across 64x16 (excluding seeded loans)");
         assertGe(totLiq, 25, "Expected high startLiquidation successes across 64x16");
         assertGe(totDef, 25, "Expected high startDefaultAuction successes across 64x16");
         assertGe(totBuy, 20, "Expected high buyAuction successes across 64x16");

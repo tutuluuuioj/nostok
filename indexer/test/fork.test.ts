@@ -755,6 +755,7 @@ async function runTests(): Promise<void> {
 
       const posAfterBuy = await ctx.db.query('SELECT * FROM positions WHERE loan_id = 1');
       assert.equal(posAfterBuy.rows[0].is_burned, true);
+      assert.equal(posAfterBuy.rows[0].auction_locked, false, 'Burned position must clear auction_locked');
       assert.equal(String(posAfterBuy.rows[0].owner).toLowerCase(), zeroAddress.toLowerCase());
 
       const assetAfterBuy = await ctx.db.query('SELECT escrow_balance_raw FROM assets WHERE token = $1', [nvdac]);

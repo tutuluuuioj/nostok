@@ -720,21 +720,23 @@ async function reconcilePosition(
     }
   }
 
-  const auctionLocked = await readAtBlock(
-    (bn) =>
-      publicClient.readContract({
-        address: config.positionNft,
-        abi: positionNftAbi,
-        functionName: 'isAuctionLocked',
-        args: [loanId],
-        blockNumber: bn,
-      }),
-    blockNumber,
-    `positionNft.isAuctionLocked(${loanId})`
-  ).catch((err) => {
-    if (isContractRevertError(err)) return false;
-    throw err;
-  });
+  const auctionLocked = isBurned
+    ? false
+    : await readAtBlock(
+        (bn) =>
+          publicClient.readContract({
+            address: config.positionNft,
+            abi: positionNftAbi,
+            functionName: 'isAuctionLocked',
+            args: [loanId],
+            blockNumber: bn,
+          }),
+        blockNumber,
+        `positionNft.isAuctionLocked(${loanId})`
+      ).catch((err) => {
+        if (isContractRevertError(err)) return false;
+        throw err;
+      });
 
   await db.query(
     `INSERT INTO positions (

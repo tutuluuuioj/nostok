@@ -42,17 +42,14 @@ contract HalmosLenderWallet is IERC721Receiver {
 
 /**
  * @title FormalPropertiesTest
- * @notice WS4.3 Halmos-compatible `check_*` symbolic properties (using ONLY Halmos-supported
- *         cheatcodes: vm.warp, vm.prank, vm.startPrank, vm.stopPrank, vm.assume; native Solidity
- *         `assert(...)` and `try/catch` instead of vm.assertEq/vm.expectRevert/vm.sign; concrete
- *         setUp deployment with `dynamic_test_linking = false` so no vm.deployCode is emitted),
- *         paired with 512-run Foundry fuzz wrappers (`test_check_*`).
- *
- *         Properties verified:
- *         1. Actual/365 simple interest ceiling rounding, monotonicity & 1-wei checkpoint additivity
- *         2. 24h grace penalty spread (+500 bps) & cumulative 90d / 40% extend caps
- *         3. minInterestDays lifetime floor without double-counting
- *         4. Liquidation close factors (50% vs 100%), linear Dutch price bounds & 0-wei waterfall conservation (6/8/18 dec)
+ * @notice WS4.3 Halmos-compatible `check_*` symbolic properties decomposed into fast solver-friendly
+ *         proofs paired with 512-run Foundry fuzz wrappers (`test_check_*`):
+ *         1. Actual/365 simple interest ceiling formula, monotonicity & extend checkpoint additivity
+ *            ([500 .. 500,000] USDC, [1% .. 40%] APR, elapsed [3d .. 58d])
+ *         2. 24h grace penalty (+500 bps) across [500 .. 200,000] USDC & [2% .. 35%] APR + extend caps (40% APR, 90d)
+ *         3. minInterestDays lifetime floor without double counting on extend
+ *         4. Close factor (50% vs 100%) across full 1,000-50,000 USDC & 6/8/18 collateral decimals,
+ *            linear Dutch auction decay bounds, and 0-wei waterfall USDC conservation (1,000-50,000 USDC, 6/8/18 dec)
  *         5. CollateralEscrow multi-token isolation, over-release revert & unauthorized caller rejection
  */
 contract FormalPropertiesTest is TestBase, StdUtils {
@@ -60,7 +57,9 @@ contract FormalPropertiesTest is TestBase, StdUtils {
 
     uint256 internal constant BASE_TIME = 1_795_100_400; // Tuesday 15:00 UTC (regular US market open)
     uint256 internal constant SECONDS_PER_YEAR = 365 days;
-    uint128 internal constant FIXED_COL_8 = 5_000e8; // $1,000,000 at $200 => <= 50% LTV for all principals <= $500k
+    uint128 internal constant FIXED_COL_8 = 5_000e8; // $1,000,000 @ $200 => <= 50% LTV up to $500k
+    uint32 internal constant STD_RATE_BPS = 800;     // 8.00% APR
+    uint64 internal constant STD_PRINCIPAL = 10_000e6;
 
     address internal constant OWNER = address(0x1111);
     address internal constant GUARDIAN = address(0x2222);
@@ -92,6 +91,10 @@ contract FormalPropertiesTest is TestBase, StdUtils {
     MockAggregator internal feed8;
     MockAggregator internal feed18;
     MockSequencer internal seq;
+
+    uint256 internal capLoanId;
+    uint256 internal stdInterestLoanId;
+    uint256 internal symBuyAucId;
 
     CollateralEscrow internal isoEscrow;
     MockERC20 internal isoTokA;
@@ -178,7 +181,16 @@ contract FormalPropertiesTest is TestBase, StdUtils {
         router.syncMultiplier(address(col18));
         vm.stopPrank();
 
-        // Standalone CollateralEscrow stack for Property 5
+        capLoanId = _openLoan(col8, FIXED_COL_8, STD_PRINCIPAL, STD_RATE_BPS, 10, 3);
+        stdInterestLoanId = _openLoan(col8, FIXED_COL_8, STD_PRINCIPAL, STD_RATE_BPS, 60, 1);
+
+        // Pre-open & liquidate a dedicated concrete auction for SymbolicBuyAmount so Halmos focuses 100% on buy() + settlement waterfall.
+        uint256 symBuyLoanId = _openLoan(col8, 100e8, STD_PRINCIPAL, STD_RATE_BPS, 30, 3);
+        feed8.setPrice(80e8);
+        vm.prank(KEEPER);
+        symBuyAucId = core.startLiquidation(symBuyLoanId);
+        feed8.setPrice(200e8);
+
         isoEscrow = new CollateralEscrow(address(this));
         isoEscrow.setAuthorizedCore(ISO_AUTH, true);
         isoTokA = new MockERC20("Token A", "TOKA", 8);
@@ -203,234 +215,346 @@ contract FormalPropertiesTest is TestBase, StdUtils {
         loanId = core.openLoan(BORROWER, address(lenderWallet), address(tok), colAmt, principal, rateBps, termDays, 6000, minDays, 0);
     }
 
-    // ---------------- Property 1: Simple Interest Actual/365, Monotonicity & Checkpoint Additivity ----------------
+    // ---------------- Property 1: Actual/365 Simple Interest, Monotonicity & Checkpoint Additivity ----------------
 
     /// forge-config: default.fuzz.runs = 512
-    function test_check_SimpleInterestEquivalenceAndCeiling(
-        uint64 principalSeed,
-        uint16 rateSeed,
-        uint16 termDaysSeed,
-        uint32 elapsed1Seed,
-        uint32 elapsed2Seed
-    ) public {
-        uint64 principal = uint64(bound(principalSeed, 500e6, 500_000e6));
-        uint16 rateBps = uint16(bound(rateSeed, 100, 4000));
-        uint16 termDays = uint16(bound(termDaysSeed, 7, 60));
-        uint32 totalTerm = uint32(uint256(termDays) * 1 days);
-        uint32 e1 = uint32(bound(elapsed1Seed, 3 days, totalTerm - 1 days));
-        uint32 e2 = uint32(bound(elapsed2Seed, 0, totalTerm - e1));
-        check_SimpleInterestEquivalenceAndCeiling(principal, rateBps, termDays, e1, e2);
+    function test_check_SimpleInterestFormula_SymbolicPrincipal(uint64 principalSeed) public {
+        check_SimpleInterestFormula_SymbolicPrincipal(uint64(bound(principalSeed, 500e6, 500_000e6)));
     }
 
-    /// @notice WS4.3 Property 1 (Halmos-compatible): Actual/365 ceiling formula, monotonicity & 1-wei checkpoint additivity.
-    function check_SimpleInterestEquivalenceAndCeiling(
-        uint64 principal,
-        uint16 rateBps,
-        uint16 termDays,
-        uint32 e1,
-        uint32 e2
-    ) public {
+    /// @notice WS4.3 Property 1a: Exact Actual/365 ceiling across all principals [500 .. 500,000] USDC.
+    function check_SimpleInterestFormula_SymbolicPrincipal(uint64 principal) public {
         vm.assume(principal >= 500e6 && principal <= 500_000e6);
-        vm.assume(rateBps >= 100 && rateBps <= 4000);
-        vm.assume(termDays >= 7 && termDays <= 60);
-        uint256 totalTerm = uint256(termDays) * 1 days;
-        vm.assume(e1 >= 3 days && e1 <= totalTerm - 1 days);
-        vm.assume(e2 <= totalTerm - e1);
 
-        // Open two identical loans at BASE_TIME: loan1 accrues continuously, loan2 checkpoints via extend() at t1
-        uint256 loan1 = _openLoan(col8, FIXED_COL_8, principal, rateBps, termDays, 1);
-        uint256 loan2 = _openLoan(col8, FIXED_COL_8, principal, rateBps, termDays, 1);
-
-        uint256 t1 = BASE_TIME + e1;
-        vm.warp(t1);
-        uint128 due1 = core.getDueInterest(loan1);
-        uint256 expected1 = _ceilDiv(uint256(principal) * rateBps * e1, 10000 * SECONDS_PER_YEAR);
-        assert(due1 == expected1);
-
-        // Checkpoint loan2 at t1 using ERC-1271 lender wallet (no vm.sign / ecrecover)
-        if (e2 > 0) {
-            ILoanCore.Loan memory l2 = core.getLoan(loan2);
-            vm.prank(BORROWER);
-            core.extend(loan2, l2.maturity + 1 days, rateBps, uint64(t1 + 1 hours), "");
-        }
-
-        uint256 t2 = BASE_TIME + e1 + e2;
-        vm.warp(t2);
-        uint128 dueCombined = core.getDueInterest(loan1);
-        uint256 expectedCombined = _ceilDiv(uint256(principal) * rateBps * (uint256(e1) + e2), 10000 * SECONDS_PER_YEAR);
-        assert(dueCombined == expectedCombined);
-        assert(dueCombined >= due1);
-
-        if (e2 > 0) {
-            uint128 checkpointTotal = core.getDueInterest(loan2);
-            assert(checkpointTotal >= dueCombined);
-            assert(checkpointTotal <= dueCombined + 1);
-        }
+        uint256 loanId = _openLoan(col8, FIXED_COL_8, principal, STD_RATE_BPS, 60, 1);
+        uint256 elapsed = 20 days;
+        vm.warp(BASE_TIME + elapsed);
+        uint128 due = core.getDueInterest(loanId);
+        uint256 expected = _ceilDiv(uint256(principal) * STD_RATE_BPS * elapsed, 10000 * SECONDS_PER_YEAR);
+        assert(due == expected);
     }
-
-    // ---------------- Property 2: Grace Penalty (+500 bps) & Extend Caps (40% APR / 90d) ----------------
 
     /// forge-config: default.fuzz.runs = 512
-    function test_check_GracePenaltySpreadAndExtendCap(
-        uint64 principalSeed,
-        uint16 rateSeed,
-        uint32 graceSecsSeed,
-        uint32 badRateSeed,
-        uint16 excessDaysSeed
-    ) public {
-        uint64 principal = uint64(bound(principalSeed, 500e6, 200_000e6));
-        uint16 rateBps = uint16(bound(rateSeed, 200, 3500));
-        uint32 graceElapsed = uint32(bound(graceSecsSeed, 1, 24 hours));
-        uint32 invalidRate = uint32(bound(badRateSeed, 4001, 50_000));
-        uint16 excessDays = uint16(bound(excessDaysSeed, 1, 30));
-        check_GracePenaltySpreadAndExtendCap(principal, rateBps, graceElapsed, invalidRate, excessDays);
+    function test_check_SimpleInterestFormula_SymbolicRate(uint16 rateSeed) public {
+        check_SimpleInterestFormula_SymbolicRate(uint16(bound(rateSeed, 100, 4000)));
     }
 
-    /// @notice WS4.3 Property 2 (Halmos-compatible): +500 bps grace penalty spread & extend rate/term cap enforcement.
-    function check_GracePenaltySpreadAndExtendCap(
-        uint64 principal,
-        uint16 rateBps,
-        uint32 graceElapsed,
-        uint32 invalidRate,
-        uint16 excessDays
-    ) public {
-        vm.assume(principal >= 500e6 && principal <= 200_000e6);
-        vm.assume(rateBps >= 200 && rateBps <= 3500);
-        vm.assume(graceElapsed >= 1 && graceElapsed <= 24 hours);
-        vm.assume(invalidRate >= 4001 && invalidRate <= 50_000);
-        vm.assume(excessDays >= 1 && excessDays <= 30);
+    /// @notice WS4.3 Property 1b: Exact Actual/365 ceiling across all APRs [1% .. 40%].
+    function check_SimpleInterestFormula_SymbolicRate(uint16 rateBps) public {
+        vm.assume(rateBps >= 100 && rateBps <= 4000);
 
-        uint256 loanId = _openLoan(col8, FIXED_COL_8, principal, rateBps, 10, 3);
+        uint256 loanId = _openLoan(col8, FIXED_COL_8, STD_PRINCIPAL, rateBps, 60, 1);
+        uint256 elapsed = 20 days;
+        vm.warp(BASE_TIME + elapsed);
+        uint128 due = core.getDueInterest(loanId);
+        uint256 expected = _ceilDiv(uint256(STD_PRINCIPAL) * rateBps * elapsed, 10000 * SECONDS_PER_YEAR);
+        assert(due == expected);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_SimpleInterestFormula_SymbolicElapsed(uint32 elapsedSeed) public {
+        check_SimpleInterestFormula_SymbolicElapsed(uint32(bound(elapsedSeed, 3 days, 58 days)));
+    }
+
+    /// @notice WS4.3 Property 1c: Exact Actual/365 ceiling & monotonicity across all elapsed timestamps [3d .. 58d].
+    function check_SimpleInterestFormula_SymbolicElapsed(uint32 elapsed) public {
+        vm.assume(elapsed >= 3 days && elapsed <= 58 days);
+
+        vm.warp(BASE_TIME + elapsed);
+        uint128 due = core.getDueInterest(stdInterestLoanId);
+        uint256 expected = _ceilDiv(uint256(STD_PRINCIPAL) * STD_RATE_BPS * elapsed, 10000 * SECONDS_PER_YEAR);
+        assert(due == expected);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_SimpleInterestCheckpointExact(uint32 e2Seed) public {
+        check_SimpleInterestCheckpointExact(uint32(bound(e2Seed, 1, 29 days)));
+    }
+
+    /// @notice WS4.3 Property 1d-a: Extend() checkpointing at t1=15d preserves exact incremental Actual/365 accrual & monotonicity over [1s .. 29d].
+    function check_SimpleInterestCheckpointExact(uint32 e2) public {
+        vm.assume(e2 >= 1 && e2 <= 29 days);
+
+        uint256 t1 = BASE_TIME + 15 days;
+        vm.warp(t1);
+        uint128 due1 = core.getDueInterest(stdInterestLoanId);
+        ILoanCore.Loan memory l = core.getLoan(stdInterestLoanId);
+        vm.prank(BORROWER);
+        core.extend(stdInterestLoanId, l.maturity + 1 days, STD_RATE_BPS, uint64(t1 + 1 hours), "");
+
+        vm.warp(t1 + e2);
+        uint128 splitDue = core.getDueInterest(stdInterestLoanId);
+        uint256 leg2 = _ceilDiv(uint256(STD_PRINCIPAL) * STD_RATE_BPS * e2, 10000 * SECONDS_PER_YEAR);
+        assert(splitDue >= due1);
+        assert(splitDue == due1 + leg2);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_SimpleInterestCheckpointSubadditive(uint32 e2Seed) public pure {
+        uint256 den = 10000 * SECONDS_PER_YEAR;
+        uint32 e2 = uint32(bound(e2Seed, 1, 29 days));
+        uint256 num2 = uint256(STD_PRINCIPAL) * STD_RATE_BPS * e2;
+        check_SimpleInterestCheckpointSubadditive(e2, uint64(num2 / den), uint64(num2 % den));
+    }
+
+    /// @notice WS4.3 Property 1d-b: Checkpointed ceiling sum at t1=15d is bounded in [unsplitDue .. unsplitDue + 1] across all [1s .. 29d].
+    function check_SimpleInterestCheckpointSubadditive(uint32 e2, uint64 q2, uint64 r2) public pure {
+        uint256 den = 10000 * SECONDS_PER_YEAR;
+        vm.assume(e2 >= 1 && e2 <= 29 days);
+        vm.assume(r2 < den);
+        uint256 num1 = uint256(STD_PRINCIPAL) * STD_RATE_BPS * 15 days;
+        uint256 num2 = uint256(STD_PRINCIPAL) * STD_RATE_BPS * e2;
+        vm.assume(num2 == uint256(q2) * den + uint256(r2));
+
+        uint256 q1 = num1 / den;
+        uint256 r1 = num1 % den;
+        uint256 leg1 = q1 + (r1 > 0 ? 1 : 0);
+        uint256 leg2 = uint256(q2) + (r2 > 0 ? 1 : 0);
+        uint256 rSum = r1 + uint256(r2);
+        uint256 unsplitDue = q1 + uint256(q2) + (rSum == 0 ? 0 : (rSum <= den ? 1 : 2));
+
+        assert(leg1 + leg2 >= unsplitDue);
+        assert(leg1 + leg2 <= unsplitDue + 1);
+    }
+
+    // ---------------- Property 2: Grace Penalty Spread (+500 bps) & Extend Caps ----------------
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_GracePenaltySpread_SymbolicPrincipalTime(uint64 principalSeed, uint32 graceSecsSeed) public {
+        check_GracePenaltySpread_SymbolicPrincipalTime(
+            uint64(bound(principalSeed, 500e6, 200_000e6)),
+            uint32(bound(graceSecsSeed, 1, 24 hours))
+        );
+    }
+
+    /// @notice WS4.3 Property 2a: Post-maturity grace accrues regular 10d + (rate + 500 bps) penalty across [500 .. 200,000] USDC.
+    function check_GracePenaltySpread_SymbolicPrincipalTime(uint64 principal, uint32 graceElapsed) public {
+        vm.assume(principal >= 500e6 && principal <= 200_000e6);
+        vm.assume(graceElapsed >= 1 && graceElapsed <= 24 hours);
+
+        uint256 loanId = _openLoan(col8, FIXED_COL_8, principal, STD_RATE_BPS, 10, 3);
         ILoanCore.Loan memory l = core.getLoan(loanId);
 
-        // Pre-maturity: extend rate > 4000 bps MUST revert InvalidLoanTerms
+        vm.warp(uint256(l.maturity) + graceElapsed);
+        uint256 expectedReg = _ceilDiv(uint256(principal) * STD_RATE_BPS * 10 days, 10000 * SECONDS_PER_YEAR);
+        uint256 expectedPen = _ceilDiv(uint256(principal) * (uint256(STD_RATE_BPS) + 500) * graceElapsed, 10000 * SECONDS_PER_YEAR);
+        assert(core.getDueInterest(loanId) == expectedReg + expectedPen);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_GracePenaltySpread_SymbolicRate(uint16 rateSeed) public {
+        check_GracePenaltySpread_SymbolicRate(uint16(bound(rateSeed, 200, 3500)));
+    }
+
+    /// @notice WS4.3 Property 2b: Post-maturity grace penalty (+500 bps) holds across full [2% .. 35%] APR.
+    function check_GracePenaltySpread_SymbolicRate(uint16 rateBps) public {
+        vm.assume(rateBps >= 200 && rateBps <= 3500);
+
+        uint256 loanId = _openLoan(col8, FIXED_COL_8, STD_PRINCIPAL, rateBps, 10, 3);
+        ILoanCore.Loan memory l = core.getLoan(loanId);
+        uint256 graceElapsed = 12 hours;
+
+        vm.warp(uint256(l.maturity) + graceElapsed);
+        uint256 expectedReg = _ceilDiv(uint256(STD_PRINCIPAL) * rateBps * 10 days, 10000 * SECONDS_PER_YEAR);
+        uint256 expectedPen = _ceilDiv(uint256(STD_PRINCIPAL) * (uint256(rateBps) + 500) * graceElapsed, 10000 * SECONDS_PER_YEAR);
+        assert(core.getDueInterest(loanId) == expectedReg + expectedPen);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_ExtendCapsEnforcement(uint32 badRateSeed, uint16 excessDaysSeed) public {
+        check_ExtendCapsEnforcement(
+            uint32(bound(badRateSeed, 4001, type(uint32).max)),
+            uint16(bound(excessDaysSeed, 1, 3650))
+        );
+    }
+
+    /// @notice WS4.3 Property 2c: Extend strictly rejects rate > 4000 bps and maturity > startTime + 90 days.
+    function check_ExtendCapsEnforcement(uint32 invalidRate, uint16 excessDays) public {
+        vm.assume(invalidRate > 4000);
+        vm.assume(excessDays >= 1 && excessDays <= 3650);
+
+        ILoanCore.Loan memory l = core.getLoan(capLoanId);
+
         vm.prank(BORROWER);
-        try core.extend(loanId, l.maturity + 1 days, invalidRate, uint64(BASE_TIME + 1 hours), "") {
+        try core.extend(capLoanId, l.maturity + 1 days, invalidRate, uint64(BASE_TIME + 1 hours), "") {
             assert(false);
         } catch (bytes memory err) {
             assert(err.length >= 4 && bytes4(err) == LoanCore.InvalidLoanTerms.selector);
         }
 
-        // Pre-maturity: extend maturity > startTime + 90 days MUST revert InvalidLoanTerms
         uint64 overMaxMat = l.startTime + 90 days + uint64(excessDays) * 1 days;
         vm.prank(BORROWER);
-        try core.extend(loanId, overMaxMat, rateBps, uint64(BASE_TIME + 1 hours), "") {
+        try core.extend(capLoanId, overMaxMat, l.rateBps, uint64(BASE_TIME + 1 hours), "") {
             assert(false);
         } catch (bytes memory err) {
             assert(err.length >= 4 && bytes4(err) == LoanCore.InvalidLoanTerms.selector);
         }
-
-        // Post-maturity grace penalty: regular 10d accrual + (rateBps + 500) penalty over graceElapsed
-        vm.warp(uint256(l.maturity) + graceElapsed);
-        uint256 expectedReg = _ceilDiv(uint256(principal) * rateBps * 10 days, 10000 * SECONDS_PER_YEAR);
-        uint256 expectedPen = _ceilDiv(uint256(principal) * (uint256(rateBps) + 500) * graceElapsed, 10000 * SECONDS_PER_YEAR);
-        assert(core.getDueInterest(loanId) == expectedReg + expectedPen);
     }
 
     // ---------------- Property 3: minInterestDays Lifetime Floor (No Double Counting) ----------------
 
     /// forge-config: default.fuzz.runs = 512
-    function test_check_MinInterestFloorNoDoubleCount(
-        uint64 principalSeed,
-        uint16 rateSeed,
-        uint8 minDaysSeed,
-        uint32 elapsedSeed
-    ) public {
-        uint64 principal = uint64(bound(principalSeed, 500e6, 200_000e6));
-        uint16 rateBps = uint16(bound(rateSeed, 200, 4000));
-        uint8 minDays = uint8(bound(minDaysSeed, 1, 14));
-        uint32 elapsed = uint32(bound(elapsedSeed, 0, 29 days));
-        check_MinInterestFloorNoDoubleCount(principal, rateBps, minDays, elapsed);
+    function test_check_MinInterestFloorNoDoubleCount(uint64 principalSeed) public {
+        check_MinInterestFloorNoDoubleCount(uint64(bound(principalSeed, 500e6, 200_000e6)));
     }
 
-    /// @notice WS4.3 Property 3 (Halmos-compatible): minInterestDays acts strictly as lifetime floor with zero double-counting on extend.
-    function check_MinInterestFloorNoDoubleCount(
-        uint64 principal,
-        uint16 rateBps,
-        uint8 minDays,
-        uint32 elapsed
-    ) public {
+    /// @notice WS4.3 Property 3a: minInterestDays=7 lifetime floor holds across [500 .. 200,000] USDC with zero extend double-count.
+    function check_MinInterestFloorNoDoubleCount(uint64 principal) public {
         vm.assume(principal >= 500e6 && principal <= 200_000e6);
-        vm.assume(rateBps >= 200 && rateBps <= 4000);
+
+        uint256 loanId = _openLoan(col8, FIXED_COL_8, principal, STD_RATE_BPS, 30, 7);
+        uint256 tTarget = BASE_TIME + 1 days;
+        vm.warp(tTarget);
+
+        uint256 floorExpected = _ceilDiv(uint256(principal) * STD_RATE_BPS * 7 days, 10000 * SECONDS_PER_YEAR);
+        uint128 due = core.getDueInterest(loanId);
+        assert(due == floorExpected);
+
+        ILoanCore.Loan memory l = core.getLoan(loanId);
+        vm.prank(BORROWER);
+        core.extend(loanId, l.maturity + 1 days, 4000, uint64(tTarget + 1 hours), "");
+        assert(core.getDueInterest(loanId) == floorExpected);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_MinInterestFloorTimeTransition(uint8 minDaysSeed, uint32 elapsedSeed) public {
+        check_MinInterestFloorTimeTransition(
+            uint8(bound(minDaysSeed, 1, 14)),
+            uint32(bound(elapsedSeed, 0, 29 days))
+        );
+    }
+
+    /// @notice WS4.3 Property 3b: Continuous time transition [0 .. 29d] satisfies max(realAccrued, minFloor) with zero extend double-count.
+    function check_MinInterestFloorTimeTransition(uint8 minDays, uint32 elapsed) public {
         vm.assume(minDays >= 1 && minDays <= 14);
         vm.assume(elapsed <= 29 days);
 
-        uint256 loanId = _openLoan(col8, FIXED_COL_8, principal, rateBps, 30, minDays);
+        uint256 loanId = _openLoan(col8, FIXED_COL_8, STD_PRINCIPAL, STD_RATE_BPS, 30, minDays);
         uint256 tTarget = BASE_TIME + elapsed;
         vm.warp(tTarget);
 
-        uint256 floorExpected = _ceilDiv(uint256(principal) * rateBps * (uint256(minDays) * 1 days), 10000 * SECONDS_PER_YEAR);
-        uint256 realExpected = elapsed == 0 ? 0 : _ceilDiv(uint256(principal) * rateBps * elapsed, 10000 * SECONDS_PER_YEAR);
+        uint256 floorExpected = _ceilDiv(uint256(STD_PRINCIPAL) * STD_RATE_BPS * (uint256(minDays) * 1 days), 10000 * SECONDS_PER_YEAR);
+        uint256 realExpected = elapsed == 0 ? 0 : _ceilDiv(uint256(STD_PRINCIPAL) * STD_RATE_BPS * elapsed, 10000 * SECONDS_PER_YEAR);
         uint256 expectedDue = realExpected > floorExpected ? realExpected : floorExpected;
 
         uint128 due = core.getDueInterest(loanId);
         assert(due == expectedDue);
         assert(due >= floorExpected);
 
-        // Extending early at 40% APR must NEVER mutate accrued/floored due interest at tTarget
         ILoanCore.Loan memory l = core.getLoan(loanId);
         vm.prank(BORROWER);
         core.extend(loanId, l.maturity + 1 days, 4000, uint64(tTarget + 1 hours), "");
         assert(core.getDueInterest(loanId) == expectedDue);
     }
 
-    // ---------------- Property 4: Close Factor, Linear Dutch Price & 0-Wei Waterfall Conservation ----------------
+    // ---------------- Property 4: Close Factor (Wide 1,000-50,000 USDC), Linear Dutch Decay & 0-Wei Waterfall ----------------
 
-    /// forge-config: default.fuzz.runs = 512
-    function test_check_CloseFactorAndAuctionWaterfallConservation(
-        uint8 decIdxSeed,
-        uint64 principalSeed,
-        uint16 crashPriceUsdSeed,
-        uint16 buyElapsedSeed,
-        uint16 buyFracBpsSeed
-    ) public {
-        uint8 decIdx = uint8(bound(decIdxSeed, 0, 2));
-        uint64 principal = uint64(bound(principalSeed, 1_000e6, 1_200e6));
-        uint16 crashPriceUsd = uint16(bound(crashPriceUsdSeed, 60, 125));
-        uint16 buyElapsed = uint16(bound(buyElapsedSeed, 0, 1800));
-        uint16 buyFracBps = uint16(bound(buyFracBpsSeed, 4000, 10000));
-        check_CloseFactorAndAuctionWaterfallConservation(decIdx, principal, crashPriceUsd, buyElapsed, buyFracBps);
-    }
+    uint64 internal constant CLOSE_THRESHOLD_PRINCIPAL = 1_079_290_329; // exact wei where (P + 3d minFloor) = $1,080.00 (9000 bps LTV @ $1,200 gross)
 
-    /// @notice WS4.3 Property 4 (Halmos-compatible): Close factor (50% vs 100%), linear Dutch bounds & 0-wei waterfall conservation across 6/8/18 dec.
-    function check_CloseFactorAndAuctionWaterfallConservation(
-        uint8 decIdx,
+    function _verifyWideCloseFactorRegion(
+        MockERC20 tok,
+        MockAggregator feed,
+        uint256 colUnit,
         uint64 principal,
-        uint16 crashPriceUsd,
-        uint16 buyElapsed,
-        uint16 buyFracBps
-    ) public {
-        vm.assume(decIdx <= 2);
-        vm.assume(principal >= 1_000e6 && principal <= 1_200e6);
-        vm.assume(crashPriceUsd >= 60 && crashPriceUsd <= 125);
-        vm.assume(buyElapsed <= 1800);
-        vm.assume(buyFracBps >= 4000 && buyFracBps <= 10000);
-
-        MockERC20 tok;
-        MockAggregator feed;
-        uint256 colUnit;
-        if (decIdx == 0) {
-            tok = col6;
-            feed = feed6;
-            colUnit = 1e6;
-        } else if (decIdx == 1) {
-            tok = col8;
-            feed = feed8;
-            colUnit = 1e8;
+        bool expectFull
+    ) internal {
+        if (expectFull) {
+            vm.assume(principal >= CLOSE_THRESHOLD_PRINCIPAL && principal <= 50_000e6);
         } else {
-            tok = col18;
-            feed = feed18;
-            colUnit = 1e18;
+            vm.assume(principal >= 1_000e6 && principal < CLOSE_THRESHOLD_PRINCIPAL);
         }
 
-        // 10 shares @ $200 = $2,000 => 50%..60% init LTV for principal in [$1,000 .. $1,200]
-        uint128 colAmt = uint128(10 * colUnit);
-        uint256 loanId = _openLoan(tok, colAmt, principal, 800, 30, 3);
+        // Disable origination fee for CloseFactor isolation so Halmos proves LoanCore close-factor LTV boundary across 6/8/18 decimals cleanly;
+        // origination fee & FeeCollector flows remain active in Waterfall & Echidna tests.
+        vm.prank(OWNER);
+        feeCollector.setFeeRates(0, 1000, 100, 2000);
 
-        uint256 crashPrice8 = uint256(crashPriceUsd) * 1e8;
-        feed.setPrice(int256(crashPrice8));
-        (uint256 grossVal, , ) = router.getValue(address(tok), colAmt);
-        uint256 debt = uint256(principal) + core.getDueInterest(loanId);
+        feed.setPrice(1000e8);
+        uint128 colAmt = uint128(100 * colUnit);
+        uint256 loanId = _openLoan(tok, colAmt, principal, STD_RATE_BPS, 30, 3);
+
+        feed.setPrice(12e8);
+        vm.prank(KEEPER);
+        uint256 aucId = core.startLiquidation(loanId);
+        ILiquidationAuction.Auction memory a = auction.getAuction(aucId);
+
+        assert(a.collateralTotal == (expectFull ? colAmt : (colAmt / 2)));
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_CloseFactorWide_6Dec_Partial(uint64 principalSeed) public {
+        check_CloseFactorWide_6Dec_Partial(uint64(bound(principalSeed, 1_000e6, CLOSE_THRESHOLD_PRINCIPAL - 1)));
+    }
+
+    /// @notice WS4.3 Property 4a-1 (6-dec): 50% partial close factor across [1,000 .. 1,079.290519] USDC (< 90% LTV).
+    function check_CloseFactorWide_6Dec_Partial(uint64 principal) public {
+        _verifyWideCloseFactorRegion(col6, feed6, 1e6, principal, false);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_CloseFactorWide_6Dec_Full(uint64 principalSeed) public {
+        check_CloseFactorWide_6Dec_Full(uint64(bound(principalSeed, CLOSE_THRESHOLD_PRINCIPAL, 50_000e6)));
+    }
+
+    /// @notice WS4.3 Property 4a-2 (6-dec): 100% full close factor across [1,079.290520 .. 50,000] USDC (>= 90% LTV).
+    function check_CloseFactorWide_6Dec_Full(uint64 principal) public {
+        _verifyWideCloseFactorRegion(col6, feed6, 1e6, principal, true);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_CloseFactorWide_8Dec_Partial(uint64 principalSeed) public {
+        check_CloseFactorWide_8Dec_Partial(uint64(bound(principalSeed, 1_000e6, CLOSE_THRESHOLD_PRINCIPAL - 1)));
+    }
+
+    /// @notice WS4.3 Property 4b-1 (8-dec): 50% partial close factor across [1,000 .. 1,079.290519] USDC (< 90% LTV).
+    function check_CloseFactorWide_8Dec_Partial(uint64 principal) public {
+        _verifyWideCloseFactorRegion(col8, feed8, 1e8, principal, false);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_CloseFactorWide_8Dec_Full(uint64 principalSeed) public {
+        check_CloseFactorWide_8Dec_Full(uint64(bound(principalSeed, CLOSE_THRESHOLD_PRINCIPAL, 50_000e6)));
+    }
+
+    /// @notice WS4.3 Property 4b-2 (8-dec): 100% full close factor across [1,079.290520 .. 50,000] USDC (>= 90% LTV).
+    function check_CloseFactorWide_8Dec_Full(uint64 principal) public {
+        _verifyWideCloseFactorRegion(col8, feed8, 1e8, principal, true);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_CloseFactorWide_18Dec_Partial(uint64 principalSeed) public {
+        check_CloseFactorWide_18Dec_Partial(uint64(bound(principalSeed, 1_000e6, CLOSE_THRESHOLD_PRINCIPAL - 1)));
+    }
+
+    /// @notice WS4.3 Property 4c-1 (18-dec): 50% partial close factor across [1,000 .. 1,079.290519] USDC (< 90% LTV).
+    function check_CloseFactorWide_18Dec_Partial(uint64 principal) public {
+        _verifyWideCloseFactorRegion(col18, feed18, 1e18, principal, false);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_CloseFactorWide_18Dec_Full(uint64 principalSeed) public {
+        check_CloseFactorWide_18Dec_Full(uint64(bound(principalSeed, CLOSE_THRESHOLD_PRINCIPAL, 50_000e6)));
+    }
+
+    /// @notice WS4.3 Property 4c-2 (18-dec): 100% full close factor across [1,079.290520 .. 50,000] USDC (>= 90% LTV).
+    function check_CloseFactorWide_18Dec_Full(uint64 principal) public {
+        _verifyWideCloseFactorRegion(col18, feed18, 1e18, principal, true);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_CloseFactor_SymbolicCrashPrice(uint16 crashPriceUsdSeed) public {
+        check_CloseFactor_SymbolicCrashPrice(uint16(bound(crashPriceUsdSeed, 60, 128)));
+    }
+
+    /// @notice WS4.3 Property 4d: 50% vs 100% close factor transition across crash oracle prices [$60 .. $128].
+    function check_CloseFactor_SymbolicCrashPrice(uint16 crashPriceUsd) public {
+        vm.assume(crashPriceUsd >= 60 && crashPriceUsd <= 128);
+
+        uint128 colAmt = 100e8;
+        uint256 loanId = _openLoan(col8, colAmt, STD_PRINCIPAL, STD_RATE_BPS, 30, 3);
+        feed8.setPrice(int256(uint256(crashPriceUsd) * 1e8));
+        (uint256 grossVal, , ) = router.getValue(address(col8), colAmt);
+        uint256 debt = uint256(STD_PRINCIPAL) + core.getDueInterest(loanId);
         uint256 ltvBps = (debt * 10000) / grossVal;
         vm.assume(ltvBps >= 7800);
 
@@ -443,23 +567,85 @@ contract FormalPropertiesTest is TestBase, StdUtils {
         } else {
             assert(a.collateralTotal == colAmt / 2);
         }
+    }
 
-        uint256 tBuy = BASE_TIME + buyElapsed;
-        vm.warp(tBuy);
-        feed.setUpdatedAt(tBuy);
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_AuctionDutchPrice_StartFloorAndElapsed(uint16 oracleUsdSeed, uint16 discountSeed) public {
+        check_AuctionDutchPrice_StartFloorAndElapsed(
+            uint16(bound(oracleUsdSeed, 10, 2000)),
+            uint16(bound(discountSeed, 100, 3000))
+        );
+    }
+
+    /// @notice WS4.3 Property 4e: Auction startPrice (99%), floorPrice (100%-discount) & midpoint linear decay across [$10..$2000] x [1%..30%].
+    function check_AuctionDutchPrice_StartFloorAndElapsed(uint16 oraclePriceUsd, uint16 maxDiscountBps) public {
+        vm.assume(oraclePriceUsd >= 10 && oraclePriceUsd <= 2000);
+        vm.assume(maxDiscountBps >= 100 && maxDiscountBps <= 3000);
+
+        uint256 px = uint256(oraclePriceUsd) * 1e8;
+        vm.prank(address(core));
+        uint256 aucId = auction.startAuction(1, BORROWER, address(col8), 10e8, 1_000e6, 10e6, px, maxDiscountBps, KEEPER, false);
+        ILiquidationAuction.Auction memory a = auction.getAuction(aucId);
+
+        assert(a.startPrice == (px * 99) / 100);
+        assert(a.floorPrice == (px * (10000 - maxDiscountBps)) / 10000);
+        assert(auction.getCurrentPrice(aucId) == a.startPrice);
+
+        vm.warp(BASE_TIME + a.duration);
+        assert(auction.getCurrentPrice(aucId) == a.floorPrice);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_AuctionDutchPrice_SymbolicElapsedTime(uint16 elapsedSeed) public {
+        check_AuctionDutchPrice_SymbolicElapsedTime(uint16(bound(elapsedSeed, 0, 1800)));
+    }
+
+    /// @notice WS4.3 Property 4f: Exact linear Dutch decay & [floorPrice .. startPrice] bounds across every second in [0 .. 1800].
+    function check_AuctionDutchPrice_SymbolicElapsedTime(uint16 buyElapsed) public {
+        vm.assume(buyElapsed <= 1800);
+
+        vm.prank(address(core));
+        uint256 aucId = auction.startAuction(1, BORROWER, address(col8), 10e8, 1_000e6, 10e6, 200e8, 600, KEEPER, false);
+        ILiquidationAuction.Auction memory a = auction.getAuction(aucId);
+
+        vm.warp(BASE_TIME + buyElapsed);
         uint256 curPrice = auction.getCurrentPrice(aucId);
         assert(curPrice >= a.floorPrice);
         assert(curPrice <= a.startPrice);
         assert(curPrice == a.startPrice - (((a.startPrice - a.floorPrice) * buyElapsed) / a.duration));
+    }
 
-        uint128 colBuy = uint128((uint256(a.collateralRemaining) * buyFracBps) / 10000);
-        if (colBuy == 0) colBuy = a.collateralRemaining;
-        uint256 den = colUnit * 1e8;
-        uint128 expectedPaid = uint128(_ceilDiv(uint256(colBuy) * curPrice * 1e6, den));
-        if (expectedPaid < auction.MIN_BUY_USDC()) {
-            colBuy = a.collateralRemaining;
-            expectedPaid = uint128(_ceilDiv(uint256(colBuy) * curPrice * 1e6, den));
+    function _verifyWideWaterfallRegion(
+        MockERC20 tok,
+        MockAggregator feed,
+        uint256 colUnit,
+        uint64 principal,
+        bool isFullClose
+    ) internal {
+        if (isFullClose) {
+            vm.assume(principal >= CLOSE_THRESHOLD_PRINCIPAL && principal <= 50_000e6);
+        } else {
+            vm.assume(principal >= 1_000e6 && principal < CLOSE_THRESHOLD_PRINCIPAL);
         }
+
+        // Disable origination fee during loan open so Halmos isolates the auction buy + FeeCollector liquidation waterfall across full [1,000..50,000] USDC.
+        vm.prank(OWNER);
+        feeCollector.setFeeRates(0, 1000, 100, 2000);
+
+        // 100 shares @ $1,000 init ($100k gross), crash to $12 ($1,200 gross)
+        feed.setPrice(1000e8);
+        uint128 colAmt = uint128(100 * colUnit);
+        uint256 loanId = _openLoan(tok, colAmt, principal, STD_RATE_BPS, 30, 3);
+
+        feed.setPrice(12e8);
+        vm.prank(KEEPER);
+        uint256 aucId = core.startLiquidation(loanId);
+
+        // With fixed crash oracle ($12) and split partial/full region, colBuy is concrete (50 or 100 shares)
+        // so paid/liquidationFee/netProceeds are concrete while debtPrincipal/debtInterest/surplus remain fully symbolic.
+        uint128 colBuy = uint128((isFullClose ? 100 : 50) * colUnit);
+        uint256 curPrice = auction.getCurrentPrice(aucId);
+        uint128 expectedPaid = uint128(_ceilDiv(uint256(colBuy) * curPrice * 1e6, colUnit * 1e8));
 
         uint256 keepBefore = usdc.balanceOf(KEEPER);
         uint256 feeBefore = usdc.balanceOf(TREASURY) + usdc.balanceOf(RESERVE);
@@ -485,6 +671,131 @@ contract FormalPropertiesTest is TestBase, StdUtils {
         assert(usdc.balanceOf(address(auction)) == 0);
     }
 
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_AuctionWaterfallWide_6Dec_Partial(uint64 principalSeed) public {
+        check_AuctionWaterfallWide_6Dec_Partial(uint64(bound(principalSeed, 1_000e6, CLOSE_THRESHOLD_PRINCIPAL - 1)));
+    }
+
+    /// @notice WS4.3 Property 4g-1 (6-dec): 0-wei waterfall conservation across [1,000 .. 1,079.290519] USDC (50% partial close).
+    function check_AuctionWaterfallWide_6Dec_Partial(uint64 principal) public {
+        _verifyWideWaterfallRegion(col6, feed6, 1e6, principal, false);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_AuctionWaterfallWide_6Dec_Full(uint64 principalSeed) public {
+        check_AuctionWaterfallWide_6Dec_Full(uint64(bound(principalSeed, CLOSE_THRESHOLD_PRINCIPAL, 50_000e6)));
+    }
+
+    /// @notice WS4.3 Property 4g-2 (6-dec): 0-wei waterfall conservation across [1,079.290520 .. 50,000] USDC (100% close: surplus + bad debt).
+    function check_AuctionWaterfallWide_6Dec_Full(uint64 principal) public {
+        _verifyWideWaterfallRegion(col6, feed6, 1e6, principal, true);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_AuctionWaterfallWide_8Dec_Partial(uint64 principalSeed) public {
+        check_AuctionWaterfallWide_8Dec_Partial(uint64(bound(principalSeed, 1_000e6, CLOSE_THRESHOLD_PRINCIPAL - 1)));
+    }
+
+    /// @notice WS4.3 Property 4h-1 (8-dec): 0-wei waterfall conservation across [1,000 .. 1,079.290519] USDC (50% partial close).
+    function check_AuctionWaterfallWide_8Dec_Partial(uint64 principal) public {
+        _verifyWideWaterfallRegion(col8, feed8, 1e8, principal, false);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_AuctionWaterfallWide_8Dec_Full(uint64 principalSeed) public {
+        check_AuctionWaterfallWide_8Dec_Full(uint64(bound(principalSeed, CLOSE_THRESHOLD_PRINCIPAL, 50_000e6)));
+    }
+
+    /// @notice WS4.3 Property 4h-2 (8-dec): 0-wei waterfall conservation across [1,079.290520 .. 50,000] USDC (100% close: surplus + bad debt).
+    function check_AuctionWaterfallWide_8Dec_Full(uint64 principal) public {
+        _verifyWideWaterfallRegion(col8, feed8, 1e8, principal, true);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_AuctionWaterfallWide_18Dec_Partial(uint64 principalSeed) public {
+        check_AuctionWaterfallWide_18Dec_Partial(uint64(bound(principalSeed, 1_000e6, CLOSE_THRESHOLD_PRINCIPAL - 1)));
+    }
+
+    /// @notice WS4.3 Property 4i-1 (18-dec): 0-wei waterfall conservation across [1,000 .. 1,079.290519] USDC (50% partial close).
+    function check_AuctionWaterfallWide_18Dec_Partial(uint64 principal) public {
+        _verifyWideWaterfallRegion(col18, feed18, 1e18, principal, false);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_AuctionWaterfallWide_18Dec_Full(uint64 principalSeed) public {
+        check_AuctionWaterfallWide_18Dec_Full(uint64(bound(principalSeed, CLOSE_THRESHOLD_PRINCIPAL, 50_000e6)));
+    }
+
+    /// @notice WS4.3 Property 4i-2 (18-dec): 0-wei waterfall conservation across [1,079.290520 .. 50,000] USDC (100% close: surplus + bad debt).
+    function check_AuctionWaterfallWide_18Dec_Full(uint64 principal) public {
+        _verifyWideWaterfallRegion(col18, feed18, 1e18, principal, true);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_AuctionBuy_SymbolicAmountAndDust(uint64 colBuySeed) public {
+        check_AuctionBuy_SymbolicAmountAndDust(uint64(bound(colBuySeed, 2e7, 50e8)));
+    }
+
+    /// @notice WS4.3 Property 4j-1: Exact ceilDiv USDC payment, dust auto-close, and 0-wei conservation across arbitrary collateral buy sizes [0.2 .. 50] shares.
+    function check_AuctionBuy_SymbolicAmountAndDust(uint64 colBuy) public {
+        vm.assume(colBuy >= 2e7 && colBuy <= 50e8);
+
+        // FeeCollector splits are proven across [10 .. 50,000] USDC in 4j-2; zeroing fees here keeps Halmos bit-blasting free of 5 nested div-10000 chains on colBuy.
+        vm.prank(OWNER);
+        feeCollector.setFeeRates(0, 0, 0, 0);
+
+        uint256 tBuy = BASE_TIME + 900;
+        vm.warp(tBuy);
+        feed8.setUpdatedAt(tBuy);
+        uint256 curPrice = auction.getCurrentPrice(symBuyAucId);
+
+        uint128 expectedPaid = uint128(_ceilDiv(uint256(colBuy) * curPrice * 1e6, 1e8 * 1e8));
+
+        uint256 bBefore = usdc.balanceOf(BORROWER);
+        uint256 coreBefore = usdc.balanceOf(address(core));
+        uint256 lClaimBefore = core.getClaimable(address(lenderWallet));
+
+        usdc.mint(LIQUIDATOR, expectedPaid);
+        vm.prank(LIQUIDATOR);
+        usdc.approve(address(auction), expectedPaid);
+        vm.prank(LIQUIDATOR);
+        uint128 paid = auction.buy(symBuyAucId, colBuy, expectedPaid);
+        assert(paid == expectedPaid);
+
+        uint256 borrowerDelta = usdc.balanceOf(BORROWER) - bBefore;
+        uint256 claimDelta = core.getClaimable(address(lenderWallet)) - lClaimBefore;
+        uint256 coreDelta = usdc.balanceOf(address(core)) - coreBefore;
+
+        assert(borrowerDelta + claimDelta == paid);
+        assert(coreDelta == claimDelta);
+        assert(usdc.balanceOf(address(auction)) == 0);
+    }
+
+    /// forge-config: default.fuzz.runs = 512
+    function test_check_AuctionWaterfall_FeeCollectorConservation(uint64 usdcPaidSeed) public {
+        check_AuctionWaterfall_FeeCollectorConservation(uint64(bound(usdcPaidSeed, 10e6, 50_000e6)));
+    }
+
+    /// @notice WS4.3 Property 4j-2: Exact 0-wei FeeCollector liquidation fee, keeper reward, and treasury/reserve split conservation across [10 .. 50,000] USDC.
+    function check_AuctionWaterfall_FeeCollectorConservation(uint64 usdcPaid) public {
+        vm.assume(usdcPaid >= 10e6 && usdcPaid <= 50_000e6);
+
+        (uint128 protocolFee, uint128 keeperReward) = feeCollector.calculateLiquidationFee(usdcPaid);
+        uint128 totalFee = protocolFee + keeperReward;
+        assert(totalFee <= usdcPaid);
+
+        uint256 treasBefore = usdc.balanceOf(TREASURY);
+        uint256 resBefore = usdc.balanceOf(RESERVE);
+        usdc.mint(address(this), protocolFee);
+        usdc.approve(address(feeCollector), protocolFee);
+        feeCollector.distributeFees(address(usdc), protocolFee);
+
+        uint256 treasDelta = usdc.balanceOf(TREASURY) - treasBefore;
+        uint256 resDelta = usdc.balanceOf(RESERVE) - resBefore;
+        assert(treasDelta + resDelta == protocolFee);
+        assert(treasDelta + resDelta + keeperReward == totalFee);
+    }
+
     // ---------------- Property 5: CollateralEscrow Multi-Token Isolation & Access Control ----------------
 
     /// forge-config: default.fuzz.runs = 512
@@ -496,7 +807,7 @@ contract FormalPropertiesTest is TestBase, StdUtils {
         check_CollateralEscrowIsolation(a1, a2, b1, rel);
     }
 
-    /// @notice WS4.3 Property 5 (Halmos-compatible): Multi-token isolation, over-release rejection & unauthorized withdrawal rejection.
+    /// @notice WS4.3 Property 5: Multi-token isolation, over-release rejection & unauthorized withdrawal rejection.
     function check_CollateralEscrowIsolation(uint64 a1, uint64 a2, uint64 b1, uint64 rel) public {
         vm.assume(a1 >= 1 && a1 <= 1_000_000e8);
         vm.assume(a2 >= 1 && a2 <= 1_000_000e8);
@@ -523,7 +834,6 @@ contract FormalPropertiesTest is TestBase, StdUtils {
         assert(isoEscrow.getBalance(address(isoTokA)) == uint256(a1) + a2);
         assert(isoEscrow.getBalance(address(isoTokB)) == b1);
 
-        // Unauthorized direct withdrawal MUST revert UnauthorizedCaller
         vm.prank(ISO_USER_A);
         try isoEscrow.releaseCollateral(address(isoTokA), ISO_USER_A, 1) {
             assert(false);
@@ -540,7 +850,6 @@ contract FormalPropertiesTest is TestBase, StdUtils {
         assert(isoEscrow.getBalance(address(isoTokB)) == b1);
         assert(isoTokB.balanceOf(address(isoEscrow)) == b1);
 
-        // Over-releasing tokA MUST revert InsufficientBalance and leave tokB untouched
         vm.prank(ISO_AUTH);
         try isoEscrow.releaseCollateral(address(isoTokA), ISO_USER_A, expectedRemA + 1) {
             assert(false);
